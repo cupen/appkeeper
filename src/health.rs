@@ -21,7 +21,7 @@ pub type TaskMap = Arc<Mutex<HashMap<String, HealthTask>>>;
 /// Probe every due task once per second and report via `report`.
 /// Serial probing is fine at app-layer scale (see design D6).
 pub fn checker_loop(tasks: TaskMap, report: impl Fn(String, bool) + Send + 'static) {
-    let agent = ureq::AgentBuilder::new().build();
+    let agent = ureq::Agent::new_with_defaults();
     let mut next_due: HashMap<String, Instant> = HashMap::new();
     loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -66,9 +66,15 @@ fn probe(agent: &ureq::Agent, check: &HealthCheck) -> bool {
 
 /// 2xx/3xx counts as healthy (matches the spec).
 fn http_ok(agent: &ureq::Agent, url: &str, timeout: Duration) -> bool {
-    match agent.get(url).timeout(timeout).call() {
-        Ok(resp) => resp.status() < 400,
-        Err(ureq::Error::Status(code, _)) => code < 400,
+    match agent
+        .get(url)
+        .config()
+        .timeout_per_call(Some(timeout))
+        .build()
+        .call()
+    {
+        Ok(resp) => resp.status().as_u16() < 400,
+        Err(ureq::Error::StatusCode(code)) => code < 400,
         Err(_) => false,
     }
 }
@@ -157,7 +163,7 @@ mod tests {
                 );
             }
         });
-        let agent = ureq::AgentBuilder::new().build();
+        let agent = ureq::Agent::new_with_defaults();
         assert!(http_ok(
             &agent,
             &format!("http://{addr}/"),

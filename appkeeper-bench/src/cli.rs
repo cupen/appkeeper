@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 
 /// The `[k] <seq> <ts> ` prefix must fit plus some fill text: worst case is
@@ -271,7 +271,11 @@ mod tests {
     #[test]
     fn drip_defaults_to_builtin_rate_but_zero_overrides() {
         let e = parse(&["--case", "drip"]).unwrap();
-        assert_eq!(e.rate, Some(DRIP_DEFAULT_RATE), "drip default rate is built in");
+        assert_eq!(
+            e.rate,
+            Some(DRIP_DEFAULT_RATE),
+            "drip default rate is built in"
+        );
         let e = parse(&["--case", "drip", "--rate", "0"]).unwrap();
         assert_eq!(e.rate, None, "explicit --rate 0 means full speed");
         let e = parse(&["--case", "drip", "--rate", "42"]).unwrap();
@@ -328,17 +332,31 @@ mod tests {
 
     #[test]
     fn unbounded_load_is_rejected() {
-        let err =
-            parse(&["--case", "firehose", "--duration", "0"]).unwrap_err();
+        let err = parse(&["--case", "firehose", "--duration", "0"]).unwrap_err();
         assert!(format!("{err:#}").contains("no load bound"));
     }
 
     #[test]
     fn total_size_splits_across_programs() {
-        let e = parse(&["--case", "fanout", "--programs", "4", "--log-total-size", "1000"])
-            .unwrap();
+        let e = parse(&[
+            "--case",
+            "fanout",
+            "--programs",
+            "4",
+            "--log-total-size",
+            "1000",
+        ])
+        .unwrap();
         assert_eq!(e.total_per_program(), 250);
-        let e = parse(&["--case", "fanout", "--programs", "4", "--log-total-size", "3"]).unwrap();
+        let e = parse(&[
+            "--case",
+            "fanout",
+            "--programs",
+            "4",
+            "--log-total-size",
+            "3",
+        ])
+        .unwrap();
         assert_eq!(e.total_per_program(), 1, "tiny budgets stay positive");
         let e = parse(&["--case", "firehose"]).unwrap();
         assert_eq!(e.total_per_program(), 0, "0 means unlimited");

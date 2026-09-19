@@ -106,8 +106,7 @@ fn render_params(p: &serde_json::Value) -> String {
         "programs",
         "socket",
     ];
-    KEYS
-        .iter()
+    KEYS.iter()
         .filter_map(|k| p.get(k).map(|v| format!("{k}={v}")))
         .collect::<Vec<_>>()
         .join(", ")
@@ -117,7 +116,10 @@ pub fn render_table(r: &Report) -> String {
     let mut s = String::new();
     s.push_str(&format!("== appkeeper-bench report: {} ==\n", r.case));
     s.push_str(&format!("  case            : {}\n", r.case));
-    s.push_str(&format!("  params          : {}\n", render_params(&r.params)));
+    s.push_str(&format!(
+        "  params          : {}\n",
+        render_params(&r.params)
+    ));
     s.push_str(&format!(
         "  rows / bytes    : {} / {}\n",
         r.aggregate.rows, r.aggregate.bytes
@@ -200,7 +202,10 @@ mod tests {
             },
             wall_time_secs: 1.91,
             rotation_count: 0,
-            daemon_rss: Some(RssDoc { peak_kib: 8123, avg_kib: 7900 }),
+            daemon_rss: Some(RssDoc {
+                peak_kib: 8123,
+                avg_kib: 7900,
+            }),
             integrity: IntegrityDoc {
                 pass: true,
                 expected_rows: 10000,
@@ -220,8 +225,16 @@ mod tests {
         let r = sample_report();
         let v = serde_json::to_value(&r).unwrap();
         for key in [
-            "case", "params", "programs", "aggregate", "wall_time_secs",
-            "rotation_count", "daemon_rss", "integrity", "started_at", "bin_versions",
+            "case",
+            "params",
+            "programs",
+            "aggregate",
+            "wall_time_secs",
+            "rotation_count",
+            "daemon_rss",
+            "integrity",
+            "started_at",
+            "bin_versions",
         ] {
             assert!(v.get(key).is_some(), "schema field {key} missing");
         }
@@ -279,7 +292,9 @@ mod tests {
     fn failed_integrity_says_fail_and_lists_problems() {
         let mut r = sample_report();
         r.integrity.pass = false;
-        r.integrity.problems.push("row count mismatch: expected 7 rows on disk, found 5".into());
+        r.integrity
+            .problems
+            .push("row count mismatch: expected 7 rows on disk, found 5".into());
         let text = render_table(&r);
         assert!(text.contains("FAIL"));
         assert!(text.contains("row count mismatch"));

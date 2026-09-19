@@ -10,7 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Fill text cycled through the payload: wordy ASCII, no newlines.
 pub const FILL: &str = "ak bench load generator fills every line with realistic text so each row can be reconciled on disk independently ";
@@ -140,13 +140,16 @@ pub fn run(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let line = render_line(stream.tag(), match stream {
-            Stream::Out => c.out_rows,
-            Stream::Err => c.err_rows,
-        }, ts_ms, row_size)
-        .ok_or_else(|| {
-            anyhow::anyhow!("row size {row_size} is too small for the line prefix")
-        })?;
+        let line = render_line(
+            stream.tag(),
+            match stream {
+                Stream::Out => c.out_rows,
+                Stream::Err => c.err_rows,
+            },
+            ts_ms,
+            row_size,
+        )
+        .ok_or_else(|| anyhow::anyhow!("row size {row_size} is too small for the line prefix"))?;
         debug_assert_eq!(line.len(), row_size);
 
         let sink: &mut dyn Write = match stream {
@@ -186,10 +189,13 @@ pub fn write_count_file(path: &Path, c: &GenCounters) {
     }
 }
 
-    /// Entry for the hidden `__generate` mode.
+/// Entry for the hidden `__generate` mode.
 pub fn run_generate(args: &crate::cli::GenerateArgs) -> Result<()> {
     if args.row_size < crate::cli::MIN_ROW_SIZE {
-        bail!("__generate --row-size must be >= {}", crate::cli::MIN_ROW_SIZE);
+        bail!(
+            "__generate --row-size must be >= {}",
+            crate::cli::MIN_ROW_SIZE
+        );
     }
     if args.rows == 0 && args.total_size == 0 && args.duration <= 0.0 {
         bail!("__generate with no bound would run forever (refusing)");
@@ -202,7 +208,13 @@ pub fn run_generate(args: &crate::cli::GenerateArgs) -> Result<()> {
     };
     let mut out = std::io::BufWriter::with_capacity(256 * 1024, std::io::stdout().lock());
     let mut err = std::io::BufWriter::with_capacity(64 * 1024, std::io::stderr().lock());
-    let counters = run(&limits, args.stderr_every, args.row_size as usize, &mut out, &mut err)?;
+    let counters = run(
+        &limits,
+        args.stderr_every,
+        args.row_size as usize,
+        &mut out,
+        &mut err,
+    )?;
     if let Some(p) = &args.count_file {
         write_count_file(p, &counters);
     }
@@ -247,7 +259,11 @@ mod tests {
     fn seq_round_trips() {
         let line = render_line("err", 12345, 99, 64).unwrap();
         assert_eq!(parse_seq(&line, "err"), Some(12345));
-        assert_eq!(parse_seq(&line, "out"), None, "tag mismatch is not parseable");
+        assert_eq!(
+            parse_seq(&line, "out"),
+            None,
+            "tag mismatch is not parseable"
+        );
         assert_eq!(parse_seq("garbage", "out"), None);
         assert_eq!(parse_seq("[out] notanumber 1 x", "out"), None);
     }
@@ -271,7 +287,12 @@ mod tests {
     #[test]
     fn row_bound_stops_production() {
         let c = counters(
-            &GenLimits { rows: 1000, total_size: 0, duration: None, rate: None },
+            &GenLimits {
+                rows: 1000,
+                total_size: 0,
+                duration: None,
+                rate: None,
+            },
             0,
             128,
         );
@@ -284,12 +305,21 @@ mod tests {
     #[test]
     fn size_bound_stops_within_one_line_of_ceiling() {
         let c = counters(
-            &GenLimits { rows: 0, total_size: 1000, duration: None, rate: None },
+            &GenLimits {
+                rows: 0,
+                total_size: 1000,
+                duration: None,
+                rate: None,
+            },
             0,
             100,
         );
         assert!(c.bytes >= 1000, "produces up to the ceiling");
-        assert!(c.bytes < 1000 + 101, "at most one line of slack, got {}", c.bytes);
+        assert!(
+            c.bytes < 1000 + 101,
+            "at most one line of slack, got {}",
+            c.bytes
+        );
     }
 
     #[test]
@@ -297,7 +327,12 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         run(
-            &GenLimits { rows: 37, total_size: 0, duration: None, rate: None },
+            &GenLimits {
+                rows: 37,
+                total_size: 0,
+                duration: None,
+                rate: None,
+            },
             10,
             64,
             &mut out,
@@ -352,7 +387,12 @@ mod tests {
     fn full_speed_throughput_is_not_degraded_by_pacing() {
         let t0 = Instant::now();
         let c = counters(
-            &GenLimits { rows: 200_000, total_size: 0, duration: None, rate: None },
+            &GenLimits {
+                rows: 200_000,
+                total_size: 0,
+                duration: None,
+                rate: None,
+            },
             0,
             128,
         );
@@ -402,7 +442,10 @@ mod tests {
         };
         let err = run_generate(&unbounded).unwrap_err();
         assert!(format!("{err:#}").contains("forever"), "{err:#}");
-        let tiny = crate::cli::GenerateArgs { row_size: 10, ..unbounded };
+        let tiny = crate::cli::GenerateArgs {
+            row_size: 10,
+            ..unbounded
+        };
         let err = run_generate(&tiny).unwrap_err();
         assert!(format!("{err:#}").contains("row-size"), "{err:#}");
     }

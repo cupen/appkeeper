@@ -5,14 +5,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::api::Client;
-use crate::cases::{ProgramPlan, BENCH_PREFIX};
+use crate::cases::{BENCH_PREFIX, ProgramPlan};
 use crate::dcfg;
 
 /// The daemon child lives in a global slot so the ctrl-C handler can stop it
@@ -193,7 +193,9 @@ impl Site {
             std::fs::write(&path, &p.toml)
                 .with_context(|| format!("write app config {}", path.display()))?;
         }
-        self.client.reload().context("reload after registering bench apps")?;
+        self.client
+            .reload()
+            .context("reload after registering bench apps")?;
         // Spawn mode owns the whole workspace, so a global apply is fine; in
         // connect mode scope the apply to the bench apps so any pending user
         // changes on the target daemon are never applied as a side effect.
@@ -219,7 +221,12 @@ impl Site {
             app_names: plans.iter().map(|p| p.name.clone()).collect(),
             log_dir: self.log_dir.clone(),
             root: if self.spawn {
-                Some(self.count_dir.parent().unwrap_or(Path::new("")).to_path_buf())
+                Some(
+                    self.count_dir
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
+                )
             } else {
                 None
             },
@@ -398,8 +405,8 @@ fn bench_app_files(app_dir: &Path) -> Result<Vec<PathBuf>> {
     if !app_dir.exists() {
         return Ok(out);
     }
-    for e in std::fs::read_dir(app_dir)
-        .with_context(|| format!("scan app_dir {}", app_dir.display()))?
+    for e in
+        std::fs::read_dir(app_dir).with_context(|| format!("scan app_dir {}", app_dir.display()))?
     {
         let p = e?.path();
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
@@ -460,7 +467,10 @@ pub fn run_cleanup(ctx: &CleanupCtx) {
         for f in &ctx.app_files {
             if let Err(e) = std::fs::remove_file(f) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("[bench] warning: cannot remove app file {}: {e}", f.display());
+                    eprintln!(
+                        "[bench] warning: cannot remove app file {}: {e}",
+                        f.display()
+                    );
                 }
             }
         }

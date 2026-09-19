@@ -43,8 +43,8 @@ pub fn discover(config_source: &Path) -> Result<DaemonPaths> {
             config_source.display()
         )
     })?;
-    let v: toml::Value =
-        toml::from_str(&text).with_context(|| format!("cannot parse {}", config_source.display()))?;
+    let v: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("cannot parse {}", config_source.display()))?;
     let config_dir = config_source
         .parent()
         .map(Path::to_path_buf)
@@ -131,7 +131,10 @@ mod tests {
         } else {
             f.parent().unwrap().join("C:\\xk\\logs")
         };
-        assert_eq!(p.log_dir, expected, "backslashes must survive the literal string");
+        assert_eq!(
+            p.log_dir, expected,
+            "backslashes must survive the literal string"
+        );
         let _ = std::fs::remove_dir_all(f.parent().unwrap());
     }
 }

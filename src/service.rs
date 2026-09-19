@@ -465,7 +465,10 @@ mod tests {
 
     #[test]
     fn unit_name_derived_from_file_stem() {
-        assert_eq!(unit_name_of(Path::new("/etc/systemd/system/xk.service")), "xk");
+        assert_eq!(
+            unit_name_of(Path::new("/etc/systemd/system/xk.service")),
+            "xk"
+        );
         assert_eq!(unit_name_of(Path::new("my-app.service")), "my-app");
     }
 

@@ -2,18 +2,18 @@
 //! done → drain → reconcile → report → cleanup. Exit code semantics live in
 //! main.rs; this module decides pass/fail of the measurement itself.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
+use crate::api::Client;
 use crate::cases::{self, ProgramPlan};
 use crate::cli::{BenchArgs, Effective};
-use crate::api::Client;
 use crate::generate::GenCounters;
 use crate::integrity;
-use crate::report::{self, Aggregate, BinVersions, IntegrityDoc, ProgramMetrics, RssDoc, Report};
+use crate::report::{self, Aggregate, BinVersions, IntegrityDoc, ProgramMetrics, Report, RssDoc};
 use crate::rss;
 use crate::topology::{self, Site};
 
@@ -193,8 +193,8 @@ pub fn run_bench(a: &BenchArgs) -> Result<()> {
             s
         }
         None => {
-            let s =
-                topology::spawn_site(a.daemon.as_deref()).map_err(|e| e.context("spawn topology"))?;
+            let s = topology::spawn_site(a.daemon.as_deref())
+                .map_err(|e| e.context("spawn topology"))?;
             eprintln!(
                 "[bench] spawned isolated daemon (pid {}, control {})",
                 s.daemon_pid.unwrap_or(0),
@@ -295,8 +295,7 @@ fn measure(
     let mut rotation_count = 0u64;
     let mut problems = Vec::new();
     for (name, c) in &counts {
-        let (out, err) =
-            integrity::verify_program(&site.log_dir, name, c.out_rows, c.err_rows);
+        let (out, err) = integrity::verify_program(&site.log_dir, name, c.out_rows, c.err_rows);
         rotation_count += integrity::count_rotated(&site.log_dir.join(format!("{name}.out.log")));
         rotation_count += integrity::count_rotated(&site.log_dir.join(format!("{name}.err.log")));
         expected_total += out.expected + err.expected;

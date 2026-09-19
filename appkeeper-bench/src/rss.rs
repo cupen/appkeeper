@@ -3,8 +3,8 @@
 //! cross-process equivalent, so it reports "no data" (the JSON field is
 //! null) — never 0.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 

@@ -25,7 +25,11 @@ fn daemon_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.parent().expect("crate lives in the workspace");
     let cand = root.join("target").join("debug").join(name);
-    assert!(cand.is_file(), "daemon binary missing at {} (cargo build first)", cand.display());
+    assert!(
+        cand.is_file(),
+        "daemon binary missing at {} (cargo build first)",
+        cand.display()
+    );
     cand
 }
 
@@ -65,7 +69,9 @@ fn leftover_generators() -> Vec<u32> {
     out
 }
 
-#[cfg(unix)]
+// Portable on purpose: it only scans the temp dir, and the `--keep` test
+// asserts with it on every platform (unlike leftover_generators, which
+// needs /proc).
 fn leftover_workspaces() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
@@ -229,15 +235,22 @@ fn pids_referencing(needle: &str) -> Vec<u32> {
 fn firehose_full_cycle_reports_and_cleans_up() {
     let json = std::env::temp_dir().join("it-firehose-report.json");
     let (code, stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "20000",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "firehose",
+        "--log-rows",
+        "20000",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     assert!(stdout.contains("rows/s"), "table on stdout: {stdout}");
     assert!(stdout.contains("integrity"), "table on stdout: {stdout}");
-    assert!(!stdout.contains('\r'), "stdout must be free of progress refreshes: {stdout}");
+    assert!(
+        !stdout.contains('\r'),
+        "stdout must be free of progress refreshes: {stdout}"
+    );
     let v = read_json(json.to_str().unwrap());
     assert_eq!(v["case"], "firehose");
     assert_eq!(v["aggregate"]["rows"], 20000, "rows bound honored exactly");
@@ -254,10 +267,14 @@ fn firehose_full_cycle_reports_and_cleans_up() {
 fn rotation_full_cycle_rotates_and_reconciles() {
     let json = std::env::temp_dir().join("it-rotation-report.json");
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "rotation",
-        "--log-rows", "120000",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "rotation",
+        "--log-rows",
+        "120000",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     let v = read_json(json.to_str().unwrap());
@@ -275,11 +292,16 @@ fn rotation_full_cycle_rotates_and_reconciles() {
 fn fanout_full_cycle_splits_streams_and_aggregates() {
     let json = std::env::temp_dir().join("it-fanout-report.json");
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "fanout",
-        "--programs", "3",
-        "--log-rows", "20000",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "fanout",
+        "--programs",
+        "3",
+        "--log-rows",
+        "20000",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     let v = read_json(json.to_str().unwrap());
@@ -309,10 +331,14 @@ fn fanout_full_cycle_splits_streams_and_aggregates() {
 fn drip_full_cycle_samples_rss_and_defaults_to_100_rows_per_sec() {
     let json = std::env::temp_dir().join("it-drip-report.json");
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "drip",
-        "--duration", "3",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "drip",
+        "--duration",
+        "3",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     let v = read_json(json.to_str().unwrap());
@@ -328,7 +354,10 @@ fn drip_full_cycle_samples_rss_and_defaults_to_100_rows_per_sec() {
     // RSS sampling (unix): peak and avg present and positive
     let rss = &v["daemon_rss"];
     if cfg!(unix) {
-        assert!(rss["peak_kib"].as_u64().unwrap() > 0, "sampled RSS peak: {v}");
+        assert!(
+            rss["peak_kib"].as_u64().unwrap() > 0,
+            "sampled RSS peak: {v}"
+        );
         assert!(rss["avg_kib"].as_u64().unwrap() > 0);
     } else {
         assert!(rss.is_null(), "RSS must degrade to null on Windows");
@@ -342,15 +371,25 @@ fn drip_full_cycle_samples_rss_and_defaults_to_100_rows_per_sec() {
 #[ignore = "spawns a real daemon; run with --ignored"]
 fn keep_preserves_the_spawn_workspace() {
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "drip",
-        "--duration", "2",
+        "--case",
+        "drip",
+        "--duration",
+        "2",
         "--keep",
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
-    assert!(stderr.contains("--keep"), "kept path is announced: {stderr}");
+    assert!(
+        stderr.contains("--keep"),
+        "kept path is announced: {stderr}"
+    );
     let kept = leftover_workspaces();
-    assert_eq!(kept.len(), 1, "exactly the kept workspace remains: {kept:?}");
+    assert_eq!(
+        kept.len(),
+        1,
+        "exactly the kept workspace remains: {kept:?}"
+    );
     let ws = &kept[0];
     assert!(ws.join("daemon.toml").is_file());
     assert!(ws.join("apps").is_dir());
@@ -368,10 +407,14 @@ fn integrity_failure_exits_nonzero_with_report() {
     let daemon = daemon_bin();
     let mut child = Command::new(&bench)
         .args([
-            "--case", "rotation",
-            "--log-rows", "400000",
-            "--json", json.to_str().unwrap(),
-            "--daemon", daemon.to_str().unwrap(),
+            "--case",
+            "rotation",
+            "--log-rows",
+            "400000",
+            "--json",
+            json.to_str().unwrap(),
+            "--daemon",
+            daemon.to_str().unwrap(),
         ])
         .spawn()
         .expect("spawn bench");
@@ -472,9 +515,12 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
     assert!(healthy, "scratch daemon did not become healthy");
 
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "20000",
-        "--connect", &format!("127.0.0.1:{port}"),
+        "--case",
+        "firehose",
+        "--log-rows",
+        "20000",
+        "--connect",
+        &format!("127.0.0.1:{port}"),
     ]);
     assert_eq!(code, 0, "connect bench failed: {stderr}");
 
@@ -490,7 +536,10 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.starts_with("appkeeper-bench-"))
         .collect();
-    assert!(logs_left.is_empty(), "bench log files must be removed: {logs_left:?}");
+    assert!(
+        logs_left.is_empty(),
+        "bench log files must be removed: {logs_left:?}"
+    );
     let status = Cmd::new("curl")
         .args(["-sf", &format!("http://127.0.0.1:{port}/v1/status")])
         .output()
@@ -546,8 +595,12 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(800));
 
-    let (code, _stdout, stderr) =
-        run_bench(&["--case", "firehose", "--connect", &format!("127.0.0.1:{port}")]);
+    let (code, _stdout, stderr) = run_bench(&[
+        "--case",
+        "firehose",
+        "--connect",
+        &format!("127.0.0.1:{port}"),
+    ]);
     assert_ne!(code, 0, "collision must be refused");
     assert!(stderr.contains("refusing"), "{stderr}");
     // the planted file is untouched
@@ -566,11 +619,16 @@ fn firehose_rate_bound_stops_at_duration_with_full_json_schema() {
     let json = std::env::temp_dir().join("it-firehose-rate-report.json");
     let t0 = std::time::Instant::now();
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--rate", "100",
-        "--duration", "3",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "firehose",
+        "--rate",
+        "100",
+        "--duration",
+        "3",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     let elapsed = t0.elapsed();
     assert_eq!(code, 0, "bench failed: {stderr}");
@@ -582,7 +640,10 @@ fn firehose_rate_bound_stops_at_duration_with_full_json_schema() {
     assert_eq!(v["case"], "firehose");
     // ~100 rows/s for ~3s (spec allows rate jitter)
     let rows = v["aggregate"]["rows"].as_u64().unwrap();
-    assert!((150..=600).contains(&rows), "~300 rows expected, got {rows}");
+    assert!(
+        (150..=600).contains(&rows),
+        "~300 rows expected, got {rows}"
+    );
     // the full D8 schema, field by field
     assert_eq!(v["params"]["rate"], 100);
     assert_eq!(v["params"]["duration"], 3);
@@ -591,7 +652,10 @@ fn firehose_rate_bound_stops_at_duration_with_full_json_schema() {
     assert!(v["wall_time_secs"].as_f64().unwrap() > 0.0);
     assert_eq!(v["rotation_count"], 0, "firehose runs without rotation");
     assert_eq!(v["integrity"]["pass"], true, "{v}");
-    assert_eq!(v["integrity"]["expected_rows"], v["integrity"]["found_rows"]);
+    assert_eq!(
+        v["integrity"]["expected_rows"],
+        v["integrity"]["found_rows"]
+    );
     assert!(v["started_at"].as_u64().unwrap() > 0);
     assert!(v["bin_versions"]["ak"].is_string());
     assert!(v["bin_versions"]["bench"].is_string());
@@ -621,17 +685,24 @@ fn firehose_full_speed_stops_at_duration() {
     let json = std::env::temp_dir().join("it-firehose-dur-report.json");
     let t0 = std::time::Instant::now();
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--duration", "3",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "firehose",
+        "--duration",
+        "3",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     let elapsed = t0.elapsed();
     assert_eq!(code, 0, "bench failed: {stderr}");
     assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
     let v = read_json(json.to_str().unwrap());
     let rows = v["aggregate"]["rows"].as_u64().unwrap();
-    assert!(rows > 1000, "full speed for 3s must produce many rows, got {rows}");
+    assert!(
+        rows > 1000,
+        "full speed for 3s must produce many rows, got {rows}"
+    );
     assert!(v["aggregate"]["rows_per_sec"].as_f64().unwrap() > 0.0);
     assert!(
         v["wall_time_secs"].as_f64().unwrap() < 15.0,
@@ -649,12 +720,18 @@ fn firehose_total_size_bound_stops_at_the_ceiling() {
     // spec scenario: --log-row-size 100 --log-total-size 2000 --log-rows 0
     let json = std::env::temp_dir().join("it-firehose-size-report.json");
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "0",
-        "--log-row-size", "100",
-        "--log-total-size", "2000",
-        "--json", json.to_str().unwrap(),
-        "--daemon", daemon_bin().to_str().unwrap(),
+        "--case",
+        "firehose",
+        "--log-rows",
+        "0",
+        "--log-row-size",
+        "100",
+        "--log-total-size",
+        "2000",
+        "--json",
+        json.to_str().unwrap(),
+        "--daemon",
+        daemon_bin().to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     let v = read_json(json.to_str().unwrap());
@@ -683,9 +760,12 @@ fn daemon_is_discovered_without_the_flag() {
     assert!(daemon_bin().is_file(), "cargo build first");
     let json = std::env::temp_dir().join("it-discovery-report.json");
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "20000",
-        "--json", json.to_str().unwrap(),
+        "--case",
+        "firehose",
+        "--log-rows",
+        "20000",
+        "--json",
+        json.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "bench failed: {stderr}");
     let v = read_json(json.to_str().unwrap());
@@ -709,10 +789,19 @@ fn connect_auth_token_gate_and_success_cycle() {
     let addr = format!("127.0.0.1:{}", daemon.port);
 
     // no token → 401, nothing registered on the target
-    let (code, _stdout, stderr) =
-        run_bench(&["--case", "firehose", "--log-rows", "100", "--connect", &addr]);
+    let (code, _stdout, stderr) = run_bench(&[
+        "--case",
+        "firehose",
+        "--log-rows",
+        "100",
+        "--connect",
+        &addr,
+    ]);
     assert_ne!(code, 0, "connect without a token must fail");
-    assert!(stderr.contains("401"), "auth failure reports the 401: {stderr}");
+    assert!(
+        stderr.contains("401"),
+        "auth failure reports the 401: {stderr}"
+    );
     assert!(
         bench_traces(&daemon.dir).is_empty(),
         "no bench traces without auth: {:?}",
@@ -721,23 +810,37 @@ fn connect_auth_token_gate_and_success_cycle() {
 
     // wrong token → 401, still nothing registered
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "100",
-        "--token", "wrong-token",
-        "--connect", &addr,
+        "--case",
+        "firehose",
+        "--log-rows",
+        "100",
+        "--token",
+        "wrong-token",
+        "--connect",
+        &addr,
     ]);
     assert_ne!(code, 0, "connect with a wrong token must fail");
-    assert!(stderr.contains("401"), "wrong-token failure reports the 401: {stderr}");
+    assert!(
+        stderr.contains("401"),
+        "wrong-token failure reports the 401: {stderr}"
+    );
     assert!(bench_traces(&daemon.dir).is_empty());
 
     // correct token → full cycle and no residue on the target
     let (code, _stdout, stderr) = run_bench(&[
-        "--case", "firehose",
-        "--log-rows", "20000",
-        "--token", "bench-it-token",
-        "--connect", &addr,
+        "--case",
+        "firehose",
+        "--log-rows",
+        "20000",
+        "--token",
+        "bench-it-token",
+        "--connect",
+        &addr,
     ]);
-    assert_eq!(code, 0, "connect with the right token must succeed: {stderr}");
+    assert_eq!(
+        code, 0,
+        "connect with the right token must succeed: {stderr}"
+    );
     assert!(
         bench_traces(&daemon.dir).is_empty(),
         "bench traces must be cleaned: {:?}",
@@ -761,9 +864,12 @@ fn connect_auth_token_gate_and_success_cycle() {
 fn ctrl_c_interrupt_cleans_up_spawn_site() {
     let mut child = Command::new(bench_bin())
         .args([
-            "--case", "drip",
-            "--duration", "300",
-            "--daemon", daemon_bin().to_str().unwrap(),
+            "--case",
+            "drip",
+            "--duration",
+            "300",
+            "--daemon",
+            daemon_bin().to_str().unwrap(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -816,7 +922,10 @@ fn unknown_case_prints_supported_list_and_exits_nonzero() {
     let (code, _stdout, stderr) = run_bench(&["--case", "turbo"]);
     assert_ne!(code, 0);
     for c in ["firehose", "rotation", "fanout", "drip"] {
-        assert!(format!("{stderr}").contains(c), "list must contain {c}: {stderr}");
+        assert!(
+            format!("{stderr}").contains(c),
+            "list must contain {c}: {stderr}"
+        );
     }
 }
 

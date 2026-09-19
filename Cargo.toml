@@ -18,7 +18,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 arc-swap = "1.7"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.4"
 rustyline = "18"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
@@ -34,7 +34,7 @@ toml = "1.1"
 toml_edit = "0.25"
 tower-http = { version = "0.7", features = ["compression-gzip"] }
 # 控制面/健康探测均为本地 http，无需 TLS（砍掉 rustls + ring）
-ureq = { version = "2.10", default-features = false }
+ureq = { version = "3.4", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -51,6 +51,7 @@ strip = "symbols"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",

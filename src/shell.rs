@@ -679,18 +679,19 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
 /// `GET /api/health` on the webui port, short timeout. Public endpoint, no
 /// token involved (webui auth is independent of /v1).
 pub(crate) fn webui_health(base: &str) -> Result<()> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(2))
-        .timeout(std::time::Duration::from_secs(2))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(2)))
+        .timeout_per_call(Some(std::time::Duration::from_secs(2)))
+        .build()
+        .into();
     let resp = agent
         .get(&format!("{base}/api/health"))
         .call()
         .map_err(|e| anyhow::anyhow!("webui unreachable: {e}"))?;
-    if (200..300).contains(&resp.status()) {
+    if (200..300).contains(&resp.status().as_u16()) {
         Ok(())
     } else {
-        bail!("webui health returned {}", resp.status())
+        bail!("webui health returned {}", resp.status().as_u16())
     }
 }
 

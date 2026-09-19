@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::{Case, Effective};
 
@@ -182,7 +182,10 @@ mod tests {
             ]
         );
         for p in &plans {
-            assert!(p.toml.contains("--stderr-every', '10"), "fanout splits 10:1");
+            assert!(
+                p.toml.contains("--stderr-every', '10"),
+                "fanout splits 10:1"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -194,8 +197,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-r", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         // 200000 * 129 bytes = 25.8MB; threshold 65536 → 394 rotations + 2
-        assert!(plans[0].toml.contains("log_max_size = \"65536\""), "{}", plans[0].toml);
-        assert!(plans[0].toml.contains("log_rotate_keep = 396"), "{}", plans[0].toml);
+        assert!(
+            plans[0].toml.contains("log_max_size = \"65536\""),
+            "{}",
+            plans[0].toml
+        );
+        assert!(
+            plans[0].toml.contains("log_rotate_keep = 396"),
+            "{}",
+            plans[0].toml
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -227,7 +238,11 @@ mod tests {
         e.rate = Some(100);
         let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-d", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
-        assert!(plans[0].toml.contains("'--rate', '100'"), "{}", plans[0].toml);
+        assert!(
+            plans[0].toml.contains("'--rate', '100'"),
+            "{}",
+            plans[0].toml
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

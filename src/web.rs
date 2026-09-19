@@ -561,9 +561,7 @@ pub fn serve(
                 // send the WebSocket Close frame before the sockets die
                 // (webui-api: 随停机 graceful 关闭).
                 loop {
-                    if stop.stopped()
-                        || sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst)
-                    {
+                    if stop.stopped() || sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1361,7 +1359,10 @@ mod tests {
 
         stop.stop();
         let started = std::time::Instant::now();
-        handle.join().expect("serve thread").expect("graceful stop is not an error");
+        handle
+            .join()
+            .expect("serve thread")
+            .expect("graceful stop is not an error");
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "graceful stop completes promptly, took {:?}",
@@ -1392,7 +1393,9 @@ mod tests {
             err.to_string().contains("webui server error") || err.to_string().contains("addr"),
             "the error explains the bind failure: {err:#}"
         );
-        let _ = handle.join().expect("serve thread returns after bind failure");
+        let _ = handle
+            .join()
+            .expect("serve thread returns after bind failure");
     }
 
     /// Daemon shutdown (the shared flag set by Ctrl+C / `POST /v1/shutdown`)
@@ -1450,8 +1453,9 @@ mod tests {
             .expect("bind report in time")
             .expect("bind succeeded");
 
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{bound}/ws")).await.unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{bound}/ws"))
+            .await
+            .unwrap();
         // The first frame is the snapshot (webui-api contract).
         let msg = ws.next().await.unwrap().unwrap();
         let (t, _) = api::decode_ws_message(&msg.into_data()).unwrap();
@@ -1460,7 +1464,10 @@ mod tests {
         stop.stop();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            assert!(tokio::time::Instant::now() < deadline, "no close frame arrived");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no close frame arrived"
+            );
             let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
                 .await
                 .expect("a frame arrives in time")

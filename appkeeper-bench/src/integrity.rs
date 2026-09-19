@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamCheck {
     pub expected: u64,
@@ -62,7 +61,10 @@ fn check_stream(live: &Path, tag: &str, expected: u64) -> StreamCheck {
             // A missing live file with expected rows is a real problem; with
             // zero expected rows it is fine (nothing was ever written).
             if expected > 0 {
-                problems.push(format!("cannot read {}: expected rows exist", path.display()));
+                problems.push(format!(
+                    "cannot read {}: expected rows exist",
+                    path.display()
+                ));
             }
             continue;
         };
@@ -112,10 +114,23 @@ fn check_stream(live: &Path, tag: &str, expected: u64) -> StreamCheck {
 
 /// Verify both streams of one program.
 /// Returns (out_check, err_check).
-pub fn verify_program(log_dir: &Path, name: &str, expected_out: u64, expected_err: u64) -> (StreamCheck, StreamCheck) {
+pub fn verify_program(
+    log_dir: &Path,
+    name: &str,
+    expected_out: u64,
+    expected_err: u64,
+) -> (StreamCheck, StreamCheck) {
     (
-        check_stream(&log_dir.join(format!("{name}.out.log")), "out", expected_out),
-        check_stream(&log_dir.join(format!("{name}.err.log")), "err", expected_err),
+        check_stream(
+            &log_dir.join(format!("{name}.out.log")),
+            "out",
+            expected_out,
+        ),
+        check_stream(
+            &log_dir.join(format!("{name}.err.log")),
+            "err",
+            expected_err,
+        ),
     )
 }
 

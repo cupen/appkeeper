@@ -1103,8 +1103,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &script,
             "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-edit.sock\"\\n' > \"$1\"\n",
         )?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        chmod_exec(&script)?;
         let out = Command::new(bin)
             .env("EDITOR", &script)
             .arg("--config")
@@ -1195,9 +1194,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &editor,
             "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-editor.sock\"\\n' > \"$1\"\n",
         )?;
-        use std::os::unix::fs::PermissionsExt;
         for s in [&visual, &editor] {
-            std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o755))?;
+            chmod_exec(s)?;
         }
         let out = Command::new(bin)
             .env("VISUAL", &visual)
@@ -3031,6 +3029,24 @@ fn pids_with_arg(arg: &str) -> Vec<u32> {
         }
     }
     out
+}
+
+#[cfg(not(unix))]
+fn pids_with_arg(_arg: &str) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Mark a helper script executable; a no-op where POSIX modes don't exist so
+/// the $EDITOR/$VISUAL steps stay compiled (and skipped) on Windows.
+#[cfg(unix)]
+fn chmod_exec(p: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(not(unix))]
+fn chmod_exec(_p: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn state_of(ws: &Workspace, program: &str) -> Result<String> {

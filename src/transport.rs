@@ -624,14 +624,15 @@ mod platform {
     use std::cell::Cell;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-        ERROR_PIPE_BUSY, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED,
+        ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PIPE_BUSY, HANDLE, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, SECURITY_ATTRIBUTES, TokenUser, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -641,10 +642,8 @@ mod platform {
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
     };
-    use windows_sys::Win32::System::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Threading::{
         CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
-        DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0,
     };
 
     /// `CreateFileW` on a pipe name is bounded by `MAX_PATH`.
@@ -801,7 +800,7 @@ mod platform {
                 return None;
             }
             let user = buf.as_ptr().cast::<TOKEN_USER>();
-            let mut sid: *mut u8 = std::ptr::null_mut();
+            let mut sid: *mut u16 = std::ptr::null_mut();
             if ConvertSidToStringSidW((*user).User.Sid, &mut sid) == 0 || sid.is_null() {
                 return None;
             }
@@ -809,7 +808,7 @@ mod platform {
             while *sid.add(len) != 0 {
                 len += 1;
             }
-            let text = String::from_utf16_lossy(std::slice::from_raw_parts(sid.cast::<u16>(), len));
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
             let _ = windows_sys::Win32::Foundation::LocalFree(sid.cast());
             Some(text)
         }
@@ -985,24 +984,22 @@ mod platform {
 
     impl Listener {
         fn create_instance(name: &str) -> Result<HANDLE, BindError> {
-            let sddl = match current_user_sid() {
-                Some(sid) => std::ffi::CString::new(super::control_pipe_sddl(&sid)),
-                None => Err(std::ffi::NulError(
-                    std::ffi::CString::new("").unwrap_err(),
-                )),
-            };
-            let sddl = sddl.map_err(|_| {
-                BindError::Io(io::Error::new(
+            // SDDL strings are wide: build the UTF-16 form up front. Without
+            // the owner SID we refuse rather than create a pipe with the
+            // default (world-accessible) DACL.
+            let Some(sid) = current_user_sid() else {
+                return Err(BindError::Io(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "cannot determine the SID of the running account; refusing to create the \
                      control pipe with the default (world-accessible) DACL",
-                ))
-            })?;
+                )));
+            };
+            let sddl_wide = wide_null(&super::control_pipe_sddl(&sid));
             let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
             let mut sd_len: u32 = 0;
             unsafe {
                 if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
+                    sddl_wide.as_ptr(),
                     1, // SDDL_REVISION_1
                     &mut sd,
                     &mut sd_len,
