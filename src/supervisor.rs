@@ -1955,8 +1955,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-apply-{}-{}", unique_tag(), app_name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        std::fs::write(&cfg_path, "").unwrap();
+        // Pin log_dir per test: the built-in default is a shared
+        // /tmp/xkeeper/logs, where the persisted user-stop record
+        // (state.json) would leak across concurrently running tests.
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
         let app_file = dir.join("xkeeper.toml");
         std::fs::write(&app_file, toml_text).unwrap();
         link_for_test(
@@ -2201,8 +2212,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-scope-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        std::fs::write(&cfg_path, "").unwrap();
+        // Pin log_dir per test: the shared default would let the persisted
+        // user-stop record (state.json) leak across concurrent tests.
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
         let a_file = dir.join("a.toml");
         let b_file = dir.join("b.toml");
         std::fs::write(
@@ -2333,8 +2354,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-conflict-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        std::fs::write(&cfg_path, "").unwrap();
+        // Pin log_dir per test: the shared default would let the persisted
+        // user-stop record (state.json) leak across concurrent tests.
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
         let a_file = dir.join("a.toml");
         let b_file = dir.join("b.toml");
         std::fs::write(&a_file, "[program.dup]\ncommand = 'true'\n").unwrap();
