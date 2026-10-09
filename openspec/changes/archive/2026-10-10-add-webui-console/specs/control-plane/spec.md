@@ -10,7 +10,9 @@
 - `GET /v1/programs/{name}`：单个程序详情（所属应用、状态、pid、存活时长、重启/退出计数、健康状态、等待原因、CPU 利用率与驻留内存（可空，metrics 能力口径）、stdout/stderr 日志输出速率）
 - `POST /v1/programs/{name}/start` / `stop` / `restart`
 - `GET /v1/programs/{name}/logs`：按 `stream=out|err`、`tail=N` 查询日志
-- `POST /v1/reload`：热更新配置
+- `POST /v1/reload`：重扫配置并检出待应用变更，返回 pending 预览（不应用）
+- `GET /v1/pending`：查询当前待应用变更（逐程序 changed 清单、app 级注册变化、不可热更字段提示、检出错误）
+- `POST /v1/apply`：应用待应用变更，请求体可指定范围（app、program）与 `restart` 布尔参数，返回逐程序结构化结果
 - `POST /v1/shutdown`：停止全部程序并退出守护进程
 
 程序详情与状态汇总中的指标字段为增量扩展：仅新增可空字段，既有字段名与
@@ -20,6 +22,21 @@
 
 - **WHEN** 向运行中的守护进程请求 `GET /v1/status`
 - **THEN** 返回 JSON，包含守护进程信息与每个程序的名称、状态、pid 与 unhealthy 标记
+
+#### Scenario: reload 返回 pending 预览
+
+- **WHEN** app 配置修改后向运行中的守护进程请求 `POST /v1/reload`
+- **THEN** 返回 pending 预览 JSON（含变更程序清单），无任何程序被停止或重启
+
+#### Scenario: pending 可独立查询
+
+- **WHEN** 配置存在未应用的变更时请求 `GET /v1/pending`
+- **THEN** 返回逐程序 changed 清单与 app 级注册变化；无变更时返回空清单
+
+#### Scenario: apply 带范围与 restart 参数
+
+- **WHEN** 请求 `POST /v1/apply`（body 含 `{"app": "A", "restart": false}`）
+- **THEN** 仅应用 app A 的 pending，返回逐程序 changed/action/result 的 JSON
 
 #### Scenario: 非法状态转换被拒绝
 

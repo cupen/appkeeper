@@ -34,7 +34,9 @@
 shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致，全部经控制面 `/v1` API 通信：
 
 - `status`：以对齐的表格输出全部程序的名称、所属 app、状态、pid、重启次数与 unhealthy 标记；
-- `start|stop|restart <name>`：执行对应动作，未知程序报错；
+- `run|stop|restart <name>`：执行对应动作（`run` 即启动，与顶层 `xkeeper run <name>` 语义一致），未知程序报错；`run|stop|restart --app <app>` 为 app 级扇出（语义与对应 CLI 一致）；
+- `action <program> <action>`：执行自定义动作，输出退出码与输出尾部，CLI 退出码语义一致；
+- `signal <program> <SIGNAL>`：投递白名单信号，语义与 CLI 一致；
 - `pid <name>`：输出程序 pid 或 `not running`；
 - `log <name> [-f] [--tail N] [--stream out|err]`：查看日志，`-f` 跟随输出；
 - `reload`：重扫并检出待应用变更，输出 pending 预览（不应用）；
@@ -57,6 +59,11 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 
 - **WHEN** shell 中输入 `sttaus`
 - **THEN** 输出 unknown command 提示并建议相近命令，shell 继续接受下一条输入
+
+#### Scenario: 在 shell 中启动程序
+
+- **WHEN** shell 中输入 `run web` 且 `web` 为已注册的已停止程序
+- **THEN** 请求经控制面 API 下发，程序状态迁移与 `xkeeper run web` 一致
 
 #### Scenario: 在 shell 中重启程序
 
@@ -82,6 +89,17 @@ shell SHALL 支持以下内置命令，语义与对应单发 CLI 子命令一致
 
 - **WHEN** webui 未启动且输入 `open`
 - **THEN** 输出"webui 未启动"的提示（含启动方式提示），不启动浏览器，shell 不退出
+
+#### Scenario: 在 shell 中执行自定义动作
+
+- **WHEN** shell 中输入 `action api upgrade` 且动作命令以退出码 3 结束
+- **THEN** 输出动作的输出尾部，shell 显示的成败语义与 `xkeeper action api upgrade` 一致，shell 不退出
+
+#### Scenario: 在 shell 中扇出启动
+
+- **WHEN** shell 中输入 `run --app gateway`
+- **THEN** gateway 全部程序按排序规则启动，输出与 `xkeeper run --app gateway` 一致的逐程序结果
+
 ### Requirement: shell 单命令模式
 
 `xkeeper shell -e "<命令>"` SHALL 执行该单条 shell 命令后立即退出，退出码遵循控制面
@@ -96,20 +114,3 @@ CLI 的同一约定（0 成功；1 一般错误；3 守护进程不可达）。�
 
 - **WHEN** 守护进程未启动时执行 `xkeeper shell -e "status"`
 - **THEN** 输出守护进程不可达提示，退出码为 3
-
-### Requirement: system webui 辅助命令
-
-`xkeeper system webui [url]` SHALL：探测守护进程与 webui 的可达性；若守护进程未运行，
-以 `xkeeper webui` 模式在后台拉起根进程；随后调用系统默认浏览器打开控制台地址。
-`url` 缺省时使用 webui 默认地址。该命令为本地辅助命令，MUST NOT 依赖控制面新增端点。
-
-#### Scenario: 守护未运行时一键打开
-
-- **WHEN** 守护进程未运行且执行 `xkeeper system webui`
-- **THEN** 根进程以 webui 模式被拉起，浏览器打开控制台页面，命令输出访问地址后返回
-
-#### Scenario: 守护已运行时打开
-
-- **WHEN** 守护进程运行中（无论 webui 是否启动）且执行 `xkeeper system webui`
-- **THEN** webui 可达时直接打开浏览器；webui 不可达时输出提示（如需以 webui 模式启动请
-  使用 `xkeeper webui`），命令不强行改动运行中的守护

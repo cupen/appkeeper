@@ -41,7 +41,7 @@
 
 ### Requirement: apply 范围与幂等
 
-`xkeeper apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 直接启动（沿用 autostart 语义）。
+`xkeeper apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 按 `restart` 策略的启动语义处理：`no` 仅完成注册不启动；其余策略启动（`unless-stopped` 存在「用户停止」记录时保持停止）。
 
 #### Scenario: 无变更时 apply 幂等
 
@@ -60,8 +60,13 @@
 
 #### Scenario: 新注册 app 随 apply 启动
 
-- **WHEN** `xkeeper add` 注册了 autostart 的新 app 后执行 `xkeeper apply`
+- **WHEN** `xkeeper add` 注册了 `restart = "always"` 的新 app 后执行 `xkeeper apply`
 - **THEN** 该 app 的程序被启动，出现在 apply 结果中
+
+#### Scenario: 新注册 no 策略程序只注册不启动
+
+- **WHEN** 注册的新 app 声明 `restart = "no"` 后执行 `xkeeper apply`
+- **THEN** 注册落地（链接/生成文件就位），程序保持 `stopped`，出现在 apply 结果的未启动说明中
 
 #### Scenario: apply 后 pending 清空
 
