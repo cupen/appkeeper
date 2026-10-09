@@ -81,7 +81,7 @@ fn free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-/// alpha: web + worker. beta: job. Both autostart.
+/// alpha: web + worker. beta: job. Both restart = "always".
 fn setup_workspace(tag: &str) -> Result<Workspace> {
     let root = std::env::temp_dir().join(format!("xk-xtask-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -94,20 +94,23 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     // put invalid `\U`-style escapes into the config.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
     // The web console is config-driven: the `[webui]` section enables it and
-    // pins its port for the browser pass.
+    // pins its port for the browser pass. `[app-default] restart = "always"`
+    // mirrors what `config --init` renders, so the scaffolded apps in this
+    // workspace get the supervised experience (the built-in cascade default is
+    // `no`).
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
         ),
     )?;
     std::fs::write(
         root.join("app-alpha/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     std::fs::write(
         root.join("app-beta/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     link_registration(
         &root.join("app-alpha/xkeeper.toml"),
@@ -394,13 +397,15 @@ fn expect(cond: bool, what: &str) -> Result<()> {
 
 // -- offline pass ----------------------------------------------------------------
 
-/// Runs BEFORE the daemon exists: an explicit `add --apply` that did not take
-/// effect must be visible (exit 3 + remedy, config kept), and `--env` parse
-/// errors must exit with the config code before anything is registered.
+/// Runs BEFORE the daemon exists. The "take effect now" entries (`add --apply`
+/// and the run ad-hoc form) auto-pull the daemon up in the background instead
+/// of failing (background-daemon spec); the pulled-up daemon is shut down
+/// again so the later offline scenarios still see a dead control plane.
+/// `--env` parse errors exit with the config code before anything is registered.
 fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let sleep = find_sleep()?;
 
-    step("G0. offline `add --apply` fails loudly: exit 3, config path + remedy");
+    step("G0. offline `add --apply` auto-pulls the daemon up (background-daemon)");
     let (ok, code, combined) = cli_try(
         bin,
         ws,
@@ -412,30 +417,77 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "--apply",
         ],
     )?;
-    expect(!ok, "offline add --apply fails")?;
     expect(
-        code == 3,
-        &format!("exit code is 3 (daemon unreachable), got {code}"),
-    )?;
-    expect(
-        combined.contains("offline"),
-        "error names the offline cause",
-    )?;
-    expect(
-        combined.contains("offline-demo.toml"),
-        "error names the generated config file",
-    )?;
-    expect(
-        combined.contains("xkeeper apply offline-demo"),
-        "error names the remedy",
+        ok,
+        &format!(
+            "offline add --apply now succeeds by pulling the daemon up, got code {code}: {combined}"
+        ),
     )?;
     expect(
         ws.root.join("apps/offline-demo.toml").is_file(),
-        "the generated config is kept for the retry",
+        "the generated config is on disk",
     )?;
+    expect(
+        !combined.contains("daemon is offline") && !combined.contains("daemon unreachable"),
+        "no more 'daemon offline' error: {combined}",
+    )?;
+    expect(
+        combined.contains("offline-demo"),
+        "the report names the new app",
+    )?;
+    // The pulled-up daemon is serving and knows the new app (its scaffolded
+    // `sleep` with no args exits immediately, so only presence is asserted).
+    expect(
+        api(ws, "/v1/status")?.contains("offline-demo"),
+        "the auto-pulled daemon loaded the new app",
+    )?;
+    // The daemon is now serving; shut it down so the offline scenarios below
+    // (and the explicit daemon spawn) see a clean, offline control plane.
+    cli(bin, ws, &["shutdown"])?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let up = Command::new("curl")
+            .args([
+                "-sf",
+                "-m",
+                "2",
+                &format!("http://127.0.0.1:{}/v1/health", ws.control_port),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !up {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!("the auto-pulled-up daemon did not shut down");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 
     step("G0b. `--env` without '=' / with an empty key exits 2 (config error)");
     let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "env-bad",
+            "--env",
+            "NOEQUALS",
+        ],
+    )?;
+    expect(
+        !ok && code == 2,
+        &format!("--env missing '=' exits 2, got {code}"),
+    )?;
+    expect(combined.contains("--env"), "error names the offending flag")?;
+    expect(
+        !ws.root.join("apps/env-bad.toml").exists(),
+        "bad --env registers nothing",
+    )?;
+    let (ok, code, _) = cli_try(
         bin,
         ws,
         &[
@@ -613,8 +665,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "auth_token renders empty",
     )?;
     expect(
-        text.contains("# [app-default]"),
-        "a fully commented [app-default] template section exists",
+        text.contains("[app-default]") && text.contains("restart = \"always\""),
+        "the [app-default] template section carries an explicit restart = \"always\"",
     )?;
     expect(dir.join("apps").is_dir(), "the app registry dir is created")?;
     let sample = dir.join("apps/example.toml.sample");
@@ -779,11 +831,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli_cfg(
         bin,
         &cfg,
-        &[
-            "config",
-            "--set",
-            "webui.listen=127.0.0.1:19877",
-        ],
+        &["config", "--set", "webui.listen=127.0.0.1:19877"],
     )?;
     expect(out.contains("webui.listen"), "set reports the written key")?;
     let text = std::fs::read_to_string(&cfg)?;
@@ -810,7 +858,10 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(out.contains("webui"), "delete reports the removed table")?;
     // Idempotent second delete of the absent table.
     let (ok, code, _) = cli_try_cfg(bin, &cfg, &["config", "--delete", "webui"])?;
-    expect(ok && code == 0, "an absent table delete is an idempotent success")?;
+    expect(
+        ok && code == 0,
+        "an absent table delete is an idempotent success",
+    )?;
 
     step("K11. config --edit through a fake $EDITOR (valid + invalid)");
     if cfg!(unix) {
@@ -892,14 +943,23 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         combined.contains("config --init"),
         "the error points at `xkeeper config --init`",
     )?;
-    expect(!missing.exists(), "nothing was created by the refused delete")?;
+    expect(
+        !missing.exists(),
+        "nothing was created by the refused delete",
+    )?;
 
     step("K15. $VISUAL wins over $EDITOR for config --edit");
     if cfg!(unix) {
         let visual = dir.join("visual-editor.sh");
         let editor = dir.join("env-editor.sh");
-        std::fs::write(&visual, "#!/bin/sh\nprintf '[daemon]\\nport = 9111\\n' > \"$1\"\n")?;
-        std::fs::write(&editor, "#!/bin/sh\nprintf '[daemon]\\nport = 9222\\n' > \"$1\"\n")?;
+        std::fs::write(
+            &visual,
+            "#!/bin/sh\nprintf '[daemon]\\nport = 9111\\n' > \"$1\"\n",
+        )?;
+        std::fs::write(
+            &editor,
+            "#!/bin/sh\nprintf '[daemon]\\nport = 9222\\n' > \"$1\"\n",
+        )?;
         use std::os::unix::fs::PermissionsExt;
         for s in [&visual, &editor] {
             std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o755))?;
@@ -940,7 +1000,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("A. disk edit only enters pending (no process action)");
     std::fs::write(
         ws.root.join("app-alpha/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     // Periodic detection window (monitor_interval 0.5s).
     std::thread::sleep(Duration::from_secs(2));
@@ -972,7 +1032,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Give beta a pending change too.
     std::fs::write(
         ws.root.join("app-beta/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.job]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
     let job_pid = pid_of(ws, "job")?.expect("job running");
     std::thread::sleep(Duration::from_secs(2));
@@ -1039,7 +1099,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     std::fs::create_dir_all(&gamma)?;
     std::fs::write(
         gamma.join("xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.gamma]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.gamma]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     let out = cli(
         bin,
@@ -1073,7 +1133,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // from a clean slate (worker currently runs sleep 200000 after step B).
     std::fs::write(
         ws.root.join("app-alpha/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     wait_pending_empty(ws)
 }
@@ -1239,7 +1299,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let worker_before = pid_of(ws, "worker")?;
     std::fs::write(
         ws.root.join("app-alpha/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
     cli(bin, ws, &["reload"])?; // publish the pending preview
     let out = cli(
@@ -1269,7 +1329,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Restore alpha's disk to the applied content so no pending leaks on.
     std::fs::write(
         ws.root.join("app-alpha/xkeeper.toml"),
-        "[app]\nautostart = true\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     cli(bin, ws, &["reload"])?;
     wait_pending_empty(ws)?;
@@ -1318,6 +1378,371 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+// -- cli-revamp scenario group -------------------------------------------------
+
+/// cli-revamp acceptance: the unified `run` verb (start / ad-hoc), `log`
+/// multi-program aggregation, `status` table vs `--json`, the four `restart`
+/// policies with the persisted user-stop record, and the legacy-alias rules.
+/// Self-contained: it runs in its own workspace with its own daemon (restarting
+/// it mid-pass is part of the restart-policy scenarios).
+fn revamp_pass(bin: &Path) -> Result<()> {
+    let ws = setup_workspace("revamp")?;
+    let mut daemon = spawn_daemon(bin, &ws)?;
+    let result = revamp_scenarios(bin, &ws, &mut daemon);
+    shutdown_daemon(&ws, &mut daemon);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+/// The scenarios run against `daemon`, which they may restart in place (the
+/// live handle is kept in `daemon` so `revamp_pass` always shuts it down).
+fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
+    step("R1. `start` is gone (BREAKING) with a `run` hint; `run <name>` starts");
+    let (ok, _code, combined) = cli_try(bin, ws, &["start", "web"])?;
+    expect(!ok, "`xkeeper start web` is rejected")?;
+    expect(
+        combined.contains("start") && combined.contains("run"),
+        &format!("the error names the removed verb and the replacement: {combined:?}"),
+    )?;
+    // `run <name>` behaves like the old start: stop then start.
+    cli(bin, ws, &["stop", "web"])?;
+    wait_state_in(ws, "web", &["stopped"])?;
+    let out = cli(bin, ws, &["run", "web"])?;
+    expect(
+        out.contains("web"),
+        &format!("run <name> reports the program: {out:?}"),
+    )?;
+    wait_running(ws, "web")?;
+
+    step("R2. `run --app` fans out; an unknown program is a 404 → exit 1");
+    let out = cli(bin, ws, &["run", "--app", "beta"])?;
+    expect(
+        out.contains("job"),
+        &format!("run --app reports the app's programs: {out:?}"),
+    )?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "nosuch"])?;
+    expect(
+        !ok && code == 1,
+        &format!("unknown program exits 1, got {code}"),
+    )?;
+    expect(
+        combined.contains("404") || combined.contains("unknown program"),
+        "the error carries the 404/unknown-program message",
+    )?;
+
+    step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_str().unwrap();
+    let out = cli(bin, ws, &["run", "--", sleep_s, "123", "--name", "adhoc-a"])?;
+    expect(
+        out.contains("generated"),
+        &format!("run -- registers and generates: {out:?}"),
+    )?;
+    expect(
+        out.contains("start"),
+        &format!("the app takes effect immediately: {out:?}"),
+    )?;
+    let a_cfg = ws.root.join("apps/adhoc-a.toml");
+    expect(a_cfg.is_file(), "adhoc-a.toml generated")?;
+    let a_text = std::fs::read_to_string(&a_cfg)?;
+    expect(
+        a_text.contains("command") && a_text.contains("args"),
+        "the generated config names the command and args",
+    )?;
+    // `--cmd` produces an identical command/args/name.
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--cmd",
+            &format!("{sleep_s} 123"),
+            "--name",
+            "adhoc-b",
+        ],
+    )?;
+    expect(
+        out.contains("generated"),
+        &format!("--cmd registers too: {out:?}"),
+    )?;
+    let b_text = std::fs::read_to_string(ws.root.join("apps/adhoc-b.toml"))?;
+    expect(
+        a_text.replace("adhoc-a", "adhoc-X") == b_text.replace("adhoc-b", "adhoc-X"),
+        "`--` and `--cmd` produce the same registration modulo the name",
+    )?;
+    // Re-running with a different arg regenerates (the new arg lands).
+    cli(bin, ws, &["run", "--", sleep_s, "456", "--name", "adhoc-a"])?;
+    let a_text2 = std::fs::read_to_string(&a_cfg)?;
+    expect(
+        a_text2.contains("456") && !a_text2.contains("123"),
+        "re-running regenerates the whole file from the new command line",
+    )?;
+    // Command resolution failure exits 2 with no artifact.
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--", "definitely-not-a-real-cmd", "--x"])?;
+    expect(
+        !ok && code == 2,
+        &format!("an unresolvable command exits 2, got {code}: {combined}"),
+    )?;
+    expect(
+        !ws.root.join("apps/definitely-not-a-real-cmd.toml").exists(),
+        "a failed resolution leaves no registration",
+    )?;
+    // `--restart=no` registers without pulling up.
+    cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--",
+            sleep_s,
+            "789",
+            "--name",
+            "adhoc-quiet",
+            "--restart=no",
+        ],
+    )?;
+    let quiet = std::fs::read_to_string(ws.root.join("apps/adhoc-quiet.toml"))?;
+    expect(
+        quiet.contains("restart = \"no\""),
+        "the restart literal is written straight into the config",
+    )?;
+    expect(
+        pid_of(ws, "adhoc-quiet")?.is_none(),
+        "--restart=no registers but does not start",
+    )?;
+    // Reserved `all` is refused.
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "--name", "all"])?;
+    expect(!ok, "run --name all is rejected")?;
+    expect(
+        combined.contains("reserved"),
+        "the reserved-word error explains",
+    )?;
+
+    step("R4. restart = no stays down; always pull-up after a daemon restart");
+    // adhoc-quiet (restart = no) stays stopped across a daemon restart, while
+    // a user-stopped `always` program is pulled back up.
+    cli(bin, ws, &["stop", "job"])?;
+    wait_state_in(ws, "job", &["stopped"])?;
+    shutdown_and_wait(bin, ws)?;
+    *daemon = spawn_daemon(bin, ws)?;
+    wait_running(ws, "job")?;
+    expect(
+        pid_of(ws, "adhoc-quiet")?.is_none(),
+        "restart = no stays stopped across the daemon restart",
+    )?;
+
+    step("R5. unless-stopped honors the persisted user-stop record across restart");
+    cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--cmd",
+            &format!("{sleep_s} 999"),
+            "--name",
+            "adhoc-us",
+            "--restart=unless-stopped",
+        ],
+    )?;
+    wait_running(ws, "adhoc-us")?;
+    cli(bin, ws, &["stop", "adhoc-us"])?;
+    let state_file = ws.root.join("logs/state.json");
+    let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
+    expect(
+        state_text.contains("adhoc-us"),
+        &format!("the user-stop record was persisted: {state_text:?}"),
+    )?;
+    shutdown_and_wait(bin, ws)?;
+    // A plain shutdown must NOT add a record for a program it stops: `job`
+    // (restart = always) is pulled back up, proving shutdown wrote nothing.
+    *daemon = spawn_daemon(bin, ws)?;
+    expect(
+        pid_of(ws, "adhoc-us")?.is_none(),
+        "unless-stopped stays stopped after the daemon restart (record kept)",
+    )?;
+    wait_running(ws, "job")?;
+    // An explicit start clears the record.
+    cli(bin, ws, &["run", "adhoc-us"])?;
+    wait_running(ws, "adhoc-us")?;
+    let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
+    expect(
+        !state_text.contains("adhoc-us"),
+        &format!("an explicit start cleared the record: {state_text:?}"),
+    )?;
+
+    step("R6. legacy field aliases read; same-layer mixing is rejected");
+    let alias_dir = ws.root.join("alias-app");
+    std::fs::create_dir_all(&alias_dir)?;
+    let alias_file = alias_dir.join("xkeeper.toml");
+    std::fs::write(
+        &alias_file,
+        "[app]\nautostart = true\nautorestart = \"on-failure\"\n[program.p]\ncommand = 'sleep 100'\n",
+    )?;
+    let out = cli(bin, ws, &["validate", &alias_file.to_string_lossy()])?;
+    expect(out.contains("OK"), "legacy aliases still validate: {out}")?;
+    std::fs::write(
+        &alias_file,
+        "[program.p]\ncommand = 'sleep 100'\nrestart = 'always'\nautorestart = 'on-failure'\n",
+    )?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["validate", &alias_file.to_string_lossy()])?;
+    expect(
+        !ok,
+        "mixing restart and autorestart in one layer is rejected",
+    )?;
+    expect(
+        combined.contains("mixed") || combined.contains("cannot be mixed"),
+        &format!("the error explains the mixing: {combined:?}"),
+    )?;
+
+    step("R7. status table by default; --json keeps the projection");
+    let table = cli(bin, ws, &["status"])?;
+    expect(
+        ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"]
+            .iter()
+            .all(|h| table.contains(h)),
+        &format!("status default prints the table header: {table:?}"),
+    )?;
+    expect(
+        !table.contains('{') && !table.contains('}'),
+        "the default output is not JSON",
+    )?;
+    let json = cli(bin, ws, &["status", "--json"])?;
+    expect(
+        json.trim_start().starts_with('{'),
+        "status --json is pretty JSON",
+    )?;
+    expect(
+        json.contains("\"programs\"") && json.contains("\"daemon\""),
+        "the JSON carries the daemon + programs projection",
+    )?;
+
+    step("R8. log multi-program aggregation: prefixes, both streams, 404 exit 1");
+    if cfg!(unix) {
+        // Two programs that actually emit output (the `sleep` apps above are
+        // silent). `sh` is unix-only.
+        let echo_dir = ws.root.join("echo-app");
+        std::fs::create_dir_all(&echo_dir)?;
+        let echo_file = echo_dir.join("xkeeper.toml");
+        std::fs::write(
+            &echo_file,
+            "[app]\nrestart = \"always\"\n\n[program.echo-a]\ncommand = 'sh'\nargs = ['-c', 'while true; do echo a-line; sleep 0.2; done']\nstartsecs = 0.2\n\n[program.echo-b]\ncommand = 'sh'\nargs = ['-c', 'while true; do echo b-line; sleep 0.2; done']\nstartsecs = 0.2\n",
+        )?;
+        cli(
+            bin,
+            ws,
+            &["add", echo_file.to_str().unwrap(), "--name", "echo"],
+        )?;
+        cli(bin, ws, &["apply", "echo"])?;
+        wait_running(ws, "echo-a")?;
+        wait_running(ws, "echo-b")?;
+        // Give the ring buffer a moment to accumulate a line.
+        std::thread::sleep(Duration::from_millis(600));
+        let multi = cli(bin, ws, &["log", "echo-a", "echo-b", "--tail", "1"])?;
+        expect(
+            multi.contains("[echo-a]") && multi.contains("[echo-b]"),
+            &format!("multi-program log prefixes each line: {multi:?}"),
+        )?;
+        let single = cli(bin, ws, &["log", "echo-a", "--tail", "1"])?;
+        expect(
+            !single.contains("[echo-a]"),
+            &format!("single-program log adds no prefix: {single:?}"),
+        )?;
+        // `--stream both` is accepted (both streams visible).
+        let _ = cli(
+            bin,
+            ws,
+            &["log", "echo-a", "--stream", "both", "--tail", "1"],
+        )?;
+    } else {
+        println!("    (windows: the multi-program log scenario needs sh; skipping)");
+    }
+    let (ok, code, _combined) = cli_try(bin, ws, &["log", "ghost", "--tail", "1"])?;
+    expect(
+        !ok && code == 1,
+        &format!("logging an unknown program exits 1, got {code}"),
+    )?;
+
+    let _ = &mut *daemon;
+    Ok(())
+}
+
+/// Ask the daemon to shut down and wait for the control port to close.
+fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
+    cli(bin, ws, &["shutdown"])?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let up = Command::new("curl")
+            .args([
+                "-sf",
+                "-m",
+                "2",
+                &format!("http://127.0.0.1:{}/v1/health", ws.control_port),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !up {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("daemon did not shut down within 15s");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// `run --detach` in its own isolated workspace: cold start becomes ready,
+/// prints the address + log path, and a second detach reports the
+/// already-running instance (no second process).
+fn detach_pass(bin: &Path) -> Result<()> {
+    step("R9. `run --detach` cold start + second instance reports already-running");
+    let root = std::env::temp_dir().join(format!("xk-xtask-detach-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("logs"))?;
+    let port = free_port()?;
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\n"
+        ),
+    )?;
+    let cfg = root.join("daemon.toml");
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["run", "--detach"])?;
+    expect(ok, &format!("run --detach exits 0, got {code}: {combined}"))?;
+    expect(
+        combined.contains(&format!("127.0.0.1:{port}")),
+        &format!("the ready message prints the listen address: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("daemon.out.log"),
+        &format!("the ready message prints the background log path: {combined:?}"),
+    )?;
+    expect(
+        root.join("logs/daemon.out.log").is_file(),
+        "the background log file exists",
+    )?;
+    // A second detach sees the healthy instance and does not fail.
+    let (ok, _code, combined) = cli_try_cfg(bin, &cfg, &["run", "--detach"])?;
+    expect(
+        ok,
+        "a second run --detach succeeds against the live instance",
+    )?;
+    expect(
+        combined.contains("already running"),
+        &format!("it reports the already-running daemon: {combined:?}"),
+    )?;
+    // Shut the background daemon down through the control plane.
+    let (ok, code, c) = cli_try_cfg(bin, &cfg, &["shutdown"])?;
+    expect(
+        ok,
+        &format!("the detached daemon shuts down via the CLI (code {code}): {c:?}"),
+    )?;
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
 // -- actions scenario group (actions + glossary change) ----------------------
 
 /// Write the scenario app used by the actions pass: one long-running service
@@ -1332,7 +1757,7 @@ fn setup_actions_app(ws: &Workspace, bin: &Path) -> Result<()> {
     let cfg_s = ws.config_arg().replace('\\', "/");
     let text = format!(
         r#"[app]
-autostart = false
+restart = "no"
 
 [program.svc]
 command = "sleep 100000"
@@ -1376,21 +1801,21 @@ timeout = 10
 [program.signalee]
 command = "sleep 100000"
 startsecs = 0.2
-autorestart = "never"
+restart = "no"
 depends_on = ["svc"]
 
 [program.trapper]
 command = "sh"
 args = ["-c", "trap '' USR1 USR2; sleep 100000"]
 startsecs = 0.2
-autorestart = "never"
+restart = "no"
 depends_on = ["signalee"]
 
 [program.logger]
 command = "sh"
 args = ["-c", "while true; do echo tick; sleep 0.2; done"]
 startsecs = 0.2
-autorestart = "never"
+restart = "no"
 "#,
         bin = bin_s,
         cfg = cfg_s,
@@ -1566,11 +1991,14 @@ fn wait_state_in(ws: &Workspace, program: &str, want: &[&str]) -> Result<()> {
 fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Everything below addresses the acts app; make sure the daemon loaded it.
     let svc_running = pid_of(ws, "svc")?;
-    expect(svc_running.is_none(), "acts programs are not autostarted")?;
+    expect(
+        svc_running.is_none(),
+        "acts programs are not started (restart = no)",
+    )?;
     let acts_dir = ws.root.join("acts");
 
-    step("H5. `start --app acts` fans out in dependency order");
-    let out = cli(bin, ws, &["start", "--app", "acts"])?;
+    step("H5. `run --app acts` fans out in dependency order");
+    let out = cli(bin, ws, &["run", "--app", "acts"])?;
     let (psvc, psig, ptrap) = (
         out.find("  svc:"),
         out.find("  signalee:"),
@@ -1675,7 +2103,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         &format!("unknown action exits 1, got {code}"),
     )?;
     expect(combined.contains("404"), "the CLI error reports the 404")?;
-    let (ok, code, combined) = cli_try(bin, ws, &["start", "--app", "ghost"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "--app", "ghost"])?;
     expect(
         !ok && code == 1,
         &format!("unknown app fan-out exits 1, got {code}"),
@@ -1855,7 +2283,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             pid_of(ws, "trapper")? == Some(trap_pid),
             "the rejected signal did not touch the program",
         )?;
-        // TERM really terminates (signalee has autorestart = never).
+        // TERM really terminates (signalee has restart = "no").
         let out = cli(bin, ws, &["signal", "signalee", "TERM"])?;
         expect(out.contains("delivered"), "TERM delivered")?;
         wait_state(ws, "signalee", "exited")?;
@@ -1881,7 +2309,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         matches!((ptrap, psig, psvc), (Some(a), Some(b), Some(c)) if a < b && b < c),
         &format!("fan-out stop lists trapper < signalee < svc (reverse): {out:?}"),
     )?;
-    // signalee was TERM-signaled to exit in H12 (autorestart never): a
+    // signalee was TERM-signaled to exit in H12 (restart = no): a
     // terminal state (exited) is as stopped as stopped itself — fan-out stop
     // must simply not leave anything running.
     for name in ["svc", "signalee", "trapper"] {
@@ -1892,7 +2320,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Every acts program is user-stopped at this point (explicit stop above
     // and in H11); the fan-out start must pull all of them up and clear the
     // marker. Issued via the shell to prove the shell verb fans out too.
-    let out = cli(bin, ws, &["shell", "-e", "start --app acts"])?;
+    let out = cli(bin, ws, &["shell", "-e", "run --app acts"])?;
     expect(
         matches!((out.find("  svc:"), out.find("  signalee:"), out.find("  trapper:")),
             (Some(a), Some(b), Some(c)) if a < b && b < c),
@@ -2031,7 +2459,11 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli(
         bin,
         ws,
-        &["config", "--set", &format!("webui.listen=127.0.0.1:{new_port}")],
+        &[
+            "config",
+            "--set",
+            &format!("webui.listen=127.0.0.1:{new_port}"),
+        ],
     )?;
     expect(
         out.contains("webui.listen"),
@@ -2063,10 +2495,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     let out = cli(bin, ws, &["reload"])?;
     expect(
-        out.contains(&format!(
-            "serving on http://127.0.0.1:{}",
-            ws.webui_port
-        )),
+        out.contains(&format!("serving on http://127.0.0.1:{}", ws.webui_port)),
         &format!("reload reports the restored address: {out:?}"),
     )?;
     expect(
@@ -2078,10 +2507,14 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("W4. reload with an occupied port degrades: note in the output, daemon keeps running");
     let blocker = std::net::TcpListener::bind("127.0.0.1:0")?;
     let occupied = blocker.local_addr()?.port();
-    let out = cli(
+    let _out = cli(
         bin,
         ws,
-        &["config", "--set", &format!("webui.listen=127.0.0.1:{occupied}")],
+        &[
+            "config",
+            "--set",
+            &format!("webui.listen=127.0.0.1:{occupied}"),
+        ],
     )?;
     let out = cli(bin, ws, &["reload"])?;
     expect(
@@ -2106,7 +2539,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(health(occupied), "the console answers after recovery")?;
 
     step("W6. restore the setup listen for the browser pass");
-    let out = cli(
+    let _out = cli(
         bin,
         ws,
         &[
@@ -2119,7 +2552,9 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(health(ws.webui_port), "the setup port serves again")?;
     expect(!health(occupied), "the temporary port is released")?;
 
-    step("W7. a bare [webui] section serves the built-in default 127.0.0.1:9877 and exits with the daemon");
+    step(
+        "W7. a bare [webui] section serves the built-in default 127.0.0.1:9877 and exits with the daemon",
+    );
     // Skip politely when something else owns the default port on this host.
     match std::net::TcpListener::bind("127.0.0.1:9877") {
         Err(_) => println!("    skip: 127.0.0.1:9877 is occupied on this host"),
@@ -2192,7 +2627,6 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
-
 // -- bench smoke (add-xkeeper-bench) ----------------------------------------------
 
 /// Build the bench binary quietly; returns its path (same profile as the
@@ -2225,8 +2659,7 @@ fn bench_workspaces() -> Vec<PathBuf> {
                 None => continue,
             };
             let mut parts = rest.split('-');
-            let numeric =
-                |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
             if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
                 if numeric(a) && numeric(b) && parts.next().is_none() {
                     out.push(e.path());
@@ -2430,7 +2863,7 @@ try {{
   const fs = await import('node:fs');
   fs.writeFileSync(ALPHA_CFG, [
     '[app]',
-    'autostart = true',
+    'restart = "always"',
     '',
     '[program.web]',
     'command = "sleep 100000"',
@@ -2516,7 +2949,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let bin = crate::build_daemon()?;
     let ws = setup_workspace("main")?;
     // The actions scenario app must exist before the daemon boots (bootstrap
-    // loads it, autostart = false keeps everything under our control).
+    // loads it, restart = "no" keeps everything under our control).
     setup_actions_app(&ws, &bin)?;
 
     println!(
@@ -2533,6 +2966,8 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let result = (|| {
         cli_pass(&bin, &ws)?;
         actions_online_pass(&bin, &ws)?;
+        revamp_pass(&bin)?;
+        detach_pass(&bin)?;
         webui_pass(&bin, &ws)?;
         if args.no_browser {
             println!("\n(--no-browser: skipping browser pass)");

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+#[derive(Clone)]
 pub struct Client {
     agent: ureq::Agent,
     pub base: String,
@@ -20,6 +21,20 @@ impl Client {
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(2))
                 .timeout(Duration::from_secs(70))
+                .build(),
+            base: format!("http://{}:{}", config.daemon.host, config.daemon.port),
+            token: config.daemon.auth_token.clone(),
+        }
+    }
+
+    /// Same target, but with a short total timeout — for readiness polling
+    /// where one hung listener must not eat the whole budget (the default
+    /// 70s total would let two probes blow a ~10s readiness window).
+    pub fn probe(config: &crate::config::DaemonConfig) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_millis(500))
+                .timeout(Duration::from_millis(800))
                 .build(),
             base: format!("http://{}:{}", config.daemon.host, config.daemon.port),
             token: config.daemon.auth_token.clone(),
@@ -170,7 +185,25 @@ impl Client {
     }
 
     /// Stream `follow` output to stdout until interrupted or disconnected.
+    /// Thin wrapper over [`Self::follow_lines`] with a stdout writer.
     pub fn log_follow(&self, name: &str, stream: &str) -> Result<()> {
+        self.follow_lines(name, stream, |line| {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let ok = writeln!(out, "{line}").is_ok() && out.flush().is_ok();
+            ok
+        })
+    }
+
+    /// Follow one program stream, invoking `on_line` for each line. `on_line`
+    /// returns false to stop (e.g. the writer failed / the consumer left).
+    /// Line-buffered so a consumer can prefix/serialize whole lines.
+    pub fn follow_lines(
+        &self,
+        name: &str,
+        stream: &str,
+        mut on_line: impl FnMut(&str) -> bool,
+    ) -> Result<()> {
         let mut path = format!("/v1/programs/{name}/logs?stream={stream}&tail=20&follow=1");
         if !self.token.is_empty() {
             path = format!("{path}&auth=1"); // token goes via header below
@@ -194,14 +227,30 @@ impl Client {
             anyhow::bail!("api error {code}: {msg}");
         }
         let mut reader = resp.into_reader();
+        let mut pending = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    // Flush a trailing line without a newline.
+                    if !pending.is_empty() {
+                        let line = String::from_utf8_lossy(&pending).into_owned();
+                        if !on_line(&line) {
+                            return Ok(());
+                        }
+                    }
+                    return Ok(());
+                }
                 Ok(n) => {
-                    use std::io::Write;
-                    std::io::stdout().write_all(&buf[..n])?;
-                    std::io::stdout().flush().ok();
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        if !on_line(line) {
+                            return Ok(());
+                        }
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -233,4 +282,103 @@ pub fn load_config(config_path: &Path) -> Result<crate::config::DaemonConfig> {
     crate::config::DaemonConfig::load_or_default(config_path)
         .with_context(|| format!("failed to load daemon config {}", config_path.display()))
         .map(|(c, _)| c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_port(port: u16) -> crate::config::DaemonConfig {
+        toml::from_str(&format!("[daemon]\nhost = \"127.0.0.1\"\nport = {port}\n")).unwrap()
+    }
+
+    /// `follow_lines` frames the chunked stream into whole lines (a line split
+    /// across chunks is reassembled; a trailing line without a newline is
+    /// flushed at EOF) and stops when the callback returns false.
+    #[test]
+    fn follow_lines_reassembles_and_stops() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
+            // Two lines, the first split across two chunks; then a final line
+            // with no trailing newline.
+            for chunk in ["one\npar", "tial\ntail-no-nl"] {
+                let body = chunk.as_bytes();
+                let framed = format!("{:x}\r\n{}\r\n", body.len(), chunk);
+                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+            }
+            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
+            let _ = std::io::Write::flush(&mut sock);
+        });
+
+        let c = Client::from_config(&config_with_port(port));
+        let mut got = Vec::new();
+        c.follow_lines("web", "out", |line| {
+            got.push(line.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(got, vec!["one", "partial", "tail-no-nl"]);
+        server.join().unwrap();
+
+        // A callback returning false stops early.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
+            for chunk in ["a\nb\nc\n"] {
+                let framed = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+            }
+            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
+            let _ = std::io::Write::flush(&mut sock);
+        });
+        let c = Client::from_config(&config_with_port(port));
+        let mut count = 0;
+        c.follow_lines("web", "out", |_| {
+            count += 1;
+            false // stop after the first line
+        })
+        .unwrap();
+        assert_eq!(count, 1, "the callback stops the stream");
+        server.join().unwrap();
+    }
+
+    /// A 404 answer is surfaced as an api error (the control plane answered,
+    /// the daemon is reachable).
+    #[test]
+    fn follow_lines_surfaces_api_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let body = "{\"error\":\"unknown program\"}";
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+        });
+        let c = Client::from_config(&config_with_port(port));
+        let err = c
+            .follow_lines("ghost", "out", |_| true)
+            .err()
+            .expect("404 must error");
+        assert!(err.to_string().contains("404"), "{err:#}");
+        server.join().unwrap();
+    }
 }

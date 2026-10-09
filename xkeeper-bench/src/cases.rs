@@ -117,7 +117,7 @@ pub fn plan(eff: &Effective, exe: &Path, count_dir: &Path) -> Result<Vec<Program
         };
 
         let toml = format!(
-            "[app]\nautostart = true\n\n[program.{name}]\ncommand = {exe_lit}\nargs = [{args}]\nstartsecs = 0\nautorestart = \"never\"\n{log_max_size_line}\n{log_rotate_line}",
+            "[app]\nrestart = \"on-failure\"\n\n[program.{name}]\ncommand = {exe_lit}\nargs = [{args}]\nstartsecs = 0\n{log_max_size_line}\n{log_rotate_line}",
             args = render_args(&gen_args),
         );
         plans.push(ProgramPlan {
@@ -161,8 +161,7 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].name, "xkeeper-bench-firehose");
         assert!(plans[0].toml.contains("log_max_size = \"0\""));
-        assert!(plans[0].toml.contains("autorestart = \"never\""));
-        assert!(plans[0].toml.contains("autostart = true"));
+        assert!(plans[0].toml.contains("restart = \"on-failure\""));
         assert!(plans[0].toml.contains("__generate"));
         assert!(plans[0].toml.contains("--stderr-every', '0"));
         let _ = std::fs::remove_dir_all(&dir);

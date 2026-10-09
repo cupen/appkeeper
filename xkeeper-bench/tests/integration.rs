@@ -531,7 +531,7 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
     .unwrap();
     std::fs::write(
         scratch.join("apps").join("xkeeper-bench-firehose.toml"),
-        "[app]\nautostart = false\n\n[program.xkeeper-bench-firehose]\ncommand = \"/bin/sleep\"\nargs = [\"30\"]\n",
+        "[app]\nrestart = \"no\"\n\n[program.xkeeper-bench-firehose]\ncommand = \"/bin/sleep\"\nargs = [\"30\"]\n",
     )
     .unwrap();
     let out = std::fs::File::create(scratch.join("daemon.out.log")).unwrap();

@@ -2,9 +2,11 @@
 //! config files (`xkeeper.toml`), with layered defaults resolution.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use log::warn;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -228,14 +230,175 @@ pub fn parse_size(s: &str) -> Result<u64> {
 // restart policy
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The single startup/restart policy field (`restart`), docker literal
+/// semantics: `no | on-failure | always | unless-stopped`. Deserialization is
+/// tolerant (a boolean `false` reads as `no`, `true` as `always`; the legacy
+/// literal `never` reads as `no`); serialization always writes the canonical
+/// literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
-    #[serde(rename = "always")]
-    Always,
-    #[serde(rename = "on-failure")]
+    No,
     OnFailure,
-    #[serde(rename = "never")]
-    Never,
+    Always,
+    UnlessStopped,
+}
+
+/// Built-in default when no layer sets `restart` (four-layer cascade to the
+/// bottom == `no`, docker-aligned; the out-of-the-box supervised experience
+/// is guided by the `config --init` template's explicit `restart = "always"`).
+pub const DEFAULT_RESTART: RestartPolicy = RestartPolicy::No;
+
+impl RestartPolicy {
+    /// The canonical docker literal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::OnFailure => "on-failure",
+            RestartPolicy::Always => "always",
+            RestartPolicy::UnlessStopped => "unless-stopped",
+        }
+    }
+
+    /// Daemon-start / apply-new-program pull-up decision. `no` never pulls up;
+    /// `always` and `on-failure` pull up; `unless-stopped` pulls up only when
+    /// there is no persisted "user stopped" record for the program.
+    pub fn pulls_up(self, user_stopped: bool) -> bool {
+        match self {
+            RestartPolicy::No => false,
+            RestartPolicy::OnFailure | RestartPolicy::Always => true,
+            RestartPolicy::UnlessStopped => !user_stopped,
+        }
+    }
+
+    /// Steady-state restart decision after an exit. `code` is `None` for a
+    /// signal-killed child (counts as a failure). `expected` is the
+    /// `exit_codes` list used by `on-failure`.
+    pub fn restarts_on_exit(self, code: Option<i32>, expected: &[i32]) -> bool {
+        match self {
+            RestartPolicy::No => false,
+            RestartPolicy::Always | RestartPolicy::UnlessStopped => true,
+            RestartPolicy::OnFailure => !matches!(code, Some(c) if expected.contains(&c)),
+        }
+    }
+}
+
+impl fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for RestartPolicy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RestartPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = RestartPolicy;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "one of \"no\", \"on-failure\", \"always\", \"unless-stopped\" (or a boolean)",
+                )
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                b: bool,
+            ) -> std::result::Result<RestartPolicy, E> {
+                // Tolerant: `false` ≡ `no`, `true` ≡ `always`.
+                Ok(if b {
+                    RestartPolicy::Always
+                } else {
+                    RestartPolicy::No
+                })
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                s: &str,
+            ) -> std::result::Result<RestartPolicy, E> {
+                parse_restart_literal(s).map_err(E::custom)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Parse one `restart` literal (shared by the config deserializer and the CLI
+/// `--restart=<literal>` flag). The legacy literal `never` is accepted as a
+/// deprecated alias of `no`.
+pub fn parse_restart_literal(s: &str) -> std::result::Result<RestartPolicy, String> {
+    match s.trim() {
+        "no" | "never" => Ok(RestartPolicy::No),
+        "on-failure" => Ok(RestartPolicy::OnFailure),
+        "always" => Ok(RestartPolicy::Always),
+        "unless-stopped" => Ok(RestartPolicy::UnlessStopped),
+        other => Err(format!(
+            "invalid restart policy {other:?} (expected no | on-failure | always | unless-stopped)"
+        )),
+    }
+}
+
+/// Strict CLI `--restart` literal: only the four canonical docker values (the
+/// legacy `never` alias is a config-read compatibility, not a write-side
+/// spelling — all write paths emit the new literal).
+pub fn parse_restart_cli(s: &str) -> std::result::Result<RestartPolicy, String> {
+    match s.trim() {
+        "no" => Ok(RestartPolicy::No),
+        "on-failure" => Ok(RestartPolicy::OnFailure),
+        "always" => Ok(RestartPolicy::Always),
+        "unless-stopped" => Ok(RestartPolicy::UnlessStopped),
+        other => Err(format!(
+            "invalid restart policy {other:?} (expected no | on-failure | always | unless-stopped)"
+        )),
+    }
+}
+
+/// Merge one layer's new `restart` field and the deprecated `autostart` /
+/// `autorestart` aliases into a single policy (design D13). `Ok(None)` means
+/// the layer sets nothing (the cascade continues to the next layer down).
+/// `Err` = the same layer mixes the new and old fields (ambiguous, rejected).
+///
+/// Mapping rules: `autostart = false` → `no`; `autostart = true` (or absent)
+/// plus `autorestart = X` → X (`never` → `no`); `autostart = true` +
+/// `autorestart = never` → `no` with a migration warning; `autostart = true`
+/// alone keeps the old "pull up at daemon start + restart by default"
+/// behavior and maps to `always`.
+fn merge_layer_restart(
+    label: &str,
+    restart: Option<RestartPolicy>,
+    autostart: Option<bool>,
+    autorestart: Option<RestartPolicy>,
+) -> Result<Option<RestartPolicy>> {
+    if restart.is_some() && (autostart.is_some() || autorestart.is_some()) {
+        bail!(
+            "{label}: `restart` cannot be mixed with the deprecated `autostart`/`autorestart` \
+             fields in the same layer — migrate to `restart` and drop the old fields"
+        );
+    }
+    if let Some(r) = restart {
+        return Ok(Some(r));
+    }
+    match (autostart, autorestart) {
+        (Some(false), _) => Ok(Some(RestartPolicy::No)),
+        (_, Some(RestartPolicy::No)) => {
+            if autostart == Some(true) {
+                warn!(
+                    "{label}: `autostart = true` + `autorestart = \"never\"` has no equivalent in \
+                     the new model; reading it as `restart = \"no\"` (the program will neither be \
+                     pulled up at daemon start nor restarted on exit). Migrate to `restart`."
+                );
+            }
+            Ok(Some(RestartPolicy::No))
+        }
+        (_, Some(r)) => Ok(Some(r)),
+        // autostart = true with no autorestart: preserve the old behavior
+        // (pull up at daemon start, restart on exit by default).
+        (Some(true), None) => Ok(Some(RestartPolicy::Always)),
+        (None, None) => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,8 +599,11 @@ impl DaemonConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LevelOptions {
+    pub restart: Option<RestartPolicy>,
+    /// Deprecated alias (read-only): boolean "pull up at daemon start".
     pub autostart: Option<bool>,
     pub priority: Option<i32>,
+    /// Deprecated alias (read-only): the old restart policy field.
     pub autorestart: Option<RestartPolicy>,
     pub exit_codes: Option<Vec<i32>>,
     pub restart_backoff: Option<f64>,
@@ -472,8 +638,11 @@ pub struct ActionRaw {
 #[serde(default, deny_unknown_fields)]
 pub struct AppMeta {
     pub description: Option<String>,
+    pub restart: Option<RestartPolicy>,
+    /// Deprecated alias (read-only).
     pub autostart: Option<bool>,
     pub priority: Option<i32>,
+    /// Deprecated alias (read-only).
     pub autorestart: Option<RestartPolicy>,
     pub exit_codes: Option<Vec<i32>>,
     pub restart_backoff: Option<f64>,
@@ -542,6 +711,8 @@ pub struct ProgramRaw {
     pub work_dir: Option<PathBuf>,
     pub env: Option<BTreeMap<String, String>>,
     pub depends_on: Option<Vec<String>>,
+    pub restart: Option<RestartPolicy>,
+    /// Deprecated alias (read-only).
     pub autorestart: Option<RestartPolicy>,
     pub exit_codes: Option<Vec<i32>>,
     pub restart_backoff: Option<f64>,
@@ -615,7 +786,7 @@ pub struct ResolvedProgram {
     pub work_dir: PathBuf,
     pub env: BTreeMap<String, String>,
     pub depends_on: Vec<String>,
-    pub autorestart: RestartPolicy,
+    pub restart: RestartPolicy,
     pub exit_codes: Vec<i32>,
     pub restart_backoff: f64,
     pub max_restart_backoff: f64,
@@ -639,7 +810,6 @@ pub struct ResolvedApp {
     pub path: PathBuf,
     #[allow(dead_code)]
     pub description: Option<String>,
-    pub autostart: bool,
     pub priority: i32,
     pub programs: Vec<ResolvedProgram>,
 }
@@ -720,11 +890,33 @@ pub fn resolve_program(
         (None, false) => (command_raw, vec![]),
     };
 
-    let autorestart = raw
-        .autorestart
-        .or(meta.as_ref().and_then(|m| m.autorestart))
-        .or(defaults.and_then(|d| d.autorestart))
-        .unwrap_or(RestartPolicy::Always);
+    // Single startup/restart policy: the new `restart` field wins, the
+    // deprecated aliases merge in per layer (same-layer mixing is rejected),
+    // and the cascade bottoms out at the built-in default `no`. Every layer is
+    // validated even when a higher layer shadows it: an ambiguous layer is a
+    // config error regardless of what wins.
+    let program_layer = merge_layer_restart(
+        &format!("program[{prog_name}]"),
+        raw.restart,
+        None,
+        raw.autorestart,
+    )?;
+    let app_layer = merge_layer_restart(
+        &format!("app[{app_name}]"),
+        meta.and_then(|m| m.restart),
+        meta.and_then(|m| m.autostart),
+        meta.and_then(|m| m.autorestart),
+    )?;
+    let defaults_layer = merge_layer_restart(
+        "[app-default]",
+        defaults.and_then(|d| d.restart),
+        defaults.and_then(|d| d.autostart),
+        defaults.and_then(|d| d.autorestart),
+    )?;
+    let restart = program_layer
+        .or(app_layer)
+        .or(defaults_layer)
+        .unwrap_or(DEFAULT_RESTART);
     let exit_codes = raw
         .exit_codes
         .clone()
@@ -861,7 +1053,7 @@ pub fn resolve_program(
         work_dir,
         env,
         depends_on,
-        autorestart,
+        restart,
         exit_codes,
         restart_backoff,
         max_restart_backoff,
@@ -893,10 +1085,6 @@ pub fn resolve_app(
         bail!("app name {name:?} is invalid: {NAME_RULE}");
     }
     let meta = raw.app.as_ref();
-    let autostart = meta
-        .and_then(|m| m.autostart)
-        .or(defaults.and_then(|d| d.autostart))
-        .unwrap_or(true);
     let priority = meta
         .and_then(|m| m.priority)
         .or(defaults.and_then(|d| d.priority))
@@ -926,7 +1114,6 @@ pub fn resolve_app(
         name: name.to_string(),
         path: path.to_path_buf(),
         description: meta.and_then(|m| m.description.clone()),
-        autostart,
         priority,
         programs,
     })
@@ -936,6 +1123,7 @@ impl AppMeta {
     /// View this metadata as the "defaults" layer for shared checks.
     pub fn as_defaults(&self) -> AppDefaults {
         AppDefaults {
+            restart: self.restart,
             autostart: self.autostart,
             priority: self.priority,
             autorestart: self.autorestart,
@@ -1091,10 +1279,8 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
             .autorestart
             .map(|v| match v {
                 toml::Value::Boolean(true) => Some(RestartPolicy::Always),
-                toml::Value::Boolean(false) => Some(RestartPolicy::Never),
-                other => other.as_str().and_then(|s| {
-                    serde_json::from_value::<RestartPolicy>(serde_json::json!(s)).ok()
-                }),
+                toml::Value::Boolean(false) => Some(RestartPolicy::No),
+                other => other.as_str().and_then(|s| parse_restart_literal(s).ok()),
             })
             .flatten();
         programs.insert(
@@ -1106,6 +1292,7 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
                 work_dir: p.working_dir.map(PathBuf::from),
                 env: p.environment,
                 depends_on: None,
+                restart: None,
                 autorestart,
                 exit_codes: None,
                 restart_backoff: p.restart_backoff,
@@ -1677,12 +1864,15 @@ pub fn atomic_write_daemon_config(path: &Path, text: &str) -> Result<()> {
 /// The fully commented `[app-default]` template section of the init output.
 const INIT_APP_DEFAULT_SECTION: &str = "\
 # ---------------------------------------------------------------------------
-# Shared defaults for every app ([app-default]) — optional, omitted here.
-# Priority: [program.*] explicit fields > the app file's [app] table > this.
-# Uncomment to use; field names match program-level fields:
-# [app-default]
-# autostart = true
-# autorestart = \"always\"
+# Shared defaults for every app ([app-default]) — optional, but the line below
+# keeps the out-of-the-box supervised experience (crash restart + daemon-start
+# pull-up). Priority: [program.*] explicit fields > the app file's [app] table
+# > this. Field names match program-level fields:
+[app-default]
+# Startup/restart policy: no | on-failure | always | unless-stopped.
+# Unset at every layer means the built-in default `no` (nothing is pulled up
+# or restarted) — docker-aligned; this template opts in explicitly.
+restart = \"always\"
 # restart_backoff = 1.0
 # max_restart_backoff = 30.0
 # max_restarts = 0
@@ -1757,8 +1947,7 @@ pub const APP_EXAMPLE_SAMPLE: &str = "\
 #
 # [app]
 # description = \"my app\"
-# autostart = true
-# autorestart = \"always\"      # always | on-failure | never
+# restart = \"always\"          # no | on-failure | always | unless-stopped
 #
 # [program.main]
 # command = \"/opt/myapp/myserver --port 8080\"   # single line, shell-lexed
@@ -2052,13 +2241,13 @@ mod tests {
     fn minimal_map_program_resolves() {
         let a = app_of("[program.api]\ncommand = \"python -m http.server 8000\"\n").unwrap();
         assert_eq!(a.name, "demo");
-        assert_eq!(a.autostart, true);
         let p = &a.programs[0];
         assert_eq!(p.name, "api");
         assert_eq!(p.command, "python");
         assert_eq!(p.args, vec!["-m", "http.server", "8000"]);
         assert_eq!(p.work_dir, PathBuf::from("/opt/demo"));
-        assert_eq!(p.autorestart, RestartPolicy::Always);
+        // Four-layer cascade bottoms out at the built-in default `no`.
+        assert_eq!(p.restart, RestartPolicy::No);
         assert_eq!(p.restart_backoff, 1.0);
         assert_eq!(p.log_max_size, Some(50 * 1024 * 1024)); // built-in default
         assert_eq!(p.log_rotate_keep, 2); // built-in default
@@ -2115,17 +2304,119 @@ mod tests {
     #[test]
     fn four_layer_priority() {
         let defaults: AppDefaults =
-            toml::from_str("restart_backoff = 2.0\nautorestart = \"always\"\n").unwrap();
+            toml::from_str("restart_backoff = 2.0\nrestart = \"always\"\n").unwrap();
         let raw: AppRaw = toml::from_str(
-            "[app]\nautorestart = \"on-failure\"\n\n[program.a]\ncommand = \"x\"\nautorestart = \"never\"\n\n[program.b]\ncommand = \"y\"\n",
+            "[app]\nrestart = \"on-failure\"\n\n[program.a]\ncommand = \"x\"\nrestart = \"no\"\n\n[program.b]\ncommand = \"y\"\n",
         )
         .unwrap();
         let a = resolve_app("demo", Path::new("x.toml"), &raw, Some(&defaults)).unwrap();
         let pa = a.programs.iter().find(|p| p.name == "a").unwrap();
         let pb = a.programs.iter().find(|p| p.name == "b").unwrap();
-        assert_eq!(pa.autorestart, RestartPolicy::Never); // program explicit wins
-        assert_eq!(pb.autorestart, RestartPolicy::OnFailure); // [app] beats [app-default]
+        assert_eq!(pa.restart, RestartPolicy::No); // program explicit wins
+        assert_eq!(pb.restart, RestartPolicy::OnFailure); // [app] beats [app-default]
         assert_eq!(pb.restart_backoff, 2.0); // [app-default] fills the gap
+    }
+
+    /// configuration: the deprecated aliases merge into `restart` per layer;
+    /// mixing the new and old fields in one layer is rejected; the
+    /// `autostart = true` + `autorestart = "never"` combination maps to `no`.
+    #[test]
+    fn restart_aliases_merge_and_reject_mixing() {
+        // autostart = false → no (app layer).
+        let raw: AppRaw =
+            toml::from_str("[app]\nautostart = false\n[program.a]\ncommand = \"x\"\n").unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::No);
+
+        // autostart = true + autorestart = "never" → no (with a warning).
+        let raw: AppRaw = toml::from_str(
+            "[app]\nautostart = true\nautorestart = \"never\"\n[program.a]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::No);
+
+        // autostart = true alone keeps the old pull-up behavior → always.
+        let raw: AppRaw =
+            toml::from_str("[app]\nautostart = true\n[program.a]\ncommand = \"x\"\n").unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::Always);
+
+        // Same-layer mixing (app) is rejected.
+        let raw: AppRaw = toml::from_str(
+            "[app]\nrestart = \"always\"\nautorestart = \"on-failure\"\n[program.a]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        let err = resolve_app("demo", Path::new("x.toml"), &raw, None)
+            .err()
+            .expect("mixing must be rejected")
+            .to_string();
+        assert!(err.contains("cannot be mixed"), "{err}");
+
+        // Same-layer mixing (program) is rejected too.
+        let raw: AppRaw = toml::from_str(
+            "[program.a]\ncommand = \"x\"\nrestart = \"always\"\nautorestart = \"on-failure\"\n",
+        )
+        .unwrap();
+        assert!(resolve_app("demo", Path::new("x.toml"), &raw, None).is_err());
+
+        // Boolean false ≡ no (tolerant parse).
+        let raw: AppRaw =
+            toml::from_str("[program.a]\ncommand = \"x\"\nrestart = false\n").unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::No);
+        // Boolean true ≡ always.
+        let raw: AppRaw = toml::from_str("[program.a]\ncommand = \"x\"\nrestart = true\n").unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::Always);
+        // The legacy literal `never` still parses as `no`.
+        let raw: AppRaw =
+            toml::from_str("[program.a]\ncommand = \"x\"\nrestart = \"never\"\n").unwrap();
+        let a = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        assert_eq!(a.programs[0].restart, RestartPolicy::No);
+        // Unknown literal is rejected.
+        assert!(
+            toml::from_str::<AppRaw>("[program.a]\ncommand = \"x\"\nrestart = \"bogus\"\n")
+                .is_err()
+        );
+    }
+
+    /// configuration: the four `restart` literals round-trip through
+    /// serialization as their canonical docker names.
+    #[test]
+    fn restart_policy_round_trips() {
+        for (lit, want) in [
+            ("no", RestartPolicy::No),
+            ("on-failure", RestartPolicy::OnFailure),
+            ("always", RestartPolicy::Always),
+            ("unless-stopped", RestartPolicy::UnlessStopped),
+        ] {
+            assert_eq!(parse_restart_literal(lit).unwrap(), want, "{lit}");
+            assert_eq!(want.as_str(), lit);
+        }
+        assert!(
+            parse_restart_literal("never").is_ok(),
+            "legacy alias accepted"
+        );
+        assert!(parse_restart_literal("nope").is_err());
+        // restart decisions per policy.
+        assert!(!RestartPolicy::No.pulls_up(false));
+        assert!(
+            RestartPolicy::Always.pulls_up(true),
+            "always ignores records"
+        );
+        assert!(RestartPolicy::OnFailure.pulls_up(false));
+        assert!(!RestartPolicy::UnlessStopped.pulls_up(true));
+        assert!(RestartPolicy::UnlessStopped.pulls_up(false));
+        assert!(!RestartPolicy::No.restarts_on_exit(Some(1), &[0]));
+        assert!(RestartPolicy::Always.restarts_on_exit(Some(0), &[0]));
+        assert!(RestartPolicy::UnlessStopped.restarts_on_exit(Some(0), &[0]));
+        assert!(!RestartPolicy::OnFailure.restarts_on_exit(Some(0), &[0]));
+        assert!(RestartPolicy::OnFailure.restarts_on_exit(Some(3), &[0]));
+        assert!(
+            RestartPolicy::OnFailure.restarts_on_exit(None, &[0]),
+            "signal = failure"
+        );
     }
 
     #[test]
@@ -2497,13 +2788,18 @@ log_buffer_lines = 7
         assert!(matches!(r, Ok(DeleteOutcome::Changed(_))), "{r:?}");
         // `--delete webui` removes the whole [webui] section (console off).
         let base = "[daemon]\nport = 1\n\n[webui]\n# console note\nlisten = \"127.0.0.1:9877\"\n";
-        let rendered =
-            match config_apply_deletes(base, &["webui".to_string()]).unwrap() {
-                DeleteOutcome::Changed(t) => t,
-                other => panic!("expected Changed, got {other:?}"),
-            };
-        assert!(!rendered.contains("webui") && !rendered.contains("listen"), "{rendered}");
-        assert!(rendered.contains("port = 1"), "untouched [daemon] kept: {rendered}");
+        let rendered = match config_apply_deletes(base, &["webui".to_string()]).unwrap() {
+            DeleteOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(
+            !rendered.contains("webui") && !rendered.contains("listen"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("port = 1"),
+            "untouched [daemon] kept: {rendered}"
+        );
         assert!(
             !rendered.contains("# console note"),
             "the section's comments go with it: {rendered}"
@@ -2546,13 +2842,11 @@ port = 8080
 host = \"0.0.0.0\"
 log_buffer_lines = 7
 ";
-        let rendered = match config_apply_deletes(
-            base,
-            &["port".to_string(), "daemon.host".to_string()],
-        ) {
-            Ok(DeleteOutcome::Changed(t)) => t,
-            other => panic!("expected Changed, got {other:?}"),
-        };
+        let rendered =
+            match config_apply_deletes(base, &["port".to_string(), "daemon.host".to_string()]) {
+                Ok(DeleteOutcome::Changed(t)) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
         assert!(!rendered.contains("port"), "{rendered}");
         assert!(!rendered.contains("host"), "{rendered}");
         assert!(
@@ -2563,14 +2857,15 @@ log_buffer_lines = 7
 
         // Dotted-key style (parses as an inline table): both targets go.
         let dotted = "daemon.port = 8080\ndaemon.host = \"0.0.0.0\"\n";
-        let rendered = match config_apply_deletes(
-            dotted,
-            &["port".to_string(), "host".to_string()],
-        ) {
+        let rendered = match config_apply_deletes(dotted, &["port".to_string(), "host".to_string()])
+        {
             Ok(DeleteOutcome::Changed(t)) => t,
             other => panic!("expected Changed, got {other:?}"),
         };
-        assert!(!rendered.contains("port") && !rendered.contains("host"), "{rendered}");
+        assert!(
+            !rendered.contains("port") && !rendered.contains("host"),
+            "{rendered}"
+        );
         load_daemon_text(&rendered).unwrap();
     }
 
@@ -2590,9 +2885,13 @@ log_buffer_lines = 7
         assert_eq!(cfg.daemon.auth_token, d.auth_token);
         assert_eq!(cfg.daemon.log_buffer_lines, d.log_buffer_lines);
         assert_eq!(cfg.daemon.app_dir, d.app_dir);
-        assert!(cfg.app_default.is_none(), "app-default stays commented out");
+        // The template guides the out-of-the-box experience with an explicit
+        // restart = "always" in [app-default] (configuration spec).
+        let app_default = cfg.app_default.as_ref().expect("[app-default] rendered");
+        assert_eq!(app_default.restart, Some(RestartPolicy::Always));
         // Comments survive the round-trip (init is the first-contact docs).
-        assert!(text.contains("# [app-default]"));
+        assert!(text.contains("[app-default]"));
+        assert!(text.contains("restart = \"always\""));
         assert!(text.contains("auth_token = \"\""));
         assert!(text.contains("app_dir = \"apps\""));
         assert!(
@@ -2727,7 +3026,15 @@ log_buffer_lines = 7
         let r: Result<DaemonConfig, _> = toml::from_str("[webui]\nauth = true\n");
         assert!(r.is_err(), "unknown [webui] key must be rejected");
         // Illegal listen values fail validation and name the field.
-        for bad in ["9877", "", " ", ":9877", "127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:x"] {
+        for bad in [
+            "9877",
+            "",
+            " ",
+            ":9877",
+            "127.0.0.1:0",
+            "127.0.0.1:99999",
+            "127.0.0.1:x",
+        ] {
             let cfg: DaemonConfig =
                 toml::from_str(&format!("[webui]\nlisten = \"{bad}\"\n")).unwrap();
             let err = cfg.validate().unwrap_err().to_string();
@@ -2738,10 +3045,7 @@ log_buffer_lines = 7
         }
         // The shared gate accepts host:port forms (ipv6 bracket host too).
         for ok in ["127.0.0.1:9877", "0.0.0.0:80", "[::1]:9877", "localhost:1"] {
-            assert!(
-                validate_listen_addr(ok).is_ok(),
-                "{ok:?} must be accepted"
-            );
+            assert!(validate_listen_addr(ok).is_ok(), "{ok:?} must be accepted");
         }
     }
 
@@ -2762,11 +3066,8 @@ log_buffer_lines = 7
         );
         // Section present → its value.
         assert_eq!(
-            config_effective_value(
-                Some("[webui]\nlisten = \"0.0.0.0:8080\"\n"),
-                "webui.listen"
-            )
-            .unwrap(),
+            config_effective_value(Some("[webui]\nlisten = \"0.0.0.0:8080\"\n"), "webui.listen")
+                .unwrap(),
             "0.0.0.0:8080"
         );
         // Unknown [webui] leaf / bare table name are rejected for --get.
@@ -2787,11 +3088,17 @@ log_buffer_lines = 7
         // Creates the section on a config without one.
         let rendered = config_apply_sets(
             "[daemon]\nport = 1234\n",
-            &[("webui.listen".to_string(), KeyValue::Str("127.0.0.1:9877".into()))],
+            &[(
+                "webui.listen".to_string(),
+                KeyValue::Str("127.0.0.1:9877".into()),
+            )],
         )
         .unwrap();
         assert!(rendered.contains("[webui]"), "section created: {rendered}");
-        assert!(rendered.contains("listen = \"127.0.0.1:9877\""), "{rendered}");
+        assert!(
+            rendered.contains("listen = \"127.0.0.1:9877\""),
+            "{rendered}"
+        );
         load_daemon_text(&rendered).unwrap();
         assert_eq!(
             config_effective_value(Some(&rendered), "webui.listen").unwrap(),
@@ -2801,21 +3108,33 @@ log_buffer_lines = 7
         let base = "[webui]\n# console note\nlisten = \"127.0.0.1:1\" # trailing\n";
         let rendered = config_apply_sets(
             base,
-            &[("webui.listen".to_string(), KeyValue::Str("0.0.0.0:9".into()))],
+            &[(
+                "webui.listen".to_string(),
+                KeyValue::Str("0.0.0.0:9".into()),
+            )],
         )
         .unwrap();
         assert!(rendered.contains("# console note"), "{rendered}");
-        assert!(rendered.contains("listen = \"0.0.0.0:9\" # trailing"), "{rendered}");
+        assert!(
+            rendered.contains("listen = \"0.0.0.0:9\" # trailing"),
+            "{rendered}"
+        );
         // The daemon table is untouched.
         let rendered = config_apply_sets(
             "[daemon]\nport = 1234\n",
             &[
                 ("port".to_string(), KeyValue::Int(4321)),
-                ("webui.listen".to_string(), KeyValue::Str("127.0.0.1:9877".into())),
+                (
+                    "webui.listen".to_string(),
+                    KeyValue::Str("127.0.0.1:9877".into()),
+                ),
             ],
         )
         .unwrap();
-        assert!(rendered.contains("port = 4321") && rendered.contains("[webui]"), "{rendered}");
+        assert!(
+            rendered.contains("port = 4321") && rendered.contains("[webui]"),
+            "{rendered}"
+        );
         // parse_sets routes the webui key through the strong-typed parser.
         let parsed = parse_sets(&["webui.listen=9877".to_string()]).is_err();
         assert!(parsed, "a host-less listen is rejected at parse time");
@@ -2837,11 +3156,10 @@ log_buffer_lines = 7
     #[test]
     fn delete_webui_listen_leaf() {
         let base = "[webui]\n# note\nlisten = \"127.0.0.1:9877\"\n";
-        let rendered =
-            match config_apply_deletes(base, &["webui.listen".to_string()]).unwrap() {
-                DeleteOutcome::Changed(t) => t,
-                other => panic!("expected Changed, got {other:?}"),
-            };
+        let rendered = match config_apply_deletes(base, &["webui.listen".to_string()]).unwrap() {
+            DeleteOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
         assert!(!rendered.contains("127.0.0.1:9877"), "{rendered}");
         // The empty section still parses (presence = enabled, default listen).
         let cfg: DaemonConfig = toml::from_str(&rendered).unwrap();
@@ -2849,11 +3167,10 @@ log_buffer_lines = 7
         assert_eq!(cfg.webui_listen(), Some(DEFAULT_WEBUI_LISTEN));
         // Dotted-key style file.
         let dotted = "webui.listen = \"127.0.0.1:1\"\n";
-        let rendered =
-            match config_apply_deletes(dotted, &["webui.listen".to_string()]).unwrap() {
-                DeleteOutcome::Changed(t) => t,
-                other => panic!("expected Changed, got {other:?}"),
-            };
+        let rendered = match config_apply_deletes(dotted, &["webui.listen".to_string()]).unwrap() {
+            DeleteOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
         assert!(!rendered.contains("webui"), "{rendered}");
     }
 

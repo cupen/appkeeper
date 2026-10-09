@@ -432,9 +432,20 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         }
         ("POST", ["v1", "shutdown"]) => {
             let (tx, rx) = mpsc::channel();
-            sup.enqueue(Command::Shutdown { reply: Some(tx) });
+            let (ftx, frx) = mpsc::channel();
+            sup.enqueue(Command::Shutdown {
+                reply: Some(tx),
+                flushed: Some(frx),
+            });
             let _ = rx.recv_timeout(Duration::from_secs(5));
-            json_bytes(200, serde_json::json!({ "result": "shutting down" }))
+            // Write the response BEFORE acknowledging: the supervisor waits on
+            // the ack, so the bytes are on the wire before the process exits
+            // (otherwise the client sees an EOF and reports exit 3).
+            let resp = json_bytes(200, serde_json::json!({ "result": "shutting down" }));
+            let _ = writer.write_all(&resp);
+            let _ = writer.flush();
+            let _ = ftx.send(());
+            return;
         }
         _ => err_bytes(404, &format!("no route {method} {path}")),
     };

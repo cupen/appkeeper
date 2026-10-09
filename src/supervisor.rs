@@ -49,6 +49,11 @@ pub enum Command {
     },
     Shutdown {
         reply: Option<Reply>,
+        /// Signalled by the HTTP layer once the response bytes are on the
+        /// wire. The supervisor waits (bounded) on it before tearing the
+        /// process down, otherwise the client can see an EOF instead of the
+        /// 200 (exit 3).
+        flushed: Option<std::sync::mpsc::Receiver<()>>,
     },
     /// Sent by the health checker when a program needs a restart.
     HealthRestart {
@@ -269,8 +274,74 @@ pub struct AppRecord {
     pub name: String,
     #[allow(dead_code)]
     pub path: PathBuf,
-    pub autostart: bool,
     pub priority: i32,
+}
+
+/// The persisted "user stopped" record file name inside `log_dir`.
+const USER_STOPPED_FILE: &str = "state.json";
+
+/// Load the persisted user-stop set. Missing file → empty; unreadable or
+/// corrupt → warn and treat as empty (worst case: one extra pull-up).
+fn load_user_stopped(log_dir: &Path) -> HashSet<String> {
+    let path = log_dir.join(USER_STOPPED_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashSet::new(),
+        Err(e) => {
+            warn!(
+                "cannot read {} ({}); treating the user-stopped set as empty",
+                path.display(),
+                e
+            );
+            return HashSet::new();
+        }
+    };
+    #[derive(Deserialize)]
+    struct State {
+        #[serde(default)]
+        user_stopped: Vec<String>,
+    }
+    match serde_json::from_str::<State>(&text) {
+        Ok(s) => s.user_stopped.into_iter().collect(),
+        Err(e) => {
+            warn!(
+                "{} is not valid state JSON ({}); treating the user-stopped set as empty",
+                path.display(),
+                e
+            );
+            HashSet::new()
+        }
+    }
+}
+
+/// Persist the user-stop set atomically (temp file + rename). A write failure
+/// is logged, never fatal — the in-memory set still governs this session.
+fn save_user_stopped(log_dir: &Path, set: &HashSet<String>) {
+    #[derive(Serialize)]
+    struct State<'a> {
+        user_stopped: Vec<&'a str>,
+    }
+    let mut names: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+    names.sort();
+    let body = match serde_json::to_string_pretty(&State {
+        user_stopped: names,
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("cannot serialize the user-stopped set: {e}");
+            return;
+        }
+    };
+    let path = log_dir.join(USER_STOPPED_FILE);
+    let tmp = log_dir.join(format!("{USER_STOPPED_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, body) {
+        warn!("cannot write {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        warn!("cannot replace {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// One program's entry in the pending-change projection: the on-disk config
@@ -362,6 +433,11 @@ pub struct SupervisorState {
     /// mtime+size snapshot per config file, to skip re-parsing unchanged
     /// files on every detect pass.
     pub file_stamps: HashMap<PathBuf, (std::time::SystemTime, u64)>,
+    /// Programs the user explicitly stopped (persisted across daemon restarts
+    /// in `{log_dir}/state.json`). Consulted by `unless-stopped` to decide
+    /// whether to pull a program up at daemon start / on apply. `always` and
+    /// `on-failure` ignore it; shutdown never writes it.
+    pub user_stopped: HashSet<String>,
 }
 
 pub struct Supervisor {
@@ -389,6 +465,10 @@ impl Supervisor {
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("failed to create log dir: {}", log_dir.display()))?;
         let interval = Duration::from_secs_f64(config.daemon.monitor_interval.max(0.05));
+        // Load the persisted "user stopped" records (unless-stopped support):
+        // a missing file is an empty set, a corrupt one is warned about and
+        // treated as empty (worst case: one extra pull-up).
+        let user_stopped = load_user_stopped(&log_dir);
         Ok(Arc::new(Supervisor {
             state: Arc::new(Mutex::new(SupervisorState {
                 programs: HashMap::new(),
@@ -398,6 +478,7 @@ impl Supervisor {
                 shutdown: AtomicBool::new(false),
                 pending: PendingDoc::default(),
                 file_stamps: HashMap::new(),
+                user_stopped,
             })),
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -468,7 +549,6 @@ impl Supervisor {
                     records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
-                        autostart: a.autostart,
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -524,6 +604,11 @@ impl Supervisor {
     /// Priority-ordered startup with dependency waiting/giving-up. Programs
     /// whose dependencies are not yet running stay `stopped` (with a wait
     /// reason); permanently unavailable dependencies make them `fatal`.
+    ///
+    /// Pull-up eligibility follows each program's `restart` policy: `no` is
+    /// never pulled up; `on-failure`/`always` are; `unless-stopped` is pulled
+    /// up only when there is no "user stopped" record for it (process-management
+    /// spec: 守护启动与 apply 引入新程序时的拉起语义).
     pub fn start_eligible(&self) {
         enum Action {
             Spawn,
@@ -532,8 +617,7 @@ impl Supervisor {
         loop {
             let snapshot: Vec<(String, Vec<String>)> = {
                 let st = self.state.lock().unwrap();
-                let mut eligible: Vec<&AppRecord> =
-                    st.apps.iter().filter(|a| a.autostart).collect();
+                let mut eligible: Vec<&AppRecord> = st.apps.iter().collect();
                 eligible.sort_by_key(|a| (a.priority, a.name.clone()));
                 eligible
                     .iter()
@@ -566,6 +650,11 @@ impl Supervisor {
                         continue;
                     };
                     if p.state() != ProgramState::Stopped || p.user_stopped() {
+                        continue;
+                    }
+                    // `no` programs are never pulled up; `unless-stopped`
+                    // honors the persisted "user stopped" record.
+                    if !p.def.restart.pulls_up(st.user_stopped.contains(name)) {
                         continue;
                     }
                     let mut ready = true;
@@ -643,8 +732,14 @@ impl Supervisor {
                 restart,
                 reply,
             } => answer(reply, self.cmd_apply(&scope, restart)),
-            Command::Shutdown { reply } => {
+            Command::Shutdown { reply, flushed } => {
                 answer(reply, Ok("shutting down".to_string()));
+                // Wait (bounded) for the HTTP layer to write the response
+                // before shutting down; without this the client races the
+                // process exit and sees "Unexpected EOF" (exit 3).
+                if let Some(rx) = flushed {
+                    let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+                }
                 self.request_shutdown();
             }
         }
@@ -652,31 +747,55 @@ impl Supervisor {
 
     fn cmd_start(&self, name: &str) -> Result<String> {
         let mut st = self.state.lock().unwrap();
-        let p = st
-            .programs
-            .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown program {name:?}"))?;
-        if matches!(p.state(), ProgramState::Running | ProgramState::Starting) {
-            bail!("program {name:?} is already {}", p.state());
+        let state_now = {
+            let p = st
+                .programs
+                .get_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown program {name:?}"))?;
+            if matches!(p.state(), ProgramState::Running | ProgramState::Starting) {
+                bail!("program {name:?} is already {}", p.state());
+            }
+            p.clear_fatal();
+            p.spawn();
+            p.state()
+        };
+        // An explicit start clears the persisted "user stopped" record
+        // (process-management spec: 对该程序的显式启动 SHALL 清除记录).
+        let changed = st.user_stopped.remove(name);
+        let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+        if changed {
+            save_user_stopped(&log_dir, &st.user_stopped);
         }
-        p.clear_fatal();
-        p.spawn();
-        Ok(format!("program {name} is {}", p.state()))
+        Ok(format!("program {name} is {state_now}"))
     }
 
     fn cmd_stop(&self, name: &str) -> Result<String> {
         let mut st = self.state.lock().unwrap();
-        let p = st
-            .programs
-            .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown program {name:?}"))?;
-        if matches!(
-            p.state(),
-            ProgramState::Stopped | ProgramState::Exited | ProgramState::Fatal
-        ) {
-            return Ok(format!("program {name} was already {}", p.state()));
+        let already = {
+            let p = st
+                .programs
+                .get_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown program {name:?}"))?;
+            if matches!(
+                p.state(),
+                ProgramState::Stopped | ProgramState::Exited | ProgramState::Fatal
+            ) {
+                Some(p.state())
+            } else {
+                p.stop();
+                None
+            }
+        };
+        if let Some(s) = already {
+            return Ok(format!("program {name} was already {s}"));
         }
-        p.stop();
+        // An explicit stop writes the persisted "user stopped" record, which
+        // `unless-stopped` consults at daemon start / apply (process-management
+        // spec). `always` ignores it; shutdown never writes it.
+        let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+        if st.user_stopped.insert(name.to_string()) {
+            save_user_stopped(&log_dir, &st.user_stopped);
+        }
         Ok(format!("program {name} is stopped"))
     }
 
@@ -851,7 +970,6 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
-                        autostart: a.autostart,
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -869,7 +987,6 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
-                        autostart: a.autostart,
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -978,7 +1095,9 @@ impl Supervisor {
         let config_path = self.config_path.lock().unwrap().clone();
         let (new_config, _) = DaemonConfig::load_or_default(&config_path)
             .map_err(|e| anyhow::anyhow!("reload aborted, daemon config invalid: {e:#}"))?;
-        let generation = self.webui.set_desired(WebuiIntent::from_config(&new_config));
+        let generation = self
+            .webui
+            .set_desired(WebuiIntent::from_config(&new_config));
         // Degraded convergence is logged by the webui manager; the note is
         // appended to the reply below for the CLI caller.
         let (_, note) = self.webui.wait_applied(generation, WEBUI_CONVERGE_TIMEOUT);
@@ -1021,7 +1140,6 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
-                        autostart: a.autostart,
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -1209,11 +1327,15 @@ impl Supervisor {
                             });
                         }
                         None => {
-                            // New program: apply the app's autostart (with
-                            // `--restart` we start it regardless).
+                            // New program: pull it up per its `restart` policy
+                            // (no → only registered; unless-stopped → unless a
+                            // user-stop record exists). `--restart` starts it
+                            // regardless.
                             let mut np =
                                 ManagedProgram::new(def.clone(), log_dir.clone(), ring_cap);
-                            let started = if app.autostart || restart {
+                            let started = if restart
+                                || def.restart.pulls_up(st.user_stopped.contains(&def.name))
+                            {
                                 np.spawn();
                                 true
                             } else {
@@ -1466,9 +1588,7 @@ impl WebuiControl {
     /// Current intent + generation (manager thread).
     fn desired(&self) -> (WebuiIntent, u64) {
         let sh = self.shared.lock().unwrap();
-        sh.desired
-            .clone()
-            .unwrap_or((WebuiIntent::disabled(), 0))
+        sh.desired.clone().unwrap_or((WebuiIntent::disabled(), 0))
     }
 
     /// Bounded wait until the manager reports `generation` applied. On timeout the
@@ -1553,7 +1673,12 @@ impl RunningWebui {
         self.stop.stop();
         let deadline = Instant::now() + WEBUI_STOP_WAIT;
         while Instant::now() < deadline {
-            if self.handle.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
+            if self
+                .handle
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(true)
+            {
                 if let Some(h) = self.handle.take() {
                     let _ = h.join();
                 }
@@ -2511,7 +2636,6 @@ mod tests {
             st.apps.push(AppRecord {
                 name: "hollow".into(),
                 path: PathBuf::new(),
-                autostart: false,
                 priority: 0,
             });
         }
@@ -2741,8 +2865,7 @@ mod tests {
             }
         );
         // An explicit listen passes through verbatim.
-        let explicit: DaemonConfig =
-            toml::from_str("[webui]\nlisten = '0.0.0.0:8080'\n").unwrap();
+        let explicit: DaemonConfig = toml::from_str("[webui]\nlisten = '0.0.0.0:8080'\n").unwrap();
         assert_eq!(
             WebuiIntent::from_config(&explicit),
             WebuiIntent {
@@ -2771,7 +2894,11 @@ mod tests {
         let addr_a = format!("127.0.0.1:{port_a}");
 
         // Serving on A.
-        std::fs::write(&cfg_path, format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n")).unwrap();
+        std::fs::write(
+            &cfg_path,
+            format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n"),
+        )
+        .unwrap();
         let out = sup.cmd_reload().unwrap();
         assert!(
             out.contains(&format!("webui: webui console serving on http://{addr_a}")),
@@ -2779,7 +2906,8 @@ mod tests {
         );
         // A live connection the reload must not disturb.
         let mut held = std::net::TcpStream::connect(&addr_a).unwrap();
-        held.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        held.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
 
         // Unchanged section: the intent is republished, the console is not
         // rebound (the held connection never sees an EOF).
@@ -2801,7 +2929,10 @@ mod tests {
 
         // Invalid section: the whole reload fails, A keeps serving.
         std::fs::write(&cfg_path, "[webui]\nlisten = 'no-host-or-port'\n").unwrap();
-        let err = sup.cmd_reload().err().expect("invalid [webui] fails reload");
+        let err = sup
+            .cmd_reload()
+            .err()
+            .expect("invalid [webui] fails reload");
         assert!(
             err.to_string().contains("webui.listen"),
             "the error names the offending key: {err:#}"
@@ -2812,7 +2943,11 @@ mod tests {
         );
 
         // Recovery: a valid section converges again.
-        std::fs::write(&cfg_path, format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n")).unwrap();
+        std::fs::write(
+            &cfg_path,
+            format!("[webui]\nlisten = '127.0.0.1:{port_a}'\n"),
+        )
+        .unwrap();
         let out = sup.cmd_reload().unwrap();
         assert!(
             out.contains("webui: webui console serving on http://"),
@@ -2844,7 +2979,9 @@ mod tests {
         .unwrap();
         let out = sup.cmd_reload().unwrap();
         assert!(
-            out.contains(&format!("webui: webui console serving on http://127.0.0.1:{port_a}")),
+            out.contains(&format!(
+                "webui: webui console serving on http://127.0.0.1:{port_a}"
+            )),
             "reload reports the converged console: {out}"
         );
         assert!(std::net::TcpStream::connect(&format!("127.0.0.1:{port_a}")).is_ok());
@@ -2876,7 +3013,10 @@ mod tests {
 
         // Invalid listen: the whole reload fails, console stays off.
         std::fs::write(&cfg_path, "[webui]\nlisten = 'no-host-or-port'\n").unwrap();
-        let err = sup.cmd_reload().err().expect("invalid [webui] fails reload");
+        let err = sup
+            .cmd_reload()
+            .err()
+            .expect("invalid [webui] fails reload");
         assert!(
             err.to_string().contains("webui.listen"),
             "the error names the offending key: {err:#}"
@@ -2899,7 +3039,8 @@ mod tests {
         {
             let st = sup.state.lock().unwrap();
             assert!(
-                st.pending.daemon_hints
+                st.pending
+                    .daemon_hints
                     .iter()
                     .any(|h| h.contains("host/port")),
                 "hint recorded in pending"
@@ -2910,6 +3051,188 @@ mod tests {
             );
         }
         end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    // -- restart policy / user-stop record (tasks 1.2 / 1.3 / 1.4) ----------
+
+    /// process-management: daemon start pulls up per `restart` policy — `no`
+    /// stays stopped, `always`/`on-failure` run, `unless-stopped` runs only
+    /// without a persisted record.
+    #[test]
+    fn bootstrap_pull_up_follows_restart_policy() {
+        let (sup, _) = setup(
+            "demo",
+            "[program.none]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'no'\n\
+             [program.always]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n\
+             [program.fail]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'on-failure'\n\
+             [program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n",
+        );
+        wait_state(&sup, "always", ProgramState::Running);
+        wait_state(&sup, "fail", ProgramState::Running);
+        wait_state(&sup, "unless", ProgramState::Running);
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["none"].state(), ProgramState::Stopped);
+        }
+        let _ = sup.shutdown_all();
+    }
+
+    /// process-management: `unless-stopped` consults the persisted record;
+    /// an explicit stop writes it, an explicit start clears it, and shutdown
+    /// does not write it (always ignores it).
+    #[test]
+    fn user_stop_record_write_clear_and_shutdown() {
+        let (sup, _) = setup(
+            "demo",
+            "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n\
+             [program.always]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
+        );
+        wait_state(&sup, "unless", ProgramState::Running);
+        wait_state(&sup, "always", ProgramState::Running);
+
+        // Explicit stop writes the record; explicit start clears it.
+        sup.cmd_stop("unless").unwrap();
+        assert!(sup.state.lock().unwrap().user_stopped.contains("unless"));
+        // The record is on disk.
+        let log_dir = {
+            let st = sup.state.lock().unwrap();
+            config::resolve_path(&st.config.daemon.log_dir, &st.config_dir)
+        };
+        let on_disk = std::fs::read_to_string(log_dir.join("state.json")).unwrap();
+        assert!(on_disk.contains("unless"), "record persisted: {on_disk}");
+        sup.cmd_start("unless").unwrap();
+        assert!(!sup.state.lock().unwrap().user_stopped.contains("unless"));
+
+        // Shutdown stops everything but writes no record.
+        sup.cmd_stop("always").unwrap();
+        assert!(sup.state.lock().unwrap().user_stopped.contains("always"));
+        sup.shutdown_all();
+        assert!(
+            sup.state.lock().unwrap().user_stopped.contains("always"),
+            "shutdown does not touch the set (the stop above did)"
+        );
+    }
+
+    /// process-management: the record survives a daemon restart — a new
+    /// supervisor built over the same log_dir reads it back and holds an
+    /// `unless-stopped` program down, while `always` is pulled up regardless.
+    #[test]
+    fn user_stop_record_persists_across_daemon_restart() {
+        let dir = std::env::temp_dir().join(format!("xk-persist-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(dir.join("apps")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("[daemon]\nlog_dir = {:?}\n", logs.to_string_lossy()),
+        )
+        .unwrap();
+        let app_file = dir.join("xkeeper.toml");
+        std::fs::write(
+            &app_file,
+            "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n\
+             [program.always]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
+        )
+        .unwrap();
+        link_for_test(&app_file, &dir.join("apps").join("demo.toml"));
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        wait_state(&sup, "unless", ProgramState::Running);
+        wait_state(&sup, "always", ProgramState::Running);
+        sup.cmd_stop("unless").unwrap();
+        sup.cmd_stop("always").unwrap();
+        let _ = sup.shutdown_all();
+
+        // A fresh daemon over the same workspace.
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup2 = Supervisor::new(config, &dir).unwrap();
+        sup2.set_config_path(&cfg_path);
+        sup2.bootstrap().unwrap();
+        wait_state(&sup2, "always", ProgramState::Running);
+        {
+            let st = sup2.state.lock().unwrap();
+            assert_eq!(
+                st.programs["unless"].state(),
+                ProgramState::Stopped,
+                "unless-stopped stays down across a daemon restart"
+            );
+        }
+        let _ = sup2.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt state.json is tolerated: the daemon starts with an empty
+    /// user-stop set (worst case one extra pull-up) instead of failing.
+    #[test]
+    fn corrupt_state_file_is_tolerated() {
+        let dir = std::env::temp_dir().join(format!("xk-state-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("state.json"), "{ not json").unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("[daemon]\nlog_dir = {:?}\n", logs.to_string_lossy()),
+        )
+        .unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).expect("a corrupt state file must not abort");
+        assert!(sup.state.lock().unwrap().user_stopped.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// apply-workflow: apply pulls a new program up per its `restart` policy —
+    /// `no` only registers (action "none"), `always` starts (action "start").
+    #[test]
+    fn apply_new_program_follows_restart_policy() {
+        let (sup, app_file) = setup(
+            "demo",
+            "[program.seed]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'no'\n",
+        );
+        std::fs::write(
+            &app_file,
+            "[program.seed]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'no'\n\
+             [program.down]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'no'\n\
+             [program.up]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
+        )
+        .unwrap();
+        let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
+        assert!(
+            out.contains("down -> none"),
+            "no-policy program not started: {out}"
+        );
+        wait_state(&sup, "up", ProgramState::Running);
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["down"].state(), ProgramState::Stopped);
+        }
+        let _ = sup.shutdown_all();
+    }
+
+    /// task 1.4: changing only the `restart` field is detected as a pending
+    /// change (the field participates in the definition hash).
+    #[test]
+    fn detect_treats_restart_change_as_pending() {
+        let (sup, app_file) = setup(
+            "demo",
+            "[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'no'\n",
+        );
+        let doc = sup.detect(true).unwrap();
+        assert!(doc.programs.is_empty(), "initial state is clean: {doc:?}");
+        std::fs::write(
+            &app_file,
+            "[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
+        )
+        .unwrap();
+        let doc = sup.detect(true).unwrap();
+        assert_eq!(doc.programs.len(), 1, "restart change is pending: {doc:?}");
+        assert_eq!(doc.programs[0].program, "p");
         let _ = sup.shutdown_all();
     }
 }

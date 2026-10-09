@@ -104,7 +104,7 @@ fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
     std::fs::write(
         app_dir.join("xkeeper.toml"),
         format!(
-            "[app]\nautostart = true\n\n[program.fire]\ncommand = 'sh'\nargs = ['-c', 'timeout 300 sh -c \"while :; do dd if=/dev/zero bs=1M count=1 2>/dev/null; sleep 0.09; done\" | tr \"\\\\0\" \"x\" | fold -w 31']\nlog_max_size = \"0\"\nautorestart = \"never\"\n"
+            "[app]\nrestart = \"always\"\n\n[program.fire]\ncommand = 'sh'\nargs = ['-c', 'timeout 300 sh -c \"while :; do dd if=/dev/zero bs=1M count=1 2>/dev/null; sleep 0.09; done\" | tr \"\\\\0\" \"x\" | fold -w 31']\nlog_max_size = \"0\"\n"
         ),
     )?;
 

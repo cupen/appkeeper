@@ -147,7 +147,7 @@ pub struct Site {
 
 impl Site {
     /// Write the app configs into the registry and make the daemon pick them
-    /// up: reload (rescan + detect) then apply (autostart spawns the load
+    /// up: reload (rescan + detect) then apply (restart spawns the load
     /// programs). Same path for both topologies.
     pub fn register(&self, plans: &[ProgramPlan]) -> Result<()> {
         for p in plans {

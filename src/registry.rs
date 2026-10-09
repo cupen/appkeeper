@@ -118,14 +118,19 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
 pub struct AddOptions {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub autostart: Option<bool>,
-    pub autorestart: Option<RestartPolicy>,
+    /// Startup/restart policy, written as the single `restart` field (as an
+    /// app-level default in the `[app]` table). `None` = leave unset (the
+    /// four-layer cascade bottoms out at the built-in default `no`).
+    pub restart: Option<RestartPolicy>,
     pub restart_backoff: Option<f64>,
     pub priority: Option<i32>,
     /// Scaffold source only: startup args as one shell-lexed string
     /// (split with `config::split_command`, same rules as a single-line
     /// `command` in a config file).
     pub args: Option<String>,
+    /// Scaffold source only: startup args already split into argv (the run
+    /// ad-hoc form). Takes precedence over `args`.
+    pub args_argv: Option<Vec<String>>,
     /// Scaffold source only: `--env K=V` pairs (repeatable; last wins).
     pub env: Option<std::collections::BTreeMap<String, String>>,
     /// Scaffold source only: working directory override. Default is the
@@ -358,7 +363,10 @@ fn add_scaffold(
     warn_if_not_executable(&exe);
     let spec = ScaffoldSpec {
         command: display_absolute(exe),
-        args: opts.args.as_deref().map(split_command).unwrap_or_default(),
+        args: opts
+            .args_argv
+            .clone()
+            .unwrap_or_else(|| opts.args.as_deref().map(split_command).unwrap_or_default()),
         env: opts.env.clone().unwrap_or_default(),
         work_dir,
     };
@@ -411,6 +419,86 @@ fn add_scaffold(
         env: spec.env,
         work_dir: spec.work_dir,
     })
+}
+
+/// Resolve a command's first token into an absolute executable path
+/// (design D7): a token containing a path separator is canonicalized (with an
+/// existence check), a bare name is looked up on the caller's `PATH` (unix:
+/// first entry with an execute bit; windows: as-is then `PATHEXT` expansion).
+/// The resolved absolute path is what gets frozen into the generated config,
+/// so the daemon's spawn environment cannot change the meaning.
+pub fn resolve_command(first: &str) -> Result<PathBuf> {
+    if first.trim().is_empty() {
+        bail!("the command is empty");
+    }
+    let has_sep = first.contains('/') || first.contains(std::path::MAIN_SEPARATOR);
+    if has_sep {
+        let p = Path::new(first);
+        return p
+            .canonicalize()
+            .map(display_absolute)
+            .with_context(|| format!("cannot resolve command {first:?} (no such executable)"));
+    }
+    resolve_on_path(first).with_context(|| {
+        format!(
+            "cannot find {first:?} on PATH (use an absolute or relative path, \
+             or make sure it is installed)"
+        )
+    })
+}
+
+/// Look a bare command name up on `PATH`.
+#[cfg(unix)]
+fn resolve_on_path(name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(name);
+        let Ok(md) = std::fs::metadata(&cand) else {
+            continue;
+        };
+        if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+            return Ok(display_absolute(cand));
+        }
+    }
+    bail!("{name:?} was not found on PATH")
+}
+
+/// Windows: try the name verbatim, then each `PATHEXT` extension.
+#[cfg(windows)]
+fn resolve_on_path(name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let has_ext = Path::new(name)
+        .extension()
+        .map(|e| !e.is_empty())
+        .unwrap_or(false);
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let direct = dir.join(name);
+        if direct.is_file() {
+            return Ok(display_absolute(direct));
+        }
+        if !has_ext {
+            for ext in &exts {
+                let cand = dir.join(format!("{name}{ext}"));
+                if cand.is_file() {
+                    return Ok(display_absolute(cand));
+                }
+            }
+        }
+    }
+    bail!("{name:?} was not found on PATH")
 }
 
 /// `p` joined onto the current directory when relative.
@@ -521,8 +609,7 @@ fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result
     let raw = AppRaw {
         app: Some(AppMeta {
             description: opts.description.clone(),
-            autostart: opts.autostart,
-            autorestart: opts.autorestart,
+            restart: opts.restart,
             restart_backoff: opts.restart_backoff,
             priority: opts.priority,
             ..Default::default()
@@ -638,8 +725,7 @@ fn make_link(link: &Path, target: &Path) -> Result<()> {
 /// formatting and comments via toml_edit. Idempotent upsert semantics.
 fn apply_flags(path: &Path, opts: &AddOptions) -> Result<()> {
     let needs_write = opts.description.is_some()
-        || opts.autostart.is_some()
-        || opts.autorestart.is_some()
+        || opts.restart.is_some()
         || opts.restart_backoff.is_some()
         || opts.priority.is_some();
     if !needs_write {
@@ -658,15 +744,14 @@ fn apply_flags(path: &Path, opts: &AddOptions) -> Result<()> {
     if let Some(d) = &opts.description {
         app_tbl["description"] = toml_edit::value(d.clone());
     }
-    if let Some(v) = opts.autostart {
-        app_tbl["autostart"] = toml_edit::value(v);
-    }
-    if let Some(v) = opts.autorestart {
-        app_tbl["autorestart"] = toml_edit::value(match v {
-            RestartPolicy::Always => "always",
-            RestartPolicy::OnFailure => "on-failure",
-            RestartPolicy::Never => "never",
-        });
+    if let Some(v) = opts.restart {
+        // Retire the deprecated aliases in the same layer: leaving them
+        // behind would mix new + old (validation rejects that) and silently
+        // drop the app the user just registered (configuration spec: write
+        // paths only ever write `restart`).
+        app_tbl.remove("autostart");
+        app_tbl.remove("autorestart");
+        app_tbl["restart"] = toml_edit::value(v.as_str());
     }
     if let Some(v) = opts.restart_backoff {
         app_tbl["restart_backoff"] = toml_edit::value(v);
@@ -882,8 +967,7 @@ mod tests {
         let config = DaemonConfig::default();
         let o = AddOptions {
             description: Some("demo service".into()),
-            autostart: Some(false),
-            autorestart: Some(RestartPolicy::OnFailure),
+            restart: Some(RestartPolicy::OnFailure),
             restart_backoff: Some(2.5),
             priority: Some(-5),
             ..opts("tuned")
@@ -893,21 +977,25 @@ mod tests {
         for needle in ["demo service", "on-failure", "2.5", "-5"] {
             assert!(text.contains(needle), "{needle:?} rendered: {text}");
         }
+        // Writes go to the new field only.
+        assert!(text.contains("restart = \"on-failure\""), "{text}");
+        assert!(
+            !text.contains("autorestart") && !text.contains("autostart"),
+            "{text}"
+        );
 
         let (raw, _) = AppRaw::load(&r.file).unwrap();
         let meta = raw.app.as_ref().expect("[app] table rendered");
         assert_eq!(meta.description.as_deref(), Some("demo service"));
-        assert_eq!(meta.autostart, Some(false));
-        assert_eq!(meta.autorestart, Some(RestartPolicy::OnFailure));
+        assert_eq!(meta.restart, Some(RestartPolicy::OnFailure));
         assert_eq!(meta.restart_backoff, Some(2.5));
         assert_eq!(meta.priority, Some(-5));
 
         let resolved = resolve_app("tuned", &r.file, &raw, None).unwrap();
-        assert!(!resolved.autostart, "autostart=false survives resolution");
         assert_eq!(resolved.priority, -5);
         assert_eq!(resolved.description.as_deref(), Some("demo service"));
         let p = &resolved.programs[0];
-        assert_eq!(p.autorestart, RestartPolicy::OnFailure);
+        assert_eq!(p.restart, RestartPolicy::OnFailure);
         assert_eq!(p.restart_backoff, 2.5);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1189,6 +1277,110 @@ mod tests {
         );
 
         std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- command resolution (cli-revamp task 3.1) ---------------------------
+
+    /// A path-bearing token is canonicalized to an absolute path.
+    #[test]
+    fn resolve_command_absolute_and_relative_paths() {
+        let tmp = tmp_dir("resolve-path");
+        let exe = make_exe(&tmp, "proc");
+        let abs = resolve_command(exe.to_str().unwrap()).unwrap();
+        assert!(abs.is_absolute(), "resolved absolute: {}", abs.display());
+        assert_eq!(abs, display_absolute(exe.canonicalize().unwrap()));
+        // Relative path with a separator resolves too.
+        let rel = format!("./{}/proc", tmp.file_name().unwrap().to_string_lossy());
+        let prev = std::env::current_dir().unwrap();
+        // Resolve from the tmp parent so the relative form is valid.
+        std::env::set_current_dir(tmp.parent().unwrap()).unwrap();
+        let got = resolve_command(&rel);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got.unwrap().is_absolute());
+        // A path that does not exist is a diagnostic error.
+        let err = resolve_command("/no/such/binary-xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot resolve"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A bare name is looked up on PATH; a miss is a diagnostic error and the
+    /// reserved `all` name is not special to the resolver.
+    #[test]
+    fn resolve_command_path_lookup() {
+        // `sh` exists on PATH on unix; use it as the hit case.
+        #[cfg(unix)]
+        {
+            let p = resolve_command("sh").unwrap();
+            assert!(p.is_absolute(), "{}", p.display());
+            assert_eq!(p.file_name().unwrap(), "sh");
+        }
+        let err = resolve_command("definitely-not-a-real-cmd-xyz").unwrap_err();
+        assert!(err.to_string().contains("PATH"), "{err:#}");
+    }
+
+    /// An empty command token is rejected.
+    #[test]
+    fn resolve_command_rejects_empty() {
+        assert!(resolve_command("").is_err());
+        assert!(resolve_command("   ").is_err());
+    }
+
+    // -- run ad-hoc bridge (cli-revamp task 3.2) ----------------------------
+
+    /// The ad-hoc bridge renders a loadable config whose command is the
+    /// resolved absolute path, whose args are the remaining argv, and whose
+    /// name defaults to the command stem.
+    #[test]
+    fn adhoc_bridge_scaffolds_absolute_command_and_args() {
+        let tmp = tmp_dir("adhoc");
+        let exe = make_exe(&tmp, "server");
+        let resolved = resolve_command(exe.to_str().unwrap()).unwrap();
+        let config = DaemonConfig::default();
+        let o = AddOptions {
+            name: None,
+            args_argv: Some(vec!["--port".into(), "8080".into()]),
+            restart: Some(RestartPolicy::OnFailure),
+            ..Default::default()
+        };
+        let r = add(&config, &tmp, &resolved, &o).unwrap();
+        // Default name = command stem.
+        assert_eq!(r.app, "server");
+        let (raw, _) = AppRaw::load(&r.file).unwrap();
+        let prog = raw
+            .program
+            .get("server")
+            .expect("program named after the stem");
+        assert!(Path::new(prog.command.as_deref().unwrap()).is_absolute());
+        assert_eq!(
+            prog.args.as_deref(),
+            Some(&["--port".to_string(), "8080".to_string()][..])
+        );
+        let text = std::fs::read_to_string(&r.file).unwrap();
+        assert!(text.contains("restart = \"on-failure\""), "{text}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The reserved `all` name is refused for the ad-hoc bridge too (both an
+    /// explicit name and a command stem of `all`).
+    #[test]
+    fn adhoc_bridge_rejects_reserved_all() {
+        let tmp = tmp_dir("adhoc-all");
+        let exe = make_exe(&tmp, "proc");
+        let config = DaemonConfig::default();
+        let resolved = resolve_command(exe.to_str().unwrap()).unwrap();
+        let o = AddOptions {
+            name: Some("all".into()),
+            ..Default::default()
+        };
+        assert!(
+            add(&config, &tmp, &resolved, &o)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

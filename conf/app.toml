@@ -11,9 +11,8 @@
 # 描述信息，仅展示用
 description = "我的应用"
 # —— 以下全部可选，省略则继承 [app-default] / 内置默认值 ——
-autostart = true           # 随守护进程启动
+restart = "always"         # no | on-failure | always | unless-stopped
 # priority = 0             # 数字小的先启动
-autorestart = "always"     # always | on-failure | never
 # exit_codes = [0]         # on-failure 时视为“失败”的退出码
 # restart_backoff = 1.0    # 首次重启延迟（秒），指数退避
 # max_restart_backoff = 30.0
@@ -46,7 +45,7 @@ command = "/opt/myapp/myserver --port 8080"
 # startsecs = 1.0
 # startretries = 3
 # stop_timeout = 10.0
-# autorestart = "always"
+# restart = "always"
 # exit_codes = [0]
 # restart_backoff = 1.0
 # max_restart_backoff = 30.0

@@ -14,7 +14,7 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
          │  └─ control API  127.0.0.1:7310 /v1/*（可选 Bearer 鉴权）         │
          └───────────────△─────────────────────────────────────────────────┘
                          │ HTTP JSON
-   xkeeper status/start/stop/restart/log/pid/reload/apply/shutdown
+   xkeeper run（daemon | <名> | -- <命令行>）· status/stop/restart/log/pid/reload/apply/shutdown
    xkeeper add/remove/list        ← 离线可用，在线时自动同步
 ```
 
@@ -35,13 +35,18 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
 - **裸程序脚手架**：`xkeeper add ./path/to/proc --name abc` 对可执行程序直接
   生成 `app_dir/abc.toml`（真实文件，注册记录即文件本身）：command 写绝对
   路径，`work_dir` 缺省为执行 add 时的目录，另有 `--args "<字符串>"`/
-  `--env K=V`（可重复）/`--workdir <路径>`。重复执行同名 add 会以本次参数
-  **全量再生**该文件（文件上的手改会被覆盖），内容有差异时提示需先
-  `xkeeper apply`；`--apply` 在注册后立即对该 app 应用。`xkeeper remove`
+  `--env K=V`（可重复）/`--workdir <路径>`/`--restart=<字面量>`。重复执行同名
+  add 会以本次参数 **全量再生**该文件（文件上的手改会被覆盖），内容有差异时
+  提示需先 `xkeeper apply`；`--apply` 在注册后立即对该 app 应用。`xkeeper remove`
   对这类生成记录连带删除文件并打印路径。
+- **命令行即注册（run ad-hoc）**：`xkeeper run -- <命令行>` / `run --cmd "<字符串>"`
+  复用同一脚手架引擎——首 token 解析为绝对路径写入 `command`，其余按 shell
+  词法作 `args`，缺省名取命令 stem，注册后立即以该 app 范围 apply。等价于
+  「add 脚手架 + 自动 apply」，是冷启动的最短路径（见「快速上手」路径一）。
 
 字段优先级（高 → 低）：`[program.*]` 显式字段 > app 配置 `[app]` 表 >
-daemon `[app-default]` > 内置默认。`autostart`/`priority` 是应用级字段。
+daemon `[app-default]` > 内置默认。`priority` 为应用级字段；`restart` 为程序级
+字段，可在 `[app]`/`[app-default]` 层作应用级默认值。
 
 ## 术语表
 
@@ -70,30 +75,55 @@ xkeeper config --init          # 可选：初始化 daemon 配置（8 个已知�
 xkeeper config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
+# 路径一：冷启动一条命令跑起来（命令行注册 + 自动后台拉起守护进程 + 立即生效）
+xkeeper run -- python -m http.server 8000 --name web
+xkeeper run --cmd "node server.js" --name api   # 等价写法（shell 词法切分，适合不便传 -- 的场景）
+xkeeper run web                                 # 之后启动/重启已注册程序
+xkeeper stop web                                # 停止（`restart = "unless-stopped"` 会记住这次用户停止）
+
+# 路径二：注册部署（离线可用，适合生产部署目录）
 # 1. 在你的应用部署目录写一个 xkeeper.toml（见 examples/demo-app）
 # 2. 注册（空配置也能先跑起来）；或从可执行程序直接脚手架生成：
-cd /opt/myapp && xkeeper add . --name myapp --autostart
+cd /opt/myapp && xkeeper add . --name myapp --restart always
 xkeeper add /opt/srv/web-server --name abc --args "--port 8080" --env LOG=debug --apply
 xkeeper list
 
 # 3. 启动守护进程（默认空无一物，只拉起已注册应用）
-xkeeper run
+xkeeper run                    # 前台；Ctrl+C 优雅停机
+xkeeper run --detach           # 后台：就绪后打印监听地址与日志路径即返回
 
 # 4. 控制
-xkeeper status
+xkeeper status                 # 人读表格（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）
+xkeeper status --json          # 脚本消费：等价 GET /v1/status 的 pretty JSON
 xkeeper stop myapp-程序名
-xkeeper log <程序名> --tail 50 -f
+xkeeper log web api --tail 50 -f   # 多程序聚合（>1 名时行首加 [名] 前缀）
+xkeeper log web --stream both      # 合并 stdout/stderr
 xkeeper signal <程序名> USR1     # 向子进程投递白名单信号（unix）
 xkeeper restart --app myapp     # 对整个 app 扇出（按启动排序，停止逆序）
 xkeeper action api flush        # 执行自定义动作（退出码透传）
 xkeeper reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
 xkeeper apply                  # 应用待应用变更（apply all 等价；apply demo / apply demo web 限定范围）
 xkeeper apply --restart        # 无变更的程序也重启（手动停止的保持停止）
+xkeeper remove web             # 注销：删除注册记录与生成文件（部署目录文件不动）
 xkeeper shutdown
 ```
 
+> **`run` 是统一入口动词**：裸 `run`（可加 `--detach`）是守护进程；
+> `run <名>` / `run --app <app>` 启动已注册程序或整个 app；`run -- <命令行>` /
+> `run --cmd "<字符串>"` 注册一条新命令行并立即生效（守护进程离线时自动后台拉起）。
+> 旧 `start` 动词已移除，调用会报未知子命令并提示改用 `run`。
+>
+> 冷启动时程序是否被拉起取决于其 `restart` 策略：`no` 只注册不拉起，
+> 其余策略拉起。`xkeeper config --init` 生成的 `[app-default] restart = "always"`
+> 让上面路径一开箱即跑；若你手写 daemon 配置且未设 `[app-default]`，级联到底的
+> 默认是 `no`——此时需 `xkeeper run web` 手动启动，或在 `[app-default]` 显式
+> 写 `restart = "always"`。
+>
+> **`--restart=no`**：命令行注册形态加 `--restart=no` 时只注册、不拉起
+> （覆盖「先登记、暂不运行」），之后 `xkeeper run <名>` 可随时启动。
+
 > `all` 是 apply 的全量保留字：`xkeeper apply all` 与裸 `xkeeper apply`
-> 严格等价，因此应用名不能叫 `all`（add 会拒绝并说明保留字）。
+> 严格等价，因此应用名不能叫 `all`（add 与 run ad-hoc 会拒绝并说明保留字）。
 
 ## 配置示例
 
@@ -111,10 +141,33 @@ log_buffer_lines = 1000
 app_dir = "apps"            # 注册目录，缺省 daemon 配置同级 apps/
 
 [app-default]               # 可选：全体应用默认值
-autostart = true
-autorestart = "always"
+restart = "always"          # 启动/重启策略：no | on-failure | always | unless-stopped
 restart_backoff = 1.0
 ```
+
+> **`restart` 取代了旧的 `autostart` + `autorestart`**（docker 字面量语义）：
+> - `no`：退出不重启，守护启动/apply 不拉起；
+> - `on-failure`：退出码不在 `exit_codes`（默认仅 0）时重启，守护启动拉起；
+> - `always`：任何退出都重启，守护启动无条件拉起；
+> - `unless-stopped`：任何退出都重启；守护启动时若无「用户停止」记录则拉起
+>   （显式 `stop` 写入记录并持久化到 `{log_dir}/state.json`，显式启动清除，
+>   正常关机不写入）。
+>
+> 宽容写法：布尔 `false` ≡ `"no"`；四层级联到底均未设置 ≡ 内置默认 `no`。
+> `xkeeper config --init` 生成的 `[app-default]` 显式写 `restart = "always"`
+> 以保持开箱守护体验。
+>
+> **迁移**：旧字段 `autorestart`（`never`→`no`，其余原值）与 `autostart`
+> （布尔）作为弃用别名继续可读（`autostart = false` → `no`；`autostart = true`
+> 或未设 + `autorestart = X` → X；`autostart = true` + `autorestart = "never"`
+> → `no` 并输出迁移告警）；同一层级同时出现新旧字段会被校验拒绝。所有写入
+> 路径（add 微调、run ad-hoc、脚手架、模板）只写新字段 `restart`。
+>
+> **级联默认变化高亮**：旧模型在无 `[app-default]` 时默认「守护启动拉起」
+> （`autostart` 缺省 true）；新模型级联到底默认 `no`——既无旧字段、又无
+> `[app-default] restart` 的既有部署升级后，守护重启将不再自动拉起程序。
+> 依赖旧行为的部署请在 `[app-default]` 显式 `restart = "always"`（`config --init`
+> 模板已内置）。
 
 ### Web 控制台开关（`[webui]` 段）
 
@@ -139,7 +192,7 @@ app（部署目录 `xkeeper.toml`，`examples/demo-app/xkeeper.toml`）：
 ```toml
 [app]                       # 可选；add 的微调 flag 写在这里，部署人可手改
 description = "演示应用"
-autorestart = "on-failure"
+restart = "on-failure"      # 应用级默认（程序未显式声明时生效）
 
 [program.api]               # 键即程序名
 command = "python -m http.server 8000"   # 单行写法（词法拆分，不经 shell）；或 command + args
@@ -230,11 +283,15 @@ app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[ap
                         ▼
                      [backoff] ──退避到期──▶ [starting]
      startretries 耗尽 ──▶ [fatal]（仅显式 start / reload 清除）
-[running] ──退出──按 autorestart 策略──▶ [backoff] 或 [exited]
+[running] ──退出──按 restart 策略──▶ [backoff] 或 [exited]
 任意 ──stop──▶ [stopping]（SIGTERM→超时强杀 / TerminateProcess）──▶ [stopped]
 ```
 
-- 重启策略：`always`（含干净退出）、`on-failure`（退出码 ∉ `exit_codes` 时重启）、`never`
+- 重启策略（`restart` 字段）：`always`（含干净退出）、`on-failure`（退出码 ∉
+  `exit_codes` 时重启）、`unless-stopped`（会话内同 always，守护启动看「用户停止」
+  记录）、`no`（不重启）
+- 守护启动 / apply 引入新程序时的拉起语义：`no` 不拉起；`on-failure`/`always`
+  拉起；`unless-stopped` 无「用户停止」记录才拉起（`always` 不受记录影响）
 - 稳态崩溃退避：`restart_backoff` 指数翻倍至 `max_restart_backoff`；
   连续运行 `backoff_reset_after` 秒后计数清零
 - 依赖编排：priority 小者先启动；依赖未 running 则等待；依赖 fatal/exited
@@ -250,12 +307,12 @@ app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[ap
 | daemon | shutdown、reload | 既有命令，语义不变 |
 | program | start、stop、restart | 既有命令；signal 见下 |
 | program | 自定义动作 | `xkeeper action <program> <动作名>`，配置声明见下 |
-| app | start、stop、restart 扇出 | `xkeeper start|stop|restart --app <名>` |
+| app | start、stop、restart 扇出 | `xkeeper run\|stop\|restart --app <名>` |
 
 **app 扇出**：作用于该 app 全部程序，排序复用启动规则——启动按依赖拓扑序
 （同名次按字典序），停止按逆序；逐程序复用既有 start/stop/restart 逻辑，
 所以扇出 start 会拉起手动停止的程序（并清除 user_stopped 标记），输出逐程序
-结果。裸 `xkeeper start <程序名>` 语义不变。
+结果。裸 `xkeeper run <程序名>` 与旧 `xkeeper start <程序名>` 语义一致。
 
 **signal（内置动作，unix）**：`xkeeper signal <程序名> <SIGNAL>` 向该程序的
 子进程 pid 投递信号（不投进程组——清理进程组是 stop 的语义）。白名单：
@@ -324,6 +381,31 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 例外：`xkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
+### 统一入口动词 `run`
+
+`xkeeper run` 承载三种形态，分派规则如下：
+
+| 形态 | 调用 | 行为 |
+| --- | --- | --- |
+| daemon | `xkeeper run` / `xkeeper run --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
+| 启动 | `xkeeper run <name>` / `xkeeper run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app（对已 running 程序返回 409，未知程序 404） |
+| ad-hoc | `xkeeper run -- <cmd...>` / `xkeeper run --cmd "<字符串>"` | 命令行注册并立即生效（首 token 解析为绝对路径；守护离线时自动后台拉起） |
+
+- ad-hoc 形态与 `name`/`--app`/`--detach` 互斥；`--detach` 仅 daemon 形态合法。
+- ad-hoc 的脚手架 flag：`--name`（缺省取命令 stem）、`--description`、
+  `--restart=<no|always|unless-stopped|on-failure>`、`--restart-backoff`、
+  `--env K=V`（可重复）、`--workdir <路径>`；`--args` 不存在（命令行本身即参数）。
+- 旧 `start` 动词已移除：`xkeeper start web` 报未知子命令并提示 `xkeeper run web`。
+- 旧 flag `--autostart`/`--no-autostart`/`--autorestart` 已移除，统一
+  `--restart=<字面量>`（add 与 run ad-hoc 共用）。
+
+**后台拉起协议**（`run --detach` 与「立即生效」入口共用）：派生
+`xkeeper run -c <配置>`（unix `process_group(0)` / Windows
+`CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`），stdio 追加写
+`{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`，总超时 ~10s。
+就绪即成功（并发拉起只留一个实例，端口竞争败者自灭）；超时以非零码退出并
+指明日志位置。守护进程为全局单例，不与调用方生命周期绑定。
+
 Web 控制台与控制面同属一个守护进程：存在 `[webui]` 配置段时（见上文
 「Web 控制台开关」）另开一个回环端口，伺服内嵌 UI、`/api/*` 查询与 `/ws`
 WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
@@ -338,7 +420,7 @@ xkeeper shell -e "status"            # 单命令模式：执行一条后退出�
 ```
 
 内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
-`start|stop|restart <name>`（或 `--app <app>` 扇出，语义同 CLI）、
+`run|stop|restart <name>`（或 `--app <app>` 扇出，语义同 CLI）、
 `action <program> <action>`（输出尾部；`-e` 模式退出码透传动作退出码）、
 `signal <program> <SIGNAL>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
 `pending`、`apply [<app> [<program>]] [--restart]`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
@@ -472,6 +554,25 @@ validate/reload 拒绝。迁移步骤：升级二进制 → `xkeeper validate`�
 
 回滚提示：`[program.<名>.action.*]` 动作表是新增配置结构，旧版本二进制
 会因未知字段拒绝整个 app 配置——回滚前先移除这些表再降级。
+
+## 升级注意（cli-revamp：run 统一动词与 restart 字段）
+
+本版把「跑」收敛到 `run` 一个动词、启动/重启策略收敛到单一 `restart` 字段，
+含三处 BREAKING：
+
+- **`start` 动词移除**：`xkeeper start <名>` → `xkeeper run <名>`；
+  `xkeeper start --app <app>` → `xkeeper run --app <app>`（报错信息自带提示）；
+  `shell` 内置动词同步由 `start` 改为 `run`。
+- **`status` 默认输出改为人读表格**：脚本消费请加 `--json`，其输出与本变更前
+  的默认 pretty JSON 逐字节等价。
+- **配置字段统一为 `restart`**：旧 `autostart`/`autorestart` 继续可读（弃用别名，
+  映射规则见「配置示例」），同层新旧同现被拒绝；级联到底的默认从旧的
+  「守护启动拉起」翻转为 `no`——依赖旧默认的部署请在 `[app-default]` 显式
+  `restart = "always"`（`config --init` 模板已内置）。
+
+另：`add --apply` 与 run 的 ad-hoc 形态在守护进程离线时不再报错，而是**自动
+后台拉起守护进程**后继续生效（曾依赖「离线报错」的自动化需知悉）；无 systemd
+等场景可用 `xkeeper run --detach` 直接后台常驻，`xkeeper shutdown` 统一管理。
 
 ## 作为系统服务运行（守护 xkeeper 本身）
 

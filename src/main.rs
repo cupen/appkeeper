@@ -10,6 +10,7 @@ mod api;
 mod assets;
 mod client;
 mod config;
+mod daemonize;
 mod health;
 mod metrics;
 mod platform;
@@ -30,14 +31,15 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use log::info;
 
-use crate::config::{DaemonConfig, RestartPolicy};
+use crate::config::DaemonConfig;
 use crate::registry::AddOptions;
 use crate::supervisor::Supervisor;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
-/// Client contract: 3 = daemon unreachable (`add --apply` offline, etc.).
+/// Client contract: 3 = daemon unreachable (mapped by `client::exit_code_of`).
+#[allow(dead_code)]
 const EXIT_UNREACHABLE: i32 = 3;
 
 #[derive(Parser, Debug)]
@@ -58,11 +60,61 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the daemon in the foreground (default when no subcommand given).
+    /// The single "run" verb (control-plane spec). Bare `run` (optionally
+    /// `--detach`) is the daemon; `run <name>` / `run --app <app>` starts an
+    /// already-registered program or fans out over a whole app; the ad-hoc
+    /// form (`run -- <cmd...>` or `run --cmd "<string>"`) registers a command
+    /// line and takes effect immediately.
+    ///
     /// The web console is config-driven: add a `[webui]` section to the
     /// daemon config (or `xkeeper config --set webui.listen=...` + reload)
     /// to enable it
-    Run,
+    Run {
+        /// Start this already-registered program
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Start every program of this app, in the established order
+        #[arg(long, conflicts_with = "name")]
+        app: Option<String>,
+        /// Run the daemon in the background (daemon form only)
+        #[arg(long)]
+        detach: bool,
+        /// (ad-hoc) register this command line as a new app; everything after
+        /// `--` is the command. Mutually exclusive with `--cmd`
+        #[arg(
+            last = true,
+            num_args = 1..,
+            allow_hyphen_values = true,
+            value_name = "CMD",
+            conflicts_with = "cmd_str"
+        )]
+        cmd: Vec<String>,
+        /// (ad-hoc) the command line as one string, split like a shell line.
+        /// Mutually exclusive with the `--` form
+        #[arg(long = "cmd", value_name = "COMMAND")]
+        cmd_str: Option<String>,
+        /// (ad-hoc) app name (default: the command's file name stem; `all` is
+        /// reserved)
+        #[arg(long = "name", value_name = "APP")]
+        scaffold_name: Option<String>,
+        /// (ad-hoc) description for the generated app
+        #[arg(long)]
+        description: Option<String>,
+        /// (ad-hoc) startup/restart policy literal written into the generated
+        /// config: no | on-failure | always | unless-stopped
+        #[arg(long, value_parser = ["no", "on-failure", "always", "unless-stopped"])]
+        restart: Option<String>,
+        /// (ad-hoc) first restart delay in seconds (exponential backoff)
+        #[arg(long)]
+        restart_backoff: Option<f64>,
+        /// (ad-hoc) environment variable K=V; repeat for more
+        #[arg(long = "env")]
+        envs: Vec<String>,
+        /// (ad-hoc) working directory for the program
+        /// (default: the directory `run` is invoked in)
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+    },
     /// Validate the daemon config + all registered apps, or one app file
     Validate {
         /// Optional path to a single app config file
@@ -101,16 +153,13 @@ enum Cmd {
         #[arg(long)]
         init: bool,
     },
-    /// Overview of daemon and all programs
-    Status,
-    /// Start a program, or fan out over one app with --app
-    Start {
-        /// Program name (the bare form keeps per-program semantics)
-        #[arg(required_unless_present = "app", conflicts_with = "app")]
-        name: Option<String>,
-        /// Start every program of this app, in the established order
+    /// Overview of daemon and all programs (human-readable table by default;
+    /// `--json` keeps the machine-readable projection)
+    Status {
+        /// Print the pretty JSON projection instead of the table (script
+        /// migration path)
         #[arg(long)]
-        app: Option<String>,
+        json: bool,
     },
     /// Stop a program (graceful, then force after stop timeout), or every
     /// program of one app with --app
@@ -139,14 +188,17 @@ enum Cmd {
     Signal { program: String, signal: String },
     /// Print a program's pid
     Pid { name: String },
-    /// Show a program's logs
+    /// Show the logs of one or more programs (multi-program output is
+    /// prefixed with `[name] `)
     Log {
-        name: String,
+        /// One or more program names
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
         #[arg(long, default_value = "20")]
         tail: usize,
         #[arg(short = 'f', long)]
         follow: bool,
-        #[arg(long, value_parser = ["out", "err"], default_value = "out")]
+        #[arg(long, value_parser = ["out", "err", "both"], default_value = "out")]
         stream: String,
     },
     /// Reload daemon config and all registered apps (per-app atomic)
@@ -183,12 +235,10 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         description: Option<String>,
-        #[arg(long)]
-        autostart: bool,
-        #[arg(long, conflicts_with = "autostart")]
-        no_autostart: bool,
-        #[arg(long, value_parser = ["always", "on-failure", "never"])]
-        autorestart: Option<String>,
+        /// Startup/restart policy written into the [app] table (as an
+        /// app-level default): no | on-failure | always | unless-stopped
+        #[arg(long, value_parser = ["no", "on-failure", "always", "unless-stopped"])]
+        restart: Option<String>,
         #[arg(long)]
         restart_backoff: Option<f64>,
         #[arg(long)]
@@ -204,8 +254,8 @@ enum Cmd {
         /// (default: the directory `add` runs in)
         #[arg(long)]
         workdir: Option<PathBuf>,
-        /// Apply this app right after registering (errors out when the
-        /// daemon is offline — the config is kept either way)
+        /// Apply this app right after registering; when the daemon is
+        /// offline it is pulled up in the background first
         #[arg(long)]
         apply: bool,
     },
@@ -253,6 +303,10 @@ enum ServiceCmd {
 }
 
 fn main() {
+    // `start` was removed in favour of the unified `run` verb (control-plane
+    // spec). Intercept it before clap so the error carries the migration hint
+    // instead of a generic "unknown subcommand".
+    reject_removed_start();
     let cli = Cli::parse();
     let code = match dispatch(&cli) {
         Ok(()) => EXIT_OK,
@@ -262,6 +316,31 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// The removed `start` verb (and only it — bare `start` as a first positional
+/// argument, not a flag value) gets an explicit "use `run`" hint.
+fn reject_removed_start() {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(a) = args.next() {
+        let s = a.to_string_lossy();
+        if s == "-c" || s == "--config" {
+            let _ = args.next();
+            continue;
+        }
+        if s.starts_with('-') {
+            continue;
+        }
+        if s == "start" {
+            eprintln!(
+                "xkeeper: error: the `start` verb has been removed — use `xkeeper run <name>` \
+                 (or `xkeeper run --app <app>`) instead"
+            );
+            std::process::exit(EXIT_CONFIG);
+        }
+        // The first non-flag token is the subcommand; anything after is its args.
+        break;
+    }
 }
 
 /// Platform default location for the daemon config.
@@ -296,14 +375,78 @@ fn dispatch(cli: &Cli) -> Result<()> {
     // this, warnings from the registry/config layers would be dropped
     // silently. `run` (and bare `xkeeper`) init their own logger from the
     // config's log_level.
-    if !matches!(&cli.cmd, None | Some(Cmd::Run)) {
+    if !matches!(&cli.cmd, None | Some(Cmd::Run { .. })) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init()
             .ok();
     }
     let config_path = config_path_of(cli);
     match &cli.cmd {
-        Some(Cmd::Run) | None => run_daemon(&config_path),
+        Some(Cmd::Run {
+            name,
+            app,
+            detach,
+            cmd,
+            cmd_str,
+            scaffold_name,
+            description,
+            restart,
+            restart_backoff,
+            envs,
+            workdir,
+        }) => {
+            let adhoc = !cmd.is_empty() || cmd_str.is_some();
+            if adhoc {
+                // The ad-hoc form conflicts with the start/daemon forms
+                // (design D10); clap cannot express this across optional
+                // positionals cleanly, so reject here.
+                if name.is_some() || app.is_some() || *detach {
+                    eprintln!(
+                        "xkeeper: error: the ad-hoc command form (`--`/`--cmd`) cannot be \
+                         combined with a program name, --app, or --detach"
+                    );
+                    std::process::exit(EXIT_CONFIG);
+                }
+                run_adhoc(
+                    &config_path,
+                    cmd,
+                    cmd_str.as_deref(),
+                    scaffold_name.as_deref(),
+                    description.as_deref(),
+                    restart.as_deref(),
+                    *restart_backoff,
+                    envs,
+                    workdir.as_deref(),
+                )
+            } else if name.is_some() || app.is_some() {
+                if *detach {
+                    eprintln!(
+                        "xkeeper: error: --detach is only valid for the bare daemon form \
+                         (`xkeeper run --detach`)"
+                    );
+                    std::process::exit(EXIT_CONFIG);
+                }
+                // Strategy flags describe a new registration; accepting them
+                // here would silently drop them (design D10: ad-hoc only).
+                if restart.is_some() || restart_backoff.is_some() {
+                    eprintln!(
+                        "xkeeper: error: --restart/--restart-backoff only apply when \
+                         registering a new command (`xkeeper run -- <cmd...>`)"
+                    );
+                    std::process::exit(EXIT_CONFIG);
+                }
+                match (name, app) {
+                    (Some(n), _) => start_or_hint(&config_path, n),
+                    (None, Some(a)) => fanout_cmd(&config_path, a, "start"),
+                    (None, None) => unreachable!("checked above"),
+                }
+            } else if *detach {
+                run_detach(&config_path)
+            } else {
+                run_daemon(&config_path)
+            }
+        }
+        None => run_daemon(&config_path),
         Some(Cmd::Validate { path }) => validate(&config_path, path.as_deref()),
         Some(Cmd::Config {
             set,
@@ -329,10 +472,14 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Status) => client_cmd(&config_path, |c| {
-            let v = c.status()?;
-            println!("{}", serde_json::to_string_pretty(&v)?);
-            Ok(())
+        Some(Cmd::Status { json }) => client_cmd(&config_path, |c| {
+            if *json {
+                let v = c.status()?;
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                Ok(())
+            } else {
+                shell::print_status(c)
+            }
         }),
         Some(Cmd::Pid { name }) => client_cmd(&config_path, |c| {
             let v = c.program(name)?;
@@ -342,11 +489,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }),
-        Some(Cmd::Start { name, app }) => match (name, app) {
-            (Some(n), _) => action_cmd(&config_path, &n, "start"),
-            (None, Some(a)) => fanout_cmd(&config_path, &a, "start"),
-            (None, None) => unreachable!("clap enforces name xor app"),
-        },
         Some(Cmd::Stop { name, app }) => match (name, app) {
             (Some(n), _) => action_cmd(&config_path, &n, "stop"),
             (None, Some(a)) => fanout_cmd(&config_path, &a, "stop"),
@@ -403,27 +545,16 @@ fn dispatch(cli: &Cli) -> Result<()> {
             Ok(())
         }),
         Some(Cmd::Log {
-            name,
+            names,
             tail,
             follow,
             stream,
-        }) => client_cmd(&config_path, |c| {
-            if *follow {
-                c.log_follow(name, stream)
-            } else {
-                for line in c.log_tail(name, stream, *tail)? {
-                    println!("{line}");
-                }
-                Ok(())
-            }
-        }),
+        }) => client_cmd(&config_path, |c| log_cmd(c, names, *tail, *follow, stream)),
         Some(Cmd::Add {
             path,
             name,
             description,
-            autostart,
-            no_autostart,
-            autorestart,
+            restart,
             restart_backoff,
             priority,
             args,
@@ -458,86 +589,37 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 }
             }
 
-            // --env K=V (repeatable): missing '=' or an empty key is a
-            // config-level error.
-            let mut env = std::collections::BTreeMap::new();
-            for kv in envs {
-                let (k, v) = match kv.split_once('=') {
-                    Some(pair) => pair,
-                    None => {
-                        eprintln!("xkeeper: error: --env expects K=V, got {kv:?}");
-                        std::process::exit(EXIT_CONFIG);
-                    }
-                };
-                if k.trim().is_empty() {
-                    eprintln!("xkeeper: error: --env key must not be empty: {kv:?}");
+            let env = match parse_envs(envs) {
+                Ok(e) => e,
+                Err(code) => std::process::exit(code),
+            };
+            let restart_policy = match restart.as_deref().map(config::parse_restart_cli) {
+                Some(Ok(v)) => Some(v),
+                Some(Err(e)) => {
+                    eprintln!("xkeeper: error: {e}");
                     std::process::exit(EXIT_CONFIG);
                 }
-                env.insert(k.to_string(), v.to_string());
-            }
+                None => None,
+            };
 
             let opts = AddOptions {
                 name: name.clone(),
                 description: description.clone(),
-                autostart: if *autostart {
-                    Some(true)
-                } else if *no_autostart {
-                    Some(false)
-                } else {
-                    None
-                },
-                autorestart: match autorestart.as_deref().map(parse_restart) {
-                    Some(Ok(v)) => Some(v),
-                    Some(Err(e)) => {
-                        eprintln!("xkeeper: error: {e:#}");
-                        std::process::exit(EXIT_CONFIG);
-                    }
-                    None => None,
-                },
+                restart: restart_policy,
                 restart_backoff: *restart_backoff,
                 priority: *priority,
                 args: args.clone(),
+                args_argv: None,
                 env: if env.is_empty() { None } else { Some(env) },
                 workdir: workdir.clone(),
             };
             let result = registry::add(&config, &config_dir, &target, &opts)?;
-            if result.scaffolded {
-                println!("generated {}", result.file.display());
-                println!("app[{}] program[{}]", result.app, result.program);
-                println!("  command:  {}", result.command);
-                if result.args.is_empty() {
-                    println!("  args:     (none)");
-                } else {
-                    println!("  args:     {}", shell_join(&result.args));
-                }
-                if result.env.is_empty() {
-                    println!("  env:      (none)");
-                } else {
-                    let kv: Vec<String> =
-                        result.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    println!("  env:      {}", kv.join(" "));
-                }
-                println!("  work_dir: {}", result.work_dir.display());
-                if result.changed {
-                    println!(
-                        "changed: run `xkeeper apply {}` (or bare `xkeeper apply`) to take effect",
-                        result.app
-                    );
-                } else {
-                    println!("no change: generated config is already up to date");
-                }
-            } else {
-                println!("app[{}] registered", result.app);
-            }
+            print_add_result(&result);
             sync_if_online(&config)?;
 
             if *apply_now {
-                match apply_after_add(&config, &result.app, &result.file) {
+                match apply_after_add(&config, &config_path, &result.app) {
                     AddApplyOutcome::Applied(text) => println!("{text}"),
-                    AddApplyOutcome::Offline(msg) => {
-                        eprintln!("xkeeper: error: {msg}");
-                        std::process::exit(EXIT_UNREACHABLE);
-                    }
                     AddApplyOutcome::Failed(msg, code) => {
                         eprintln!("xkeeper: error: {msg}");
                         std::process::exit(code);
@@ -573,7 +655,9 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     unit_file,
                     user,
                 } => ("install", unit_file, user, *force, *now),
-                ServiceCmd::Uninstall { unit_file } => ("uninstall", unit_file, &None, false, false),
+                ServiceCmd::Uninstall { unit_file } => {
+                    ("uninstall", unit_file, &None, false, false)
+                }
             };
             let opts = service::ServiceOptions {
                 unit_file: unit_file.clone(),
@@ -610,13 +694,333 @@ fn dispatch(cli: &Cli) -> Result<()> {
     }
 }
 
-fn parse_restart(s: &str) -> Result<RestartPolicy> {
-    Ok(match s {
-        "always" => RestartPolicy::Always,
-        "on-failure" => RestartPolicy::OnFailure,
-        "never" => RestartPolicy::Never,
-        _ => bail!("invalid --autorestart value {s:?} (always | on-failure | never)"),
-    })
+/// Parse `--env K=V` pairs (repeatable, last wins). A missing `=` or an empty
+/// key is a config-level error; the caller exits with [`EXIT_CONFIG`].
+fn parse_envs(
+    envs: &[String],
+) -> std::result::Result<std::collections::BTreeMap<String, String>, i32> {
+    let mut env = std::collections::BTreeMap::new();
+    for kv in envs {
+        let (k, v) = match kv.split_once('=') {
+            Some(pair) => pair,
+            None => {
+                eprintln!("xkeeper: error: --env expects K=V, got {kv:?}");
+                return Err(EXIT_CONFIG);
+            }
+        };
+        if k.trim().is_empty() {
+            eprintln!("xkeeper: error: --env key must not be empty: {kv:?}");
+            return Err(EXIT_CONFIG);
+        }
+        env.insert(k.to_string(), v.to_string());
+    }
+    Ok(env)
+}
+
+/// Print the full non-interactive report of one `registry::add` result.
+fn print_add_result(result: &registry::AddResult) {
+    if result.scaffolded {
+        println!("generated {}", result.file.display());
+        println!("app[{}] program[{}]", result.app, result.program);
+        println!("  command:  {}", result.command);
+        if result.args.is_empty() {
+            println!("  args:     (none)");
+        } else {
+            println!("  args:     {}", shell_join(&result.args));
+        }
+        if result.env.is_empty() {
+            println!("  env:      (none)");
+        } else {
+            let kv: Vec<String> = result.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("  env:      {}", kv.join(" "));
+        }
+        println!("  work_dir: {}", result.work_dir.display());
+        if result.changed {
+            println!(
+                "changed: run `xkeeper apply {}` (or bare `xkeeper apply`) to take effect",
+                result.app
+            );
+        } else {
+            println!("no change: generated config is already up to date");
+        }
+    } else {
+        println!("app[{}] registered", result.app);
+    }
+}
+
+/// One output line of `log`: multi-program output carries a `[name] ` prefix,
+/// single-program output is byte-identical to the legacy form (no prefix).
+fn format_log_line(name: &str, line: &str, multi: bool) -> String {
+    if multi {
+        format!("[{name}] {line}")
+    } else {
+        line.to_string()
+    }
+}
+
+/// `xkeeper log <name...>`: multi-program aggregation. A single program keeps
+/// the byte-identical legacy output (no prefix); multiple programs get a
+/// `[name] ` line prefix and, in follow mode, concurrent connections.
+fn log_cmd(
+    c: &client::Client,
+    names: &[String],
+    tail: usize,
+    follow: bool,
+    stream: &str,
+) -> Result<()> {
+    let streams: Vec<&str> = if stream == "both" {
+        vec!["out", "err"]
+    } else {
+        vec![stream]
+    };
+    let multi = names.len() > 1;
+    if follow {
+        // Concurrent connections, line-buffered, serialized through one
+        // stdout lock so interleaved lines never tear (design D8).
+        let out = std::sync::Arc::new(std::sync::Mutex::new(std::io::stdout()));
+        let mut handles = Vec::new();
+        for name in names {
+            for s in &streams {
+                let c = c.clone();
+                let name = name.clone();
+                let s = s.to_string();
+                let out = out.clone();
+                handles.push(std::thread::spawn(move || -> Result<()> {
+                    use std::io::Write;
+                    c.follow_lines(&name, &s, |line| {
+                        let mut w = out.lock().unwrap();
+                        let r = writeln!(&mut *w, "{}", format_log_line(&name, line, multi));
+                        let _ = w.flush();
+                        r.is_ok()
+                    })
+                }));
+            }
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => bail!("a log follower thread panicked"),
+            }
+        }
+        return Ok(());
+    }
+    // Non-follow: per program, in argument order; `both` prints out then err.
+    for name in names {
+        for s in &streams {
+            for line in c.log_tail(name, s, tail)? {
+                println!("{}", format_log_line(name, &line, multi));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `xkeeper run --detach`: spawn the daemon in the background and report once
+/// it is serving (background-daemon spec). Non-zero exit on timeout / bind
+/// conflict, naming the background log.
+fn run_detach(config_path: &Path) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let config_dir = config_dir_of(config_path);
+    match daemonize::ensure_daemon(&config, config_path, &config_dir) {
+        daemonize::SpawnOutcome::Ready { already_online } => {
+            let addr = format!("{}:{}", config.daemon.host, config.daemon.port);
+            if already_online {
+                println!("daemon already running on http://{addr}");
+            } else {
+                println!("daemon running in the background on http://{addr}");
+            }
+            println!(
+                "logs: {}",
+                daemonize::daemon_log_path(&config, &config_dir).display()
+            );
+            Ok(())
+        }
+        daemonize::SpawnOutcome::TimedOut { log_path } => {
+            eprintln!(
+                "xkeeper: error: the daemon did not become ready; see {} \
+                 (a port conflict is likely — check `xkeeper status`)",
+                log_path.display()
+            );
+            std::process::exit(EXIT_ERROR);
+        }
+    }
+}
+
+/// The scaffold flags recognized inside the trailing `run --` region (after
+/// the command line). A leading `--` split means clap hands the whole region
+/// over as one vector, so the runtime splits command-vs-flags at the first
+/// recognized flag (design D10 / app-registry spec examples).
+#[derive(Debug, Default, PartialEq)]
+struct AdhocFlags {
+    name: Option<String>,
+    description: Option<String>,
+    restart: Option<String>,
+    restart_backoff: Option<f64>,
+    envs: Vec<String>,
+    workdir: Option<PathBuf>,
+}
+
+/// Split the trailing region into `(argv, flags)`: argv is everything up to
+/// the first recognized scaffold flag; the rest is parsed as scaffold flags
+/// (supporting both `--flag value` and `--flag=value`).
+fn split_adhoc_trailing(
+    trailing: &[String],
+) -> std::result::Result<(Vec<String>, AdhocFlags), String> {
+    const FLAGS: [&str; 6] = [
+        "--name",
+        "--description",
+        "--restart",
+        "--restart-backoff",
+        "--env",
+        "--workdir",
+    ];
+    let is_flag = |t: &str| {
+        FLAGS
+            .iter()
+            .any(|f| t == *f || t.starts_with(&format!("{f}=")))
+    };
+    let split = trailing
+        .iter()
+        .position(|t| is_flag(t))
+        .unwrap_or(trailing.len());
+    let (argv, rest) = trailing.split_at(split);
+    let mut flags = AdhocFlags::default();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        let (flag, inline) = match tok.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (tok.clone(), None),
+        };
+        let take_value = |i: &mut usize| -> std::result::Result<String, String> {
+            if let Some(v) = &inline {
+                return Ok(v.clone());
+            }
+            *i += 1;
+            rest.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--name" => flags.name = Some(take_value(&mut i)?),
+            "--description" => flags.description = Some(take_value(&mut i)?),
+            "--restart" => flags.restart = Some(take_value(&mut i)?),
+            "--restart-backoff" => {
+                let v = take_value(&mut i)?;
+                flags.restart_backoff = Some(
+                    v.parse()
+                        .map_err(|_| format!("--restart-backoff expects a number, got {v:?}"))?,
+                );
+            }
+            "--env" => flags.envs.push(take_value(&mut i)?),
+            "--workdir" => flags.workdir = Some(PathBuf::from(take_value(&mut i)?)),
+            other => return Err(format!("unknown flag {other:?} in the run command form")),
+        }
+        i += 1;
+    }
+    Ok((argv.to_vec(), flags))
+}
+
+/// `xkeeper run -- <cmd...>` / `run --cmd "<string>"`: register the command
+/// line as a new app and take effect immediately (app-registry spec). The two
+/// entry forms normalize to the same argv; the first token is resolved to an
+/// absolute path; the rest become args. The scaffold engine is reused, so
+/// `--restart=no` registers without pulling up.
+#[allow(clippy::too_many_arguments)]
+fn run_adhoc(
+    config_path: &Path,
+    trailing: &[String],
+    cmd_str: Option<&str>,
+    name: Option<&str>,
+    description: Option<&str>,
+    restart: Option<&str>,
+    restart_backoff: Option<f64>,
+    envs: &[String],
+    workdir: Option<&Path>,
+) -> Result<()> {
+    // For the `--` form the scaffold flags may ride after the command line
+    // (`run -- node server.js --name worker`); split them out here.
+    let (argv, flags) = if cmd_str.is_some() {
+        (Vec::new(), AdhocFlags::default())
+    } else {
+        match split_adhoc_trailing(trailing) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("xkeeper: error: {e}");
+                std::process::exit(EXIT_CONFIG);
+            }
+        }
+    };
+    // clap-level flags (before `--`) win when set; otherwise the trailing ones.
+    let name = flags.name.as_deref().or(name);
+    let description = flags.description.as_deref().or(description);
+    let restart = flags.restart.as_deref().or(restart);
+    let restart_backoff = flags.restart_backoff.or(restart_backoff);
+    let workdir = flags.workdir.as_deref().or(workdir);
+    let envs: Vec<String> = if flags.envs.is_empty() {
+        envs.to_vec()
+    } else {
+        flags.envs.clone()
+    };
+
+    let argv: Vec<String> = if let Some(s) = cmd_str {
+        config::split_command(s)
+    } else {
+        argv
+    };
+    if argv.is_empty() {
+        eprintln!(
+            "xkeeper: error: no command given (use `xkeeper run -- <cmd...>` or `--cmd \"...\"`)"
+        );
+        std::process::exit(EXIT_CONFIG);
+    }
+    let env = match parse_envs(&envs) {
+        Ok(e) => e,
+        Err(code) => std::process::exit(code),
+    };
+    let restart_policy = match restart.map(config::parse_restart_cli) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => {
+            eprintln!("xkeeper: error: {e}");
+            std::process::exit(EXIT_CONFIG);
+        }
+        None => None,
+    };
+    let (command, args) = match registry::resolve_command(&argv[0]) {
+        Ok(p) => (p, argv[1..].to_vec()),
+        Err(e) => {
+            // Command resolution failure: exit 2 with no registration artifact.
+            eprintln!("xkeeper: error: {e:#}");
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
+
+    let config = client::load_config(config_path)?;
+    let config_dir = config_dir_of(config_path);
+    let opts = AddOptions {
+        name: name.map(|s| s.to_string()),
+        description: description.map(|s| s.to_string()),
+        restart: restart_policy,
+        restart_backoff,
+        priority: None,
+        args: None,
+        args_argv: Some(args),
+        env: if env.is_empty() { None } else { Some(env) },
+        workdir: workdir.map(|p| p.to_path_buf()),
+    };
+    let result = registry::add(&config, &config_dir, &command, &opts)?;
+    print_add_result(&result);
+    // Take effect immediately: pull the daemon up when offline, then apply
+    // this app's scope (background-daemon spec).
+    match apply_after_add(&config, config_path, &result.app) {
+        AddApplyOutcome::Applied(text) => println!("{text}"),
+        AddApplyOutcome::Failed(msg, code) => {
+            eprintln!("xkeeper: error: {msg}");
+            std::process::exit(code);
+        }
+    }
+    Ok(())
 }
 
 /// Render argv as one paste-able line (quoting mirrors the quote-aware
@@ -685,6 +1089,34 @@ fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
     })
 }
 
+/// `xkeeper run <name>`: start an already-registered program. An unknown name
+/// is a control-plane 404; per the control-plane spec the error must also
+/// point at the ad-hoc form (a bare token can only ever be a program name —
+/// registering a new command line goes through `run --`).
+fn start_or_hint(config_path: &Path, name: &str) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let c = client::Client::from_config(&config);
+    match c.action(name, "start") {
+        Ok(v) => {
+            println!(
+                "{}",
+                v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("xkeeper: error: {e:#}");
+            if format!("{e:#}").contains("404") {
+                eprintln!(
+                    "hint: `{name}` is not a registered program — to register and run a new \
+                     command line, use `xkeeper run -- <cmd...>`"
+                );
+            }
+            std::process::exit(client::exit_code_of(&e));
+        }
+    }
+}
+
 /// `xkeeper action <program> <action>`: print the output tail and pass the
 /// action's own exit code through (control-plane spec: 调用失败 1、守护不可达 3、
 /// 超时 1 — anything else is the action's exit status).
@@ -736,32 +1168,37 @@ fn fanout_cmd(config_path: &Path, app: &str, verb: &str) -> Result<()> {
 
 // -- add --apply --------------------------------------------------------------
 
-/// Outcome of `add --apply`: the caller prints `Applied`/the message and
-/// terminates with the outcome's exit code (0 for `Applied`). Kept free of
-/// `process::exit` so tests can drive the offline/API-error branches.
+/// Outcome of `add --apply` / the run ad-hoc form: the caller prints
+/// `Applied`/the message and terminates with the outcome's exit code (0 for
+/// `Applied`). Kept free of `process::exit` so tests can drive the branches.
 #[derive(Debug)]
 enum AddApplyOutcome {
     /// The control-plane result text (rendered apply result).
     Applied(String),
-    /// Daemon offline: message explains that the config was generated and
-    /// names the remedy (`xkeeper apply <app>`); exit code 3.
-    Offline(String),
     /// The daemon answered but the apply failed: message + exit code.
     Failed(String, i32),
 }
 
-/// `add --apply`: apply one app right after registering (app scope only —
-/// other apps' pending is untouched). An explicit request that did not take
-/// effect must be visible: offline is a non-zero exit with the remedy.
-fn apply_after_add(config: &DaemonConfig, app: &str, file: &Path) -> AddApplyOutcome {
-    let c = client::Client::from_config(config);
-    if c.health().is_err() {
-        return AddApplyOutcome::Offline(format!(
-            "daemon is offline — the config for app[{app}] is at {}; \
-             start the daemon and run `xkeeper apply {app}` to take effect",
-            file.display()
-        ));
+/// Apply one app right after registering (app scope only — other apps'
+/// pending is untouched). When the daemon is offline it is pulled up in the
+/// background first (background-daemon spec), so the "take effect now"
+/// entries never fail with "daemon offline".
+fn apply_after_add(config: &DaemonConfig, config_path: &Path, app: &str) -> AddApplyOutcome {
+    let config_dir = config_dir_of(config_path);
+    match daemonize::ensure_daemon(config, config_path, &config_dir) {
+        daemonize::SpawnOutcome::Ready { .. } => {}
+        daemonize::SpawnOutcome::TimedOut { log_path } => {
+            return AddApplyOutcome::Failed(
+                format!(
+                    "the daemon did not become ready, so app[{app}] could not take effect; \
+                     see {} (check the config with `xkeeper validate`)",
+                    log_path.display()
+                ),
+                EXIT_ERROR,
+            );
+        }
     }
+    let c = client::Client::from_config(config);
     match c.apply(Some(app), None, false) {
         Ok(v) => AddApplyOutcome::Applied(
             v.get("result")
@@ -1322,24 +1759,9 @@ mod sync_tests {
         sync_if_online(&config).expect("offline sync must be a silent success");
     }
 
-    /// add --apply offline: the config is already on disk, so the failure
-    /// must be visible (exit 3) and name the remedy — never a silent no-op.
-    #[test]
-    fn add_apply_offline_reports_generated_config_and_remedy() {
-        let config = config_with_port(1).unwrap(); // loopback:1 is never open
-        match apply_after_add(&config, "abc", Path::new("apps/abc.toml")) {
-            AddApplyOutcome::Offline(msg) => {
-                assert!(msg.contains("offline"), "names the offline cause: {msg}");
-                assert!(msg.contains("apps/abc.toml"), "names the config: {msg}");
-                assert!(msg.contains("xkeeper apply abc"), "names the remedy: {msg}");
-            }
-            other => panic!("offline add --apply must be Offline, got {other:?}"),
-        }
-    }
-
-    /// add --apply online: one health probe + one app-scoped apply; the
-    /// rendered control-plane result comes back (fake daemon, sync_tests
-    /// style).
+    /// add --apply online: the daemon is already healthy, so no spawn happens
+    /// (online short-circuit) and one app-scoped apply is sent; the rendered
+    /// control-plane result comes back (fake daemon, sync_tests style).
     #[test]
     fn add_apply_online_runs_app_scoped_apply() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1395,14 +1817,20 @@ mod sync_tests {
             }
         });
 
+        let dir = std::env::temp_dir().join(format!("xk-apply-online-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
         let config = config_with_port(port).unwrap();
-        match apply_after_add(&config, "abc", Path::new("apps/abc.toml")) {
+        match apply_after_add(&config, &config_path, "abc") {
             AddApplyOutcome::Applied(text) => {
                 assert!(text.contains("abc.abc -> start"), "result text: {text}");
             }
             other => panic!("online add --apply must be Applied, got {other:?}"),
         }
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1703,5 +2131,268 @@ mod config_cmd_tests {
             msg.contains("offline") && msg.contains("next start"),
             "{msg}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests: the unified `run` verb, `log` multi-name and `status --json`
+// (cli-revamp tasks 2.1 / 2.2 / 2.3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod cli_verb_tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Cli {
+        let mut full = vec!["xkeeper"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(&full).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"))
+    }
+
+    fn parse_err(argv: &[&str]) -> String {
+        let mut full = vec!["xkeeper"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(&full)
+            .err()
+            .unwrap_or_else(|| panic!("{argv:?} must be rejected"))
+            .to_string()
+    }
+
+    /// Bare `run` (daemon) and `run --detach` parse; `--detach` rides along.
+    #[test]
+    fn run_daemon_forms_parse() {
+        match parse(&["run"]).cmd {
+            Some(Cmd::Run {
+                name,
+                app,
+                detach,
+                cmd,
+                cmd_str,
+                ..
+            }) => {
+                assert!(name.is_none() && app.is_none());
+                assert!(!detach && cmd.is_empty() && cmd_str.is_none());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        let cli = parse(&["run", "--detach"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Run { detach: true, .. })));
+    }
+
+    /// `run <name>` and `run --app <app>` are the start forms; both at once is
+    /// rejected (name xor app).
+    #[test]
+    fn run_start_forms_parse_and_conflict() {
+        let cli = parse(&["run", "web"]);
+        match cli.cmd {
+            Some(Cmd::Run {
+                name,
+                app,
+                detach,
+                cmd,
+                ..
+            }) => {
+                assert_eq!(name.as_deref(), Some("web"));
+                assert!(app.is_none() && !detach && cmd.is_empty());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        let cli = parse(&["run", "--app", "demo"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Run { app: Some(ref a), .. }) if a == "demo"));
+        // name xor app.
+        assert!(parse_err(&["run", "web", "--app", "demo"]).contains("cannot be used with"));
+    }
+
+    /// The ad-hoc `--` form captures everything after `--` as the command
+    /// region (including hyphen-leading tokens); scaffold flags riding after
+    /// the command are split out at runtime.
+    #[test]
+    fn run_adhoc_trailing_and_cmd_str_parse() {
+        let cli = parse(&["run", "--", "python", "-m", "http.server", "8000"]);
+        match cli.cmd {
+            Some(Cmd::Run {
+                cmd,
+                cmd_str,
+                scaffold_name,
+                ..
+            }) => {
+                assert_eq!(cmd, vec!["python", "-m", "http.server", "8000"]);
+                assert!(cmd_str.is_none() && scaffold_name.is_none());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // Scaffold flags after the command line are split out.
+        let cli = parse(&[
+            "run",
+            "--",
+            "node",
+            "server.js",
+            "--name",
+            "worker",
+            "--restart",
+            "unless-stopped",
+        ]);
+        let cmd = match cli.cmd {
+            Some(Cmd::Run { cmd, .. }) => cmd,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
+        assert_eq!(argv, vec!["node", "server.js"]);
+        assert_eq!(flags.name.as_deref(), Some("worker"));
+        assert_eq!(flags.restart.as_deref(), Some("unless-stopped"));
+        // `--flag=value` form too.
+        let (argv, flags) =
+            split_adhoc_trailing(&["/bin/echo".into(), "hi".into(), "--name=w2".into()]).unwrap();
+        assert_eq!(argv, vec!["/bin/echo", "hi"]);
+        assert_eq!(flags.name.as_deref(), Some("w2"));
+        // A missing value is a diagnostic error.
+        assert!(split_adhoc_trailing(&["x".into(), "--name".into()]).is_err());
+        // `--cmd "<string>"` is the equivalent single-string entry.
+        let cli = parse(&[
+            "run",
+            "--cmd",
+            "python -m http.server 8000",
+            "--name",
+            "web",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Run {
+                cmd,
+                cmd_str,
+                scaffold_name,
+                ..
+            }) => {
+                assert!(cmd.is_empty());
+                assert_eq!(cmd_str.as_deref(), Some("python -m http.server 8000"));
+                assert_eq!(scaffold_name.as_deref(), Some("web"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // The two entry forms are mutually exclusive.
+        assert!(parse_err(&["run", "--cmd", "x", "--", "y"]).contains("cannot be used with"));
+    }
+
+    /// An invalid `--restart` literal is rejected — at clap parse time for the
+    /// flags before `--`, and at runtime for the trailing form.
+    #[test]
+    fn run_adhoc_restart_literal_validated() {
+        for ok in ["no", "on-failure", "always", "unless-stopped"] {
+            parse(&["run", "--restart", ok, "--", "x"]);
+        }
+        assert!(parse_err(&["run", "--restart", "never", "--", "x"]).contains("invalid value"));
+        // The trailing form validates at runtime via parse_restart_literal.
+        let (_, flags) =
+            split_adhoc_trailing(&["x".into(), "--restart".into(), "never".into()]).unwrap();
+        assert!(config::parse_restart_cli(flags.restart.as_deref().unwrap()).is_err());
+    }
+
+    /// `start` is gone: no such subcommand parses (the hint is added in main).
+    #[test]
+    fn start_subcommand_is_gone() {
+        let e = parse_err(&["start", "web"]);
+        assert!(
+            e.contains("unrecognized subcommand") || e.contains("invalid subcommand"),
+            "{e}"
+        );
+    }
+
+    /// `log` takes one or more program names; `--stream` accepts both.
+    #[test]
+    fn log_multi_name_and_stream_both_parse() {
+        let cli = parse(&["log", "web"]);
+        match cli.cmd {
+            Some(Cmd::Log {
+                names,
+                tail,
+                follow,
+                stream,
+            }) => {
+                assert_eq!(names, vec!["web"]);
+                assert_eq!(tail, 20);
+                assert!(!follow);
+                assert_eq!(stream, "out");
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+        let cli = parse(&[
+            "log", "web", "api", "-f", "--tail", "50", "--stream", "both",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Log {
+                names,
+                tail,
+                follow,
+                stream,
+            }) => {
+                assert_eq!(names, vec!["web", "api"]);
+                assert_eq!(tail, 50);
+                assert!(follow);
+                assert_eq!(stream, "both");
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+        // At least one name is required.
+        assert!(parse_err(&["log"]).contains("required"));
+        // An out-of-range stream value is rejected.
+        assert!(parse_err(&["log", "web", "--stream", "side"]).contains("invalid value"));
+    }
+
+    /// `status` defaults to the table and `--json` is an opt-in flag.
+    #[test]
+    fn status_json_flag_parses() {
+        assert!(matches!(
+            parse(&["status"]).cmd,
+            Some(Cmd::Status { json: false })
+        ));
+        assert!(matches!(
+            parse(&["status", "--json"]).cmd,
+            Some(Cmd::Status { json: true })
+        ));
+    }
+
+    /// `add` no longer carries the deprecated flags; `--restart` is the single
+    /// policy flag.
+    #[test]
+    fn add_flags_converged_to_restart() {
+        let cli = parse(&["add", ".", "--restart", "on-failure", "--priority", "2"]);
+        match cli.cmd {
+            Some(Cmd::Add {
+                restart, priority, ..
+            }) => {
+                assert_eq!(restart.as_deref(), Some("on-failure"));
+                assert_eq!(priority, Some(2));
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+        for bad in [
+            vec!["add", ".", "--autostart"],
+            vec!["add", ".", "--no-autostart"],
+            vec!["add", ".", "--autorestart", "always"],
+        ] {
+            assert!(
+                parse_err(&bad).contains("unexpected argument"),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(parse_err(&["add", ".", "--restart", "never"]).contains("invalid value"));
+    }
+
+    /// The removed-`start` interception fires only for a bare `start`
+    /// subcommand, not for a program literally named start passed to `run`.
+    #[test]
+    fn removed_start_interception_scope() {
+        // `run start` is a program name, not the removed verb.
+        let cli = parse(&["run", "start"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Run { name: Some(ref n), .. }) if n == "start"));
+    }
+
+    /// Multi-program log lines carry the `[name] ` prefix; a single program
+    /// stays byte-identical (no prefix) — the legacy output contract.
+    #[test]
+    fn log_line_prefix_only_for_multiple_programs() {
+        assert_eq!(format_log_line("web", "hello", false), "hello");
+        assert_eq!(format_log_line("web", "hello", true), "[web] hello");
+        // Empty lines keep the prefix too (a blank line still belongs to a stream).
+        assert_eq!(format_log_line("api", "", true), "[api] ");
     }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
-use crate::config::{ResolvedProgram, RestartPolicy};
+use crate::config::ResolvedProgram;
 use crate::platform;
 use crate::pump::{self, PumpSet, Stream};
 
@@ -345,20 +345,19 @@ impl ManagedProgram {
     }
 
     fn schedule_after_exit(&mut self, now: Instant) {
-        let restart = match self.def.autorestart {
-            RestartPolicy::Never => false,
-            RestartPolicy::Always => true,
-            RestartPolicy::OnFailure => {
-                // Exit was expected -> do not restart. Signals (code = None)
-                // count as failures.
-                !matches!(self.last_code, Some(c) if self.def.exit_codes.contains(&c))
-            }
-        };
+        // Four `restart` strategies (process-management spec): `no` never
+        // restarts; `on-failure` restarts when the exit code is not in the
+        // expected list; `always`/`unless-stopped` restart on any exit
+        // (unless-stopped behaves like always within a daemon session).
+        let restart = self
+            .def
+            .restart
+            .restarts_on_exit(self.last_code, &self.def.exit_codes);
         if !restart {
             self.state = ProgramState::Exited;
             info!(
-                "program[{}] not restarted (autorestart = {:?})",
-                self.def.name, self.def.autorestart
+                "program[{}] not restarted (restart = {})",
+                self.def.name, self.def.restart
             );
             return;
         }
@@ -553,7 +552,7 @@ mod tests {
 
     #[test]
     fn restarts_and_reaches_stable_running() {
-        let mut p = make(&slow_exit(""), "restart");
+        let mut p = make(&slow_exit("restart = \"always\"\n"), "restart");
         p.spawn();
         drive(&mut p, |p| {
             p.total_exits() >= 2 && p.state() == ProgramState::Running
@@ -581,7 +580,7 @@ mod tests {
 
     #[test]
     fn never_policy_stays_exited() {
-        let mut p = make(&slow_exit("autorestart = \"never\"\n"), "never");
+        let mut p = make(&slow_exit("restart = \"no\"\n"), "never");
         p.spawn();
         drive(&mut p, |p| p.state() == ProgramState::Exited);
         assert_eq!(p.state(), ProgramState::Exited);
@@ -624,7 +623,7 @@ mod tests {
     fn on_failure_respects_expected_exit_codes() {
         // exits 0 which IS expected -> no restart, stays exited
         let mut p = make(
-            &slow_exit("autorestart = \"on-failure\"\nexit_codes = [0]\n"),
+            &slow_exit("restart = \"on-failure\"\nexit_codes = [0]\n"),
             "expect",
         );
         p.spawn();
@@ -637,7 +636,7 @@ mod tests {
     fn on_failure_restarts_on_unexpected_exit_code() {
         // exits 0 but only 3 is expected -> restart and run again
         let mut p = make(
-            &slow_exit("autorestart = \"on-failure\"\nexit_codes = [3]\n"),
+            &slow_exit("restart = \"on-failure\"\nexit_codes = [3]\n"),
             "unexpected",
         );
         p.spawn();

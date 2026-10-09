@@ -28,7 +28,7 @@ pub(crate) enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ShellCmd {
     Status,
-    Start(Target),
+    Run(Target),
     Stop(Target),
     Restart(Target),
     Action {
@@ -67,7 +67,7 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
     };
     let cmd = match head.as_str() {
         "status" | "st" => ShellCmd::Status,
-        "start" => parse_target("start", args).map(ShellCmd::Start)?,
+        "run" => parse_target("run", args).map(ShellCmd::Run)?,
         "stop" => parse_target("stop", args).map(ShellCmd::Stop)?,
         "restart" => parse_target("restart", args).map(ShellCmd::Restart)?,
         "action" => parse_two_args("action", args, "action <program> <action>")
@@ -251,8 +251,8 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
 /// Naive "did you mean" for the unknown-command hint.
 fn similar_hint(input: &str) -> String {
     const COMMANDS: [&str; 15] = [
-        "status", "start", "stop", "restart", "action", "signal", "pid", "log", "reload",
-        "pending", "apply", "shutdown", "open", "help", "exit",
+        "status", "run", "stop", "restart", "action", "signal", "pid", "log", "reload", "pending",
+        "apply", "shutdown", "open", "help", "exit",
     ];
     let input = input.to_lowercase();
     let similar: Vec<&str> = COMMANDS
@@ -290,8 +290,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 pub(crate) const HELP_TEXT: &str = "\
 Built-in commands:
   status                              list all programs (app, state, pid, restarts)
-  start|stop|restart <name>           control a program
-  start|stop|restart --app <app>      fan out over every program of an app
+  run|stop|restart <name>             control a program
+  run|stop|restart --app <app>        fan out over every program of an app
   action <program> <action>           run a custom action (prints its output tail;
                                       -e mode exits with the action's exit code)
   signal <program> <SIGNAL>           send a whitelist signal to the program's
@@ -412,8 +412,8 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
 /// Execute one parsed command against the control-plane client.
 fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
     match cmd {
-        ShellCmd::Status => print_status(c),
-        ShellCmd::Start(t) => run_target(c, t, "start"),
+        ShellCmd::Status => print_status(c).map(|_| Outcome::Continue),
+        ShellCmd::Run(t) => run_target(c, t, "start"),
         ShellCmd::Stop(t) => run_target(c, t, "stop"),
         ShellCmd::Restart(t) => run_target(c, t, "restart"),
         ShellCmd::Action { program, name } => run_custom_action(c, program, name),
@@ -577,8 +577,19 @@ fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
 }
 
 /// Aligned status table: name / app / state / pid / restarts / unhealthy.
-fn print_status(c: &Client) -> Result<Outcome> {
+/// Shared by the shell's `status` built-in and the top-level `xkeeper status`
+/// default output (control-plane spec: same columns and format).
+pub(crate) fn print_status(c: &Client) -> Result<()> {
     let v = c.status()?;
+    print!("{}", render_status_table(&v));
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// Pure renderer for the status table (the `GET /v1/status` projection is its
+/// input), so both callers share one format and it is unit-testable without a
+/// live daemon. An empty program list renders the registration hint.
+pub(crate) fn render_status_table(v: &serde_json::Value) -> String {
     let rows: Vec<[String; 6]> = v
         .get("programs")
         .and_then(|p| p.as_array())
@@ -612,8 +623,7 @@ fn print_status(c: &Client) -> Result<Outcome> {
         .unwrap_or_default();
 
     if rows.is_empty() {
-        println!("no programs (register an app with `xkeeper add <dir>`)");
-        return Ok(Outcome::Continue);
+        return "no programs (register an app with `xkeeper add <dir>`)\n".to_string();
     }
     let header = ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"];
     let mut width = [4usize; 6];
@@ -654,9 +664,7 @@ fn print_status(c: &Client) -> Result<Outcome> {
     for row in &rows {
         emit(&mut out, row.to_vec());
     }
-    print!("{out}");
-    let _ = std::io::stdout().flush();
-    Ok(Outcome::Continue)
+    out
 }
 
 fn str_field(v: &serde_json::Value, key: &str) -> String {
@@ -791,19 +799,20 @@ mod tests {
     #[test]
     fn unknown_and_missing_args() {
         assert!(parse_line("sttaus").is_err());
-        assert!(parse_line("start").is_err());
-        assert!(parse_line("start a b").is_err());
+        assert!(parse_line("start").is_err(), "`start` is no longer a verb");
+        assert!(parse_line("run").is_err());
+        assert!(parse_line("run a b").is_err());
         assert!(parse_line("log").is_err());
         assert!(parse_line("log web --tail").is_err());
         assert!(parse_line("log web --stream both").is_err());
     }
 
-    /// actions: start/stop/restart take a bare program name or --app <app>.
+    /// actions: run/stop/restart take a bare program name or --app <app>.
     #[test]
     fn target_parsing_program_and_app() {
         assert_eq!(
-            parse("start web"),
-            Some(ShellCmd::Start(Target::Program("web".into())))
+            parse("run web"),
+            Some(ShellCmd::Run(Target::Program("web".into())))
         );
         assert_eq!(
             parse("stop web"),
@@ -814,14 +823,17 @@ mod tests {
             Some(ShellCmd::Restart(Target::App("gateway".into())))
         );
         assert_eq!(
-            parse("start --app demo"),
-            Some(ShellCmd::Start(Target::App("demo".into())))
+            parse("run --app demo"),
+            Some(ShellCmd::Run(Target::App("demo".into())))
         );
         // Both shapes at once, a missing --app value, or an unknown flag: all errors.
-        assert!(parse_line("start web --app demo").is_err());
-        assert!(parse_line("start --app").is_err());
-        assert!(parse_line("start --bogus x").is_err());
+        assert!(parse_line("run web --app demo").is_err());
+        assert!(parse_line("run --app").is_err());
+        assert!(parse_line("run --bogus x").is_err());
         assert!(parse_line("stop a b").is_err());
+        // `start` was renamed: it is an unknown command now (no alias).
+        let e = parse_line("start web").unwrap_err().to_string();
+        assert!(e.contains("unknown command"), "{e}");
     }
 
     /// actions: `action`/`signal` verbs parse two positional arguments.
@@ -898,10 +910,11 @@ mod tests {
         assert!(similar_hint("resart").contains("restart"));
         assert!(!similar_hint("zzzzz").contains("did you mean"));
     }
-
     #[test]
     fn status_table_alignment() {
-        // Pure formatting check: columns line up via the emit logic.
+        // Pure formatting check: the shared renderer lines columns up and
+        // flags unhealthy programs. Same input the top-level `xkeeper status`
+        // default consumes.
         let v = serde_json::json!({
             "programs": [
                 {"name": "web", "app": "demo", "state": "running", "pid": 42,
@@ -910,42 +923,27 @@ mod tests {
                  "total_exits": 0, "unhealthy": true}
             ]
         });
-        let rows: Vec<[String; 6]> = v["programs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| {
-                [
-                    str_field(p, "name"),
-                    str_field(p, "app"),
-                    str_field(p, "state"),
-                    match p.get("pid") {
-                        Some(x) if !x.is_null() => x.to_string(),
-                        _ => "-".into(),
-                    },
-                    p.get("total_exits")
-                        .and_then(|x| x.as_u64())
-                        .map(|x| x.to_string())
-                        .unwrap_or_default(),
-                    if p.get("unhealthy")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false)
-                    {
-                        "yes".into()
-                    } else {
-                        "-".into()
-                    },
-                ]
-            })
-            .collect();
-        // header + separator + 2 rows share the NAME column width
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0], "web");
-        assert_eq!(rows[1][0], "worker-a");
-        assert_eq!(rows[1][4], "0");
-        assert_eq!(rows[1][5], "yes");
-        assert_eq!(rows[0][3], "42");
-        assert_eq!(rows[1][3], "-");
+        let out = render_status_table(&v);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "header + separator + 2 rows: {out}");
+        assert!(lines[0].starts_with("NAME"), "{out}");
+        assert!(lines[0].contains("APP") && lines[0].contains("STATE"));
+        assert!(lines[0].contains("PID") && lines[0].contains("RESTARTS"));
+        assert!(lines[0].contains("UNHEALTHY"));
+        assert!(lines[1].starts_with("----"), "{out}");
+        assert!(lines[2].contains("web") && lines[2].contains("42"));
+        assert!(lines[3].contains("worker-a"));
+        assert!(lines[3].contains("yes"), "unhealthy marked: {out}");
+        // No JSON braces in the table form.
+        assert!(!out.contains('{') && !out.contains('}'), "{out}");
+    }
+
+    /// An empty program list renders the registration hint (both callers).
+    #[test]
+    fn status_table_empty_hint() {
+        let v = serde_json::json!({ "programs": [] });
+        let out = render_status_table(&v);
+        assert!(out.contains("no programs"), "{out}");
     }
 
     #[test]

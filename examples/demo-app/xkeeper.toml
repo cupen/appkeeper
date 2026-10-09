@@ -4,8 +4,7 @@
 
 [app]
 description = "Demo app kept alive by xkeeper"
-autostart = true            # start with the daemon
-autorestart = "always"      # always | on-failure | never
+restart = "always"          # no | on-failure | always | unless-stopped
 # priority = 0              # smaller starts first
 # restart_backoff = 1.0
 # stop_timeout = 10

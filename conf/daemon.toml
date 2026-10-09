@@ -36,11 +36,10 @@ app_dir = "apps"
 # ---------------------------------------------------------------------------
 # 所有 app 的公共默认值（整个表可省略）。
 # 优先级：[program.*] 显式字段 > app 文件的 [app] 表 > 这里的 [app-default]。
-# 字段名与程序级字段一致（autorestart/exit_codes/restart_backoff/... 全集见
+# 字段名与程序级字段一致（restart/exit_codes/restart_backoff/... 全集见
 # conf/app.toml 注释），下面只列最常用的：
 [app-default]
-autostart = true           # 随守护进程启动
-autorestart = "always"     # always | on-failure | never
+restart = "always"         # 启动/重启策略：no | on-failure | always | unless-stopped
 restart_backoff = 1.0      # 首次重启延迟（秒），指数退避到 max_restart_backoff
 # max_restart_backoff = 30.0
 # max_restarts = 0         # 0 = 不限次数

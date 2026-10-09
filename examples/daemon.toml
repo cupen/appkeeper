@@ -16,6 +16,5 @@ app_dir = "apps"            # registration directory: one <name>.toml link per r
 # Optional: defaults for every registered app (fields mirror program fields).
 # Program-explicit fields and the app's own [app] table override these.
 [app-default]
-autostart = true            # start with the daemon
-autorestart = "always"      # always | on-failure | never
+restart = "always"          # no | on-failure | always | unless-stopped
 restart_backoff = 1.0       # restart delay (seconds), doubles up to max_restart_backoff
