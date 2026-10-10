@@ -13,8 +13,8 @@ import type { PendingDoc } from '../lib/types.js'
 import { formatBytes, formatPercent, formatUptime } from '../lib/format.js'
 import { REFRESH_CHOICES_MS, loadRefreshMs, saveRefreshMs, type RefreshMs } from '../lib/prefs.js'
 
-@customElement('xkeeper-overview-bar')
-export class XkeeperOverviewBar extends LitElement {
+@customElement('ak-overview-bar')
+export class AkOverviewBar extends LitElement {
   /** Injectable for tests; defaults to the shared singleton. */
   @property({ attribute: false }) store: ConsoleStore = consoleStore
 
@@ -37,21 +37,21 @@ export class XkeeperOverviewBar extends LitElement {
       display: flex;
       align-items: center;
       flex-wrap: wrap;
-      gap: var(--xkeeper-space-2) var(--xkeeper-space-3);
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-4);
-      margin-bottom: calc(-1 * var(--xkeeper-space-1, 4px));
-      background: color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 12%, var(--xkeeper-surface));
-      border: 1px solid color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 35%, var(--xkeeper-border));
-      border-radius: var(--xkeeper-radius-lg, 10px);
+      gap: var(--ak-space-2) var(--ak-space-3);
+      padding: var(--ak-space-2) var(--ak-space-4);
+      margin-bottom: calc(-1 * var(--ak-space-1, 4px));
+      background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 12%, var(--ak-surface));
+      border: 1px solid color-mix(in srgb, var(--ak-accent-strong, #6366f1) 35%, var(--ak-border));
+      border-radius: var(--ak-radius-lg, 10px);
       font-size: 0.82rem;
-      color: var(--xkeeper-text);
+      color: var(--ak-text);
     }
     .pending .badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       font-weight: 600;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .pending .count {
       display: inline-grid;
@@ -60,13 +60,13 @@ export class XkeeperOverviewBar extends LitElement {
       height: 18px;
       padding: 0 5px;
       border-radius: 9px;
-      background: var(--xkeeper-accent-strong, #6366f1);
-      color: var(--xkeeper-accent-ink, #fff);
+      background: var(--ak-accent-strong, #6366f1);
+      color: var(--ak-accent-ink, #fff);
       font-size: 0.72rem;
       font-weight: 700;
     }
     .pending .detail {
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       max-width: 46ch;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -82,23 +82,23 @@ export class XkeeperOverviewBar extends LitElement {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       font-size: 0.78rem;
       cursor: pointer;
     }
     .pending button {
-      border: 1px solid var(--xkeeper-border);
-      background: var(--xkeeper-surface-2);
-      color: var(--xkeeper-text);
+      border: 1px solid var(--ak-border);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
       font: inherit;
       padding: 4px 12px;
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      border-radius: var(--ak-radius-sm, 6px);
       cursor: pointer;
     }
     .pending button[data-primary='true'] {
-      background: var(--xkeeper-accent-strong, #6366f1);
+      background: var(--ak-accent-strong, #6366f1);
       border-color: transparent;
-      color: var(--xkeeper-accent-ink, #fff);
+      color: var(--ak-accent-ink, #fff);
       font-weight: 600;
     }
     .pending button:disabled {
@@ -107,31 +107,31 @@ export class XkeeperOverviewBar extends LitElement {
     }
     .apply-result {
       margin-top: 4px;
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
+      padding: var(--ak-space-2) var(--ak-space-3);
       font-size: 0.8rem;
       white-space: pre-wrap;
-      background: var(--xkeeper-surface);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
-      color: var(--xkeeper-text-dim);
+      background: var(--ak-surface);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
+      color: var(--ak-text-dim);
       max-height: 12em;
       overflow-y: auto;
     }
     .apply-result[data-error='true'] {
-      border-color: var(--xkeeper-status-failed, #ef4444);
-      color: var(--xkeeper-text);
+      border-color: var(--ak-status-failed, #ef4444);
+      color: var(--ak-text);
     }
     .bar {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: var(--xkeeper-space-3) var(--xkeeper-space-5);
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-4);
-      background: var(--xkeeper-surface);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
+      gap: var(--ak-space-3) var(--ak-space-5);
+      padding: var(--ak-space-2) var(--ak-space-4);
+      background: var(--ak-surface);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
       font-size: 0.82rem;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
     }
     .item {
       display: inline-flex;
@@ -143,10 +143,10 @@ export class XkeeperOverviewBar extends LitElement {
       font-size: 0.72rem;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
     .item .v {
-      color: var(--xkeeper-text);
+      color: var(--ak-text);
       font-variant-numeric: tabular-nums;
     }
     .cpu,
@@ -160,18 +160,18 @@ export class XkeeperOverviewBar extends LitElement {
       min-width: 48px;
       align-self: center;
       border-radius: 2px;
-      background: var(--xkeeper-surface-3);
+      background: var(--ak-surface-3);
       overflow: hidden;
     }
     .meter > span {
       position: absolute;
       inset: 0 auto 0 0;
       border-radius: 2px;
-      background: var(--xkeeper-accent-strong);
-      transition: width 0.4s var(--xkeeper-ease, ease);
+      background: var(--ak-accent-strong);
+      transition: width 0.4s var(--ak-ease, ease);
     }
     .meter > span[data-hot='true'] {
-      background: var(--xkeeper-signal);
+      background: var(--ak-signal);
     }
     .refresh {
       margin-left: auto;
@@ -180,10 +180,10 @@ export class XkeeperOverviewBar extends LitElement {
       gap: 6px;
     }
     .refresh select {
-      background: var(--xkeeper-surface-2);
-      color: var(--xkeeper-text);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-sm, 6px);
       font: inherit;
       padding: 3px 6px;
     }
@@ -191,7 +191,7 @@ export class XkeeperOverviewBar extends LitElement {
       font-size: 0.72rem;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
   `
 
@@ -340,6 +340,6 @@ export class XkeeperOverviewBar extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-overview-bar': XkeeperOverviewBar
+    'ak-overview-bar': AkOverviewBar
   }
 }

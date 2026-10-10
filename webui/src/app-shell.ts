@@ -31,8 +31,8 @@ export const ROUTES: RouteDef[] = [
   { id: 'program', pattern: '/app/:app/program/:program' },
 ]
 
-@customElement('xkeeper-app')
-export class XkeeperApp extends LitElement {
+@customElement('ak-app')
+export class AkApp extends LitElement {
   private console = new ConsoleController(this, consoleStore)
 
   @state() private routeId: string = 'dashboard'
@@ -50,11 +50,11 @@ export class XkeeperApp extends LitElement {
       height: 100vh;
       min-height: 0;
       overflow: hidden;
-      background: var(--xkeeper-bg);
+      background: var(--ak-bg);
       background-image: radial-gradient(1100px 480px at 82% -12%, rgba(91, 100, 242, 0.09), transparent 62%),
         radial-gradient(900px 420px at -8% 108%, rgba(56, 209, 221, 0.05), transparent 60%);
       background-attachment: fixed;
-      color: var(--xkeeper-text);
+      color: var(--ak-text);
     }
     nav {
       width: 220px;
@@ -65,24 +65,24 @@ export class XkeeperApp extends LitElement {
       box-sizing: border-box; /* 高度吃进 padding，否则 100vh+padding 撑破框架 */
       min-height: 0; /* flex 项默认 min-height:auto 会撑破 100vh 框架 */
       overflow-y: auto;
-      background: var(--xkeeper-surface);
-      border-right: 1px solid var(--xkeeper-border);
-      padding: var(--xkeeper-space-4) var(--xkeeper-space-3);
+      background: var(--ak-surface);
+      border-right: 1px solid var(--ak-border);
+      padding: var(--ak-space-4) var(--ak-space-3);
       display: flex;
       flex-direction: column;
     }
-    xkeeper-console-tree {
-      margin-top: var(--xkeeper-space-3);
+    ak-console-tree {
+      margin-top: var(--ak-space-3);
       flex: 1;
       min-height: 0;
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: var(--xkeeper-space-3);
-      padding: var(--xkeeper-space-2);
+      gap: var(--ak-space-3);
+      padding: var(--ak-space-2);
       text-decoration: none;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .brand .mark {
       display: grid;
@@ -90,14 +90,14 @@ export class XkeeperApp extends LitElement {
       width: 28px;
       height: 28px;
       flex: 0 0 auto;
-      border-radius: var(--xkeeper-radius-md);
-      background: linear-gradient(135deg, var(--xkeeper-accent-strong), #4338ca);
-      color: var(--xkeeper-accent-ink);
-      font-family: var(--xkeeper-font-mono);
+      border-radius: var(--ak-radius-md);
+      background: linear-gradient(135deg, var(--ak-accent-strong), #4338ca);
+      color: var(--ak-accent-ink);
+      font-family: var(--ak-font-mono);
       font-size: 0.9rem;
       font-weight: 700;
       box-shadow:
-        var(--xkeeper-shadow-1),
+        var(--ak-shadow-1),
         inset 0 1px 0 rgba(255, 255, 255, 0.18);
     }
     .brand .name {
@@ -111,7 +111,7 @@ export class XkeeperApp extends LitElement {
       font-size: 0.66rem;
       letter-spacing: 0.09em;
       text-transform: uppercase;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
     main {
       flex: 1;
@@ -119,11 +119,11 @@ export class XkeeperApp extends LitElement {
       min-height: 0;
       display: flex;
       flex-direction: column;
-      padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
-      gap: var(--xkeeper-space-3);
+      padding: var(--ak-space-3) var(--ak-space-4);
+      gap: var(--ak-space-3);
       box-sizing: border-box;
     }
-    xkeeper-overview-bar {
+    ak-overview-bar {
       flex: 0 0 auto;
     }
     .outlet {
@@ -136,10 +136,10 @@ export class XkeeperApp extends LitElement {
     }
     /* Route change mounts a fresh view — replay a soft rise-in. */
     .outlet > * {
-      animation: xkeeper-view-in 0.28s var(--xkeeper-ease) both;
+      animation: appkeeper-view-in 0.28s var(--ak-ease) both;
       min-height: 0;
     }
-    @keyframes xkeeper-view-in {
+    @keyframes appkeeper-view-in {
       from {
         opacity: 0;
         transform: translateY(6px);
@@ -163,8 +163,8 @@ export class XkeeperApp extends LitElement {
         height: auto;
         width: auto;
         border-right: none;
-        border-bottom: 1px solid var(--xkeeper-border);
-        padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
+        border-bottom: 1px solid var(--ak-border);
+        padding: var(--ak-space-3) var(--ak-space-4);
       }
       .brand .name small {
         display: none;
@@ -230,27 +230,27 @@ export class XkeeperApp extends LitElement {
       <nav aria-label="Primary">
         <a class="brand" href="/">
           <span class="mark" aria-hidden="true">xk</span>
-          <span class="name">xkeeper<small>console</small></span>
+          <span class="name">appkeeper<small>console</small></span>
         </a>
-        <xkeeper-console-tree
+        <ak-console-tree
           .apps=${apps}
           selectedApp=${selectedApp}
           selectedProgram=${selectedProgram}
-        ></xkeeper-console-tree>
+        ></ak-console-tree>
       </nav>
       <main>
-        <xkeeper-overview-bar></xkeeper-overview-bar>
+        <ak-overview-bar></ak-overview-bar>
         <div class="outlet" data-route=${this.routeId}>
           ${this.routeId === 'program'
-            ? html`<xkeeper-program-detail
+            ? html`<ak-program-detail
                 .app=${decodeURIComponent(this.params['app'] ?? '')}
                 .program=${decodeURIComponent(this.params['program'] ?? '')}
-              ></xkeeper-program-detail>`
+              ></ak-program-detail>`
             : this.routeId === 'app'
-              ? html`<xkeeper-app-overview
+              ? html`<ak-app-overview
                   .app=${decodeURIComponent(this.params['app'] ?? '')}
-                ></xkeeper-app-overview>`
-              : html`<xkeeper-dashboard></xkeeper-dashboard>`}
+                ></ak-app-overview>`
+              : html`<ak-dashboard></ak-dashboard>`}
         </div>
       </main>
     `

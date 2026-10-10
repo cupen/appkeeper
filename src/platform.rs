@@ -42,7 +42,7 @@ impl Signal {
             "USR2" => Ok(Signal::Usr2),
             "KILL" => Err(format!(
                 "signal {s:?} is not in the whitelist (TERM, INT, HUP, QUIT, USR1, USR2); \
-                 to stop the program use `xkeeper stop <name>` instead of KILL"
+                 to stop the program use `ak stop <name>` instead of KILL"
             )),
             "STOP" | "CONT" => Err(format!(
                 "signal {s:?} is not in the whitelist (TERM, INT, HUP, QUIT, USR1, USR2); \
@@ -70,7 +70,7 @@ mod imp {
     };
 
     /// Owns a Windows job object the child was assigned to. When the handle is
-    /// dropped — or xkeeper itself dies — every process left in the job is
+    /// dropped — or appkeeper itself dies — every process left in the job is
     /// killed by the kernel, so no orphaned grandchildren survive.
     pub struct JobHandle(HANDLE);
 
@@ -119,7 +119,7 @@ mod imp {
     pub fn send_signal(_pid: u32, sig: Signal) -> Result<(), String> {
         Err(format!(
             "the signal action is not supported on windows (cannot deliver {}); \
-             use `xkeeper restart <name>` for equivalent service control",
+             use `ak restart <name>` for equivalent service control",
             sig.name()
         ))
     }

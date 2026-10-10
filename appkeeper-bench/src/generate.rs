@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 
 /// Fill text cycled through the payload: wordy ASCII, no newlines.
-pub const FILL: &str = "xkeeper bench load generator fills every line with realistic text so each row can be reconciled on disk independently ";
+pub const FILL: &str = "ak bench load generator fills every line with realistic text so each row can be reconciled on disk independently ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
@@ -182,7 +182,7 @@ pub fn write_count_file(path: &Path, c: &GenCounters) {
         path,
         serde_json::to_vec(c).unwrap_or_else(|_| b"{}".to_vec()),
     ) {
-        eprintln!("xkeeper-bench: warning: cannot write count file {}: {e}", path.display());
+        eprintln!("appkeeper-bench: warning: cannot write count file {}: {e}", path.display());
     }
 }
 

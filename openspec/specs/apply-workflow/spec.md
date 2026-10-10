@@ -3,7 +3,7 @@
 ## Purpose
 
 定义配置变更的两阶段生效机制：守护进程检出（detect）磁盘配置与运行配置的
-差异形成待应用（pending）变更，用户以 `xkeeper apply` 显式触发应用
+差异形成待应用（pending）变更，用户以 `ak apply` 显式触发应用
 （apply），并约束范围选择、`--restart` 重启语义与结果呈现。
 
 ## Requirements
@@ -16,7 +16,7 @@
 变化 = changed）、注册新增/移除按 app 归属记录。跨应用校验失败时 SHALL
 整体不形成 pending 并上报错误（与 reload 现行为一致）；单个 app 文件
 非法时 SHALL 隔离——该 app 不进入 pending、保持旧定义，其余 app 照常检出。
-`xkeeper reload` SHALL 触发一次立即重扫并输出 pending 预览，等价于一个
+`ak reload` SHALL 触发一次立即重扫并输出 pending 预览，等价于一个
 周期的自动检出。
 
 #### Scenario: 配置修改只进入 pending
@@ -27,7 +27,7 @@
 #### Scenario: 周期检出免手工 reload
 
 - **WHEN** 直接编辑磁盘上的 app 配置文件（未执行任何命令），等待一个重扫周期
-- **THEN** 守护进程无需 `xkeeper reload` 即形成 pending 变更
+- **THEN** 守护进程无需 `ak reload` 即形成 pending 变更
 
 #### Scenario: 单个 app 文件损坏不影响其他检出
 
@@ -41,36 +41,36 @@
 
 ### Requirement: apply 范围与幂等
 
-`xkeeper apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 按 `restart` 策略的启动语义处理：`no` 仅完成注册不启动；其余策略启动（`unless-stopped` 存在「用户停止」记录时保持停止）。
+`ak apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 按 `restart` 策略的启动语义处理：`no` 仅完成注册不启动；其余策略启动（`unless-stopped` 存在「用户停止」记录时保持停止）。
 
 #### Scenario: 无变更时 apply 幂等
 
-- **WHEN** 配置无任何 pending 时执行 `xkeeper apply`
+- **WHEN** 配置无任何 pending 时执行 `ak apply`
 - **THEN** 无程序被停止/重启/启动，输出「无变更」类提示，退出码 0
 
 #### Scenario: apply all 等价全量
 
-- **WHEN** app A 与 app B 均有 pending 变更，执行 `xkeeper apply all`
-- **THEN** A 与 B 的全部 pending 被应用，结果与裸 `xkeeper apply` 一致
+- **WHEN** app A 与 app B 均有 pending 变更，执行 `ak apply all`
+- **THEN** A 与 B 的全部 pending 被应用，结果与裸 `ak apply` 一致
 
 #### Scenario: 单 app 范围不波及其他
 
-- **WHEN** app A 与 app B 均有 pending 变更，执行 `xkeeper apply A`
+- **WHEN** app A 与 app B 均有 pending 变更，执行 `ak apply A`
 - **THEN** 仅 A 的变更被应用；B 的 pending 保留，B 的进程不受影响
 
 #### Scenario: 新注册 app 随 apply 启动
 
-- **WHEN** `xkeeper add` 注册了 `restart = "always"` 的新 app 后执行 `xkeeper apply`
+- **WHEN** `ak add` 注册了 `restart = "always"` 的新 app 后执行 `ak apply`
 - **THEN** 该 app 的程序被启动，出现在 apply 结果中
 
 #### Scenario: 新注册 no 策略程序只注册不启动
 
-- **WHEN** 注册的新 app 声明 `restart = "no"` 后执行 `xkeeper apply`
+- **WHEN** 注册的新 app 声明 `restart = "no"` 后执行 `ak apply`
 - **THEN** 注册落地（链接/生成文件就位），程序保持 `stopped`，出现在 apply 结果的未启动说明中
 
 #### Scenario: apply 后 pending 清空
 
-- **WHEN** 全量 `xkeeper apply` 成功后立即查询 pending
+- **WHEN** 全量 `ak apply` 成功后立即查询 pending
 - **THEN** pending 为空（应用失败被隔离的 app 除外，其 pending 保留）
 
 ### Requirement: apply 的重启语义
@@ -83,24 +83,24 @@ apply 应用配置变更时 SHALL 沿用 reload 的既有程序重建规则：�
 
 #### Scenario: 变更程序原先在跑则重启
 
-- **WHEN** 运行中的程序 `web` 的配置有 pending 变更，执行 `xkeeper apply`
+- **WHEN** 运行中的程序 `web` 的配置有 pending 变更，执行 `ak apply`
 - **THEN** `web` 被停止并以新定义重新拉起，结果中 action 为重启类
 
 #### Scenario: 变更程序原先停止则保持停止
 
-- **WHEN** 已被 `xkeeper stop` 停止的程序 `web` 的配置有 pending 变更，执行 `xkeeper apply`
+- **WHEN** 已被 `ak stop` 停止的程序 `web` 的配置有 pending 变更，执行 `ak apply`
 - **THEN** `web` 以新定义重建但保持停止，结果中 action 为仅更新定义
 
 #### Scenario: --restart 跳过手动停止的程序
 
 - **WHEN** 程序 `web` 无配置变更且处于 stopped、`job` 无配置变更且处于
-  running、`worker` 处于 backoff（崩溃等待重试），执行 `xkeeper apply --restart`
+  running、`worker` 处于 backoff（崩溃等待重试），执行 `ak apply --restart`
 - **THEN** `job` 被重启，`worker` 被拉起，`web` 保持 stopped，三者都在结果中
   可见且动作不同
 
 #### Scenario: --restart 无 pending 也重启
 
-- **WHEN** 配置无任何 pending，执行 `xkeeper apply --restart`
+- **WHEN** 配置无任何 pending，执行 `ak apply --restart`
 - **THEN** 范围内运行中与 backoff 的程序被重启/拉起，手动停止的保持停止
 
 ### Requirement: apply 结果呈现

@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import './log-viewer.js'
-import type { XkeeperLogViewer } from './log-viewer.js'
+import type { AkLogViewer } from './log-viewer.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type StreamId } from '../lib/types.js'
 
@@ -65,10 +65,10 @@ function gapFrame(program: string, stream: StreamId, skipped: number): Uint8Arra
   return out
 }
 
-describe('xkeeper-log-viewer', () => {
+describe('ak-log-viewer', () => {
   let store: ConsoleStore
   let ws: FakeWebSocket
-  let el: XkeeperLogViewer
+  let el: AkLogViewer
 
   beforeEach(async () => {
     vi.useFakeTimers()
@@ -78,7 +78,7 @@ describe('xkeeper-log-viewer', () => {
     store.start()
     ws = FakeWebSocket.instances[0]!
     ws.serverOpen()
-    el = document.createElement('xkeeper-log-viewer') as XkeeperLogViewer
+    el = document.createElement('ak-log-viewer') as AkLogViewer
     el.store = store
     el.program = 'p'
     document.body.appendChild(el)

@@ -3,7 +3,7 @@ name = "xtask"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Developer tasks for xkeeper: test suite runner, acceptance e2e and firehose stress harness"
+description = "Developer tasks for ak: test suite runner, acceptance e2e and firehose stress harness"
 
 [dependencies]
 anyhow = "1.0"

@@ -21,8 +21,8 @@ import type { LogEntry, StreamId } from '../lib/types.js'
 const MAX_ENTRIES = 5000
 const MAX_RENDER_FPS_MS = 100
 
-@customElement('xkeeper-log-viewer')
-export class XkeeperLogViewer extends LitElement {
+@customElement('ak-log-viewer')
+export class AkLogViewer extends LitElement {
   @property() program = ''
   /** Injectable for tests; defaults to the shared singleton. */
   @property({ attribute: false }) store: ConsoleStore = consoleStore
@@ -48,55 +48,55 @@ export class XkeeperLogViewer extends LitElement {
       display: flex;
       flex-direction: column;
       min-height: 220px;
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
-      background: var(--xkeeper-well);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
+      background: var(--ak-well);
       overflow: hidden;
     }
     .toolbar {
       display: flex;
       align-items: center;
-      gap: var(--xkeeper-space-3);
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
-      background: var(--xkeeper-surface);
-      border-bottom: 1px solid var(--xkeeper-border);
+      gap: var(--ak-space-3);
+      padding: var(--ak-space-2) var(--ak-space-3);
+      background: var(--ak-surface);
+      border-bottom: 1px solid var(--ak-border);
       font-size: 0.8rem;
     }
     .tabs {
       display: inline-flex;
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-sm, 6px);
       overflow: hidden;
     }
     .tabs button {
       border: none;
       background: transparent;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       font: inherit;
       padding: 3px 12px;
       cursor: pointer;
     }
     .tabs button[aria-pressed='true'] {
-      background: var(--xkeeper-accent-soft);
-      color: var(--xkeeper-accent-hover);
+      background: var(--ak-accent-soft);
+      color: var(--ak-accent-hover);
       font-weight: 600;
     }
     .follow {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       cursor: pointer;
       user-select: none;
     }
     .follow input {
-      accent-color: var(--xkeeper-accent-strong);
+      accent-color: var(--ak-accent-strong);
     }
     .spacer {
       flex: 1;
     }
     .meta {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.74rem;
       font-variant-numeric: tabular-nums;
     }
@@ -104,19 +104,19 @@ export class XkeeperLogViewer extends LitElement {
       flex: 1;
       overflow-y: auto;
       min-height: 0;
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
-      font-family: var(--xkeeper-font-mono, monospace);
+      padding: var(--ak-space-2) var(--ak-space-3);
+      font-family: var(--ak-font-mono, monospace);
       font-size: 0.78rem;
       line-height: 1.5;
     }
     .row {
       white-space: pre-wrap;
       word-break: break-all;
-      color: var(--xkeeper-text);
+      color: var(--ak-text);
       min-height: 1.5em;
     }
     .row[data-stream='1'] {
-      color: color-mix(in srgb, var(--xkeeper-status-failed) 70%, var(--xkeeper-text));
+      color: color-mix(in srgb, var(--ak-status-failed) 70%, var(--ak-text));
     }
     .gap-row {
       display: flex;
@@ -124,18 +124,18 @@ export class XkeeperLogViewer extends LitElement {
       gap: 8px;
       margin: 2px 0;
       padding: 2px 8px;
-      border-left: 3px solid var(--xkeeper-signal);
-      background: color-mix(in srgb, var(--xkeeper-signal) 12%, transparent);
-      color: var(--xkeeper-signal);
-      font-family: var(--xkeeper-font-sans, sans-serif);
+      border-left: 3px solid var(--ak-signal);
+      background: color-mix(in srgb, var(--ak-signal) 12%, transparent);
+      color: var(--ak-signal);
+      font-family: var(--ak-font-sans, sans-serif);
       font-size: 0.76rem;
       font-weight: 600;
       user-select: none;
     }
     .empty-hint {
-      color: var(--xkeeper-text-faint);
-      font-family: var(--xkeeper-font-sans, sans-serif);
-      padding: var(--xkeeper-space-2) 0;
+      color: var(--ak-text-faint);
+      font-family: var(--ak-font-sans, sans-serif);
+      padding: var(--ak-space-2) 0;
     }
   `
 
@@ -357,6 +357,6 @@ export function splitLines(text: string, carry: string[]): LogEntry[] {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-log-viewer': XkeeperLogViewer
+    'ak-log-viewer': AkLogViewer
   }
 }

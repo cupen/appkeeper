@@ -31,7 +31,7 @@ function stubScheme(light: boolean): void {
 }
 
 afterEach(() => {
-  localStorage.removeItem('xkeeper:theme')
+  localStorage.removeItem('ak:theme')
   document.documentElement.classList.remove('wa-dark')
   vi.unstubAllGlobals()
 })
@@ -56,13 +56,13 @@ describe('theme', () => {
     stubScheme(true) // OS 说要 light，但用户显式选了 dark
     setThemeMode('dark')
     expect(getThemeMode()).toBe('dark')
-    expect(localStorage.getItem('xkeeper:theme')).toBe('dark')
+    expect(localStorage.getItem('ak:theme')).toBe('dark')
     expect(document.documentElement.classList.contains('wa-dark')).toBe(true)
     setThemeMode('light')
     expect(document.documentElement.classList.contains('wa-dark')).toBe(false)
     // 回到 system：重新交给 OS（light）。
     setThemeMode('system')
-    expect(localStorage.getItem('xkeeper:theme')).toBe('system')
+    expect(localStorage.getItem('ak:theme')).toBe('system')
     expect(document.documentElement.classList.contains('wa-dark')).toBe(false)
   })
 
@@ -74,7 +74,7 @@ describe('theme', () => {
   })
 
   it('corrupted storage values fall back to system', () => {
-    localStorage.setItem('xkeeper:theme', 'hotpink')
+    localStorage.setItem('ak:theme', 'hotpink')
     expect(getThemeMode()).toBe('system')
   })
 })

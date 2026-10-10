@@ -1,6 +1,6 @@
 //! Firehose stress + zero-backpressure verification against the REAL daemon
 //! binary (moved from the in-process `#[ignore]` test in src/web.rs — this
-//! version drives an actual `xkeeper run` process with a `[webui]` config
+//! version drives an actual `ak run` process with a `[webui]` config
 //! section, so the measurements include the full HTTP/WS stack and a real
 //! child generator).
 //!
@@ -102,7 +102,7 @@ fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
     // stays monotonic for the throughput assertions); no restarts (a restart
     // would leave a generator-EOF artifact line on disk).
     std::fs::write(
-        app_dir.join("xkeeper.toml"),
+        app_dir.join("appkeeper.toml"),
         format!(
             "[app]\nrestart = \"always\"\n\n[program.fire]\ncommand = 'sh'\nargs = ['-c', 'timeout 300 sh -c \"while :; do dd if=/dev/zero bs=1M count=1 2>/dev/null; sleep 0.09; done\" | tr \"\\\\0\" \"x\" | fold -w 31']\nlog_max_size = \"0\"\n"
         ),

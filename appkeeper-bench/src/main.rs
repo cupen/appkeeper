@@ -1,4 +1,4 @@
-//! xkeeper-bench — load benchmark harness for a real xkeeper daemon.
+//! appkeeper-bench — load benchmark harness for a real appkeeper daemon.
 //!
 //! Bench is a pure external consumer of the daemon: it drives the existing
 //! /v1 control plane (no daemon changes) and reads the load programs' disk
@@ -30,7 +30,7 @@ fn main() {
         None => measure::run_bench(&cli.bench),
     };
     if let Err(e) = result {
-        eprintln!("xkeeper-bench: error: {e:#}");
+        eprintln!("appkeeper-bench: error: {e:#}");
         std::process::exit(1);
     }
 }

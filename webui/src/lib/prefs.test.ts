@@ -24,12 +24,12 @@ describe('prefs', () => {
     expect(loadRefreshMs()).toBe(10000)
     expect(loadRateWindowS()).toBe(60)
     // The value is really in localStorage (survives a page reload).
-    expect(localStorage.getItem('xkeeper.refresh_ms')).toBe('10000')
+    expect(localStorage.getItem('ak.refresh_ms')).toBe('10000')
   })
 
   it('falls back to defaults on out-of-vocabulary values', () => {
-    localStorage.setItem('xkeeper.refresh_ms', '7000')
-    localStorage.setItem('xkeeper.rate_window_s', '42')
+    localStorage.setItem('ak.refresh_ms', '7000')
+    localStorage.setItem('ak.rate_window_s', '42')
     expect(loadRefreshMs()).toBe(3000)
     expect(loadRateWindowS()).toBe(10)
   })

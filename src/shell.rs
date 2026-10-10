@@ -1,9 +1,9 @@
-//! Interactive shell client (`xkeeper shell`) — a pure client over the
+//! Interactive shell client (`appkeeper shell`) — a pure client over the
 //! control-plane API, mirroring the supervisorctl workflow. The daemon is
 //! untouched: every command reuses `client::Client` and the shared exit-code
 //! contract. The `open` verb probes the web console (`GET /api/health`) and
 //! launches the system browser; enabling the console itself is a daemon
-//! config concern (`[webui]` section + `xkeeper reload`).
+//! config concern (`[webui]` section + `ak reload`).
 
 use std::io::Write;
 
@@ -313,7 +313,7 @@ Built-in commands:
   exit (or quit)                      leave the shell";
 
 /// Exit-code carrier for `-e` single-command mode: an action's own exit code
-/// passes through the shell exactly like `xkeeper action` would. Implements
+/// passes through the shell exactly like `appkeeper action` would. Implements
 /// StdError so it can ride in an `anyhow::Error` and be downcast later.
 #[derive(Debug)]
 struct ActionExit(i32);
@@ -349,7 +349,7 @@ pub(crate) fn run(config_path: &std::path::Path, single: Option<&str>) -> Result
                     Err(e) => {
                         // The message is the only trace of what the control
                         // plane answered — never exit silently.
-                        eprintln!("xkeeper: error: {e:#}");
+                        eprintln!("ak: error: {e:#}");
                         let code = e
                             .downcast_ref::<ActionExit>()
                             .map(|a| a.0)
@@ -379,10 +379,10 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new().context("cannot init line editor")?;
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive {
-        println!("xkeeper shell — type `help` for commands, `exit` to leave.");
+        println!("appkeeper shell — type `help` for commands, `exit` to leave.");
     }
     loop {
-        let readline = rl.readline("xkeeper> ");
+        let readline = rl.readline("appkeeper> ");
         let line = match readline {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
@@ -400,10 +400,10 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
                     Ok(Outcome::Exit) => break,
                     // Per the CLI contract the shell stays alive on command
                     // errors; only the `-e` mode maps them to exit codes.
-                    Err(e) => eprintln!("xkeeper: error: {e:#}"),
+                    Err(e) => eprintln!("ak: error: {e:#}"),
                 }
             }
-            Err(e) => eprintln!("xkeeper: {e:#}"),
+            Err(e) => eprintln!("ak: {e:#}"),
         }
     }
     Ok(())
@@ -550,7 +550,7 @@ fn run_target(c: &Client, t: &Target, verb: &str) -> Result<Outcome> {
 }
 
 /// `action <program> <action>`: print the output tail, keep the same
-/// success/failure semantics as `xkeeper action` (non-zero exit → error;
+/// success/failure semantics as `appkeeper action` (non-zero exit → error;
 /// in `-e` mode the action's own exit code leaves the shell via ActionExit).
 fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
     let v = c.custom_action(program, name)?;
@@ -577,7 +577,7 @@ fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
 }
 
 /// Aligned status table: name / app / state / pid / restarts / unhealthy.
-/// Shared by the shell's `status` built-in and the top-level `xkeeper status`
+/// Shared by the shell's `status` built-in and the top-level `ak status`
 /// default output (control-plane spec: same columns and format).
 pub(crate) fn print_status(c: &Client) -> Result<()> {
     let v = c.status()?;
@@ -623,7 +623,7 @@ pub(crate) fn render_status_table(v: &serde_json::Value) -> String {
         .unwrap_or_default();
 
     if rows.is_empty() {
-        return "no programs (register an app with `xkeeper add <dir>`)\n".to_string();
+        return "no programs (register an app with `ak add <dir>`)\n".to_string();
     }
     let header = ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"];
     let mut width = [4usize; 6];
@@ -726,8 +726,8 @@ fn open_webui(url: &str) -> Result<()> {
     if let Err(e) = webui_health(url) {
         eprintln!(
             "webui not reachable at {url} — enable it in the daemon config \
-             (`xkeeper config --set webui.listen={DEFAULT_WEBUI_LISTEN}`) and run \
-             `xkeeper reload`, then retry"
+             (`ak config --set webui.listen={DEFAULT_WEBUI_LISTEN}`) and run \
+             `ak reload`, then retry"
         );
         bail!("{e:#}");
     }
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn status_table_alignment() {
         // Pure formatting check: the shared renderer lines columns up and
-        // flags unhealthy programs. Same input the top-level `xkeeper status`
+        // flags unhealthy programs. Same input the top-level `ak status`
         // default consumes.
         let v = serde_json::json!({
             "programs": [

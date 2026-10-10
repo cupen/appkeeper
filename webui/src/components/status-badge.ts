@@ -3,7 +3,7 @@
  * (label + slug + glyph) as a tinted pill: glyph shape, colored dot, and the
  * word — so state survives greyscale and colour-blindness (shape + word +
  * colour). Pill background/border/text come from the per-slug status tokens
- * via the data-status attribute; the dot keeps an inline `--xkeeper-status-*`
+ * via the data-status attribute; the dot keeps an inline `--ak-status-*`
  * reference (stylesheet hook, mirrors the SSR projection).
  *
  * The mapping lives server-side (single source); this component only
@@ -20,8 +20,8 @@ import { customElement, property } from 'lit/decorators.js'
  */
 export type StatusSlug = string
 
-@customElement('xkeeper-status-badge')
-export class XkeeperStatusBadge extends LitElement {
+@customElement('ak-status-badge')
+export class AkStatusBadge extends LitElement {
   @property() slug: StatusSlug = ''
   @property() label = ''
   @property() glyph = ''
@@ -32,10 +32,10 @@ export class XkeeperStatusBadge extends LitElement {
       align-items: center;
       gap: 7px;
       padding: 3px 10px 3px 9px;
-      border-radius: var(--xkeeper-radius-full, 999px);
-      border: 1px solid var(--xkeeper-status-queued-border, rgba(56, 209, 221, 0.3));
-      background: var(--xkeeper-status-queued-bg, rgba(56, 209, 221, 0.1));
-      color: var(--xkeeper-status-queued, #38d1dd);
+      border-radius: var(--ak-radius-full, 999px);
+      border: 1px solid var(--ak-status-queued-border, rgba(56, 209, 221, 0.3));
+      background: var(--ak-status-queued-bg, rgba(56, 209, 221, 0.1));
+      color: var(--ak-status-queued, #38d1dd);
       font-size: 0.78rem;
       font-weight: 550;
       letter-spacing: 0.01em;
@@ -43,67 +43,67 @@ export class XkeeperStatusBadge extends LitElement {
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
       transition:
-        background var(--xkeeper-dur, 150ms) var(--xkeeper-ease, ease),
-        border-color var(--xkeeper-dur, 150ms) var(--xkeeper-ease, ease);
+        background var(--ak-dur, 150ms) var(--ak-ease, ease),
+        border-color var(--ak-dur, 150ms) var(--ak-ease, ease);
     }
     .badge[data-status='starting'] {
-      background: var(--xkeeper-status-starting-bg);
-      border-color: var(--xkeeper-status-starting-border);
-      color: var(--xkeeper-status-starting);
+      background: var(--ak-status-starting-bg);
+      border-color: var(--ak-status-starting-border);
+      color: var(--ak-status-starting);
     }
     .badge[data-status='queued'] {
-      background: var(--xkeeper-status-queued-bg);
-      border-color: var(--xkeeper-status-queued-border);
-      color: var(--xkeeper-status-queued);
+      background: var(--ak-status-queued-bg);
+      border-color: var(--ak-status-queued-border);
+      color: var(--ak-status-queued);
     }
     .badge[data-status='working'] {
-      background: var(--xkeeper-status-working-bg);
-      border-color: var(--xkeeper-status-working-border);
-      color: var(--xkeeper-status-working);
+      background: var(--ak-status-working-bg);
+      border-color: var(--ak-status-working-border);
+      color: var(--ak-status-working);
     }
     .badge[data-status='done'] {
-      background: var(--xkeeper-status-done-bg);
-      border-color: var(--xkeeper-status-done-border);
-      color: var(--xkeeper-status-done);
+      background: var(--ak-status-done-bg);
+      border-color: var(--ak-status-done-border);
+      color: var(--ak-status-done);
     }
     .badge[data-status='failed'] {
-      background: var(--xkeeper-status-failed-bg);
-      border-color: var(--xkeeper-status-failed-border);
-      color: var(--xkeeper-status-failed);
+      background: var(--ak-status-failed-bg);
+      border-color: var(--ak-status-failed-border);
+      color: var(--ak-status-failed);
     }
     .badge[data-status='dormant'] {
-      background: var(--xkeeper-status-dormant-bg);
-      border-color: var(--xkeeper-status-dormant-border);
-      color: var(--xkeeper-status-dormant);
+      background: var(--ak-status-dormant-bg);
+      border-color: var(--ak-status-dormant-border);
+      color: var(--ak-status-dormant);
     }
     /* Daemon lifecycle slugs (process-management capability) map onto the
        same status token families — one visual language for all states. */
     .badge[data-status='running'] {
-      background: var(--xkeeper-status-done-bg);
-      border-color: var(--xkeeper-status-done-border);
-      color: var(--xkeeper-status-done);
+      background: var(--ak-status-done-bg);
+      border-color: var(--ak-status-done-border);
+      color: var(--ak-status-done);
     }
     .badge[data-status='starting'],
     .badge[data-status='stopping'] {
-      background: var(--xkeeper-status-starting-bg);
-      border-color: var(--xkeeper-status-starting-border);
-      color: var(--xkeeper-status-starting);
+      background: var(--ak-status-starting-bg);
+      border-color: var(--ak-status-starting-border);
+      color: var(--ak-status-starting);
     }
     .badge[data-status='backoff'] {
-      background: var(--xkeeper-status-working-bg);
-      border-color: var(--xkeeper-status-working-border);
-      color: var(--xkeeper-status-working);
+      background: var(--ak-status-working-bg);
+      border-color: var(--ak-status-working-border);
+      color: var(--ak-status-working);
     }
     .badge[data-status='exited'],
     .badge[data-status='stopped'] {
-      background: var(--xkeeper-status-dormant-bg);
-      border-color: var(--xkeeper-status-dormant-border);
-      color: var(--xkeeper-status-dormant);
+      background: var(--ak-status-dormant-bg);
+      border-color: var(--ak-status-dormant-border);
+      color: var(--ak-status-dormant);
     }
     .badge[data-status='fatal'] {
-      background: var(--xkeeper-status-failed-bg);
-      border-color: var(--xkeeper-status-failed-border);
-      color: var(--xkeeper-status-failed);
+      background: var(--ak-status-failed-bg);
+      border-color: var(--ak-status-failed-border);
+      color: var(--ak-status-failed);
     }
     .glyph {
       font-size: 0.9em;
@@ -114,7 +114,7 @@ export class XkeeperStatusBadge extends LitElement {
       width: 7px;
       height: 7px;
       border-radius: 50%;
-      background: var(--xkeeper-status-queued, #38d1dd);
+      background: var(--ak-status-queued, #38d1dd);
       flex: 0 0 auto;
     }
     /* Live pulse on the working status — CSS only, honours reduced motion. */
@@ -123,10 +123,10 @@ export class XkeeperStatusBadge extends LitElement {
       position: absolute;
       inset: -3px;
       border-radius: 50%;
-      border: 1px solid var(--xkeeper-status-working, currentColor);
-      animation: xkeeper-ping 1.6s var(--xkeeper-ease, ease) infinite;
+      border: 1px solid var(--ak-status-working, currentColor);
+      animation: appkeeper-ping 1.6s var(--ak-ease, ease) infinite;
     }
-    @keyframes xkeeper-ping {
+    @keyframes appkeeper-ping {
       0% {
         transform: scale(0.55);
         opacity: 0.9;
@@ -150,7 +150,7 @@ export class XkeeperStatusBadge extends LitElement {
 
   private get statusColor(): string {
     const slug = this.slug.replace(/[^a-z]/g, '')
-    return `var(--xkeeper-status-${slug}, var(--xkeeper-status-queued, #b8860b))`
+    return `var(--ak-status-${slug}, var(--ak-status-queued, #b8860b))`
   }
 
   render() {
@@ -165,6 +165,6 @@ export class XkeeperStatusBadge extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-status-badge': XkeeperStatusBadge
+    'ak-status-badge': AkStatusBadge
   }
 }

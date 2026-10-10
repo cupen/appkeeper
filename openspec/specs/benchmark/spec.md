@@ -1,64 +1,64 @@
 # benchmark Specification
 
 ## Purpose
-定义 xkeeper-bench 负载基准测量能力：以独立二进制驱动真实 xkeeper daemon 按选定 case 产生真实日志负载，采集吞吐、内存、轮转与完整性指标并输出报告，用于容量评估与版本间性能回归对比。
+定义 appkeeper-bench 负载基准测量能力：以独立二进制驱动真实 appkeeper daemon 按选定 case 产生真实日志负载，采集吞吐、内存、轮转与完整性指标并输出报告，用于容量评估与版本间性能回归对比。
 
 ## Requirements
 
 ### Requirement: 命令形态与用例选择
 
-`xkeeper-bench` SHALL 作为独立可执行二进制随 workspace 构建分发，与 `xkeeper` daemon 主二进制互不包含。负载场景 SHALL 通过必选参数 `--case <name>` 选择；v1 SHALL 支持 `firehose`、`rotation`、`fanout`、`drip` 四个用例。传入未支持的 case 名时 MUST 打印支持的 case 清单并以非零码退出。
+`appkeeper-bench` SHALL 作为独立可执行二进制随 workspace 构建分发，与 `appkeeper` daemon 主二进制互不包含。负载场景 SHALL 通过必选参数 `--case <name>` 选择；v1 SHALL 支持 `firehose`、`rotation`、`fanout`、`drip` 四个用例。传入未支持的 case 名时 MUST 打印支持的 case 清单并以非零码退出。
 
 #### Scenario: 选择 case
 
-- **WHEN** 执行 `xkeeper-bench --case firehose`（其余参数取缺省）
+- **WHEN** 执行 `appkeeper-bench --case firehose`（其余参数取缺省）
 - **THEN** bench 按 firehose 场景完成一轮基准测量并正常退出
 
 #### Scenario: 未知 case 拒绝
 
-- **WHEN** 执行 `xkeeper-bench --case turbo`
+- **WHEN** 执行 `appkeeper-bench --case turbo`
 - **THEN** bench 不启动任何负载，打印 `firehose/rotation/fanout/drip` 支持清单，以非零码退出
 
 ### Requirement: 自带隔离环境拓扑
 
-未指定 `--connect` 时，bench SHALL 自建隔离测量环境：在临时 workspace 目录中生成 daemon 配置与 bench app 配置，拉起真实 `xkeeper` daemon 进程，注册并 apply 启动负载程序；测量结束后停止 daemon 并删除临时 workspace。`--keep` 指定时 SHALL 保留 workspace 供检查。daemon 二进制位置 SHALL 可用 `--daemon <path>` 指定，缺省在工作区 target 目录发现。
+未指定 `--connect` 时，bench SHALL 自建隔离测量环境：在临时 workspace 目录中生成 daemon 配置与 bench app 配置，拉起真实 `appkeeper` daemon 进程，注册并 apply 启动负载程序；测量结束后停止 daemon 并删除临时 workspace。`--keep` 指定时 SHALL 保留 workspace 供检查。daemon 二进制位置 SHALL 可用 `--daemon <path>` 指定，缺省在工作区 target 目录发现。
 
 #### Scenario: 缺省自跑完整周期
 
-- **WHEN** 在仓库目录执行 `xkeeper-bench --case firehose`
+- **WHEN** 在仓库目录执行 `appkeeper-bench --case firehose`
 - **THEN** bench 拉起自己的 daemon 与负载程序完成测量，退出后该临时 workspace 不存在，系统内无遗留 bench 进程
 
 #### Scenario: --keep 保留现场
 
-- **WHEN** 执行 `xkeeper-bench --case firehose --keep` 且测量完成
+- **WHEN** 执行 `appkeeper-bench --case firehose --keep` 且测量完成
 - **THEN** bench 退出时打印保留的 workspace 路径，daemon 已停止，workspace 内容仍在磁盘上
 
 ### Requirement: 连接既有 daemon 拓扑
 
-指定 `--connect <addr>` 时，bench SHALL 连接该地址的运行中 daemon 并通过既有 `/v1` 控制面接口注册名为 `xkeeper-bench-<case>[-<序号>]` 形态的临时 app、apply 启动负载、采集指标、stop 并卸载。守护进程开启 Bearer 鉴权时 SHALL 支持 `--token <token>` 携带凭据。连接失败或鉴权失败 MUST 以非零码退出且不在目标 daemon 上留下任何注册痕迹。
+指定 `--connect <addr>` 时，bench SHALL 连接该地址的运行中 daemon 并通过既有 `/v1` 控制面接口注册名为 `appkeeper-bench-<case>[-<序号>]` 形态的临时 app、apply 启动负载、采集指标、stop 并卸载。守护进程开启 Bearer 鉴权时 SHALL 支持 `--token <token>` 携带凭据。连接失败或鉴权失败 MUST 以非零码退出且不在目标 daemon 上留下任何注册痕迹。
 
 #### Scenario: 对运行中 daemon 测量
 
-- **WHEN** daemon 运行于 `127.0.0.1:7310`，执行 `xkeeper-bench --case firehose --connect 127.0.0.1:7310`
-- **THEN** 该 daemon 上出现 `xkeeper-bench-` 前缀的临时 app 并产生日志负载，测量结束后该 app 被卸载
+- **WHEN** daemon 运行于 `127.0.0.1:7310`，执行 `appkeeper-bench --case firehose --connect 127.0.0.1:7310`
+- **THEN** 该 daemon 上出现 `appkeeper-bench-` 前缀的临时 app 并产生日志负载，测量结束后该 app 被卸载
 
 #### Scenario: 目标不可达
 
-- **WHEN** 执行 `xkeeper-bench --case firehose --connect 127.0.0.1:9` 且该地址无 daemon
+- **WHEN** 执行 `appkeeper-bench --case firehose --connect 127.0.0.1:9` 且该地址无 daemon
 - **THEN** bench 以非零码退出，报错说明连接失败
 
 ### Requirement: 压测资源清理
 
-无论测量成功、失败或被中断，bench 退出前 SHALL 清理其创建的资源：connect 模式卸载临时 app 并删除其在 daemon 日志目录下的日志文件；spawn 模式删除临时 workspace（`--keep` 除外）。目标 daemon 上已存在 `xkeeper-bench-` 前缀同名 app 时 MUST 拒绝开跑（非零码退出），MUST NOT 覆写或删除非 bench 创建的任何 app 与文件。
+无论测量成功、失败或被中断，bench 退出前 SHALL 清理其创建的资源：connect 模式卸载临时 app 并删除其在 daemon 日志目录下的日志文件；spawn 模式删除临时 workspace（`--keep` 除外）。目标 daemon 上已存在 `appkeeper-bench-` 前缀同名 app 时 MUST 拒绝开跑（非零码退出），MUST NOT 覆写或删除非 bench 创建的任何 app 与文件。
 
 #### Scenario: 失败也清理
 
 - **WHEN** 测量中途 bench 内部出错退出
-- **THEN** 目标 daemon 上不留 `xkeeper-bench-` 前缀 app，其日志文件已删除
+- **THEN** 目标 daemon 上不留 `appkeeper-bench-` 前缀 app，其日志文件已删除
 
 #### Scenario: 同名拒跑
 
-- **WHEN** 目标 daemon 已存在名为 `xkeeper-bench-firehose` 的 app，执行 `xkeeper-bench --case firehose --connect <addr>`
+- **WHEN** 目标 daemon 已存在名为 `appkeeper-bench-firehose` 的 app，执行 `appkeeper-bench --case firehose --connect <addr>`
 - **THEN** bench 以非零码退出且该既有 app 未被修改
 
 ### Requirement: 负载参数语义
@@ -109,7 +109,7 @@ bench MUST 拒绝非法组合（负数、非数字）并以非零码退出。
 
 #### Scenario: 全速吞吐测量
 
-- **WHEN** `xkeeper-bench --case firehose --duration 10`
+- **WHEN** `appkeeper-bench --case firehose --duration 10`
 - **THEN** 报告给出非零的 rows/s 与 bytes/s 吞吐数字，测量约 10 秒后结束
 
 ### Requirement: rotation 用例
@@ -118,16 +118,16 @@ bench MUST 拒绝非法组合（负数、非数字）并以非零码退出。
 
 #### Scenario: 高频轮转完整性
 
-- **WHEN** `xkeeper-bench --case rotation --log-rows 200000 --log-row-size 128`
+- **WHEN** `appkeeper-bench --case rotation --log-rows 200000 --log-row-size 128`
 - **THEN** 测量期内日志发生多次轮转，报告 rotation count 大于 0，完整性校验通过
 
 ### Requirement: fanout 用例
 
-`--case fanout` SHALL 并行运行 `--programs <n>` 个负载程序（各自独立 app 程序），每程序向 stdout 与 stderr 双流产出，测量 supervisor 多程序下的聚合吞吐与每程序吞吐。程序名 SHALL 为 `xkeeper-bench-fanout-<序号>` 形态。
+`--case fanout` SHALL 并行运行 `--programs <n>` 个负载程序（各自独立 app 程序），每程序向 stdout 与 stderr 双流产出，测量 supervisor 多程序下的聚合吞吐与每程序吞吐。程序名 SHALL 为 `appkeeper-bench-fanout-<序号>` 形态。
 
 #### Scenario: 多程序聚合
 
-- **WHEN** `xkeeper-bench --case fanout --programs 8 --duration 10`
+- **WHEN** `appkeeper-bench --case fanout --programs 8 --duration 10`
 - **THEN** 8 个负载程序并行产出，报告给出聚合吞吐与每程序吞吐分解
 
 ### Requirement: drip 用例
@@ -136,12 +136,12 @@ bench MUST 拒绝非法组合（负数、非数字）并以非零码退出。
 
 #### Scenario: 稳态 RSS 有界
 
-- **WHEN** `xkeeper-bench --case drip --rate 100 --duration 60`
+- **WHEN** `appkeeper-bench --case drip --rate 100 --duration 60`
 - **THEN** 报告给出 60 秒内 daemon RSS 峰值与均值，峰值不随产出总量线性增长
 
 #### Scenario: 缺省低速稳态
 
-- **WHEN** `xkeeper-bench --case drip`（未指定 `--rate`）
+- **WHEN** `appkeeper-bench --case drip`（未指定 `--rate`）
 - **THEN** 负载以约 100 行/秒产出而非全速，报告给出 daemon RSS 峰值与均值
 
 ### Requirement: 指标采集与报告
@@ -150,7 +150,7 @@ bench SHALL 完全从外部采集指标——读取 daemon 既有 `/v1` 状态�
 
 #### Scenario: 表格与 JSON 双输出
 
-- **WHEN** `xkeeper-bench --case firehose --json report.json` 正常完成
+- **WHEN** `appkeeper-bench --case firehose --json report.json` 正常完成
 - **THEN** stdout 呈现人类可读指标表格，`report.json` 存在且包含 case、rows、bytes、rows_per_sec、bytes_per_sec、wall_time、rotation_count、integrity 等字段
 
 #### Scenario: 指标不依赖 daemon 改动

@@ -96,7 +96,7 @@ export class ConsoleStore {
     this.stopPolling()
   }
 
-  // -- reactive glue --------------------------------------------------------
+  // --ak- reactive glue --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
@@ -122,7 +122,7 @@ export class ConsoleStore {
     this.emit()
   }
 
-  // -- apply -------------------------------------------------------------------
+  // --ak- apply --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak--
 
   /** The current pending projection (never null; empty when in sync). */
   get pending(): PendingDoc {
@@ -157,7 +157,7 @@ export class ConsoleStore {
     await this.pollOnce()
   }
 
-  // -- log subscriptions ------------------------------------------------------
+  // --ak- log subscriptions --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-
 
   subscribeLogs(program: string, stream: StreamId): void {
     const key = `${program}\u0000${stream}`
@@ -194,7 +194,7 @@ export class ConsoleStore {
     })
   }
 
-  // -- internals ---------------------------------------------------------------
+  // --ak- internals --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak--
 
   private mergeDelta(programs: ProgramInfo[]): void {
     if (!this.doc) return

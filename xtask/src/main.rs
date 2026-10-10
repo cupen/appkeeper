@@ -1,4 +1,4 @@
-//! xtask — developer tasks for xkeeper.
+//! xtask — developer tasks for ak.
 //!
 //! - `cargo run -p xtask -- test`   full verification suite (fmt + backend
 //!   tests + frontend typecheck/tests/build + rebuild)
@@ -137,5 +137,5 @@ pub(crate) fn build_daemon() -> Result<PathBuf> {
     if !status.success() {
         bail!("cargo build failed");
     }
-    Ok(root.join("target/debug/xkeeper"))
+    Ok(root.join("target/debug/appkeeper"))
 }

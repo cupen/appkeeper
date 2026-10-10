@@ -5,7 +5,7 @@
 //! stress harness for the same reasoning). Run them explicitly:
 //!
 //! ```sh
-//! cargo test -p xkeeper-bench --test integration -- --ignored --test-threads=1
+//! cargo test -p appkeeper-bench --test integration -- --ignored --test-threads=1
 //! ```
 //!
 //! Every cycle asserts the cleanup contract: no `xk-bench-*` workspaces and
@@ -17,11 +17,11 @@ use std::time::Duration;
 
 /// The bench binary under test (provided by cargo for integration tests).
 fn bench_bin() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_xkeeper-bench"))
+    Path::new(env!("CARGO_BIN_EXE_appkeeper-bench"))
 }
 
 fn daemon_bin() -> PathBuf {
-    let name = if cfg!(windows) { "xkeeper.exe" } else { "xkeeper" };
+    let name = if cfg!(windows) { "ak.exe" } else { "appkeeper" };
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.parent().expect("crate lives in the workspace");
     let cand = root.join("target").join("debug").join(name);
@@ -186,7 +186,7 @@ fn bench_traces(dir: &Path) -> Vec<String> {
         if let Ok(entries) = std::fs::read_dir(dir.join(sub)) {
             for e in entries.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("xkeeper-bench-") {
+                if n.starts_with("appkeeper-bench-") {
                     out.push(format!("{sub}/{n}"));
                 }
             }
@@ -243,7 +243,7 @@ fn firehose_full_cycle_reports_and_cleans_up() {
     assert_eq!(v["aggregate"]["rows"], 20000, "rows bound honored exactly");
     assert_eq!(v["integrity"]["pass"], true);
     assert!(v["aggregate"]["rows_per_sec"].as_f64().unwrap() > 0.0);
-    assert!(v["bin_versions"]["xkeeper"].is_string());
+    assert!(v["bin_versions"]["ak"].is_string());
     #[cfg(unix)]
     assert_no_residue();
     let _ = std::fs::remove_file(&json);
@@ -287,7 +287,7 @@ fn fanout_full_cycle_splits_streams_and_aggregates() {
     let progs = v["programs"].as_array().unwrap();
     assert_eq!(progs.len(), 3);
     for (i, p) in progs.iter().enumerate() {
-        assert_eq!(p["name"], format!("xkeeper-bench-fanout-{i}"));
+        assert_eq!(p["name"], format!("appkeeper-bench-fanout-{i}"));
         let rows = p["rows"].as_u64().unwrap();
         let err = p["err_rows"].as_u64().unwrap();
         assert_eq!(rows, 20000);
@@ -391,7 +391,7 @@ fn integrity_failure_exits_nonzero_with_report() {
                         .flatten()
                         .map(|f| f.path())
                         .filter(|p| {
-                            p.to_string_lossy().contains("xkeeper-bench-rotation.out.log.")
+                            p.to_string_lossy().contains("appkeeper-bench-rotation.out.log.")
                         })
                         .collect();
                     if let Some(victim) = rotated.first() {
@@ -488,7 +488,7 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with("xkeeper-bench-"))
+        .filter(|n| n.starts_with("appkeeper-bench-"))
         .collect();
     assert!(logs_left.is_empty(), "bench log files must be removed: {logs_left:?}");
     let status = Cmd::new("curl")
@@ -496,7 +496,7 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&status.stdout).to_string();
-    assert!(!text.contains("xkeeper-bench-"), "no bench programs on the daemon: {text}");
+    assert!(!text.contains("appkeeper-bench-"), "no bench programs on the daemon: {text}");
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -530,8 +530,8 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
     )
     .unwrap();
     std::fs::write(
-        scratch.join("apps").join("xkeeper-bench-firehose.toml"),
-        "[app]\nrestart = \"no\"\n\n[program.xkeeper-bench-firehose]\ncommand = \"/bin/sleep\"\nargs = [\"30\"]\n",
+        scratch.join("apps").join("appkeeper-bench-firehose.toml"),
+        "[app]\nrestart = \"no\"\n\n[program.appkeeper-bench-firehose]\ncommand = \"/bin/sleep\"\nargs = [\"30\"]\n",
     )
     .unwrap();
     let out = std::fs::File::create(scratch.join("daemon.out.log")).unwrap();
@@ -551,7 +551,7 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
     assert_ne!(code, 0, "collision must be refused");
     assert!(stderr.contains("refusing"), "{stderr}");
     // the planted file is untouched
-    assert!(scratch.join("apps").join("xkeeper-bench-firehose.toml").is_file());
+    assert!(scratch.join("apps").join("appkeeper-bench-firehose.toml").is_file());
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -593,10 +593,10 @@ fn firehose_rate_bound_stops_at_duration_with_full_json_schema() {
     assert_eq!(v["integrity"]["pass"], true, "{v}");
     assert_eq!(v["integrity"]["expected_rows"], v["integrity"]["found_rows"]);
     assert!(v["started_at"].as_u64().unwrap() > 0);
-    assert!(v["bin_versions"]["xkeeper"].is_string());
+    assert!(v["bin_versions"]["ak"].is_string());
     assert!(v["bin_versions"]["bench"].is_string());
     let p = &v["programs"][0];
-    assert_eq!(p["name"], "xkeeper-bench-firehose");
+    assert_eq!(p["name"], "appkeeper-bench-firehose");
     assert!(p["rows_per_sec"].as_f64().unwrap() > 0.0);
     assert!(p["bytes_per_sec"].as_f64().unwrap() > 0.0);
     assert!(p["out_rows"].as_u64().unwrap() > 0);
@@ -748,7 +748,7 @@ fn connect_auth_token_gate_and_success_cycle() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&status.stdout).to_string();
-    assert!(!text.contains("xkeeper-bench-"), "no bench programs left: {text}");
+    assert!(!text.contains("appkeeper-bench-"), "no bench programs left: {text}");
     #[cfg(unix)]
     assert_no_residue();
 }
@@ -831,7 +831,7 @@ fn help_lists_cases_hides_generator_and_bare_run_is_rejected() {
         !stdout.contains("__generate"),
         "the self-reentry generator must stay hidden from --help: {stdout}"
     );
-    // bare `xkeeper-bench` (no --case) is a parameter error, not a run
+    // bare `appkeeper-bench` (no --case) is a parameter error, not a run
     let (code, _stdout, stderr) = run_bench(&[]);
     assert_ne!(code, 0, "--case is required");
     assert!(stderr.contains("--case"), "{stderr}");

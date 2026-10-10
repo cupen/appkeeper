@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0a0c11" />
-    <title>xkeeper console</title>
+    <title>appkeeper console</title>
     <script>
       // Theme pre-paint (inline: module scripts run too late and a light-OS
       // user would flash dark). Mirrors src/theme.ts — `wa-dark` on <html> is
-      // the single switch; the mode persists under 'xkeeper:theme'.
+      // the single switch; the mode persists under 'ak:theme'.
       ;(() => {
         let mode = 'system'
         try {
-          mode = localStorage.getItem('xkeeper:theme') || 'system'
+          mode = localStorage.getItem('ak:theme') || 'system'
         } catch {}
         const light =
           mode === 'light' ||
@@ -27,7 +27,7 @@
     <link rel="stylesheet" href="/src/styles/app.css" />
   </head>
   <body>
-    <xkeeper-app></xkeeper-app>
+    <ak-app></ak-app>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

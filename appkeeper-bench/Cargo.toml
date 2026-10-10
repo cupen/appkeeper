@@ -1,9 +1,9 @@
 [package]
-name = "xkeeper-bench"
+name = "appkeeper-bench"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Load benchmark harness for a real xkeeper daemon: case-driven load generation, external metric collection and machine-readable reports"
+description = "Load benchmark harness for a real appkeeper daemon: case-driven load generation, external metric collection and machine-readable reports"
 
 [dependencies]
 anyhow = "1.0"

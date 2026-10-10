@@ -5,20 +5,20 @@
 - name: Assert required variables are set
   ansible.builtin.assert:
     that:
-      - xkeeper_binary_src is defined and xkeeper_binary_src | length > 0
-      - xkeeper_config_src is defined and xkeeper_config_src | length > 0
+      - appkeeper_binary_src is defined and appkeeper_binary_src | length > 0
+      - appkeeper_config_src is defined and appkeeper_config_src | length > 0
     fail_msg: >-
-      必填变量缺失：xkeeper_binary_src（二进制路径或 URL）与
-      xkeeper_config_src（daemon 配置文件路径）必须由 extra-vars 或调用方提供。
+      必填变量缺失：appkeeper_binary_src（二进制路径或 URL）与
+      appkeeper_config_src（daemon 配置文件路径）必须由 extra-vars 或调用方提供。
 
 - name: Classify binary source (URL or local path)
   ansible.builtin.set_fact:
-    xk_binary_is_url: "{{ xkeeper_binary_src is string and xkeeper_binary_src | lower is match('https?://') }}"
+    xk_binary_is_url: "{{ appkeeper_binary_src is string and appkeeper_binary_src | lower is match('https?://') }}"
 
 # ---- 控制机侧：解析源文件与 checksum（不触碰目标机） ----
 - name: Prepare controller staging directory
   ansible.builtin.file:
-    path: "{{ xkeeper_staging_dir }}"
+    path: "{{ appkeeper_staging_dir }}"
     state: directory
     mode: "0755"
   when: xk_binary_is_url | bool
@@ -27,10 +27,10 @@
 
 - name: Stage binary from URL on controller
   ansible.builtin.get_url:
-    url: "{{ xkeeper_binary_src }}"
-    dest: "{{ xkeeper_staging_dir }}/xkeeper-staged-{{ inventory_hostname }}"
+    url: "{{ appkeeper_binary_src }}"
+    dest: "{{ appkeeper_staging_dir }}/appkeeper-staged-{{ inventory_hostname }}"
     mode: "0755"
-    checksum: "{{ ('sha256:' ~ xkeeper_binary_checksum) if xkeeper_binary_checksum | length > 0 else omit }}"
+    checksum: "{{ ('sha256:' ~ appkeeper_binary_checksum) if appkeeper_binary_checksum | length > 0 else omit }}"
   register: xk_stage_binary
   when: xk_binary_is_url | bool
   delegate_to: localhost
@@ -38,7 +38,7 @@
 
 - name: Resolve effective binary source path
   ansible.builtin.set_fact:
-    xk_binary_effective_src: "{{ xk_stage_binary.dest if xk_binary_is_url | bool else xkeeper_binary_src }}"
+    xk_binary_effective_src: "{{ xk_stage_binary.dest if xk_binary_is_url | bool else appkeeper_binary_src }}"
 
 - name: Stat binary source on controller
   ansible.builtin.stat:
@@ -51,7 +51,7 @@
 
 - name: Stat config source on controller
   ansible.builtin.stat:
-    path: "{{ xkeeper_config_src }}"
+    path: "{{ appkeeper_config_src }}"
     get_checksum: true
   register: xk_src_config
   delegate_to: localhost
@@ -66,12 +66,12 @@
   ansible.builtin.meta: end_host
   when: xk_idempotent_hit | bool
 
-- name: Install xkeeper (binary, config, service)
+- name: Install appkeeper (binary, config, service)
   ansible.builtin.include_tasks: install.yml
 
 - name: Clean up controller staging directory
   ansible.builtin.file:
-    path: "{{ xkeeper_staging_dir }}"
+    path: "{{ appkeeper_staging_dir }}"
     state: absent
   when: xk_binary_is_url | bool
   delegate_to: localhost

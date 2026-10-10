@@ -1,0 +1,12 @@
+---
+# 全部变量带安全缺省；必填的 appkeeper_binary_src / appkeeper_config_src
+# 由调用方（extra-vars 或调用 playbook）提供，缺省即触发断言失败。
+
+appkeeper_binary_dest: /usr/local/bin/ak
+appkeeper_config_dest: /etc/appkeeper/daemon.toml
+appkeeper_service_name: appkeeper
+appkeeper_service_user: ""
+appkeeper_force_overwrite: false
+appkeeper_binary_checksum: ""
+# 控制机侧暂存目录（URL 来源时下载至此再分发）
+appkeeper_staging_dir: "{{ playbook_dir }}/.tmp"

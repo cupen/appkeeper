@@ -7,11 +7,11 @@
 
 - name: Detect existing systemd unit file
   ansible.builtin.stat:
-    path: "/etc/systemd/system/{{ xkeeper_service_name }}.service"
+    path: "/etc/systemd/system/{{ appkeeper_service_name }}.service"
   register: xk_unit_pre
 
 - name: Detect service active state
-  ansible.builtin.command: "systemctl is-active {{ xkeeper_service_name }}"
+  ansible.builtin.command: "systemctl is-active {{ appkeeper_service_name }}"
   register: xk_active_pre
   failed_when: false
   changed_when: false
@@ -19,7 +19,7 @@
   check_mode: false
 
 - name: Detect service enabled state
-  ansible.builtin.command: "systemctl is-enabled {{ xkeeper_service_name }}"
+  ansible.builtin.command: "systemctl is-enabled {{ appkeeper_service_name }}"
   register: xk_enabled_pre
   failed_when: false
   changed_when: false
@@ -27,13 +27,13 @@
 
 - name: Detect existing binary (with checksum)
   ansible.builtin.stat:
-    path: "{{ xkeeper_binary_dest }}"
+    path: "{{ appkeeper_binary_dest }}"
     get_checksum: true
   register: xk_binary_pre
 
 - name: Detect existing daemon config (with checksum)
   ansible.builtin.stat:
-    path: "{{ xkeeper_config_dest }}"
+    path: "{{ appkeeper_config_dest }}"
     get_checksum: true
   register: xk_config_pre
 
@@ -41,11 +41,11 @@
   ansible.builtin.set_fact:
     xk_traces: >-
       {{ []
-         + (['systemd unit file exists: /etc/systemd/system/' ~ xkeeper_service_name ~ '.service'] if xk_unit_pre.stat.exists else [])
+         + (['systemd unit file exists: /etc/systemd/system/' ~ appkeeper_service_name ~ '.service'] if xk_unit_pre.stat.exists else [])
          + (['service is ' ~ xk_active_pre.stdout] if xk_active_pre.rc == 0 else [])
          + (['service is enabled'] if xk_enabled_pre.rc == 0 else [])
-         + (['binary exists at ' ~ xkeeper_binary_dest] if xk_binary_pre.stat.exists else [])
-         + (['daemon config exists at ' ~ xkeeper_config_dest] if xk_config_pre.stat.exists else []) }}
+         + (['binary exists at ' ~ appkeeper_binary_dest] if xk_binary_pre.stat.exists else [])
+         + (['daemon config exists at ' ~ appkeeper_config_dest] if xk_config_pre.stat.exists else []) }}
 
 - name: Determine idempotent hit (own deployment, identical content)
   ansible.builtin.set_fact:
@@ -68,20 +68,20 @@
 - name: Fail fast on existing installation without force override
   ansible.builtin.fail:
     msg: >-
-      检测到目标机已存在 xkeeper 安装，为避免误触生产环境，本次执行已停止，
+      检测到目标机已存在 appkeeper 安装，为避免误触生产环境，本次执行已停止，
       目标机未做任何修改。检测到的痕迹：{{ xk_traces | join('; ') }}。
       如确认要覆盖并重启既有安装，请在 extra-vars 中显式设置
-      xkeeper_force_overwrite: true 后重试。
+      appkeeper_force_overwrite: true 后重试。
   when:
     - xk_traces | length > 0
     - not xk_idempotent_hit | bool
-    - not xkeeper_force_overwrite | bool
+    - not appkeeper_force_overwrite | bool
 
 - name: Report force-overwrite path
   ansible.builtin.debug:
     msg: >-
-      xkeeper_force_overwrite=true：检测到既有安装（{{ xk_traces | join('; ') }}），
+      appkeeper_force_overwrite=true：检测到既有安装（{{ xk_traces | join('; ') }}），
       将覆盖二进制与配置并按需重启服务。
   when:
     - xk_traces | length > 0
-    - xkeeper_force_overwrite | bool
+    - appkeeper_force_overwrite | bool

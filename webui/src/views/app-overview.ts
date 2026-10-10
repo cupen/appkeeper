@@ -27,8 +27,8 @@ import {
 } from '../lib/prefs.js'
 import { navigate } from '../router.js'
 
-@customElement('xkeeper-app-overview')
-export class XkeeperAppOverview extends LitElement {
+@customElement('ak-app-overview')
+export class AkAppOverview extends LitElement {
   @property() app = ''
 
   /** Injectable for tests; defaults to the shared singleton. */
@@ -52,22 +52,22 @@ export class XkeeperAppOverview extends LitElement {
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: var(--xkeeper-space-4);
-      padding: var(--xkeeper-space-4) var(--xkeeper-space-5);
+      gap: var(--ak-space-4);
+      padding: var(--ak-space-4) var(--ak-space-5);
       box-sizing: border-box;
     }
     header {
       display: flex;
       align-items: baseline;
-      gap: var(--xkeeper-space-3);
+      gap: var(--ak-space-3);
     }
     h1 {
       margin: 0;
       font-size: 1.25rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .sub {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.85rem;
     }
     .window-switch {
@@ -76,22 +76,22 @@ export class XkeeperAppOverview extends LitElement {
       align-items: center;
       gap: 6px;
       font-size: 0.8rem;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
     }
     .window-switch select {
-      background: var(--xkeeper-surface-2);
-      color: var(--xkeeper-text);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-sm, 6px);
       font: inherit;
       padding: 3px 6px;
     }
     table {
       width: 100%;
       border-collapse: collapse;
-      background: var(--xkeeper-surface);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
+      background: var(--ak-surface);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
       overflow: hidden;
       font-size: 0.86rem;
     }
@@ -99,7 +99,7 @@ export class XkeeperAppOverview extends LitElement {
     td {
       text-align: left;
       padding: 9px 14px;
-      border-bottom: 1px solid var(--xkeeper-border);
+      border-bottom: 1px solid var(--ak-border);
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
@@ -107,26 +107,26 @@ export class XkeeperAppOverview extends LitElement {
       font-size: 0.72rem;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-weight: 600;
-      background: var(--xkeeper-surface-2);
+      background: var(--ak-surface-2);
     }
     tr:last-child td {
       border-bottom: none;
     }
     tbody tr {
       cursor: pointer;
-      transition: background var(--xkeeper-dur, 150ms) var(--xkeeper-ease, ease);
+      transition: background var(--ak-dur, 150ms) var(--ak-ease, ease);
     }
     tbody tr:hover {
-      background: var(--xkeeper-surface-2);
+      background: var(--ak-surface-2);
     }
     tr[data-fatal='true'] {
-      background: var(--xkeeper-status-failed-bg);
-      box-shadow: inset 3px 0 0 var(--xkeeper-status-failed);
+      background: var(--ak-status-failed-bg);
+      box-shadow: inset 3px 0 0 var(--ak-status-failed);
     }
     tr[data-fatal='true']:hover {
-      background: color-mix(in srgb, var(--xkeeper-status-failed-bg) 60%, var(--xkeeper-surface-2));
+      background: color-mix(in srgb, var(--ak-status-failed-bg) 60%, var(--ak-surface-2));
     }
     td.num {
       text-align: right;
@@ -135,39 +135,39 @@ export class XkeeperAppOverview extends LitElement {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
       font-weight: 600;
     }
     .name-cell .glyph {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
     .prog-count {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.9rem;
     }
     .apply-strip {
       display: flex;
       align-items: center;
-      gap: var(--xkeeper-space-3);
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-4);
-      background: color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 12%, var(--xkeeper-surface));
-      border: 1px solid color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 35%, var(--xkeeper-border));
-      border-radius: var(--xkeeper-radius-lg, 10px);
+      gap: var(--ak-space-3);
+      padding: var(--ak-space-2) var(--ak-space-4);
+      background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 12%, var(--ak-surface));
+      border: 1px solid color-mix(in srgb, var(--ak-accent-strong, #6366f1) 35%, var(--ak-border));
+      border-radius: var(--ak-radius-lg, 10px);
       font-size: 0.84rem;
     }
     .apply-strip .count {
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
       font-weight: 600;
     }
     .apply-strip button {
       margin-left: auto;
       border: 1px solid transparent;
-      background: var(--xkeeper-accent-strong, #6366f1);
-      color: var(--xkeeper-accent-ink, #fff);
+      background: var(--ak-accent-strong, #6366f1);
+      color: var(--ak-accent-ink, #fff);
       font: inherit;
       font-weight: 600;
       padding: 4px 14px;
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      border-radius: var(--ak-radius-sm, 6px);
       cursor: pointer;
     }
     .apply-strip button:disabled {
@@ -175,7 +175,7 @@ export class XkeeperAppOverview extends LitElement {
       cursor: default;
     }
     .apply-strip .feedback {
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       white-space: pre-wrap;
       max-width: 52ch;
       max-height: 8em;
@@ -183,7 +183,7 @@ export class XkeeperAppOverview extends LitElement {
       font-size: 0.78rem;
     }
     .apply-strip .feedback[data-error='true'] {
-      color: var(--xkeeper-status-failed, #ef4444);
+      color: var(--ak-status-failed, #ef4444);
     }
     .changed-mark {
       margin-left: 6px;
@@ -192,13 +192,13 @@ export class XkeeperAppOverview extends LitElement {
       font-size: 0.68rem;
       font-weight: 700;
       letter-spacing: 0.04em;
-      background: color-mix(in srgb, var(--xkeeper-accent-strong, #6366f1) 22%, transparent);
-      color: var(--xkeeper-text-bright);
+      background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 22%, transparent);
+      color: var(--ak-text-bright);
     }
     .empty {
-      padding: var(--xkeeper-space-6);
+      padding: var(--ak-space-6);
       text-align: center;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
   `
 
@@ -323,8 +323,8 @@ export class XkeeperAppOverview extends LitElement {
                         >${pendingSet.has(p.name) ? html`<span class="changed-mark">待应用</span>` : nothing}
                       </td>
                       <td>
-                        <xkeeper-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
-                        ></xkeeper-status-badge>
+                        <ak-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
+                        ></ak-status-badge>
                         ${p.wait_reason ? html`<span class="sub">　${p.wait_reason}</span>` : nothing}
                         ${p.fatal_reason ? html`<span class="sub">　${p.fatal_reason}</span>` : nothing}
                       </td>
@@ -346,6 +346,6 @@ export class XkeeperAppOverview extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-app-overview': XkeeperAppOverview
+    'ak-app-overview': AkAppOverview
   }
 }

@@ -169,7 +169,7 @@ pub fn bind(sup: &Arc<Supervisor>) -> Result<TcpListener> {
     };
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).with_context(|| {
-        format!("failed to bind control API on {addr} (is another xkeeper running?)")
+        format!("failed to bind control API on {addr} (is another ak running?)")
     })?;
     info!("control API listening on http://{addr}");
     Ok(listener)
@@ -663,7 +663,7 @@ fn respond_logs(sup: &Arc<Supervisor>, name: &str, query: &str, mut writer: TcpS
                     lines.iter().all(|l| write_chunk(&mut writer, l))
                 }
                 crate::pump::SubItem::Gap(n) => {
-                    write_chunk(&mut writer, &format!("[[xkeeper: skipped {n} lines]]"))
+                    write_chunk(&mut writer, &format!("[[ak: skipped {n} lines]]"))
                 }
             };
             if !ok {
@@ -728,7 +728,7 @@ mod tests {
                 },
                 monitor_interval: 1.0,
                 uptime_secs: 5.0,
-                config_source: "/tmp/xkeeper.toml".into(),
+                config_source: "/tmp/appkeeper.toml".into(),
             },
             programs: vec![info],
             pending: crate::supervisor::PendingDoc::default(),

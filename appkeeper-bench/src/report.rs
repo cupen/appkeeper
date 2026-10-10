@@ -61,7 +61,7 @@ pub struct Report {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BinVersions {
-    pub xkeeper: String,
+    pub ak: String,
     pub bench: String,
 }
 
@@ -115,7 +115,7 @@ fn render_params(p: &serde_json::Value) -> String {
 
 pub fn render_table(r: &Report) -> String {
     let mut s = String::new();
-    s.push_str(&format!("== xkeeper-bench report: {} ==\n", r.case));
+    s.push_str(&format!("== appkeeper-bench report: {} ==\n", r.case));
     s.push_str(&format!("  case            : {}\n", r.case));
     s.push_str(&format!("  params          : {}\n", render_params(&r.params)));
     s.push_str(&format!(
@@ -149,8 +149,8 @@ pub fn render_table(r: &Report) -> String {
         s.push_str(&format!("    - {p}\n"));
     }
     s.push_str(&format!(
-        "  versions        : xkeeper {} / bench {}\n",
-        r.bin_versions.xkeeper, r.bin_versions.bench
+        "  versions        : ak {} / bench {}\n",
+        r.bin_versions.ak, r.bin_versions.bench
     ));
     s.push_str("\n  programs:\n");
     s.push_str(&format!(
@@ -184,7 +184,7 @@ mod tests {
                 "rate": null, "duration": 30, "programs": 1, "connect": null
             }),
             programs: vec![ProgramMetrics {
-                name: "xkeeper-bench-firehose".into(),
+                name: "appkeeper-bench-firehose".into(),
                 rows: 10000,
                 bytes: 1_290_000,
                 out_rows: 10000,
@@ -209,7 +209,7 @@ mod tests {
             },
             started_at: 1_700_000_000,
             bin_versions: BinVersions {
-                xkeeper: "0.1.0".into(),
+                ak: "0.1.0".into(),
                 bench: env!("CARGO_PKG_VERSION").into(),
             },
         }
@@ -226,7 +226,7 @@ mod tests {
             assert!(v.get(key).is_some(), "schema field {key} missing");
         }
         assert_eq!(v["aggregate"]["rows_per_sec"], 5234.1);
-        assert_eq!(v["programs"][0]["name"], "xkeeper-bench-firehose");
+        assert_eq!(v["programs"][0]["name"], "appkeeper-bench-firehose");
         assert_eq!(v["integrity"]["pass"], true);
         assert_eq!(v["bin_versions"]["bench"], env!("CARGO_PKG_VERSION"));
         // null-able rss serializes as null when absent
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn table_is_stdout_clean_and_names_the_key_numbers() {
         let text = render_table(&sample_report());
-        assert!(text.contains("== xkeeper-bench report: firehose =="));
+        assert!(text.contains("== appkeeper-bench report: firehose =="));
         // The effective parameters line (spec: the table carries the params).
         assert!(
             text.contains(
@@ -267,7 +267,7 @@ mod tests {
         assert!(text.contains("rotations"));
         assert!(text.contains("peak 8123 KiB / avg 7900 KiB"));
         assert!(text.contains("integrity       : PASS"));
-        assert!(text.contains("xkeeper-bench-firehose"));
+        assert!(text.contains("appkeeper-bench-firehose"));
         assert!(text.contains("0.1.0"));
         // progress noise would use carriage returns / live refresh markers;
         // the table must be a plain multi-line block.

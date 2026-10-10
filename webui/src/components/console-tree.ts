@@ -16,8 +16,8 @@ export interface TreeApp {
   programs: ProgramInfo[]
 }
 
-@customElement('xkeeper-console-tree')
-export class XkeeperConsoleTree extends LitElement {
+@customElement('ak-console-tree')
+export class AkConsoleTree extends LitElement {
   @property({ type: Array }) apps: TreeApp[] = []
   /** Currently selected path segments (raw, still encoded). */
   @property() selectedApp = ''
@@ -28,37 +28,37 @@ export class XkeeperConsoleTree extends LitElement {
       display: block;
     }
     .app {
-      margin: 0 0 var(--xkeeper-space-2);
+      margin: 0 0 var(--ak-space-2);
     }
     .app-link {
       display: flex;
       align-items: center;
       gap: 8px;
       padding: 7px 10px;
-      border-radius: var(--xkeeper-radius-md);
+      border-radius: var(--ak-radius-md);
       text-decoration: none;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
       font-weight: 600;
       font-size: 0.92rem;
     }
     .app-link:hover {
-      background: var(--xkeeper-surface-2);
+      background: var(--ak-surface-2);
     }
     .app-link[data-active='true'] {
-      background: var(--xkeeper-accent-soft);
-      color: var(--xkeeper-accent-hover);
+      background: var(--ak-accent-soft);
+      color: var(--ak-accent-hover);
     }
     .app-link .count {
       margin-left: auto;
       font-size: 0.72rem;
       font-weight: 500;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-variant-numeric: tabular-nums;
     }
     .progs {
       margin: 2px 0 0 14px;
       padding-left: 10px;
-      border-left: 1px solid var(--xkeeper-border);
+      border-left: 1px solid var(--ak-border);
       display: flex;
       flex-direction: column;
       gap: 1px;
@@ -68,19 +68,19 @@ export class XkeeperConsoleTree extends LitElement {
       align-items: center;
       gap: 7px;
       padding: 4px 9px;
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      border-radius: var(--ak-radius-sm, 6px);
       text-decoration: none;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       font-size: 0.86rem;
       font-variant-numeric: tabular-nums;
     }
     a.prog:hover {
-      background: var(--xkeeper-surface-2);
-      color: var(--xkeeper-text);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
     }
     a.prog[data-active='true'] {
-      background: var(--xkeeper-accent-soft);
-      color: var(--xkeeper-accent-hover);
+      background: var(--ak-accent-soft);
+      color: var(--ak-accent-hover);
     }
     a.prog .glyph {
       width: 1em;
@@ -93,17 +93,17 @@ export class XkeeperConsoleTree extends LitElement {
       white-space: nowrap;
     }
     a.prog[data-state='fatal'] {
-      color: var(--xkeeper-status-failed);
+      color: var(--ak-status-failed);
     }
     a.prog[data-state='backoff'] {
-      color: var(--xkeeper-status-working);
+      color: var(--ak-status-working);
     }
     a.prog[data-state='running'] {
-      color: var(--xkeeper-status-done);
+      color: var(--ak-status-done);
     }
     .empty {
       padding: 10px;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.85rem;
     }
   `
@@ -116,7 +116,7 @@ export class XkeeperConsoleTree extends LitElement {
 
   render() {
     if (this.apps.length === 0) {
-      return html`<div class="empty">没有已注册的应用（xkeeper add 注册后出现在这里）</div>`
+      return html`<div class="empty">没有已注册的应用（ak add 注册后出现在这里）</div>`
     }
     return html`
       ${this.apps.map(
@@ -162,6 +162,6 @@ export class XkeeperConsoleTree extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-console-tree': XkeeperConsoleTree
+    'ak-console-tree': AkConsoleTree
   }
 }

@@ -12,8 +12,8 @@ import { formatBytes, formatPercent, formatUptime, stateGlyph } from '../lib/for
 
 type PendingAction = 'stop' | 'restart' | null
 
-@customElement('xkeeper-program-detail')
-export class XkeeperProgramDetail extends LitElement {
+@customElement('ak-program-detail')
+export class AkProgramDetail extends LitElement {
   @property() app = ''
   @property() program = ''
 
@@ -37,105 +37,105 @@ export class XkeeperProgramDetail extends LitElement {
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: var(--xkeeper-space-4);
-      padding: var(--xkeeper-space-4) var(--xkeeper-space-5);
+      gap: var(--ak-space-4);
+      padding: var(--ak-space-4) var(--ak-space-5);
       box-sizing: border-box;
     }
     header {
       display: flex;
       align-items: baseline;
-      gap: var(--xkeeper-space-3);
+      gap: var(--ak-space-3);
       flex-wrap: wrap;
     }
     h1 {
       margin: 0;
       font-size: 1.2rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .crumb {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.85rem;
     }
     .actions {
       margin-left: auto;
       display: inline-flex;
-      gap: var(--xkeeper-space-2);
+      gap: var(--ak-space-2);
     }
     button {
       font: inherit;
       font-size: 0.84rem;
       padding: 6px 14px;
-      border-radius: var(--xkeeper-radius-sm, 6px);
-      border: 1px solid var(--xkeeper-border);
-      background: var(--xkeeper-surface-2);
-      color: var(--xkeeper-text);
+      border-radius: var(--ak-radius-sm, 6px);
+      border: 1px solid var(--ak-border);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
       cursor: pointer;
       transition:
-        background var(--xkeeper-dur, 150ms) var(--xkeeper-ease, ease),
-        border-color var(--xkeeper-dur, 150ms) var(--xkeeper-ease, ease);
+        background var(--ak-dur, 150ms) var(--ak-ease, ease),
+        border-color var(--ak-dur, 150ms) var(--ak-ease, ease);
     }
     button:hover:not(:disabled) {
-      border-color: var(--xkeeper-border-strong);
-      background: var(--xkeeper-surface-3);
+      border-color: var(--ak-border-strong);
+      background: var(--ak-surface-3);
     }
     button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
     }
     button[data-kind='start'] {
-      border-color: var(--xkeeper-status-done-border);
-      color: var(--xkeeper-status-done);
+      border-color: var(--ak-status-done-border);
+      color: var(--ak-status-done);
     }
     button[data-kind='stop'] {
-      border-color: var(--xkeeper-status-failed-border);
-      color: var(--xkeeper-status-failed);
+      border-color: var(--ak-status-failed-border);
+      color: var(--ak-status-failed);
     }
     .confirm {
       display: inline-flex;
       align-items: center;
-      gap: var(--xkeeper-space-2);
+      gap: var(--ak-space-2);
       padding: 6px 12px;
-      border: 1px solid var(--xkeeper-signal);
-      border-radius: var(--xkeeper-radius-sm, 6px);
-      background: color-mix(in srgb, var(--xkeeper-signal) 10%, transparent);
-      color: var(--xkeeper-text);
+      border: 1px solid var(--ak-signal);
+      border-radius: var(--ak-radius-sm, 6px);
+      background: color-mix(in srgb, var(--ak-signal) 10%, transparent);
+      color: var(--ak-text);
       font-size: 0.84rem;
     }
     .notice {
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      padding: var(--ak-space-2) var(--ak-space-3);
+      border-radius: var(--ak-radius-sm, 6px);
       font-size: 0.85rem;
     }
     .notice[data-ok='true'] {
-      background: var(--xkeeper-status-done-bg);
-      color: var(--xkeeper-status-done);
+      background: var(--ak-status-done-bg);
+      color: var(--ak-status-done);
     }
     .notice[data-ok='false'] {
-      background: var(--xkeeper-status-failed-bg);
-      color: var(--xkeeper-status-failed);
+      background: var(--ak-status-failed-bg);
+      color: var(--ak-status-failed);
     }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: var(--xkeeper-space-3);
+      gap: var(--ak-space-3);
     }
     .card {
-      background: var(--xkeeper-surface);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
-      padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
+      background: var(--ak-surface);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
+      padding: var(--ak-space-3) var(--ak-space-4);
     }
     .card .k {
       display: block;
       font-size: 0.7rem;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       margin-bottom: 4px;
     }
     .card .v {
       font-size: 0.95rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
       font-variant-numeric: tabular-nums;
       word-break: break-all;
     }
@@ -143,21 +143,21 @@ export class XkeeperProgramDetail extends LitElement {
       grid-column: 1 / -1;
     }
     .cmd .v {
-      font-family: var(--xkeeper-font-mono, monospace);
+      font-family: var(--ak-font-mono, monospace);
       font-size: 0.85rem;
     }
-    xkeeper-log-viewer {
+    ak-log-viewer {
       min-height: 260px;
     }
     .log-title {
-      margin: var(--xkeeper-space-2) 0 0;
+      margin: var(--ak-space-2) 0 0;
       font-size: 0.95rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .missing {
-      padding: var(--xkeeper-space-6);
+      padding: var(--ak-space-6);
       text-align: center;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
   `
 
@@ -241,7 +241,7 @@ export class XkeeperProgramDetail extends LitElement {
         <h1>
           <span aria-hidden="true">${stateGlyph(p.state)}</span> ${p.name}
         </h1>
-        <xkeeper-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}></xkeeper-status-badge>
+        <ak-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}></ak-status-badge>
         ${this.renderActions()}
       </header>
       ${this.notice
@@ -281,13 +281,13 @@ export class XkeeperProgramDetail extends LitElement {
       ${p.last_exit ? html`<div class="notice" data-ok="false">上次退出：${p.last_exit}</div>` : nothing}
 
       <h2 class="log-title">日志</h2>
-      <xkeeper-log-viewer .program=${this.program}></xkeeper-log-viewer>
+      <ak-log-viewer .program=${this.program}></ak-log-viewer>
     `
   }
 }
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-program-detail': XkeeperProgramDetail
+    'ak-program-detail': AkProgramDetail
   }
 }

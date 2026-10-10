@@ -23,5 +23,5 @@
 ## 5. e2e 与文档
 
 - [x] 5.1 xtask e2e 增加 config 场景段：init → get 默认值 → set 合法键 → get 文件值 → 非法 set 拒绝且文件不变 → delete 已设键回退默认 → delete 幂等无变化 → 未知键 delete 拒绝 → 已存在 init 拒绝 → example.toml.sample 不进 list → `config --edit`（EDITOR=fake 脚本）校验路径；`cargo run -p xtask -- e2e` 全绿
-- [x] 5.2 README/AGENTS.md：config 子命令用法（五动作示例）、`xkeeper edit` 引用全部改为 `xkeeper config --edit`、架构行更新（CLI 子命令清单去 edit 增 config）
-- [ ] 5.3 双平台检查：`cargo check`（unix）与 Windows 目标交叉编译检查（`cargo check --target x86_64-pc-windows-msvc` 或 CI 等价），init 模板中平台差异默认值（log_dir）在 windows 渲染正确
+- [x] 5.2 README/AGENTS.md：config 子命令用法（五动作示例）、`ak edit` 引用全部改为 `ak config --edit`、架构行更新（CLI 子命令清单去 edit 增 config）
+- [x] 5.3 双平台检查：`cargo check`（unix）与 Windows 目标交叉编译检查（`cargo check --target x86_64-pc-windows-msvc` 或 CI 等价），init 模板中平台差异默认值（log_dir）在 windows 渲染正确

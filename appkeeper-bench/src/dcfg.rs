@@ -17,9 +17,9 @@ pub struct DaemonPaths {
 /// relative to the config dir; a fixed absolute default log dir).
 pub fn default_log_dir() -> PathBuf {
     if cfg!(windows) {
-        std::env::temp_dir().join("xkeeper").join("logs")
+        std::env::temp_dir().join("appkeeper").join("logs")
     } else {
-        PathBuf::from("/tmp/xkeeper/logs")
+        PathBuf::from("/tmp/appkeeper/logs")
     }
 }
 

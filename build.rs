@@ -8,7 +8,7 @@
 //!    no pnpm invocation, so Rust iteration stays fast. Whatever `dist/` is
 //!    on disk gets used (rust-embed serves it live from disk in debug); if
 //!    dist is missing a placeholder entry page is written so the server has
-//!    something to serve. `XKEEPER_WEBUI_BUILD=force` opts back into the
+//!    something to serve. `AK_WEBUI_BUILD=force` opts back into the
 //!    automatic build.
 //! 2. Release builds (or debug + `force`) keep the bundle current: when any
 //!    webui input (`src/`, configs, lockfile) is newer than the bundle — or
@@ -22,9 +22,9 @@
 //!    changed bundle recompiles the crate (and is re-embedded) even when no
 //!    Rust source changed.
 //!
-//! Set `XKEEPER_WEBUI_BUILD=skip` to never invoke the frontend toolchain and
+//! Set `AK_WEBUI_BUILD=skip` to never invoke the frontend toolchain and
 //! use whatever `dist/` is already on disk (used by CI jobs without a Node
-//! setup that don't serve the real UI). The legacy `XKEEPER_FRONTEND_BUILD`
+//! setup that don't serve the real UI). The legacy `AK_WEBUI_BUILD`
 //! variable is still honored with lower precedence.
 
 use std::fs;
@@ -54,14 +54,14 @@ fn main() {
     }
 
     let index = dist.join("index.html");
-    let marker = dist.join(".xkeeper-placeholder");
+    let marker = dist.join(".ak-placeholder");
 
     match build_mode() {
         BuildMode::Skip => {
             if !index.exists() {
                 write_placeholder(&dist);
             }
-            println!("cargo:rustc-env=XKEEPER_WEBUI_STAMP=skip");
+            println!("cargo:rustc-env=AK_WEBUI_STAMP=skip");
             return;
         }
         BuildMode::Auto | BuildMode::Force => {}
@@ -91,7 +91,7 @@ fn main() {
         );
     }
 
-    println!("cargo:rustc-env=XKEEPER_WEBUI_STAMP={}", stamp(&dist));
+    println!("cargo:rustc-env=AK_WEBUI_STAMP={}", stamp(&dist));
 }
 
 enum BuildMode {
@@ -105,12 +105,10 @@ enum BuildMode {
 
 /// Debug builds skip the frontend toolchain by default; `skip` forces that
 /// off-switch everywhere and `force` opts debug builds into the automatic
-/// build. The legacy `XKEEPER_FRONTEND_BUILD` variable is honored when the
-/// new one is unset.
+/// build. There is no legacy compatibility fallback — only `AK_WEBUI_BUILD`
+/// is read (design D2: no shim for the pre-rename env var).
 fn build_mode() -> BuildMode {
-    let raw = std::env::var("XKEEPER_WEBUI_BUILD")
-        .or_else(|_| std::env::var("XKEEPER_FRONTEND_BUILD"))
-        .unwrap_or_default();
+    let raw = std::env::var("AK_WEBUI_BUILD").unwrap_or_default();
     match raw.as_str() {
         "skip" | "0" | "false" => BuildMode::Skip,
         "force" => BuildMode::Force,
@@ -201,14 +199,14 @@ fn write_placeholder(dist: &Path) {
     fs::create_dir_all(dist).expect("create webui dist directory");
     fs::write(
         dist.join("index.html"),
-        "<!doctype html><html><body><h1>xkeeper webui</h1><p>Frontend bundle not built \
+        "<!doctype html><html><body><h1>appkeeper webui</h1><p>Frontend bundle not built \
          yet. Install Node >= 22 + pnpm and run <code>cargo build</code> — the \
          frontend is built automatically for release builds (debug: \
-         <code>XKEEPER_WEBUI_BUILD=force</code> or <code>pnpm build</code>).</p>\
+         <code>AK_WEBUI_BUILD=force</code> or <code>pnpm build</code>).</p>\
          </body></html>\n",
     )
     .expect("write placeholder index.html");
-    fs::write(dist.join(".xkeeper-placeholder"), "placeholder\n")
+    fs::write(dist.join(".ak-placeholder"), "placeholder\n")
         .expect("write placeholder marker");
 }
 

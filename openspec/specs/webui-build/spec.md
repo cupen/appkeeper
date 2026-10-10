@@ -18,7 +18,7 @@
 #### Scenario: release 构建包含真实控制台
 
 - **WHEN** 在有 Node 工具链的环境执行 `cargo build --release`
-- **THEN** 构建产物内嵌 `webui/dist` 的真实 SPA 入口页，`xkeeper webui`
+- **THEN** 构建产物内嵌 `webui/dist` 的真实 SPA 入口页，`appkeeper webui`
   启动后浏览器可加载控制台
 
 #### Scenario: 前端源码变更触发重新嵌入
@@ -30,7 +30,7 @@
 
 debug 构建（`PROFILE=debug`）SHALL 默认不调用前端包管理器：dist 缺失或
 为占位产物时直接嵌入占位页。此默认行为 MUST 可被环境变量
-`XKEEPER_WEBUI_BUILD=force` 覆盖，覆盖后 debug 构建与 release 行为一致。
+`AK_WEBUI_BUILD=force` 覆盖，覆盖后 debug 构建与 release 行为一致。
 
 #### Scenario: 无 dist 的 debug 构建快速通过
 
@@ -39,14 +39,14 @@ debug 构建（`PROFILE=debug`）SHALL 默认不调用前端包管理器：dist 
 
 #### Scenario: debug 强制构建
 
-- **WHEN** 设置 `XKEEPER_WEBUI_BUILD=force` 后执行 debug 构建
+- **WHEN** 设置 `AK_WEBUI_BUILD=force` 后执行 debug 构建
 - **THEN** 前端被正常构建并嵌入真实 UI
 
 #### Scenario: 环境变量重命名
 
-- **WHEN** 设置旧变量 `XKEEPER_FRONTEND_BUILD=skip`
+- **WHEN** 设置旧变量 `AK_WEBUI_BUILD=skip`
 - **THEN** 其语义（跳过前端构建、沿用磁盘已有 dist）与新变量
-  `XKEEPER_WEBUI_BUILD=skip` 等价，保证既有脚本（CI、文档）不立即失效
+  `AK_WEBUI_BUILD=skip` 等价，保证既有脚本（CI、文档）不立即失效
 
 ### Requirement: 工具链缺失回退
 
@@ -63,7 +63,7 @@ corepack 不可用或构建失败时，构建 SHALL 回退为嵌入占位入口�
 
 前端开发 SHALL 支持 `pnpm dev`（Vite dev server，固定端口 5273）热更新
 模式：dev server SHALL 把后端伺服的 `/api`、`/health` 与 `/ws` 三类路径
-代理到 `xkeeper webui` 后端（默认 `127.0.0.1:9877`），代理目标 MUST 可用
+代理到 `appkeeper webui` 后端（默认 `127.0.0.1:9877`），代理目标 MUST 可用
 环境变量覆盖。前端 `pnpm exec tsc --noEmit`、`pnpm test`、`pnpm build`
 MUST 可在 `webui/` 目录下独立执行。
 

@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use crate::cli::{Case, Effective};
 
 /// The registry name prefix shared by every bench-created app (design D7).
-pub const BENCH_PREFIX: &str = "xkeeper-bench-";
+pub const BENCH_PREFIX: &str = "appkeeper-bench-";
 
 /// fanout's built-in stderr split (design D2: fixed, not a parameter).
 pub const STDERR_EVERY: u32 = 10;
@@ -148,9 +148,9 @@ mod tests {
 
     fn fake_exe() -> PathBuf {
         if cfg!(windows) {
-            PathBuf::from("C:\\fake\\xkeeper-bench.exe")
+            PathBuf::from("C:\\fake\\appkeeper-bench.exe")
         } else {
-            PathBuf::from("/fake/xkeeper-bench")
+            PathBuf::from("/fake/appkeeper-bench")
         }
     }
 
@@ -159,7 +159,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-f", std::process::id()));
         let plans = plan(&eff(Case::Firehose), &fake_exe(), &dir).unwrap();
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].name, "xkeeper-bench-firehose");
+        assert_eq!(plans[0].name, "appkeeper-bench-firehose");
         assert!(plans[0].toml.contains("log_max_size = \"0\""));
         assert!(plans[0].toml.contains("restart = \"on-failure\""));
         assert!(plans[0].toml.contains("__generate"));
@@ -176,9 +176,9 @@ mod tests {
         assert_eq!(
             plans.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             vec![
-                "xkeeper-bench-fanout-0",
-                "xkeeper-bench-fanout-1",
-                "xkeeper-bench-fanout-2",
+                "appkeeper-bench-fanout-0",
+                "appkeeper-bench-fanout-1",
+                "appkeeper-bench-fanout-2",
             ]
         );
         for p in &plans {

@@ -7,7 +7,7 @@ import './app-shell.js'
 // Web Awesome theme + base styles (self-hosted, no CDN).
 import '@awesome.me/webawesome/dist/styles/webawesome.css'
 import '@awesome.me/webawesome/dist/styles/themes/default.css'
-// xkeeper's theme mapping on top of Web Awesome (indigo brand, dark surfaces).
+// appkeeper's theme mapping on top of Web Awesome (indigo brand, dark surfaces).
 import './styles/wa-overrides.css'
 
 // Theme: `wa-dark` on <html> is the single switch (dark is the default; the

@@ -97,7 +97,7 @@ fn unique_suffix() -> u128 {
 // -- daemon binary discovery (design D4) -------------------------------------
 
 pub fn discover_daemon(explicit: Option<&Path>) -> Result<PathBuf> {
-    let exe_name = if cfg!(windows) { "xkeeper.exe" } else { "xkeeper" };
+    let exe_name = if cfg!(windows) { "ak.exe" } else { "appkeeper" };
     if let Some(p) = explicit {
         let p = p
             .canonicalize()
@@ -127,8 +127,8 @@ pub fn discover_daemon(explicit: Option<&Path>) -> Result<PathBuf> {
         }
     }
     bail!(
-        "cannot find the xkeeper daemon binary (tried the bench binary's directory and \
-         workspace target/{{debug,release}}); pass --daemon <path to xkeeper>"
+        "cannot find the appkeeper daemon binary (tried the bench binary's directory and \
+         workspace target/{{debug,release}}); pass --daemon <path to appkeeper>"
     )
 }
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn discovery_prefers_explicit_and_bails_when_missing() {
-        assert!(discover_daemon(Some(Path::new("/nonexistent/xkeeper"))).is_err());
+        assert!(discover_daemon(Some(Path::new("/nonexistent/appkeeper"))).is_err());
         // sibling/manifest discovery is environment dependent; only assert the
         // explicit path contract here.
     }
@@ -463,7 +463,7 @@ mod tests {
         let ctx = CleanupCtx {
             client: Client::new("127.0.0.1:9", None).unwrap(),
             app_files: vec![dir.join("nope.toml")],
-            app_names: vec!["xkeeper-bench-nope".into()],
+            app_names: vec!["appkeeper-bench-nope".into()],
             log_dir: dir.clone(),
             root: None,
             count_dir: Some(dir.clone()),

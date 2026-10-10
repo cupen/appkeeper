@@ -259,7 +259,7 @@ impl Client {
 }
 
 fn unreachable(e: ureq::Error) -> anyhow::Error {
-    let hint = "daemon unreachable (is `xkeeper run` active?)";
+    let hint = "daemon unreachable (is `ak run` active?)";
     match e {
         ureq::Error::Transport(t) => anyhow::anyhow!("{hint}: {t}"),
         other => anyhow::anyhow!("{hint}: {other}"),

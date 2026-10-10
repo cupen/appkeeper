@@ -2,13 +2,13 @@
 
 ## Purpose
 
-定义 xkeeper 对子进程输出的接管与日志服务契约：输出捕获与落盘、按大小轮转、内存环形缓冲，以及日志查询/跟随行为和守护进程自身日志。
+定义 appkeeper 对子进程输出的接管与日志服务契约：输出捕获与落盘、按大小轮转、内存环形缓冲，以及日志查询/跟随行为和守护进程自身日志。
 
 ## Requirements
 
 ### Requirement: 输出捕获
 
-xkeeper SHALL 捕获每个子进程的 stdout 与 stderr，并分别追加写入 `{log_dir}/{name}.out.log` 与 `{log_dir}/{name}.err.log`；子进程的 stdin SHALL 连接到空输入。程序重启 SHALL 继续追加到同一组文件而不是覆盖。
+appkeeper SHALL 捕获每个子进程的 stdout 与 stderr，并分别追加写入 `{log_dir}/{name}.out.log` 与 `{log_dir}/{name}.err.log`；子进程的 stdin SHALL 连接到空输入。程序重启 SHALL 继续追加到同一组文件而不是覆盖。
 
 #### Scenario: 标准输出落盘
 
@@ -51,7 +51,7 @@ xkeeper SHALL 捕获每个子进程的 stdout 与 stderr，并分别追加写入
 
 ### Requirement: 环形缓冲与日志查询
 
-xkeeper SHALL 为每个输出流在内存中保留有界数量的最近日志行（可配置），供 `log` 查询与跟随使用，不依赖读取磁盘文件；查询 SHALL 支持 `tail=N` 返回最近 N 行，`follow` SHALL 持续推送新增行直到客户端断开或用户中断。
+appkeeper SHALL 为每个输出流在内存中保留有界数量的最近日志行（可配置），供 `log` 查询与跟随使用，不依赖读取磁盘文件；查询 SHALL 支持 `tail=N` 返回最近 N 行，`follow` SHALL 持续推送新增行直到客户端断开或用户中断。
 
 #### Scenario: tail 不受轮转影响
 
@@ -65,7 +65,7 @@ xkeeper SHALL 为每个输出流在内存中保留有界数量的最近日志行
 
 ### Requirement: 守护进程自身日志
 
-xkeeper 自身的生命周期事件（启动/关闭、程序启停、退出原因、健康状态变化、reload 结果）SHALL 以带时间戳的行输出到 stderr，级别可通过 `RUST_LOG` 或配置的 `log_level` 调整。
+appkeeper 自身的生命周期事件（启动/关闭、程序启停、退出原因、健康状态变化、reload 结果）SHALL 以带时间戳的行输出到 stderr，级别可通过 `RUST_LOG` 或配置的 `log_level` 调整。
 
 #### Scenario: 程序启停事件可见
 
@@ -74,7 +74,7 @@ xkeeper 自身的生命周期事件（启动/关闭、程序启停、退出原�
 
 ### Requirement: 输出排空零反压
 
-xkeeper 对子进程 stdout/stderr 管道的排空 MUST NOT 被下游任何环节反压：
+appkeeper 对子进程 stdout/stderr 管道的排空 MUST NOT 被下游任何环节反压：
 子进程的输出写 MUST NOT 因守护进程自身的处理（落盘、轮转、环形缓冲、
 订阅投递、查看者慢消费、指标采集）而阻塞超出操作系统管道固有的缓冲
 行为。具体地：

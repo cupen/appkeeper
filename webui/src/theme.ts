@@ -11,7 +11,7 @@
 
 export type ThemeMode = 'system' | 'dark' | 'light'
 
-const STORAGE_KEY = 'xkeeper:theme'
+const STORAGE_KEY = 'ak:theme'
 
 export function getThemeMode(): ThemeMode {
   try {

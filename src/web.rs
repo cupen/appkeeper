@@ -665,7 +665,7 @@ mod tests {
 
     fn test_sup() -> Arc<Supervisor> {
         let config = DaemonConfig::default();
-        let dir = std::env::temp_dir().join(format!("xkeeper-web-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-web-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         Supervisor::new(config, &dir).unwrap()
     }

@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import './dashboard.js'
-import type { XkeeperDashboard } from './dashboard.js'
+import type { AkDashboard } from './dashboard.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
@@ -110,8 +110,8 @@ describe('dashboard (console overview)', () => {
     return { store, ws }
   }
 
-  async function mount(store: ConsoleStore): Promise<XkeeperDashboard> {
-    const el = document.createElement('xkeeper-dashboard') as XkeeperDashboard
+  async function mount(store: ConsoleStore): Promise<AkDashboard> {
+    const el = document.createElement('ak-dashboard') as AkDashboard
     el.store = store
     document.body.appendChild(el)
     await el.updateComplete

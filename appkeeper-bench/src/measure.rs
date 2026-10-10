@@ -350,7 +350,7 @@ fn measure(
         },
         started_at: started_epoch,
         bin_versions: BinVersions {
-            xkeeper: site.daemon_version.clone(),
+            ak: site.daemon_version.clone(),
             bench: env!("CARGO_PKG_VERSION").to_string(),
         },
     };

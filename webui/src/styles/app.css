@@ -10,9 +10,9 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background-color: var(--xkeeper-bg);
-  color: var(--xkeeper-text);
-  font-family: var(--xkeeper-font-sans);
+  background-color: var(--ak-bg);
+  color: var(--ak-text);
+  font-family: var(--ak-font-sans);
   font-size: 15px;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
@@ -28,28 +28,28 @@ body {
 }
 
 ::selection {
-  background: var(--xkeeper-selection-bg);
+  background: var(--ak-selection-bg);
 }
 
 /* One visible focus indicator everywhere, keyboard or pointer. */
 :focus-visible {
-  outline: var(--xkeeper-focus-ring);
+  outline: var(--ak-focus-ring);
   outline-offset: 2px;
-  border-radius: var(--xkeeper-radius-sm);
+  border-radius: var(--ak-radius-sm);
 }
 
 /* Quiet, dev-tool scrollbars. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--xkeeper-border-strong) transparent;
+  scrollbar-color: var(--ak-border-strong) transparent;
 }
 *::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 *::-webkit-scrollbar-thumb {
-  background: var(--xkeeper-border-strong);
-  border-radius: var(--xkeeper-radius-full);
+  background: var(--ak-border-strong);
+  border-radius: var(--ak-radius-full);
   border: 2px solid transparent;
   background-clip: content-box;
 }

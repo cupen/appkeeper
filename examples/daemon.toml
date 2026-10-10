@@ -1,16 +1,16 @@
-# xkeeper daemon config sample (daemon.toml) — global settings only.
-# Default locations: Linux /etc/xkeeper/daemon.toml, Windows %APPDATA%\xkeeper\daemon.toml
-# Override with: xkeeper --config <path> run
-# The file may be absent entirely; xkeeper then runs empty with these defaults.
+# appkeeper daemon config sample (daemon.toml) — global settings only.
+# Default locations: Linux /etc/appkeeper/daemon.toml, Windows %APPDATA%\appkeeper\daemon.toml
+# Override with: ak --config <path> run
+# The file may be absent entirely; appkeeper then runs empty with these defaults.
 
 [daemon]
 log_level = "info"          # trace|debug|info|warn|error
-log_dir = "/tmp/xkeeper/logs" # absolute path required; /tmp is volatile — use e.g. /var/log/xkeeper for logs that survive reboots
+log_dir = "/tmp/appkeeper/logs" # absolute path required; /tmp is volatile — use e.g. /var/log/appkeeper for logs that survive reboots
 monitor_interval = 1.0      # supervision tick (seconds)
 host = "127.0.0.1"          # control API bind address (loopback by default)
 port = 7310                 # control API port
 auth_token = ""             # empty = no auth (loopback only); set a secret to require Bearer auth
-log_buffer_lines = 1000     # in-memory ring per stream, used by `xkeeper log --tail/-f`
+log_buffer_lines = 1000     # in-memory ring per stream, used by `ak log --tail/-f`
 app_dir = "apps"            # registration directory: one <name>.toml link per registered app
 
 # Optional: defaults for every registered app (fields mirror program fields).

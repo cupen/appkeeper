@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 /// The daemon/CLI binary under test (provided by cargo for integration tests).
 fn bin() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_xkeeper"))
+    Path::new(env!("CARGO_BIN_EXE_ak"))
 }
 
 fn free_port() -> u16 {
@@ -97,7 +97,7 @@ impl Ws {
             .arg(self.cfg())
             .args(args)
             .output()
-            .expect("spawn the xkeeper CLI");
+            .expect("spawn the appkeeper CLI");
         let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         (
@@ -154,7 +154,7 @@ impl Ws {
         panic!("daemon health never became {want}");
     }
 
-    /// Poll `xkeeper pid <name>`: Some(pid) when running, None when not.
+    /// Poll `ak pid <name>`: Some(pid) when running, None when not.
     fn pid_of(&self, name: &str) -> Option<u32> {
         let (ok, _code, out) = self.cli(&["pid", name]);
         if !ok {
@@ -583,7 +583,7 @@ fn add_restart_over_legacy_app_table_stays_valid() {
     let deploy = ws.root.join("deploy");
     std::fs::create_dir_all(&deploy).unwrap();
     std::fs::write(
-        deploy.join("xkeeper.toml"),
+        deploy.join("appkeeper.toml"),
         "[app]\nautorestart = \"always\"\n\n[program.p]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )
     .unwrap();
@@ -599,13 +599,13 @@ fn add_restart_over_legacy_app_table_stays_valid() {
     assert!(ok, "add must succeed (exit {code}): {out}");
 
     // The written file must not mix the new and deprecated fields in one layer.
-    let text = std::fs::read_to_string(deploy.join("xkeeper.toml")).unwrap();
+    let text = std::fs::read_to_string(deploy.join("appkeeper.toml")).unwrap();
     assert!(
         !(text.contains("restart =")
             && (text.contains("autorestart") || text.contains("autostart"))),
         "add must migrate the legacy fields, not mix them: {text}"
     );
-    let (ok, _code, out) = ws.cli(&["validate", deploy.join("xkeeper.toml").to_str().unwrap()]);
+    let (ok, _code, out) = ws.cli(&["validate", deploy.join("appkeeper.toml").to_str().unwrap()]);
     assert!(ok, "the migrated app must still validate: {out}");
 
     // And the daemon must actually load it.

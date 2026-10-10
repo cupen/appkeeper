@@ -1,7 +1,7 @@
 # metrics Specification
 
 ## Purpose
-定义 xkeeper 守护进程内建的指标采集与暴露能力：受管子进程的 CPU/内存利用率
+定义 appkeeper 守护进程内建的指标采集与暴露能力：受管子进程的 CPU/内存利用率
 采样、系统资源概况、按流的日志输出速率统计（滚动窗口），及其精度、空值与
 跨平台一致性要求，供控制面与 Web 控制台共享消费。
 
@@ -9,7 +9,7 @@
 
 ### Requirement: 每程序资源利用率采样
 
-xkeeper SHALL 对每个处于运行态的受管程序周期采样 CPU 利用率与驻留内存
+appkeeper SHALL 对每个处于运行态的受管程序周期采样 CPU 利用率与驻留内存
 （RSS），采样周期 MUST 不高于 1 秒：
 
 - `cpu_percent` SHALL 由相邻两次采样的进程 CPU 时间（用户 + 内核）增量除以
@@ -54,7 +54,7 @@ xkeeper SHALL 对每个处于运行态的受管程序周期采样 CPU 利用率�
 
 ### Requirement: 日志输出速率统计
 
-xkeeper SHALL 为每个程序的每个输出流（stdout/stderr）统计日志输出行数：
+appkeeper SHALL 为每个程序的每个输出流（stdout/stderr）统计日志输出行数：
 
 - 统计 SHALL 以每秒为粒度维护滚动计数，保留最近至少 300 秒；
 - 对 1s、10s、60s、300s 四种窗口，SHALL 能给出该窗口内的平均行速率

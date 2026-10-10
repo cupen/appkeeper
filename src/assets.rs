@@ -2,7 +2,7 @@
 //!
 //! The built SPA (`webui/dist`, built automatically by `build.rs` during
 //! `cargo build` for release; debug builds serve the on-disk dist) is
-//! compiled into the binary so a single `xkeeper` artifact
+//! compiled into the binary so a single `appkeeper` artifact
 //! ships the whole UI: `/assets/*` serves the content-hashed bundle files,
 //! and every page path falls back to the SPA entry document so client-side
 //! routes survive deep links and reloads.

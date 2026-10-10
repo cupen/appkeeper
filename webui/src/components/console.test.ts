@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import './console-tree.js'
 import './overview-bar.js'
 import '../views/program-detail.js'
-import type { XkeeperConsoleTree } from './console-tree.js'
-import type { XkeeperOverviewBar } from './overview-bar.js'
-import type { XkeeperProgramDetail } from '../views/program-detail.js'
+import type { AkConsoleTree } from './console-tree.js'
+import type { AkOverviewBar } from './overview-bar.js'
+import type { AkProgramDetail } from '../views/program-detail.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type ProgramInfo, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
@@ -82,7 +82,7 @@ function doc(): StatusDoc {
       system: { cpu_percent: 21.5, mem_used_bytes: 4 * 1024 ** 3, mem_total_bytes: 16 * 1024 ** 3 },
       monitor_interval: 1,
       uptime_secs: 90,
-      config_source: '/tmp/xkeeper.toml',
+      config_source: '/tmp/appkeeper.toml',
     },
     pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
     programs: [
@@ -118,7 +118,7 @@ describe('console components', () => {
   })
 
   it('tree lists every program including never-started ones, with active highlighting', async () => {
-    const el = document.createElement('xkeeper-console-tree') as XkeeperConsoleTree
+    const el = document.createElement('ak-console-tree') as AkConsoleTree
     el.apps = [{ name: 'demo', programs: doc().programs }]
     el.selectedApp = 'demo'
     el.selectedProgram = 'web'
@@ -136,7 +136,7 @@ describe('console components', () => {
   })
 
   it('overview bar shows system metrics and the refresh selector persists', async () => {
-    const el = document.createElement('xkeeper-overview-bar') as XkeeperOverviewBar
+    const el = document.createElement('ak-overview-bar') as AkOverviewBar
     el.store = store
     document.body.appendChild(el)
     await el.updateComplete
@@ -146,7 +146,7 @@ describe('console components', () => {
 
     const text = el.shadowRoot!.textContent!
     expect(text).toContain('0.1.0')
-    expect(text).toContain('/tmp/xkeeper.toml')
+    expect(text).toContain('/tmp/appkeeper.toml')
     expect(text).toContain('21.5%')
     expect(text).toContain('4.0 GiB')
     const select = el.shadowRoot!.querySelector('#refresh-select') as HTMLSelectElement
@@ -155,13 +155,13 @@ describe('console components', () => {
     select.value = '10000'
     select.dispatchEvent(new Event('change'))
     await el.updateComplete
-    expect(localStorage.getItem('xkeeper.refresh_ms')).toBe('10000')
+    expect(localStorage.getItem('ak.refresh_ms')).toBe('10000')
     expect(store.refreshInterval).toBe(10000)
     el.remove()
   })
 
   it('program detail shows run info and requires confirmation for stop', async () => {
-    const el = document.createElement('xkeeper-program-detail') as XkeeperProgramDetail
+    const el = document.createElement('ak-program-detail') as AkProgramDetail
     el.store = store
     el.app = 'demo'
     el.program = 'web'
@@ -203,7 +203,7 @@ describe('console components', () => {
   })
 
   it('program detail surfaces failure feedback on 409', async () => {
-    const el = document.createElement('xkeeper-program-detail') as XkeeperProgramDetail
+    const el = document.createElement('ak-program-detail') as AkProgramDetail
     el.store = store
     el.app = 'demo'
     el.program = 'worker' // fatal state → start button offered

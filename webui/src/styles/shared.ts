@@ -13,34 +13,34 @@ export const viewStyles = css`
     display: block;
   }
 
-  /* ---- Page header ------------------------------------------------- */
+  /* --ak---ak- Page header --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
   .page-head {
     display: flex;
     align-items: flex-end;
     justify-content: space-between;
-    gap: var(--xkeeper-space-4);
+    gap: var(--ak-space-4);
     flex-wrap: wrap;
-    margin-bottom: var(--xkeeper-space-5);
+    margin-bottom: var(--ak-space-5);
   }
   .page-title {
     margin: 0;
     font-size: 1.25rem;
     font-weight: 650;
     letter-spacing: -0.015em;
-    color: var(--xkeeper-text-bright);
+    color: var(--ak-text-bright);
   }
   .page-sub {
-    margin: var(--xkeeper-space-1) 0 0;
-    color: var(--xkeeper-text-dim);
+    margin: var(--ak-space-1) 0 0;
+    color: var(--ak-text-dim);
     font-size: 0.875rem;
   }
 
-  /* ---- Panels ------------------------------------------------------- */
+  /* --ak---ak- Panels --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
   .panel {
-    background: var(--xkeeper-surface);
-    border: 1px solid var(--xkeeper-border);
-    border-radius: var(--xkeeper-radius-lg);
-    box-shadow: var(--xkeeper-shadow-1);
+    background: var(--ak-surface);
+    border: 1px solid var(--ak-border);
+    border-radius: var(--ak-radius-lg);
+    box-shadow: var(--ak-shadow-1);
     overflow: hidden;
   }
   /* 8.1: at narrow widths a wide child (e.g. a data table) must stay
@@ -51,29 +51,29 @@ export const viewStyles = css`
     }
   }
   .panel-pad {
-    padding: var(--xkeeper-space-4);
+    padding: var(--ak-space-4);
   }
   .panel-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: var(--xkeeper-space-3);
+    gap: var(--ak-space-3);
     flex-wrap: wrap;
-    padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
-    border-bottom: 1px solid var(--xkeeper-border);
+    padding: var(--ak-space-3) var(--ak-space-4);
+    border-bottom: 1px solid var(--ak-border);
   }
   .panel-title {
     margin: 0;
     font-size: 0.95rem;
     font-weight: 600;
-    color: var(--xkeeper-text-bright);
+    color: var(--ak-text-bright);
   }
   .panel-caption {
-    color: var(--xkeeper-text-faint);
+    color: var(--ak-text-faint);
     font-size: 0.8rem;
   }
 
-  /* ---- Tables ------------------------------------------------------- */
+  /* --ak---ak- Tables --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
   table {
     width: 100%;
     border-collapse: collapse;
@@ -81,111 +81,111 @@ export const viewStyles = css`
   th,
   td {
     text-align: left;
-    padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
-    border-bottom: 1px solid var(--xkeeper-border);
+    padding: var(--ak-space-3) var(--ak-space-4);
+    border-bottom: 1px solid var(--ak-border);
     vertical-align: middle;
   }
   th {
-    color: var(--xkeeper-text-faint);
+    color: var(--ak-text-faint);
     font-weight: 550;
     font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    background: var(--xkeeper-surface-2);
+    background: var(--ak-surface-2);
     white-space: nowrap;
   }
   tbody tr {
-    transition: background var(--xkeeper-dur) var(--xkeeper-ease);
+    transition: background var(--ak-dur) var(--ak-ease);
   }
   tbody tr:hover {
-    background: var(--xkeeper-surface-2);
+    background: var(--ak-surface-2);
   }
   tbody tr:last-child td {
     border-bottom: none;
   }
   /* Status accent on the leading edge of a row (set data-status on the tr). */
   tbody tr[data-status] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-dormant);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-dormant);
   }
   tbody tr[data-status='starting'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-starting);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-starting);
   }
   tbody tr[data-status='queued'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-queued);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-queued);
   }
   tbody tr[data-status='working'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-working);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-working);
   }
   tbody tr[data-status='done'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-done);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-done);
   }
   tbody tr[data-status='failed'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-failed);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-failed);
   }
   tbody tr[data-status='dormant'] td:first-child {
-    box-shadow: inset 2px 0 0 0 var(--xkeeper-status-dormant);
+    box-shadow: inset 2px 0 0 0 var(--ak-status-dormant);
   }
 
-  /* ---- Typography helpers ------------------------------------------ */
+  /* --ak---ak- Typography helpers --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .mono {
-    font-family: var(--xkeeper-font-mono);
+    font-family: var(--ak-font-mono);
     font-size: 0.82rem;
   }
   .tnum {
     font-variant-numeric: tabular-nums;
   }
   .dim {
-    color: var(--xkeeper-text-dim);
+    color: var(--ak-text-dim);
   }
 
-  /* ---- Links -------------------------------------------------------- */
+  /* --ak---ak- Links --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   a {
-    color: var(--xkeeper-accent);
+    color: var(--ak-accent);
     text-decoration: none;
-    transition: color var(--xkeeper-dur) var(--xkeeper-ease);
+    transition: color var(--ak-dur) var(--ak-ease);
   }
   a:hover {
-    color: var(--xkeeper-accent-hover);
+    color: var(--ak-accent-hover);
     text-decoration: underline;
     text-underline-offset: 3px;
   }
   a:focus-visible {
-    outline: var(--xkeeper-focus-ring);
+    outline: var(--ak-focus-ring);
     outline-offset: 2px;
-    border-radius: var(--xkeeper-radius-sm);
+    border-radius: var(--ak-radius-sm);
   }
   button:focus-visible,
   textarea:focus-visible,
   input:focus-visible,
   select:focus-visible,
   [tabindex]:focus-visible {
-    outline: var(--xkeeper-focus-ring);
+    outline: var(--ak-focus-ring);
     outline-offset: 2px;
   }
 
-  /* ---- Empty states -------------------------------------------------- */
+  /* --ak---ak- Empty states --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .empty {
-    padding: var(--xkeeper-space-10) var(--xkeeper-space-6);
+    padding: var(--ak-space-10) var(--ak-space-6);
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: var(--xkeeper-space-2);
+    gap: var(--ak-space-2);
     text-align: center;
-    color: var(--xkeeper-text-dim);
+    color: var(--ak-text-dim);
   }
   .empty .glyph {
     display: grid;
     place-items: center;
     width: 44px;
     height: 44px;
-    border-radius: var(--xkeeper-radius-full);
-    background: var(--xkeeper-surface-2);
-    border: 1px solid var(--xkeeper-border);
-    color: var(--xkeeper-text-faint);
-    margin-bottom: var(--xkeeper-space-2);
+    border-radius: var(--ak-radius-full);
+    background: var(--ak-surface-2);
+    border: 1px solid var(--ak-border);
+    color: var(--ak-text-faint);
+    margin-bottom: var(--ak-space-2);
   }
   .empty .title {
-    color: var(--xkeeper-text-bright);
+    color: var(--ak-text-bright);
     font-weight: 600;
     font-size: 0.95rem;
   }
@@ -195,26 +195,26 @@ export const viewStyles = css`
     max-width: 42ch;
   }
   .empty .cta {
-    margin-top: var(--xkeeper-space-3);
+    margin-top: var(--ak-space-3);
   }
 
-  /* ---- Loading skeletons --------------------------------------------- */
+  /* --ak---ak- Loading skeletons --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
   .skel {
-    border-radius: var(--xkeeper-radius-sm);
+    border-radius: var(--ak-radius-sm);
     background: linear-gradient(
       90deg,
-      var(--xkeeper-surface-2) 25%,
-      var(--xkeeper-surface-3) 45%,
-      var(--xkeeper-surface-2) 65%
+      var(--ak-surface-2) 25%,
+      var(--ak-surface-3) 45%,
+      var(--ak-surface-2) 65%
     );
     background-size: 200% 100%;
-    animation: xkeeper-shimmer 1.4s ease-in-out infinite;
+    animation: appkeeper-shimmer 1.4s ease-in-out infinite;
   }
   .skel-row {
     display: flex;
-    gap: var(--xkeeper-space-4);
-    padding: var(--xkeeper-space-4);
-    border-bottom: 1px solid var(--xkeeper-border);
+    gap: var(--ak-space-4);
+    padding: var(--ak-space-4);
+    border-bottom: 1px solid var(--ak-border);
   }
   .skel-row:last-child {
     border-bottom: none;
@@ -222,7 +222,7 @@ export const viewStyles = css`
   .skel-line {
     height: 12px;
   }
-  @keyframes xkeeper-shimmer {
+  @keyframes appkeeper-shimmer {
     from {
       background-position: 180% 0;
     }
@@ -236,48 +236,48 @@ export const viewStyles = css`
     }
   }
 
-  /* ---- Callouts ------------------------------------------------------ */
+  /* --ak---ak- Callouts --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .callout {
     display: flex;
     align-items: flex-start;
-    gap: var(--xkeeper-space-2);
-    padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
-    border-radius: var(--xkeeper-radius-md);
+    gap: var(--ak-space-2);
+    padding: var(--ak-space-3) var(--ak-space-4);
+    border-radius: var(--ak-radius-md);
     border: 1px solid;
     font-size: 0.875rem;
-    margin: 0 0 var(--xkeeper-space-4);
+    margin: 0 0 var(--ak-space-4);
   }
   .callout svg {
     flex: 0 0 auto;
     margin-top: 2px;
   }
   .callout-error {
-    color: var(--xkeeper-status-failed);
-    background: var(--xkeeper-status-failed-bg);
-    border-color: var(--xkeeper-status-failed-border);
+    color: var(--ak-status-failed);
+    background: var(--ak-status-failed-bg);
+    border-color: var(--ak-status-failed-border);
   }
   .callout-warn,
   .callout-warning {
-    color: var(--xkeeper-status-working);
-    background: var(--xkeeper-status-working-bg);
-    border-color: var(--xkeeper-status-working-border);
+    color: var(--ak-status-working);
+    background: var(--ak-status-working-bg);
+    border-color: var(--ak-status-working-border);
   }
   .callout-info {
-    color: var(--xkeeper-status-done);
-    background: var(--xkeeper-status-done-bg);
-    border-color: var(--xkeeper-status-done-border);
+    color: var(--ak-status-done);
+    background: var(--ak-status-done-bg);
+    border-color: var(--ak-status-done-border);
   }
 
-  /* ---- Chips ---------------------------------------------------------- */
+  /* --ak---ak- Chips --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .chip {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     padding: 3px 10px;
-    border-radius: var(--xkeeper-radius-full);
-    border: 1px solid var(--xkeeper-border);
-    background: var(--xkeeper-surface-2);
-    color: var(--xkeeper-text-dim);
+    border-radius: var(--ak-radius-full);
+    border: 1px solid var(--ak-border);
+    background: var(--ak-surface-2);
+    color: var(--ak-text-dim);
     font-size: 0.78rem;
     white-space: nowrap;
   }
@@ -285,33 +285,33 @@ export const viewStyles = css`
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--xkeeper-text-faint);
+    background: var(--ak-text-faint);
   }
   .chip b {
-    color: var(--xkeeper-text-bright);
+    color: var(--ak-text-bright);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
 
-  /* ---- Key/value rows -------------------------------------------------- */
+  /* --ak---ak- Key/value rows --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .kv {
     display: grid;
     grid-template-columns: minmax(140px, 220px) 1fr;
-    gap: var(--xkeeper-space-2) var(--xkeeper-space-6);
-    padding: var(--xkeeper-space-3) 0;
-    border-bottom: 1px solid var(--xkeeper-border);
+    gap: var(--ak-space-2) var(--ak-space-6);
+    padding: var(--ak-space-3) 0;
+    border-bottom: 1px solid var(--ak-border);
     margin: 0;
   }
   .kv:last-child {
     border-bottom: none;
   }
   .kv dt {
-    color: var(--xkeeper-text-dim);
+    color: var(--ak-text-dim);
     font-size: 0.875rem;
   }
   .kv dd {
     margin: 0;
-    color: var(--xkeeper-text);
+    color: var(--ak-text);
     font-variant-numeric: tabular-nums;
     overflow-wrap: anywhere;
   }

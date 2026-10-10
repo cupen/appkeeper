@@ -3,13 +3,13 @@
 // webui-ui: pending 变更提示与 apply 操作 — component-level interaction
 // tests mirroring the acceptance checklist (F) against the real Lit
 // components with a fake transport. The full-browser pass lives in
-// `cargo run -p xtask -- e2e` (playwright).
+// `cargo run -p xtask --ak- e2e` (playwright).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import './overview-bar.js'
 import '../views/app-overview.js'
-import type { XkeeperOverviewBar } from './overview-bar.js'
-import type { XkeeperAppOverview } from '../views/app-overview.js'
+import type { AkOverviewBar } from './overview-bar.js'
+import type { AkAppOverview } from '../views/app-overview.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type ProgramInfo, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
@@ -133,16 +133,16 @@ describe('pending + apply UI (webui-ui: pending 变更提示与 apply 操作)', 
     vi.restoreAllMocks()
   })
 
-  async function mountBar(): Promise<XkeeperOverviewBar> {
-    const el = document.createElement('xkeeper-overview-bar') as XkeeperOverviewBar
+  async function mountBar(): Promise<AkOverviewBar> {
+    const el = document.createElement('ak-overview-bar') as AkOverviewBar
     el.store = store
     document.body.appendChild(el)
     await el.updateComplete
     return el
   }
 
-  async function mountOverview(app: string): Promise<XkeeperAppOverview> {
-    const el = document.createElement('xkeeper-app-overview') as XkeeperAppOverview
+  async function mountOverview(app: string): Promise<AkAppOverview> {
+    const el = document.createElement('ak-app-overview') as AkAppOverview
     el.store = store
     el.app = app
     document.body.appendChild(el)

@@ -1,8 +1,8 @@
-# xkeeper-webui — Agent Instructions
+# appkeeper — Agent Instructions
 
 轻量级进程守护工具（Rust），通过 TOML 配置守护任意多个子进程：退出后指数退避重启、
 stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理进程树。
-内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`xkeeper reload` 热生效）。
+内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`ak reload` 热生效）。
 
 ## Architecture
 
@@ -19,7 +19,7 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
   状态投影（`StatusDoc`/`ProgramInfo`）由此导出。
-- `xkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
+- `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
   bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
   外部采集（daemon 侧零改动）；轮转对账/清理契约见 README「性能基准」。
 - `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
@@ -29,13 +29,13 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 - `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
 - `webui/` — Web 控制台前端（pnpm + Vite + TypeScript + Lit），release 构建
   后 `dist/` 经 rust-embed 嵌入二进制；dist 不提交。build.rs 在 release（或
-  `XKEEPER_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
+  `AK_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
   运行时读盘，无 Node 时回退占位页）。
 
 ## Build & Run
 
 ```bash
-cargo build --release                  # 产物 target/release/xkeeper(.exe)
+cargo build --release                  # 产物 target/release/appkeeper(.exe)
 
 cd webui
 pnpm install
@@ -44,13 +44,13 @@ pnpm dev                               # HMR dev server（:5273），代理 /api
 
 cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--restart/add 场景
                                        #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
-                                       #   + xkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
+                                       #   + appkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- run                       # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
                                        #   config --set webui.listen=... + reload 可热开启）
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
 
-cargo run -p xkeeper-bench -- --case firehose --duration 10
+cargo run -p appkeeper-bench -- --case firehose --duration 10
                                        # 性能基准：firehose/rotation/fanout/drip 四 case；
                                        #   缺省自带隔离环境（临时 workspace + 随机端口），
                                        #   --connect <addr> 连同机已运行 daemon（--token Bearer），

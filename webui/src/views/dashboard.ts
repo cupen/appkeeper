@@ -12,8 +12,8 @@ import type { ProgramInfo } from '../lib/types.js'
 import { stateGlyph } from '../lib/format.js'
 import { navigate } from '../router.js'
 
-@customElement('xkeeper-dashboard')
-export class XkeeperDashboard extends LitElement {
+@customElement('ak-dashboard')
+export class AkDashboard extends LitElement {
   /** Injectable for tests; defaults to the shared singleton. */
   @property({ attribute: false }) store: ConsoleStore = consoleStore
 
@@ -26,47 +26,47 @@ export class XkeeperDashboard extends LitElement {
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: var(--xkeeper-space-4);
-      padding: var(--xkeeper-space-4) var(--xkeeper-space-5);
+      gap: var(--ak-space-4);
+      padding: var(--ak-space-4) var(--ak-space-5);
       box-sizing: border-box;
     }
     h1 {
       margin: 0;
       font-size: 1.25rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .banner {
-      padding: var(--xkeeper-space-2) var(--xkeeper-space-3);
-      border-radius: var(--xkeeper-radius-sm, 6px);
+      padding: var(--ak-space-2) var(--ak-space-3);
+      border-radius: var(--ak-radius-sm, 6px);
       font-size: 0.85rem;
     }
     .banner[data-mode='poll'] {
-      background: color-mix(in srgb, var(--xkeeper-status-working) 12%, transparent);
-      color: var(--xkeeper-status-working);
-      border: 1px solid var(--xkeeper-status-working-border, transparent);
+      background: color-mix(in srgb, var(--ak-status-working) 12%, transparent);
+      color: var(--ak-status-working);
+      border: 1px solid var(--ak-status-working-border, transparent);
     }
     .banner[data-mode='offline'] {
-      background: var(--xkeeper-status-failed-bg);
-      color: var(--xkeeper-status-failed);
-      border: 1px solid var(--xkeeper-status-failed-border);
+      background: var(--ak-status-failed-bg);
+      color: var(--ak-status-failed);
+      border: 1px solid var(--ak-status-failed-border);
     }
     .app {
-      background: var(--xkeeper-surface);
-      border: 1px solid var(--xkeeper-border);
-      border-radius: var(--xkeeper-radius-lg, 10px);
-      padding: var(--xkeeper-space-3) var(--xkeeper-space-4);
+      background: var(--ak-surface);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-lg, 10px);
+      padding: var(--ak-space-3) var(--ak-space-4);
     }
     .app h2 {
-      margin: 0 0 var(--xkeeper-space-2);
+      margin: 0 0 var(--ak-space-2);
       font-size: 1rem;
-      color: var(--xkeeper-text-bright);
+      color: var(--ak-text-bright);
     }
     .app a {
       color: inherit;
       text-decoration: none;
     }
     .app a:hover h2 {
-      color: var(--xkeeper-accent-hover);
+      color: var(--ak-accent-hover);
     }
     ul {
       list-style: none;
@@ -81,32 +81,32 @@ export class XkeeperDashboard extends LitElement {
       align-items: center;
       gap: 8px;
       font-size: 0.88rem;
-      color: var(--xkeeper-text-dim);
+      color: var(--ak-text-dim);
       font-variant-numeric: tabular-nums;
       cursor: pointer;
     }
     li[data-state='fatal'] {
-      color: var(--xkeeper-status-failed);
+      color: var(--ak-status-failed);
     }
     li .glyph {
       width: 1em;
       text-align: center;
     }
     .fatal-note {
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
       font-size: 0.8rem;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
     .empty {
-      padding: var(--xkeeper-space-6);
+      padding: var(--ak-space-6);
       text-align: center;
-      color: var(--xkeeper-text-faint);
+      color: var(--ak-text-faint);
     }
     .empty code {
-      font-family: var(--xkeeper-font-mono, monospace);
-      color: var(--xkeeper-text-dim);
+      font-family: var(--ak-font-mono, monospace);
+      color: var(--ak-text-dim);
     }
   `
 
@@ -151,7 +151,7 @@ export class XkeeperDashboard extends LitElement {
         : nothing}
       ${doc && doc.programs.length === 0
         ? html`<div class="empty">
-              还没有应用。<code>xkeeper add &lt;目录&gt;</code> 注册后出现在这里。
+              还没有应用。<code>ak add &lt;目录&gt;</code> 注册后出现在这里。
             </div>`
         : nothing}
       ${[...this.byApp()].map(
@@ -172,8 +172,8 @@ export class XkeeperDashboard extends LitElement {
                       navigate(`/app/${encodeURIComponent(app)}/program/${encodeURIComponent(p.name)}`)}
                   >
                     <span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span>
-                    <xkeeper-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
-                    ></xkeeper-status-badge>
+                    <ak-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
+                    ></ak-status-badge>
                     <span>${p.name}</span>
                     ${p.fatal_reason ? html`<span class="fatal-note">${p.fatal_reason}</span>` : nothing}
                   </li>
@@ -189,6 +189,6 @@ export class XkeeperDashboard extends LitElement {
 
 declare global {
   interface HTMLElementTagNameMap {
-    'xkeeper-dashboard': XkeeperDashboard
+    'ak-dashboard': AkDashboard
   }
 }

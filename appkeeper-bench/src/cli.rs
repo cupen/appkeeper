@@ -39,90 +39,90 @@ impl Case {
 #[derive(Debug, Args)]
 pub struct BenchArgs {
     /// Load case to measure: firehose | rotation | fanout | drip.
-    #[arg(long, value_enum)]
+    #[arg(long = "case", value_enum)]
     pub case: Option<Case>,
 
     /// Total rows produced per load program (0 or absent = unlimited).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "log-rows", default_value_t = 0)]
     pub log_rows: u64,
 
     /// Payload bytes of one log line, newline excluded.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long = "log-row-size", default_value_t = 128)]
     pub log_row_size: u64,
 
     /// Aggregate byte ceiling over all load programs, first limit wins (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "log-total-size", default_value_t = 0)]
     pub log_total_size: u64,
 
     /// Production rate in rows/sec per program (0 = full speed; drip defaults to 100 when absent).
-    #[arg(long)]
+    #[arg(long = "rate")]
     pub rate: Option<u64>,
 
     /// Wall-clock ceiling in seconds for the load phase (0 = unlimited).
-    #[arg(long, default_value_t = 30)]
+    #[arg(long = "duration", default_value_t = 30)]
     pub duration: u64,
 
     /// Number of parallel load programs (consumed by the fanout case only).
-    #[arg(long, default_value_t = 4)]
+    #[arg(long = "programs", default_value_t = 4)]
     pub programs: u32,
 
     /// Connect to an already-running daemon at HOST:PORT instead of spawning
     /// an isolated one. The daemon must be on the same host (bench reads its
     /// app registry and log files from disk). NOTE: the load writes real disk
     /// logs through the target daemon.
-    #[arg(long)]
+    #[arg(long = "connect")]
     pub connect: Option<String>,
 
     /// Bearer token for the daemon control plane (use with --connect).
-    #[arg(long)]
+    #[arg(long = "token")]
     pub token: Option<String>,
 
-    /// Path of the xkeeper daemon binary (default: discovered next to this
+    /// Path of the appkeeper daemon binary (default: discovered next to this
     /// binary, then target/{debug,release} of this workspace).
-    #[arg(long)]
+    #[arg(long = "daemon")]
     pub daemon: Option<PathBuf>,
 
     /// Also write the machine-readable report to this JSON file.
-    #[arg(long)]
+    #[arg(long = "json")]
     pub json: Option<PathBuf>,
 
     /// Keep the measurement site for inspection: spawn mode keeps the temp
     /// workspace, connect mode keeps the bench log files. The bench app is
     /// always unregistered from the daemon.
-    #[arg(long)]
+    #[arg(long = "keep")]
     pub keep: bool,
 }
 
-/// Hidden self-reentry generator: `xkeeper-bench __generate ...` runs as a
+/// Hidden self-reentry generator: `appkeeper-bench __generate ...` runs as a
 /// supervised daemon child writing paced log lines to stdout/stderr.
 #[derive(Debug, Args)]
 pub struct GenerateArgs {
     /// Rows per second (0 or absent = full speed).
-    #[arg(long)]
+    #[arg(long = "rate")]
     pub rate: Option<f64>,
 
     /// Total rows to produce (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "rows", default_value_t = 0)]
     pub rows: u64,
 
     /// Payload bytes of one line, newline excluded.
-    #[arg(long)]
+    #[arg(long = "row-size")]
     pub row_size: u64,
 
     /// Total produced bytes ceiling (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "total-size", default_value_t = 0)]
     pub total_size: u64,
 
     /// Wall-clock ceiling in seconds (0 = unlimited).
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long = "duration", default_value_t = 0.0)]
     pub duration: f64,
 
     /// Every Nth row goes to stderr (0 = never; fanout uses 10).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "stderr-every", default_value_t = 0)]
     pub stderr_every: u32,
 
     /// Where to write the produced-rows/bytes counters as JSON on exit.
-    #[arg(long)]
+    #[arg(long = "count-file")]
     pub count_file: Option<PathBuf>,
 }
 
@@ -135,9 +135,9 @@ pub enum Cmd {
 
 #[derive(Debug, clap::Parser)]
 #[command(
-    name = "xkeeper-bench",
+    name = "appkeeper-bench",
     version,
-    about = "Load benchmark harness for a real xkeeper daemon (cases: firehose, rotation, fanout, drip)",
+    about = "Load benchmark harness for a real appkeeper daemon (cases: firehose, rotation, fanout, drip)",
     after_help = "Exit code reflects run success only; compare two JSON reports yourself for regressions."
 )]
 pub struct Cli {
@@ -225,7 +225,7 @@ mod tests {
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Result<Effective> {
-        let cli = Cli::try_parse_from(std::iter::once("xkeeper-bench").chain(args.iter().copied()))
+        let cli = Cli::try_parse_from(std::iter::once("appkeeper-bench").chain(args.iter().copied()))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         resolve(&cli.bench)
     }
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn unknown_case_prints_supported_list_and_fails() {
-        let err = Cli::try_parse_from(["xkeeper-bench", "--case", "turbo"]).unwrap_err();
+        let err = Cli::try_parse_from(["appkeeper-bench", "--case", "turbo"]).unwrap_err();
         let text = format!("{err}");
         for c in ["firehose", "rotation", "fanout", "drip"] {
             assert!(text.contains(c), "supported list must mention {c}: {text}");
@@ -274,15 +274,15 @@ mod tests {
 
     #[test]
     fn negative_and_non_numeric_values_are_rejected() {
-        assert!(Cli::try_parse_from(["xkeeper-bench", "--case", "firehose", "--log-rows", "-5"])
+        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "-5"])
             .is_err());
-        assert!(Cli::try_parse_from(["xkeeper-bench", "--case", "firehose", "--log-rows", "abc"])
+        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "abc"])
             .is_err());
         assert!(
-            Cli::try_parse_from(["xkeeper-bench", "--case", "firehose", "--log-row-size", "-1"])
+            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-row-size", "-1"])
                 .is_err()
         );
-        assert!(Cli::try_parse_from(["xkeeper-bench", "--case", "firehose", "--programs", "x"])
+        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--programs", "x"])
             .is_err());
     }
 
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn generate_mode_is_hidden_but_parses() {
         let cli = Cli::try_parse_from([
-            "xkeeper-bench",
+            "appkeeper-bench",
             "__generate",
             "--row-size",
             "64",

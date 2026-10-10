@@ -1,13 +1,18 @@
 [workspace]
-members = ["xtask", "xkeeper-bench"]
+members = ["xtask", "appkeeper-bench"]
 resolver = "2"
 
 [package]
-name = "xkeeper"
+name = "appkeeper"
 version = "0.1.0"
 edition = "2024"
-description = "A lightweight process keeper/daemon supervised from a TOML file"
+description = "appkeeper: a lightweight process keeper/daemon supervised from a TOML file"
 license = "MIT"
+default-run = "ak"
+
+[[bin]]
+name = "ak"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

@@ -1,7 +1,7 @@
-//! xkeeper — a cross-platform, application-layer process keeper with a TOML
+//! appkeeper — a cross-platform, application-layer process keeper with a TOML
 //! layered config (global daemon config + per-app deployment files).
 //!
-//! `xkeeper run` is the daemon; everything else is a client: control
+//! `ak run` is the daemon; everything else is a client: control
 //! subcommands talk to the loopback HTTP API, and add/remove/list manage the
 //! app registry (app_dir links).
 
@@ -44,13 +44,13 @@ const EXIT_UNREACHABLE: i32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "xkeeper",
+    name = "ak",
     version,
     about = "Cross-platform application-layer process keeper (daemon + CLI)"
 )]
 struct Cli {
     /// Path to the daemon config file. Defaults to the platform location
-    /// (/etc/xkeeper/daemon.toml on Linux, %APPDATA%\xkeeper\daemon.toml on Windows).
+    /// (/etc/appkeeper/daemon.toml on Linux, %APPDATA%\appkeeper\daemon.toml on Windows).
     #[arg(short = 'c', long, global = true)]
     config: Option<PathBuf>,
 
@@ -67,20 +67,21 @@ enum Cmd {
     /// line and takes effect immediately.
     ///
     /// The web console is config-driven: add a `[webui]` section to the
-    /// daemon config (or `xkeeper config --set webui.listen=...` + reload)
+    /// daemon config (or `ak config --set webui.listen=...` + reload)
     /// to enable it
     Run {
         /// Start this already-registered program
         #[arg(value_name = "NAME")]
         name: Option<String>,
         /// Start every program of this app, in the established order
-        #[arg(long, conflicts_with = "name")]
+        #[arg(long = "app", conflicts_with = "name")]
         app: Option<String>,
         /// Run the daemon in the background (daemon form only)
-        #[arg(long)]
+        #[arg(long = "detach")]
         detach: bool,
         /// (ad-hoc) register this command line as a new app; everything after
-        /// `--` is the command. Mutually exclusive with `--cmd`
+        /// `--` (the clap end-of-flags separator) is the command.
+        /// Mutually exclusive with `--cmd`
         #[arg(
             last = true,
             num_args = 1..,
@@ -98,21 +99,21 @@ enum Cmd {
         #[arg(long = "name", value_name = "APP")]
         scaffold_name: Option<String>,
         /// (ad-hoc) description for the generated app
-        #[arg(long)]
+        #[arg(long = "description")]
         description: Option<String>,
         /// (ad-hoc) startup/restart policy literal written into the generated
         /// config: no | on-failure | always | unless-stopped
-        #[arg(long, value_parser = ["no", "on-failure", "always", "unless-stopped"])]
+        #[arg(long = "restart", value_parser = ["no", "on-failure", "always", "unless-stopped"])]
         restart: Option<String>,
         /// (ad-hoc) first restart delay in seconds (exponential backoff)
-        #[arg(long)]
+        #[arg(long = "restart-backoff")]
         restart_backoff: Option<f64>,
         /// (ad-hoc) environment variable K=V; repeat for more
         #[arg(long = "env")]
         envs: Vec<String>,
         /// (ad-hoc) working directory for the program
         /// (default: the directory `run` is invoked in)
-        #[arg(long)]
+        #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
     },
     /// Validate the daemon config + all registered apps, or one app file
@@ -129,12 +130,12 @@ enum Cmd {
         /// --set webui.listen=127.0.0.1:9877. Strong-typed whitelist; unknown
         /// keys / type violations are rejected untouched and the result is
         /// validated before it is written atomically
-        #[arg(long, value_name = "KEY=VALUE", conflicts_with_all = ["get", "delete", "edit", "init"])]
+        #[arg(long = "set", value_name = "KEY=VALUE", conflicts_with_all = ["get", "delete", "edit", "init"])]
         set: Vec<String>,
         /// Print the effective value of a daemon config key (repeatable; a
         /// bare value per key; unset keys answer with the built-in default,
         /// e.g. `webui.listen` falls back to 127.0.0.1:9877)
-        #[arg(long, value_name = "KEY", conflicts_with_all = ["delete", "edit", "init"])]
+        #[arg(long = "get", value_name = "KEY", conflicts_with_all = ["delete", "edit", "init"])]
         get: Vec<String>,
         /// Remove a daemon config key or whole section (repeatable): bare
         /// keys are shorthand for [daemon] leaves, dotted paths like
@@ -142,15 +143,15 @@ enum Cmd {
         /// section name (`webui`) removes the whole table — deleting
         /// `[webui]` turns the console off. Idempotent — absent targets
         /// change nothing
-        #[arg(long, value_name = "KEY", conflicts_with_all = ["edit", "init"])]
+        #[arg(long = "delete", value_name = "KEY", conflicts_with_all = ["edit", "init"])]
         delete: Vec<String>,
         /// Open the daemon config in $VISUAL/$EDITOR (vi/notepad), creating
         /// it when missing, then validate the result
-        #[arg(long, conflicts_with = "init")]
+        #[arg(long = "edit", conflicts_with = "init")]
         edit: bool,
         /// Initialize a fresh daemon config (refuses to overwrite) plus the
         /// app registry directory and an example.toml.sample template
-        #[arg(long)]
+        #[arg(long = "init")]
         init: bool,
     },
     /// Overview of daemon and all programs (human-readable table by default;
@@ -158,7 +159,7 @@ enum Cmd {
     Status {
         /// Print the pretty JSON projection instead of the table (script
         /// migration path)
-        #[arg(long)]
+        #[arg(long = "json")]
         json: bool,
     },
     /// Stop a program (graceful, then force after stop timeout), or every
@@ -168,7 +169,7 @@ enum Cmd {
         #[arg(required_unless_present = "app", conflicts_with = "app")]
         name: Option<String>,
         /// Stop every program of this app, in reverse start order
-        #[arg(long)]
+        #[arg(long = "app")]
         app: Option<String>,
     },
     /// Restart a program, or every program of one app with --app
@@ -177,7 +178,7 @@ enum Cmd {
         #[arg(required_unless_present = "app", conflicts_with = "app")]
         name: Option<String>,
         /// Restart every program of this app
-        #[arg(long)]
+        #[arg(long = "app")]
         app: Option<String>,
     },
     /// Execute a program's declared custom action; the CLI exit code is the
@@ -194,11 +195,11 @@ enum Cmd {
         /// One or more program names
         #[arg(required = true, value_name = "NAME")]
         names: Vec<String>,
-        #[arg(long, default_value = "20")]
+        #[arg(long = "tail", default_value = "20")]
         tail: usize,
-        #[arg(short = 'f', long)]
+        #[arg(short = 'f', long = "follow")]
         follow: bool,
-        #[arg(long, value_parser = ["out", "err", "both"], default_value = "out")]
+        #[arg(long = "stream", value_parser = ["out", "err", "both"], default_value = "out")]
         stream: String,
     },
     /// Reload daemon config and all registered apps (per-app atomic)
@@ -214,49 +215,49 @@ enum Cmd {
         #[arg(default_value = None)]
         program: Option<String>,
         /// Also restart unchanged programs (user-stopped ones stay stopped)
-        #[arg(long)]
+        #[arg(long = "restart")]
         restart: bool,
     },
     /// Stop all programs and exit the daemon
     Shutdown,
-    /// Register an app: a directory with xkeeper.toml, a config file path,
+    /// Register an app: a directory with appkeeper.toml, a config file path,
     /// or an executable program (scaffolds a fresh config in app_dir).
     /// Re-running `add` on the same executable regenerates its whole config
     /// from the given flags — manual edits to the generated file are
     /// overwritten.
     Add {
-        /// App directory (containing xkeeper.toml), a config file path, or
+        /// App directory (containing appkeeper.toml), a config file path, or
         /// an executable program to scaffold a config from
         #[arg(default_value = ".")]
         path: PathBuf,
         /// App name (default: directory name, or the executable's file
         /// name without extension for scaffolds; `all` is reserved)
-        #[arg(long)]
+        #[arg(long = "name")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long = "description")]
         description: Option<String>,
         /// Startup/restart policy written into the [app] table (as an
         /// app-level default): no | on-failure | always | unless-stopped
-        #[arg(long, value_parser = ["no", "on-failure", "always", "unless-stopped"])]
+        #[arg(long = "restart", value_parser = ["no", "on-failure", "always", "unless-stopped"])]
         restart: Option<String>,
-        #[arg(long)]
+        #[arg(long = "restart-backoff")]
         restart_backoff: Option<f64>,
-        #[arg(long)]
+        #[arg(long = "priority")]
         priority: Option<i32>,
         /// (scaffold) startup args as one string, split like a shell line:
         /// --args "--port 8080 --mode x"
-        #[arg(long)]
+        #[arg(long = "args")]
         args: Option<String>,
         /// (scaffold) environment variable K=V; repeat for more
         #[arg(long = "env")]
         envs: Vec<String>,
         /// (scaffold) working directory for the program
         /// (default: the directory `add` runs in)
-        #[arg(long)]
+        #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
         /// Apply this app right after registering; when the daemon is
         /// offline it is pulled up in the background first
-        #[arg(long)]
+        #[arg(long = "apply")]
         apply: bool,
     },
     /// Unregister an app: external deployment configs are kept; a
@@ -270,7 +271,7 @@ enum Cmd {
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
     },
-    /// Install/uninstall xkeeper as a system service (Linux systemd; root required)
+    /// Install/uninstall appkeeper as a system service (Linux systemd; root required)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
@@ -311,7 +312,7 @@ fn main() {
     let code = match dispatch(&cli) {
         Ok(()) => EXIT_OK,
         Err(e) => {
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             EXIT_ERROR
         }
     };
@@ -333,8 +334,8 @@ fn reject_removed_start() {
         }
         if s == "start" {
             eprintln!(
-                "xkeeper: error: the `start` verb has been removed — use `xkeeper run <name>` \
-                 (or `xkeeper run --app <app>`) instead"
+                "ak: error: the `start` verb has been removed — use `ak run <name>` \
+                 (or `ak run --app <app>`) instead"
             );
             std::process::exit(EXIT_CONFIG);
         }
@@ -347,19 +348,19 @@ fn reject_removed_start() {
 pub(crate) fn default_config_path() -> PathBuf {
     #[cfg(unix)]
     {
-        PathBuf::from("/etc/xkeeper/daemon.toml")
+        PathBuf::from("/etc/appkeeper/daemon.toml")
     }
     #[cfg(windows)]
     {
-        // %APPDATA%\xkeeper\daemon.toml
+        // %APPDATA%\appkeeper\daemon.toml
         match std::env::var("APPDATA") {
-            Ok(appdata) => PathBuf::from(appdata).join("xkeeper").join("daemon.toml"),
+            Ok(appdata) => PathBuf::from(appdata).join("appkeeper").join("daemon.toml"),
             Err(_) => {
                 let home = std::env::var("USERPROFILE").unwrap_or_default();
                 PathBuf::from(home)
                     .join("AppData")
                     .join("Roaming")
-                    .join("xkeeper")
+                    .join("appkeeper")
                     .join("daemon.toml")
             }
         }
@@ -373,7 +374,7 @@ fn config_path_of(cli: &Cli) -> PathBuf {
 fn dispatch(cli: &Cli) -> Result<()> {
     // Client subcommands don't reach the daemon's logger init; without
     // this, warnings from the registry/config layers would be dropped
-    // silently. `run` (and bare `xkeeper`) init their own logger from the
+    // silently. `run` (and bare `appkeeper`) init their own logger from the
     // config's log_level.
     if !matches!(&cli.cmd, None | Some(Cmd::Run { .. })) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -394,6 +395,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             restart_backoff,
             envs,
             workdir,
+            ..
         }) => {
             let adhoc = !cmd.is_empty() || cmd_str.is_some();
             if adhoc {
@@ -402,7 +404,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 // positionals cleanly, so reject here.
                 if name.is_some() || app.is_some() || *detach {
                     eprintln!(
-                        "xkeeper: error: the ad-hoc command form (`--`/`--cmd`) cannot be \
+                        "ak: error: the ad-hoc command form (`--`/`--cmd`) cannot be \
                          combined with a program name, --app, or --detach"
                     );
                     std::process::exit(EXIT_CONFIG);
@@ -421,8 +423,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
             } else if name.is_some() || app.is_some() {
                 if *detach {
                     eprintln!(
-                        "xkeeper: error: --detach is only valid for the bare daemon form \
-                         (`xkeeper run --detach`)"
+                        "ak: error: --detach is only valid for the bare daemon form \
+                         (`ak run --detach`)"
                     );
                     std::process::exit(EXIT_CONFIG);
                 }
@@ -430,8 +432,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 // here would silently drop them (design D10: ad-hoc only).
                 if restart.is_some() || restart_backoff.is_some() {
                     eprintln!(
-                        "xkeeper: error: --restart/--restart-backoff only apply when \
-                         registering a new command (`xkeeper run -- <cmd...>`)"
+                        "ak: error: --restart/--restart-backoff only apply when \
+                         registering a new command (`ak run -- <cmd...>`)"
                     );
                     std::process::exit(EXIT_CONFIG);
                 }
@@ -456,7 +458,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             init,
         }) => {
             if set.is_empty() && get.is_empty() && delete.is_empty() && !*edit && !*init {
-                // `xkeeper config` with no action flag prints its own usage
+                // `ak config` with no action flag prints its own usage
                 // and exits 0 (a global --config alone must stay legal, so
                 // clap's arg_required_else_help does not apply here).
                 let mut cmd = Cli::command();
@@ -596,7 +598,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             let restart_policy = match restart.as_deref().map(config::parse_restart_cli) {
                 Some(Ok(v)) => Some(v),
                 Some(Err(e)) => {
-                    eprintln!("xkeeper: error: {e}");
+                    eprintln!("ak: error: {e}");
                     std::process::exit(EXIT_CONFIG);
                 }
                 None => None,
@@ -621,7 +623,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 match apply_after_add(&config, &config_path, &result.app) {
                     AddApplyOutcome::Applied(text) => println!("{text}"),
                     AddApplyOutcome::Failed(msg, code) => {
-                        eprintln!("xkeeper: error: {msg}");
+                        eprintln!("ak: error: {msg}");
                         std::process::exit(code);
                     }
                 }
@@ -678,7 +680,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             let apps = registry::ListedApp::good(registry::list(&config, &config_dir)?);
             if apps.is_empty() {
                 println!(
-                    "no apps registered (use `xkeeper add <dir>` in an app deployment directory)"
+                    "no apps registered (use `ak add <dir>` in an app deployment directory)"
                 );
                 return Ok(());
             }
@@ -704,12 +706,12 @@ fn parse_envs(
         let (k, v) = match kv.split_once('=') {
             Some(pair) => pair,
             None => {
-                eprintln!("xkeeper: error: --env expects K=V, got {kv:?}");
+                eprintln!("ak: error: --env expects K=V, got {kv:?}");
                 return Err(EXIT_CONFIG);
             }
         };
         if k.trim().is_empty() {
-            eprintln!("xkeeper: error: --env key must not be empty: {kv:?}");
+            eprintln!("ak: error: --env key must not be empty: {kv:?}");
             return Err(EXIT_CONFIG);
         }
         env.insert(k.to_string(), v.to_string());
@@ -737,7 +739,7 @@ fn print_add_result(result: &registry::AddResult) {
         println!("  work_dir: {}", result.work_dir.display());
         if result.changed {
             println!(
-                "changed: run `xkeeper apply {}` (or bare `xkeeper apply`) to take effect",
+                "changed: run `ak apply {}` (or bare `ak apply`) to take effect",
                 result.app
             );
         } else {
@@ -758,7 +760,7 @@ fn format_log_line(name: &str, line: &str, multi: bool) -> String {
     }
 }
 
-/// `xkeeper log <name...>`: multi-program aggregation. A single program keeps
+/// `ak log <name...>`: multi-program aggregation. A single program keeps
 /// the byte-identical legacy output (no prefix); multiple programs get a
 /// `[name] ` line prefix and, in follow mode, concurrent connections.
 fn log_cmd(
@@ -816,7 +818,7 @@ fn log_cmd(
     Ok(())
 }
 
-/// `xkeeper run --detach`: spawn the daemon in the background and report once
+/// `ak run --detach`: spawn the daemon in the background and report once
 /// it is serving (background-daemon spec). Non-zero exit on timeout / bind
 /// conflict, naming the background log.
 fn run_detach(config_path: &Path) -> Result<()> {
@@ -838,8 +840,8 @@ fn run_detach(config_path: &Path) -> Result<()> {
         }
         daemonize::SpawnOutcome::TimedOut { log_path } => {
             eprintln!(
-                "xkeeper: error: the daemon did not become ready; see {} \
-                 (a port conflict is likely — check `xkeeper status`)",
+                "ak: error: the daemon did not become ready; see {} \
+                 (a port conflict is likely — check `ak status`)",
                 log_path.display()
             );
             std::process::exit(EXIT_ERROR);
@@ -922,7 +924,7 @@ fn split_adhoc_trailing(
     Ok((argv.to_vec(), flags))
 }
 
-/// `xkeeper run -- <cmd...>` / `run --cmd "<string>"`: register the command
+/// `ak run -- <cmd...>` / `run --cmd "<string>"`: register the command
 /// line as a new app and take effect immediately (app-registry spec). The two
 /// entry forms normalize to the same argv; the first token is resolved to an
 /// absolute path; the rest become args. The scaffold engine is reused, so
@@ -947,7 +949,7 @@ fn run_adhoc(
         match split_adhoc_trailing(trailing) {
             Ok(pair) => pair,
             Err(e) => {
-                eprintln!("xkeeper: error: {e}");
+                eprintln!("ak: error: {e}");
                 std::process::exit(EXIT_CONFIG);
             }
         }
@@ -971,7 +973,7 @@ fn run_adhoc(
     };
     if argv.is_empty() {
         eprintln!(
-            "xkeeper: error: no command given (use `xkeeper run -- <cmd...>` or `--cmd \"...\"`)"
+            "ak: error: no command given (use `ak run -- <cmd...>` or `--cmd \"...\"`)"
         );
         std::process::exit(EXIT_CONFIG);
     }
@@ -982,7 +984,7 @@ fn run_adhoc(
     let restart_policy = match restart.map(config::parse_restart_cli) {
         Some(Ok(v)) => Some(v),
         Some(Err(e)) => {
-            eprintln!("xkeeper: error: {e}");
+            eprintln!("ak: error: {e}");
             std::process::exit(EXIT_CONFIG);
         }
         None => None,
@@ -991,7 +993,7 @@ fn run_adhoc(
         Ok(p) => (p, argv[1..].to_vec()),
         Err(e) => {
             // Command resolution failure: exit 2 with no registration artifact.
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             std::process::exit(EXIT_CONFIG);
         }
     };
@@ -1016,7 +1018,7 @@ fn run_adhoc(
     match apply_after_add(&config, config_path, &result.app) {
         AddApplyOutcome::Applied(text) => println!("{text}"),
         AddApplyOutcome::Failed(msg, code) => {
-            eprintln!("xkeeper: error: {msg}");
+            eprintln!("ak: error: {msg}");
             std::process::exit(code);
         }
     }
@@ -1054,12 +1056,12 @@ fn sync_if_online(config: &DaemonConfig) -> Result<()> {
     let c = client::Client::from_config(config);
     if c.health().is_ok() {
         // reload = rescan + detect only: the registry change enters pending;
-        // `xkeeper apply` makes it take effect (app-registry spec).
+        // `ak apply` makes it take effect (app-registry spec).
         c.reload().with_context(|| {
             "registry change persisted, but the running daemon failed to rescan; \
-             run `xkeeper reload` once the problem is fixed, then `xkeeper apply`"
+             run `ak reload` once the problem is fixed, then `ak apply`"
         })?;
-        println!("daemon synced: registration is pending — run `xkeeper apply` to take effect");
+        println!("daemon synced: registration is pending — run `ak apply` to take effect");
     }
     Ok(())
 }
@@ -1072,7 +1074,7 @@ fn client_cmd(config_path: &Path, f: impl FnOnce(&client::Client) -> Result<()>)
         Err(e) => {
             // Exit with the class code, but never silently — the message is
             // the only trace of what the control plane answered.
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             std::process::exit(client::exit_code_of(&e));
         }
     }
@@ -1089,7 +1091,7 @@ fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
     })
 }
 
-/// `xkeeper run <name>`: start an already-registered program. An unknown name
+/// `ak run <name>`: start an already-registered program. An unknown name
 /// is a control-plane 404; per the control-plane spec the error must also
 /// point at the ad-hoc form (a bare token can only ever be a program name —
 /// registering a new command line goes through `run --`).
@@ -1105,11 +1107,11 @@ fn start_or_hint(config_path: &Path, name: &str) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             if format!("{e:#}").contains("404") {
                 eprintln!(
                     "hint: `{name}` is not a registered program — to register and run a new \
-                     command line, use `xkeeper run -- <cmd...>`"
+                     command line, use `ak run -- <cmd...>`"
                 );
             }
             std::process::exit(client::exit_code_of(&e));
@@ -1117,7 +1119,7 @@ fn start_or_hint(config_path: &Path, name: &str) -> Result<()> {
     }
 }
 
-/// `xkeeper action <program> <action>`: print the output tail and pass the
+/// `appkeeper action <program> <action>`: print the output tail and pass the
 /// action's own exit code through (control-plane spec: 调用失败 1、守护不可达 3、
 /// 超时 1 — anything else is the action's exit status).
 fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<()> {
@@ -1126,7 +1128,7 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
     let v = match c.custom_action(program, action) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             std::process::exit(client::exit_code_of(&e));
         }
     };
@@ -1141,7 +1143,7 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
         .and_then(|t| t.as_bool())
         .unwrap_or(false)
     {
-        eprintln!("xkeeper: error: action {program}.{action} timed out (process tree killed)");
+        eprintln!("ak: error: action {program}.{action} timed out (process tree killed)");
         std::process::exit(EXIT_ERROR);
     }
     match v.get("exit_code").and_then(|e| e.as_i64()) {
@@ -1153,7 +1155,7 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
     }
 }
 
-/// `xkeeper start|stop|restart --app <name>`: app-level fan-out; the server
+/// `ak start|stop|restart --app <name>`: app-level fan-out; the server
 /// expands it in the established order and reports per-program results.
 fn fanout_cmd(config_path: &Path, app: &str, verb: &str) -> Result<()> {
     client_cmd(config_path, |c| {
@@ -1191,7 +1193,7 @@ fn apply_after_add(config: &DaemonConfig, config_path: &Path, app: &str) -> AddA
             return AddApplyOutcome::Failed(
                 format!(
                     "the daemon did not become ready, so app[{app}] could not take effect; \
-                     see {} (check the config with `xkeeper validate`)",
+                     see {} (check the config with `ak validate`)",
                     log_path.display()
                 ),
                 EXIT_ERROR,
@@ -1272,14 +1274,14 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
 fn config_sync_hint(config: &DaemonConfig) -> &'static str {
     let c = client::Client::from_config(config);
     if c.health().is_ok() {
-        "note: daemon is online — run `xkeeper reload` (then `xkeeper apply` if apps changed) \
+        "note: daemon is online — run `ak reload` (then `ak apply` if apps changed) \
          for the new config to take effect"
     } else {
         "note: daemon is offline — the change takes effect at next start"
     }
 }
 
-/// `xkeeper config` body: perform exactly one action class (clap enforces
+/// `ak config` body: perform exactly one action class (clap enforces
 /// the mutual exclusion). Returns the process exit code so tests can drive
 /// the branches; config-level problems print to stderr and return
 /// `EXIT_CONFIG` (2), IO errors bubble up (`EXIT_ERROR` via main).
@@ -1312,7 +1314,7 @@ fn config_cmd(
             match config::config_effective_value(text.as_deref(), k) {
                 Ok(v) => out.push((k.clone(), v)),
                 Err(e) => {
-                    eprintln!("xkeeper: error: {e:#}");
+                    eprintln!("ak: error: {e:#}");
                     return Ok(EXIT_CONFIG);
                 }
             }
@@ -1331,13 +1333,13 @@ fn config_cmd(
         let parsed = match config::parse_sets(sets) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("xkeeper: error: {e:#}");
+                eprintln!("ak: error: {e:#}");
                 return Ok(EXIT_CONFIG);
             }
         };
         if !config_path.exists() {
             eprintln!(
-                "xkeeper: error: no daemon config at {} — run `xkeeper config --init` first",
+                "ak: error: no daemon config at {} — run `ak config --init` first",
                 config_path.display()
             );
             return Ok(EXIT_CONFIG);
@@ -1347,12 +1349,12 @@ fn config_cmd(
         let rendered = match config::config_apply_sets(&text, &parsed) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("xkeeper: error: {e:#}");
+                eprintln!("ak: error: {e:#}");
                 return Ok(EXIT_CONFIG);
             }
         };
         if let Err(e) = config::atomic_write_daemon_config(config_path, &rendered) {
-            eprintln!("xkeeper: error: {e:#}");
+            eprintln!("ak: error: {e:#}");
             return Ok(EXIT_CONFIG);
         }
         for (k, kv) in &parsed {
@@ -1365,7 +1367,7 @@ fn config_cmd(
     if !deletes.is_empty() {
         if !config_path.exists() {
             eprintln!(
-                "xkeeper: error: no daemon config at {} — run `xkeeper config --init` first",
+                "ak: error: no daemon config at {} — run `ak config --init` first",
                 config_path.display()
             );
             return Ok(EXIT_CONFIG);
@@ -1376,14 +1378,14 @@ fn config_cmd(
             Ok(config::DeleteOutcome::Changed(r)) => Some(r),
             Ok(config::DeleteOutcome::NoChange) => None,
             Err(e) => {
-                eprintln!("xkeeper: error: {e:#}");
+                eprintln!("ak: error: {e:#}");
                 return Ok(EXIT_CONFIG);
             }
         };
         match rendered {
             Some(r) => {
                 if let Err(e) = config::atomic_write_daemon_config(config_path, &r) {
-                    eprintln!("xkeeper: error: {e:#}");
+                    eprintln!("ak: error: {e:#}");
                     return Ok(EXIT_CONFIG);
                 }
                 for k in deletes {
@@ -1409,8 +1411,8 @@ fn config_cmd(
     if init {
         if config_path.exists() {
             eprintln!(
-                "xkeeper: error: {} already exists — refusing to initialize over an existing \
-                 config (delete it first or use `xkeeper config --edit`)",
+                "ak: error: {} already exists — refusing to initialize over an existing \
+                 config (delete it first or use `ak config --edit`)",
                 config_path.display()
             );
             return Ok(EXIT_CONFIG);
@@ -1424,7 +1426,7 @@ fn config_cmd(
             println!("kept existing {}", rep.sample_file.display());
         }
         println!(
-            "next: `xkeeper config --edit` to customize, `xkeeper add <dir>` to register apps"
+            "next: `ak config --edit` to customize, `ak add <dir>` to register apps"
         );
         println!("{}", config_sync_hint(&pre_config));
         return Ok(EXIT_OK);
@@ -1435,7 +1437,7 @@ fn config_cmd(
 
 /// Content written when `edit` creates a missing config file.
 const EDIT_SEED: &str = "\
-# xkeeper daemon config — every field is optional; built-in defaults apply
+# appkeeper daemon config — every field is optional; built-in defaults apply
 # for anything omitted. Annotated templates live in the repository:
 #   conf/daemon.toml  (this file)    conf/app.toml  (per-app deployment)
 ";
@@ -1444,7 +1446,7 @@ const EDIT_SEED: &str = "\
 ///
 /// `$VISUAL` wins over `$EDITOR` (standard precedence); both fall back to a
 /// platform default. A missing config file is created (with parents) seeded
-/// with `EDIT_SEED`, so first-time setup via `xkeeper config --edit` works.
+/// with `EDIT_SEED`, so first-time setup via `ak config --edit` works.
 /// Returns the process exit code: `EXIT_OK` when the config is valid (or
 /// absent, meaning defaults), `EXIT_CONFIG` when the editor left an invalid
 /// file behind; launching the editor itself fails with `Err`.
@@ -1488,12 +1490,12 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
     let (cfg, existed) = match DaemonConfig::load_or_default(config_path) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("xkeeper: daemon config is invalid:\n{e:#}");
+            eprintln!("ak: daemon config is invalid:\n{e:#}");
             return Ok(EXIT_CONFIG);
         }
     };
     if let Err(e) = cfg.validate() {
-        eprintln!("xkeeper: daemon config is invalid:\n{e:#}");
+        eprintln!("ak: daemon config is invalid:\n{e:#}");
         return Ok(EXIT_CONFIG);
     }
     if existed {
@@ -1510,7 +1512,7 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 // -- daemon -----------------------------------------------------------------
 /// `run` is the only daemon entry. The web console is config-driven: its
 /// initial state comes from the `[webui]` section of the daemon config
-/// (absent = off), and `xkeeper reload` converges it later at runtime.
+/// (absent = off), and `ak reload` converges it later at runtime.
 fn run_daemon(config_path: &Path) -> Result<()> {
     let (config, existed) = DaemonConfig::load_or_default(config_path)
         .with_context(|| format!("failed to load daemon config {}", config_path.display()))?;
@@ -1595,7 +1597,7 @@ fn run_daemon(config_path: &Path) -> Result<()> {
     // Bootstrap the registry and enter the supervision loop.
     sup.bootstrap()?;
     info!(
-        "xkeeper {} running (Ctrl+C to stop)",
+        "appkeeper {} running (Ctrl+C to stop)",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -1641,7 +1643,7 @@ mod edit_tests {
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("# xkeeper daemon config"),
+            text.contains("# appkeeper daemon config"),
             "seed missing: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1849,7 +1851,7 @@ mod config_cmd_tests {
 
     #[test]
     fn clap_config_repeated_set_parses() {
-        let cli = Cli::try_parse_from(["xkeeper", "config", "--set", "port=1", "--set", "host=x"])
+        let cli = Cli::try_parse_from(["appkeeper", "config", "--set", "port=1", "--set", "host=x"])
             .unwrap();
         match cli.cmd {
             Some(Cmd::Config {
@@ -1868,12 +1870,12 @@ mod config_cmd_tests {
 
     #[test]
     fn clap_config_bare_action_flags_parse() {
-        let cli = Cli::try_parse_from(["xkeeper", "config", "--edit"]).unwrap();
+        let cli = Cli::try_parse_from(["appkeeper", "config", "--edit"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Config { edit: true, .. })));
-        let cli = Cli::try_parse_from(["xkeeper", "config", "--init"]).unwrap();
+        let cli = Cli::try_parse_from(["appkeeper", "config", "--init"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Config { init: true, .. })));
         // Bare `config` parses too — dispatch then prints help with exit 0.
-        let cli = Cli::try_parse_from(["xkeeper", "config"]).unwrap();
+        let cli = Cli::try_parse_from(["appkeeper", "config"]).unwrap();
         match cli.cmd {
             Some(Cmd::Config {
                 set,
@@ -1905,7 +1907,7 @@ mod config_cmd_tests {
             &["--init", "--delete", "port"],
         ];
         for combo in combos {
-            let mut argv = vec!["xkeeper", "config"];
+            let mut argv = vec!["appkeeper", "config"];
             argv.extend_from_slice(combo);
             let r = Cli::try_parse_from(&argv);
             assert!(r.is_err(), "config {combo:?} must be rejected");
@@ -1917,8 +1919,8 @@ mod config_cmd_tests {
         // Spec: 无任何动作 flag 时打印五个动作 flag 的用法说明并以 0 退出。
         // dispatch renders the subcommand help and returns Ok (exit 0); the
         // usage content itself is asserted by the e2e config pass (K13).
-        let cli = Cli::try_parse_from(["xkeeper", "config"]).unwrap();
-        dispatch(&cli).expect("bare `xkeeper config` must exit 0");
+        let cli = Cli::try_parse_from(["appkeeper", "config"]).unwrap();
+        dispatch(&cli).expect("bare `ak config` must exit 0");
     }
 
     // -- orchestration: exit codes over real temp files -----------------------
@@ -2144,13 +2146,13 @@ mod cli_verb_tests {
     use super::*;
 
     fn parse(argv: &[&str]) -> Cli {
-        let mut full = vec!["xkeeper"];
+        let mut full = vec!["appkeeper"];
         full.extend_from_slice(argv);
         Cli::try_parse_from(&full).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"))
     }
 
     fn parse_err(argv: &[&str]) -> String {
-        let mut full = vec!["xkeeper"];
+        let mut full = vec!["appkeeper"];
         full.extend_from_slice(argv);
         Cli::try_parse_from(&full)
             .err()

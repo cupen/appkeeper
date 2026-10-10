@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
 import './status-badge.js'
-import type { XkeeperStatusBadge } from './status-badge.js'
+import type { AkStatusBadge } from './status-badge.js'
 
 describe('accessibility baseline', () => {
   it('status badge text remains available in greyscale (label + glyph nodes)', async () => {
-    const el = document.createElement('xkeeper-status-badge') as XkeeperStatusBadge
+    const el = document.createElement('ak-status-badge') as AkStatusBadge
     el.slug = 'failed'
     el.label = 'Failed'
     el.glyph = '✕'

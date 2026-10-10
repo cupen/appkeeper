@@ -10,41 +10,41 @@
     group: root
     mode: "0755"
   loop:
-    - "{{ xkeeper_binary_dest }}"
-    - "{{ xkeeper_config_dest }}"
+    - "{{ appkeeper_binary_dest }}"
+    - "{{ appkeeper_config_dest }}"
 
-- name: Distribute xkeeper binary
+- name: Distribute appkeeper binary
   ansible.builtin.copy:
     src: "{{ xk_binary_effective_src }}"
-    dest: "{{ xkeeper_binary_dest }}"
+    dest: "{{ appkeeper_binary_dest }}"
     owner: root
     group: root
     mode: "0755"
-  notify: Restart xkeeper service
+  notify: Restart ak service
 
 - name: Install daemon config
   ansible.builtin.copy:
-    src: "{{ xkeeper_config_src }}"
-    dest: "{{ xkeeper_config_dest }}"
+    src: "{{ appkeeper_config_src }}"
+    dest: "{{ appkeeper_config_dest }}"
     owner: root
     group: root
     mode: "0644"
-  notify: Restart xkeeper service
+  notify: Restart ak service
 
 - name: Build service install argument list
   ansible.builtin.set_fact:
     xk_service_install_argv: >-
-      {{ [xkeeper_binary_dest, 'service', 'install', '--now', '--name', xkeeper_service_name]
-         + (['--force'] if (xkeeper_force_overwrite | bool and xk_traces | length > 0) else [])
-         + (['--user', xkeeper_service_user] if xkeeper_service_user | length > 0 else []) }}
+      {{ [appkeeper_binary_dest, 'service', 'install', '--now', '--name', appkeeper_service_name]
+         + (['--force'] if (appkeeper_force_overwrite | bool and xk_traces | length > 0) else [])
+         + (['--user', appkeeper_service_user] if appkeeper_service_user | length > 0 else []) }}
 
-- name: Register and start xkeeper service
+- name: Register and start ak service
   ansible.builtin.command:
     argv: "{{ xk_service_install_argv }}"
   changed_when: not xk_unit_pre.stat.exists
 
 - name: Verify service is running
-  ansible.builtin.command: "systemctl is-active {{ xkeeper_service_name }}"
+  ansible.builtin.command: "systemctl is-active {{ appkeeper_service_name }}"
   register: xk_active_post
   changed_when: false
   failed_when: xk_active_post.rc != 0

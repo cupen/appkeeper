@@ -2,7 +2,7 @@
 
 ## Purpose
 
-定义 xkeeper 对受管子进程生命周期的行为契约：状态机、启动与重启策略、启动/停止排序、优雅停止与进程树清理、健康监控。所有行为在 Linux 与 Windows 上对齐到同一规格，平台差异仅体现在信号与进程树机制上。
+定义 appkeeper 对受管子进程生命周期的行为契约：状态机、启动与重启策略、启动/停止排序、优雅停止与进程树清理、健康监控。所有行为在 Linux 与 Windows 上对齐到同一规格，平台差异仅体现在信号与进程树机制上。
 
 ## Requirements
 
@@ -75,7 +75,7 @@
 
 #### Scenario: 守护正常关机不写停止记录
 
-- **WHEN** `unless-stopped` 程序随 `xkeeper shutdown` 被停止后守护进程重新启动
+- **WHEN** `unless-stopped` 程序随 `ak shutdown` 被停止后守护进程重新启动
 - **THEN** 无「用户停止」记录，该程序被自动拉起
 
 ### Requirement: 启动与停止排序
@@ -99,7 +99,7 @@
 
 ### Requirement: 优雅停止
 
-对运行中的程序发出停止请求时，xkeeper SHALL 先请求优雅终止（Unix 上发送 SIGTERM），等待至多 `stop_timeout` 秒；超时后 SHALL 强制终止（Unix 上 SIGKILL，Windows 上 TerminateProcess）。停止完成后程序 SHALL 进入 `stopped`。
+对运行中的程序发出停止请求时，appkeeper SHALL 先请求优雅终止（Unix 上发送 SIGTERM），等待至多 `stop_timeout` 秒；超时后 SHALL 强制终止（Unix 上 SIGKILL，Windows 上 TerminateProcess）。停止完成后程序 SHALL 进入 `stopped`。
 
 #### Scenario: 进程在超时内自行退出
 
@@ -109,11 +109,11 @@
 #### Scenario: 进程无视优雅信号被强杀
 
 - **WHEN** 进程在 `stop_timeout` 内未退出
-- **THEN** xkeeper 强制终止该进程，程序仍进入 `stopped`，且记录使用了强制终止
+- **THEN** appkeeper 强制终止该进程，程序仍进入 `stopped`，且记录使用了强制终止
 
 ### Requirement: 进程树清理
 
-守护进程退出时 MUST NOT 遗留存活的子进程。在 Windows 上，该保证 SHALL 由作业对象（kill-on-close）兜底：即使守护进程被强制杀死，子进程树也被内核回收。在 Unix 上，xkeeper SHALL 将子进程放入独立进程组，停止程序时终止整个进程组。
+守护进程退出时 MUST NOT 遗留存活的子进程。在 Windows 上，该保证 SHALL 由作业对象（kill-on-close）兜底：即使守护进程被强制杀死，子进程树也被内核回收。在 Unix 上，appkeeper SHALL 将子进程放入独立进程组，停止程序时终止整个进程组。
 
 #### Scenario: 守护进程被强制杀死后无孤儿（Windows）
 

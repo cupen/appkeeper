@@ -1,7 +1,7 @@
 ---
 galaxy_info:
-  author: xkeeper
-  description: Deploy the xkeeper process keeper binary and register it as a systemd service
+  author: appkeeper
+  description: Deploy the appkeeper process keeper binary and register it as a systemd service
   license: MIT
   min_ansible_version: "2.12"
   platforms:

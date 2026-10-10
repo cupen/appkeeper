@@ -1,6 +1,6 @@
 //! Background daemon spawn + readiness polling (background-daemon spec).
 //!
-//! Two entry points share this module: the explicit `xkeeper run --detach`
+//! Two entry points share this module: the explicit `ak run --detach`
 //! and the implicit pull-up performed by the "take effect now" entries
 //! (`add --apply` and the run ad-hoc form) when the daemon is offline.
 //!
@@ -82,10 +82,10 @@ pub fn wait_ready(client: &Client, timeout: Duration) -> bool {
     }
 }
 
-/// Spawn `xkeeper run -c <config>` detached, with stdout/stderr appended to
+/// Spawn `ak run -c <config>` detached, with stdout/stderr appended to
 /// `log_path`. Returns the child pid for diagnostics.
 pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
-    let exe = std::env::current_exe().context("cannot locate the xkeeper executable")?;
+    let exe = std::env::current_exe().context("cannot locate the appkeeper executable")?;
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("cannot create log dir {}", dir.display()))?;
@@ -225,7 +225,7 @@ mod tests {
     }
 
     /// `spawn_detached` creates the log file (append) and reports a pid; the
-    /// process is a real xkeeper invocation pointed at the given config.
+    /// process is a real appkeeper invocation pointed at the given config.
     /// Guarded to unix (it actually starts a process).
     #[test]
     #[cfg(unix)]

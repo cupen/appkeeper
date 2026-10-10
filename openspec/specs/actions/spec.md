@@ -11,7 +11,7 @@
 
 #### Scenario: app 扇出启动按既有排序
 
-- **WHEN** 执行 `xkeeper start --app <name>` 且该 app 含多个程序
+- **WHEN** 执行 `ak start --app <name>` 且该 app 含多个程序
 - **THEN** 各程序按 priority 与 depends_on 排序规则依次启动，返回逐程序结果
 
 #### Scenario: 扇出 start 覆盖 user_stopped
@@ -21,7 +21,7 @@
 
 #### Scenario: 扇出停止按逆序
 
-- **WHEN** 执行 `xkeeper stop --app <name>`
+- **WHEN** 执行 `ak stop --app <name>`
 - **THEN** 各程序按启动排序的逆序依次停止
 
 ### Requirement: signal 动作
@@ -30,12 +30,12 @@ signal 动作 SHALL 向 program 的当前子进程（pid 本身）投递信号�
 
 #### Scenario: 投递白名单信号
 
-- **WHEN** unix 上对 running 程序执行 `xkeeper signal web USR1`
+- **WHEN** unix 上对 running 程序执行 `appkeeper signal web USR1`
 - **THEN** SIGUSR1 投递给该程序的子进程 pid，命令成功，程序状态保持 running
 
 #### Scenario: 非白名单信号被拒绝
 
-- **WHEN** 执行 `xkeeper signal web KILL`
+- **WHEN** 执行 `appkeeper signal web KILL`
 - **THEN** 报错说明 KILL 不在白名单（需要停止请使用 stop），程序不受影响
 
 #### Scenario: Windows 平台不支持
@@ -50,7 +50,7 @@ signal 动作 SHALL 向 program 的当前子进程（pid 本身）投递信号�
 
 ### Requirement: 自定义动作执行契约
 
-自定义动作 SHALL 以 program 名义执行：命令字符串经平台 shell（unix `/bin/sh -c`，Windows `cmd /C`）执行，多行命令整体作为 shell 脚本文本；执行前 xkeeper SHALL 完成 `${...}` 内置变量替换，shell MUST NOT 接触到 `${program.…}` 语法的原文。动作子进程的工作目录 SHALL 缺省为所属程序的 work_dir。动作 SHALL 在独立于 supervisor 巡检循环的工作线程执行，巡检循环 MUST NOT 被动作阻塞。stdout/stderr SHALL 被捕获：完整输出写入 daemon 日志（附动作名、程序名与退出码），调用响应携带截断的输出尾部。调用方同步等待至动作结束或超时：正常结束返回退出码与耗时；超时 SHALL 终止动作进程树并返回超时错误。同一 program 的同一动作 SHALL 互斥：执行中再次调用返回冲突错误，不排队。对处于停止状态的程序 SHALL 允许执行动作（此时 `pid` 变量替换为空串）。动作执行 MUST NOT 进入状态投影（StatusDoc）；动作结果仅通过调用响应与 daemon 日志呈现。
+自定义动作 SHALL 以 program 名义执行：命令字符串经平台 shell（unix `/bin/sh -c`，Windows `cmd /C`）执行，多行命令整体作为 shell 脚本文本；执行前 appkeeper SHALL 完成 `${...}` 内置变量替换，shell MUST NOT 接触到 `${program.…}` 语法的原文。动作子进程的工作目录 SHALL 缺省为所属程序的 work_dir。动作 SHALL 在独立于 supervisor 巡检循环的工作线程执行，巡检循环 MUST NOT 被动作阻塞。stdout/stderr SHALL 被捕获：完整输出写入 daemon 日志（附动作名、程序名与退出码），调用响应携带截断的输出尾部。调用方同步等待至动作结束或超时：正常结束返回退出码与耗时；超时 SHALL 终止动作进程树并返回超时错误。同一 program 的同一动作 SHALL 互斥：执行中再次调用返回冲突错误，不排队。对处于停止状态的程序 SHALL 允许执行动作（此时 `pid` 变量替换为空串）。动作执行 MUST NOT 进入状态投影（StatusDoc）；动作结果仅通过调用响应与 daemon 日志呈现。
 
 #### Scenario: 变量替换后经 shell 执行
 
@@ -69,7 +69,7 @@ signal 动作 SHALL 向 program 的当前子进程（pid 本身）投递信号�
 
 #### Scenario: 动作中链式调用控制命令
 
-- **WHEN** 动作命令包含 `xkeeper restart <程序名>`（如 `command = "cargo install --path . && xkeeper restart api"`）
+- **WHEN** 动作命令包含 `ak restart <程序名>`（如 `command = "cargo install --path . && ak restart api"`）
 - **THEN** 该调用经本地控制面 API 生效（CLI 自行从 daemon 配置读取连接与鉴权信息），动作以自身命令的退出码结束，重启结果记录于 daemon 日志
 
 #### Scenario: 对已停程序执行动作

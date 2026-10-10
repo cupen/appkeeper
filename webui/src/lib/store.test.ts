@@ -216,7 +216,7 @@ describe('store', () => {
     expect(store.refreshInterval).toBe(3000)
     store.setRefreshInterval(5000)
     expect(store.refreshInterval).toBe(5000)
-    expect(localStorage.getItem('xkeeper.refresh_ms')).toBe('5000')
+    expect(localStorage.getItem('ak.refresh_ms')).toBe('5000')
     store.stop()
   })
   it('tracks pending changes from snapshot and STATUS deltas (apply-workflow)', async () => {

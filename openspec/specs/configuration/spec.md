@@ -2,17 +2,17 @@
 
 ## Purpose
 
-定义 xkeeper 的分层配置契约：唯一的 daemon 根配置（只做全局：守护进程设置、`app_dir`、`[app-default]` 应用默认值）、随应用部署目录分布的 app 配置（map 接口、扁平字段）、四层字段优先级、校验规则、v0.1 迁移路径与按应用粒度的热更新语义。
+定义 appkeeper 的分层配置契约：唯一的 daemon 根配置（只做全局：守护进程设置、`app_dir`、`[app-default]` 应用默认值）、随应用部署目录分布的 app 配置（map 接口、扁平字段）、四层字段优先级、校验规则、v0.1 迁移路径与按应用粒度的热更新语义。
 
 ## Requirements
 
 ### Requirement: daemon 根配置
 
-daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（监听地址/端口、鉴权 token、日志、巡检间隔、`app_dir` 应用注册目录）、可选的 `[app-default]`（全部应用共享的默认值表，字段名与程序字段一致）与可选的 `[webui]`（内嵌控制台段：`listen` 监听地址；段存在即启用控制台，`listen` 缺省 `127.0.0.1:9877`）。daemon 配置 MUST NOT 承载任何应用专属内容：应用条目（如 `[[app]]`）、应用名、配置路径等 SHALL 被校验直接拒绝。`app_dir` 缺省为 daemon 配置文件同级的 `apps` 目录。`daemon.log_dir` 缺省为 `/tmp/xkeeper/logs`（绝对路径，不随 daemon 配置文件位置漂移）；配置的 `log_dir` MUST 为绝对路径，相对路径 SHALL 被校验拒绝（守护进程拒绝启动）。daemon 配置默认路径 SHALL 为 Linux `/etc/xkeeper/daemon.toml`、Windows `%APPDATA%\xkeeper\daemon.toml`，并 SHALL 可用 `-c/--config` 覆盖。daemon 配置文件不存在时守护进程 SHALL 以内置默认值空启动，首次写入时创建。
+daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（监听地址/端口、鉴权 token、日志、巡检间隔、`app_dir` 应用注册目录）、可选的 `[app-default]`（全部应用共享的默认值表，字段名与程序字段一致）与可选的 `[webui]`（内嵌控制台段：`listen` 监听地址；段存在即启用控制台，`listen` 缺省 `127.0.0.1:9877`）。daemon 配置 MUST NOT 承载任何应用专属内容：应用条目（如 `[[app]]`）、应用名、配置路径等 SHALL 被校验直接拒绝。`app_dir` 缺省为 daemon 配置文件同级的 `apps` 目录。`daemon.log_dir` 缺省为 `/tmp/appkeeper/logs`（绝对路径，不随 daemon 配置文件位置漂移）；配置的 `log_dir` MUST 为绝对路径，相对路径 SHALL 被校验拒绝（守护进程拒绝启动）。daemon 配置默认路径 SHALL 为 Linux `/etc/appkeeper/daemon.toml`、Windows `%APPDATA%\appkeeper\daemon.toml`，并 SHALL 可用 `-c/--config` 覆盖。daemon 配置文件不存在时守护进程 SHALL 以内置默认值空启动，首次写入时创建。
 
 #### Scenario: 全新机器空启动
 
-- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `xkeeper run`
+- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `ak run`
 - **THEN** 守护进程以默认设置启动，受管程序为空，控制平面正常可用，控制台不伺服
 
 #### Scenario: daemon 配置中的应用条目被拒绝
@@ -23,16 +23,16 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（监听地
 #### Scenario: 缺省日志目录固定
 
 - **WHEN** daemon 配置未声明 `log_dir`，守护进程拉起任一程序并产生输出
-- **THEN** 程序日志写入 `/tmp/xkeeper/logs`，与 daemon 配置文件所在目录无关
+- **THEN** 程序日志写入 `/tmp/appkeeper/logs`，与 daemon 配置文件所在目录无关
 
 ### Requirement: app 配置
 
-每个应用的配置本体 SHALL 存放在其部署目录，默认文件名 `xkeeper.toml`，注册时可指定任意路径。app 配置 SHALL 由可选的 `[app]` 表（应用级默认值与 `description` 元数据，注册微调 flag 的落点）与一或多个 `[program.<name>]` 映射表组成：映射键即程序名，MUST NOT 再写 `name` 字段。程序字段 SHALL 采用简化写法：`work_dir`（工作目录）、`env`（环境变量表）、`log_max_size`/`log_rotate_keep`（日志轮转，无需独立 section；缺省 `50MB` 保留 `2` 份，即每流盘上最多 3 个文件；`log_max_size = "0"` 显式禁用轮转）、`health_check`（单字符串，按协议前缀分发：`http(s)://` 为 HTTP 探测、`tcp://` 为 TCP 连通、其余视为探测命令行）；`health_interval`/`health_timeout`/`health_retries`/`health_start_period` 为可选节奏字段。`command` SHALL 支持单行带参写法（如 `"python -m http.server 8000"`，按 shell 词法规则拆分为 argv、不经过 shell），与显式 `args` 数组互斥。
+每个应用的配置本体 SHALL 存放在其部署目录，默认文件名 `appkeeper.toml`，注册时可指定任意路径。app 配置 SHALL 由可选的 `[app]` 表（应用级默认值与 `description` 元数据，注册微调 flag 的落点）与一或多个 `[program.<name>]` 映射表组成：映射键即程序名，MUST NOT 再写 `name` 字段。程序字段 SHALL 采用简化写法：`work_dir`（工作目录）、`env`（环境变量表）、`log_max_size`/`log_rotate_keep`（日志轮转，无需独立 section；缺省 `50MB` 保留 `2` 份，即每流盘上最多 3 个文件；`log_max_size = "0"` 显式禁用轮转）、`health_check`（单字符串，按协议前缀分发：`http(s)://` 为 HTTP 探测、`tcp://` 为 TCP 连通、其余视为探测命令行）；`health_interval`/`health_timeout`/`health_retries`/`health_start_period` 为可选节奏字段。`command` SHALL 支持单行带参写法（如 `"python -m http.server 8000"`，按 shell 词法规则拆分为 argv、不经过 shell），与显式 `args` 数组互斥。
 
 #### Scenario: 最小 app 配置可用
 
-- **WHEN** 部署目录 `xkeeper.toml` 只写 `[program.api]` 与其 `command = "python -m http.server 8000"`
-- **THEN** `xkeeper add .` 即可注册，程序名为 `api`，参数经拆分后按默认值运行
+- **WHEN** 部署目录 `appkeeper.toml` 只写 `[program.api]` 与其 `command = "python -m http.server 8000"`
+- **THEN** `ak add .` 即可注册，程序名为 `api`，参数经拆分后按默认值运行
 
 #### Scenario: 健康检查按协议分发
 
@@ -70,11 +70,11 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（监听地
 
 ### Requirement: app_dir 注册目录
 
-daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链接，且链接 SHALL 作为注册记录本体：守护进程与 `xkeeper list` 通过扫描 `app_dir` 发现应用。注册成功时自动以应用名创建 `<name>.toml` 链接指向 app 配置本体（优先符号链接，平台不允许时回退硬链接）。链接 MUST 因任何原因（权限不足、平台限制等）无法建立时，注册 SHALL 视为失败：错误信息 MUST 指明 `app_dir` 路径与修复方式（如 sudo、目录归属）并以非零码退出，MUST NOT 输出注册成功。app 配置本体 MUST 始终以部署目录中的原件为准，链接仅为集中查看的投影；add/remove SHALL 同步维护链接，发现链接缺失或悬空时 SHALL 告警。
+daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链接，且链接 SHALL 作为注册记录本体：守护进程与 `ak list` 通过扫描 `app_dir` 发现应用。注册成功时自动以应用名创建 `<name>.toml` 链接指向 app 配置本体（优先符号链接，平台不允许时回退硬链接）。链接 MUST 因任何原因（权限不足、平台限制等）无法建立时，注册 SHALL 视为失败：错误信息 MUST 指明 `app_dir` 路径与修复方式（如 sudo、目录归属）并以非零码退出，MUST NOT 输出注册成功。app 配置本体 MUST 始终以部署目录中的原件为准，链接仅为集中查看的投影；add/remove SHALL 同步维护链接，发现链接缺失或悬空时 SHALL 告警。
 
 #### Scenario: 注册后自动链接
 
-- **WHEN** 在部署目录执行 `xkeeper add . --name web` 成功且平台支持符号链接
+- **WHEN** 在部署目录执行 `ak add . --name web` 成功且平台支持符号链接
 - **THEN** `app_dir/web.toml` 出现并指向部署目录中的配置本体，本体内容变化即时可见
 
 #### Scenario: 链接创建被拒绝
@@ -98,7 +98,7 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 #### Scenario: 相对 log_dir 拒绝启动
 
-- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `xkeeper run` 或 `xkeeper validate`
+- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `ak run` 或 `ak validate`
 - **THEN** 校验失败，错误信息指明 `daemon.log_dir` 必须为绝对路径，守护进程不启动
 
 #### Scenario: 非法字符名被拒绝
@@ -118,11 +118,11 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 ### Requirement: v0.1 旧配置迁移
 
-v0.1 的单文件配置（`[daemon]` + `[[program]]` 数组）SHALL 可通过 `xkeeper add <旧文件>` 直接导入：导入器 SHALL 以独立的旧版 schema 解析，将 `[[program]]` 转写为 `[program.*]` 映射并注册为一个应用，`[daemon]` 段被检测并提示需要并入 daemon 配置；导入 MUST NOT 修改原文件。
+v0.1 的单文件配置（`[daemon]` + `[[program]]` 数组）SHALL 可通过 `ak add <旧文件>` 直接导入：导入器 SHALL 以独立的旧版 schema 解析，将 `[[program]]` 转写为 `[program.*]` 映射并注册为一个应用，`[daemon]` 段被检测并提示需要并入 daemon 配置；导入 MUST NOT 修改原文件。
 
 #### Scenario: 一键迁移旧配置
 
-- **WHEN** 对 v0.1 的 `config.toml` 执行 `xkeeper add config.toml`
+- **WHEN** 对 v0.1 的 `config.toml` 执行 `ak add config.toml`
 - **THEN** 其中全部程序注册为一个应用并可被守护进程拉起，输出提示 `[daemon]` 段需并入 daemon 配置，原文件内容未变
 
 ### Requirement: 按应用粒度的热更新
@@ -132,7 +132,7 @@ reload SHALL 重扫 `app_dir` 注册并重读全部 app 配置本体与 daemon �
 任何程序（应用由 apply 触发，见 apply-workflow 能力）。**唯一例外**：
 `[webui]` 段的启用/关闭/`listen` 变更 SHALL 由 reload 立即热应用（见 webui-api
 「配置驱动的控制台生命周期」），MUST NOT 进入 pending。守护进程 SHALL 周期性
-自动执行该重扫，`xkeeper reload` 触发一次立即重扫。单个 app 文件非法时
+自动执行该重扫，`ak reload` 触发一次立即重扫。单个 app 文件非法时
 SHALL 隔离失败——该 app 不进入 pending、保持旧定义继续运行并上报错误，其余
 app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending。daemon 配置中
 守护进程自身字段变更（`[webui]` 段之外）SHALL 尽量热应用（如日志级别），无法
@@ -145,23 +145,23 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 #### Scenario: reload 只检出不应用
 
-- **WHEN** app A 的程序 `web` 配置已修改且正在运行，执行 `xkeeper reload`
+- **WHEN** app A 的程序 `web` 配置已修改且正在运行，执行 `ak reload`
 - **THEN** 输出包含 `web` 的 pending 预览，进程未被停止或重启
 
 #### Scenario: 不可热更字段提示
 
-- **WHEN** daemon 配置的 `port` 被修改，执行 `xkeeper reload`
+- **WHEN** daemon 配置的 `port` 被修改，执行 `ak reload`
 - **THEN** pending 预览提示该字段需重启守护进程方可生效，控制面仍监听旧端口
 
 #### Scenario: 移除注册立即生效
 
-- **WHEN** 守护进程运行中执行 `xkeeper remove <app>`
+- **WHEN** 守护进程运行中执行 `ak remove <app>`
 - **THEN** `app_dir` 链接即时清理，该 app 的移除进入 pending，其程序在
   apply 前继续运行
 
 ### Requirement: validate 子命令
 
-`xkeeper validate` SHALL 校验 daemon 配置及 `app_dir` 中全部已注册 app 配置本体；`xkeeper validate <path>` SHALL 单独校验一个 app 配置文件。通过时输出应用与程序清单并以 0 退出；失败时输出全部错误并以非零码退出；两种情况均 MUST NOT 启动任何进程。
+`ak validate` SHALL 校验 daemon 配置及 `app_dir` 中全部已注册 app 配置本体；`ak validate <path>` SHALL 单独校验一个 app 配置文件。通过时输出应用与程序清单并以 0 退出；失败时输出全部错误并以非零码退出；两种情况均 MUST NOT 启动任何进程。
 
 #### Scenario: 校验通过
 
@@ -175,11 +175,11 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 ### Requirement: edit 子命令
 
-`xkeeper edit` SHALL 用 `$VISUAL`（优先）或 `$EDITOR`（均未设置时取平台默认：Unix `vi`、Windows `notepad`）打开解析后的 daemon 配置路径（`-c/--config` 可覆盖）；配置文件不存在时 SHALL 先连同父目录创建再打开。编辑器退出后 SHALL 校验该配置：合法 SHALL 以 0 退出；非法 SHALL 逐条输出错误并以 2 退出，文件保持编辑器保存的内容不回滚；编辑器启动失败或异常退出 SHALL 以非零码退出。
+`ak edit` SHALL 用 `$VISUAL`（优先）或 `$EDITOR`（均未设置时取平台默认：Unix `vi`、Windows `notepad`）打开解析后的 daemon 配置路径（`-c/--config` 可覆盖）；配置文件不存在时 SHALL 先连同父目录创建再打开。编辑器退出后 SHALL 校验该配置：合法 SHALL 以 0 退出；非法 SHALL 逐条输出错误并以 2 退出，文件保持编辑器保存的内容不回滚；编辑器启动失败或异常退出 SHALL 以非零码退出。
 
 #### Scenario: 首次配置一台新机器
 
-- **WHEN** 在没有 daemon 配置的机器上执行 `xkeeper edit`，写入合法配置并退出编辑器
+- **WHEN** 在没有 daemon 配置的机器上执行 `ak edit`，写入合法配置并退出编辑器
 - **THEN** 配置文件被创建，输出校验通过并以 0 退出
 
 #### Scenario: 保存了非法配置
@@ -196,7 +196,7 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 - `always`：无论退出码如何都重启；守护进程启动时无条件拉起（不受用户停止记录影响）。
 - `unless-stopped`：无论退出码如何都重启；守护进程启动时若无「用户停止」持久化记录则拉起，有记录则保持停止（记录的写入与清除见 process-management 能力的重启策略 requirement）。
 
-解析 SHALL 接受宽容写法：布尔 `false` 等价 `"no"`；四层级联到底均未设置（留空）时 SHALL 取内置默认 `"no"`。守护语义的开箱体验由模板引导：`xkeeper config --init` 生成的 `[app-default]` SHALL 显式写入 `restart = "always"`，仓库随附的 daemon 配置模板同步。
+解析 SHALL 接受宽容写法：布尔 `false` 等价 `"no"`；四层级联到底均未设置（留空）时 SHALL 取内置默认 `"no"`。守护语义的开箱体验由模板引导：`ak config --init` 生成的 `[app-default]` SHALL 显式写入 `restart = "always"`，仓库随附的 daemon 配置模板同步。
 
 旧字段兼容（弃用别名，仅读取）：`autorestart`（`never` 映射 `no`，`on-failure`/`always` 原值）与 `autostart`（布尔，应用级）SHALL 继续可读，读取时按以下规则归并为 `restart`：`autostart = false` → `no`；`autostart = true`（或未设置）且 `autorestart = X` → `X` 的映射值；`autostart = true` 且 `autorestart = "never"` → `no`，并 SHALL 输出迁移警告（该组合的「守护启动拉起」行为在新模型中不存在）。同一层级同时显式出现新旧字段 SHALL 被校验拒绝（歧义，指明二者不得混用）。所有写入路径（add 微调 flag、run ad-hoc、脚手架生成、模板）SHALL 只写新字段 `restart`。
 
@@ -217,7 +217,7 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 #### Scenario: init 模板保持开箱守护
 
-- **WHEN** 执行 `xkeeper config --init` 后以模板默认值注册并启动程序
+- **WHEN** 执行 `ak config --init` 后以模板默认值注册并启动程序
 - **THEN** 模板 `[app-default]` 的 `restart = "always"` 生效，程序崩溃自动拉起、守护重启自动恢复
 
 ### Requirement: 动作定义表
@@ -227,7 +227,7 @@ app 配置 SHALL 支持在 `[program.<name>]` 下声明自定义动作表 `[prog
 #### Scenario: 最小动作定义可用
 
 - **WHEN** 程序 api 声明 `[program.api.action.flush]` 且 `command = "curl -fsS http://127.0.0.1:8080/flush"`
-- **THEN** validate 通过，动作可经 `xkeeper action api flush` 执行
+- **THEN** validate 通过，动作可经 `appkeeper action api flush` 执行
 
 #### Scenario: 多行长命令与显式脚本调用
 
@@ -245,20 +245,20 @@ daemon 配置的 `[webui]` 段 SHALL 由 config 子命令按统一键表机制�
 
 #### Scenario: config 开启控制台
 
-- **WHEN** 执行 `xkeeper config --set webui.listen=127.0.0.1:9877`（daemon 离线）
+- **WHEN** 执行 `ak config --set webui.listen=127.0.0.1:9877`（daemon 离线）
 - **THEN** daemon 配置文件新增 `[webui]` 段且整体校验通过，输出说明离线时下次启动生效
 
 #### Scenario: config 关闭控制台
 
-- **WHEN** 配置含 `[webui]` 段，执行 `xkeeper config --delete webui`
+- **WHEN** 配置含 `[webui]` 段，执行 `ak config --delete webui`
 - **THEN** 该段整体从文件移除（其余内容含注释保持原样），守护在线时输出需 reload 提示
 
 #### Scenario: 非法 listen 拒绝写入
 
-- **WHEN** 执行 `xkeeper config --set webui.listen=9877`（缺 host）或 `xkeeper config --set webui.listen=`（空值）
+- **WHEN** 执行 `ak config --set webui.listen=9877`（缺 host）或 `ak config --set webui.listen=`（空值）
 - **THEN** 非零码退出并说明值必须是 `host:port`，配置文件内容不变
 
 #### Scenario: 段内未知键校验拒绝
 
-- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `xkeeper validate` 或 `xkeeper run`
+- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `ak validate` 或 `ak run`
 - **THEN** 校验失败并指明该未知字段，守护进程拒绝以该配置启动

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import './status-badge.js'
-import type { XkeeperStatusBadge } from './status-badge.js'
+import type { AkStatusBadge } from './status-badge.js'
 
 const SLUGS = ['starting', 'queued', 'working', 'done', 'failed', 'dormant']
 const GLYPHS: Record<string, string> = {
@@ -12,9 +12,9 @@ const GLYPHS: Record<string, string> = {
   dormant: '·',
 }
 
-describe('xkeeper-status-badge', () => {
+describe('ak-status-badge', () => {
   it('renders label and glyph (status never colour-only)', async () => {
-    const el = document.createElement('xkeeper-status-badge') as XkeeperStatusBadge
+    const el = document.createElement('ak-status-badge') as AkStatusBadge
     el.slug = 'working'
     el.label = 'Working'
     el.glyph = GLYPHS['working']
@@ -31,14 +31,14 @@ describe('xkeeper-status-badge', () => {
   it('resolves a distinct CSS variable per slug', async () => {
     const colors = new Set<string>()
     for (const slug of SLUGS) {
-      const el = document.createElement('xkeeper-status-badge') as XkeeperStatusBadge
+      const el = document.createElement('ak-status-badge') as AkStatusBadge
       el.slug = slug
       el.label = slug
       el.glyph = GLYPHS[slug] ?? ''
       document.body.appendChild(el)
       await el.updateComplete
       const dot = el.shadowRoot?.querySelector<HTMLElement>('.dot')
-      expect(dot?.getAttribute('style')).toContain(`--xkeeper-status-${slug}`)
+      expect(dot?.getAttribute('style')).toContain(`--ak-status-${slug}`)
       colors.add(dot?.getAttribute('style') ?? '')
       el.remove()
     }
@@ -47,7 +47,7 @@ describe('xkeeper-status-badge', () => {
   })
 
   it('falls back to the slug as label when none provided', async () => {
-    const el = document.createElement('xkeeper-status-badge') as XkeeperStatusBadge
+    const el = document.createElement('ak-status-badge') as AkStatusBadge
     el.slug = 'done'
     document.body.appendChild(el)
     await el.updateComplete

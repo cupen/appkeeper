@@ -1,7 +1,7 @@
-# xkeeper Ansible 部署（role 化）
+# appkeeper Ansible 部署（role 化）
 
-以 Ansible role（`roles/xkeeper/`）封装部署流程：分发二进制 → 安装 daemon 配置 →
-`xkeeper service install --now`（复用 xkeeper 自身的服务注册能力）。
+以 Ansible role（`roles/appkeeper/`）封装部署流程：分发二进制 → 安装 daemon 配置 →
+`ak service install --now`（复用 appkeeper 自身的服务注册能力）。
 默认**免 inventory 本机部署**：`ansible.cfg` 已内置隐式 localhost，
 `cd .ansible && ansible-playbook site.yml` 即可。
 
@@ -9,9 +9,9 @@
 
 - 控制机：Ansible ≥ 2.12
 - 目标机：Linux + systemd + Python 3，root 权限（play 已设 `become: true`）
-- xkeeper 的 Linux 二进制（`cargo build --release` 产物或 release 下载）与一份 daemon 配置 TOML
+- appkeeper 的 Linux 二进制（`cargo build --release` 产物或 release 下载）与一份 daemon 配置 TOML
 
-> Windows 目标机不支持（`xkeeper service` 本身仅实现 systemd）。
+> Windows 目标机不支持（`ak service` 本身仅实现 systemd）。
 
 ## 快速开始（本机部署）
 
@@ -19,12 +19,12 @@
 cargo build --release                      # 先产出二进制
 cd .ansible
 ansible-playbook site.yml \
-  -e xkeeper_binary_src=../target/release/xkeeper \
-  -e xkeeper_config_src=../examples/daemon.toml
+  -e appkeeper_binary_src=../target/release/appkeeper \
+  -e appkeeper_config_src=../examples/daemon.toml
 ```
 
 `become` 需要 sudo；无免密 sudo 时加 `--ask-become-pass`。
-验证结果：`systemctl is-active xkeeper` 为 active，`xkeeper status` 可查询。
+验证结果：`systemctl is-active appkeeper` 为 active，`ak status` 可查询。
 
 预演（不落盘）加 `--check`：护栏预检（`stat`/`systemctl is-active`）仍会真实
 执行，可提前看到既有安装拦截效果。
@@ -34,11 +34,11 @@ ansible-playbook site.yml \
 role 不绑定 hosts 与连接方式，可直接被其他 playbook 复用：
 
 ```yaml
-- name: Deploy xkeeper
+- name: Deploy appkeeper
   hosts: all
   become: true
   roles:
-    - xkeeper
+    - appkeeper
 ```
 
 ```bash
@@ -49,8 +49,8 @@ all:
       ansible_host: 10.0.0.11
       ansible_user: deploy
   vars:
-    xkeeper_binary_src: ./dist/xkeeper          # 控制机上的二进制路径
-    xkeeper_config_src: ./conf/daemon.toml     # 控制机上的 daemon 配置
+    appkeeper_binary_src: ./dist/appkeeper          # 控制机上的二进制路径
+    appkeeper_config_src: ./conf/daemon.toml     # 控制机上的 daemon 配置
 ```
 
 ```bash
@@ -62,14 +62,14 @@ ansible-playbook -i inventory/prod.yml -e @extra.yml site.yml
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `xkeeper_binary_src` | 是 | — | 控制机上的二进制文件路径，或 `http(s)://` 下载 URL |
-| `xkeeper_config_src` | 是 | — | 控制机上的 daemon 配置文件路径，复制到目标机 |
-| `xkeeper_binary_dest` | 否 | `/usr/local/bin/xkeeper` | 目标机二进制落位路径 |
-| `xkeeper_config_dest` | 否 |  `/etc/xkeeper/daemon.toml` | 目标机 daemon 配置路径 |
-| `xkeeper_service_name` | 否 | `xkeeper` | systemd unit 名（传给 `service install --name`） |
-| `xkeeper_service_user` | 否 | 空（不传） | 服务运行用户（传给 `service install --user`） |
-| `xkeeper_binary_checksum` | 否 | 空 | URL 来源时的 sha256 值，用于校验下载产物 |
-| `xkeeper_force_overwrite` | 否 | `false` | 强制覆盖开关，见下节 |
+| `appkeeper_binary_src` | 是 | — | 控制机上的二进制文件路径，或 `http(s)://` 下载 URL |
+| `appkeeper_config_src` | 是 | — | 控制机上的 daemon 配置文件路径，复制到目标机 |
+| `appkeeper_binary_dest` | 否 | `/usr/local/bin/ak` | 目标机二进制落位路径 |
+| `appkeeper_config_dest` | 否 |  `/etc/appkeeper/daemon.toml` | 目标机 daemon 配置路径 |
+| `appkeeper_service_name` | 否 | `appkeeper` | systemd unit 名（传给 `service install --name`） |
+| `appkeeper_service_user` | 否 | 空（不传） | 服务运行用户（传给 `service install --user`） |
+| `appkeeper_binary_checksum` | 否 | 空 | URL 来源时的 sha256 值，用于校验下载产物 |
+| `appkeeper_force_overwrite` | 否 | `false` | 强制覆盖开关，见下节 |
 
 ## 安全护栏：默认不触碰既有安装
 
@@ -84,7 +84,7 @@ role 在对目标机做**任何变更之前**做只读预检，检测以下痕�
 目标机不做任何修改、服务不重启**——防止一键脚本误触生产环境：
 
 ```
-检测到目标机已存在 xkeeper 安装，为避免误触生产环境，本次执行已停止，
+检测到目标机已存在 appkeeper 安装，为避免误触生产环境，本次执行已停止，
 目标机未做任何修改。检测到的痕迹：service is active; binary exists at ...
 ```
 
@@ -92,7 +92,7 @@ role 在对目标机做**任何变更之前**做只读预检，检测以下痕�
 按需重启服务）：
 
 ```bash
-ansible-playbook site.yml -e xkeeper_force_overwrite=true -e ...
+ansible-playbook site.yml -e appkeeper_force_overwrite=true -e ...
 ```
 
 两种例外情况不会触发护栏拦截：
@@ -112,7 +112,7 @@ ansible-playbook site.yml -e xkeeper_force_overwrite=true -e ...
 .ansible/
   ansible.cfg                  # 隐式 localhost inventory，免 inventory 即用
   site.yml                     # 本机部署入口 playbook（hosts: localhost + connection: local）
-  roles/xkeeper/
+  roles/appkeeper/
     defaults/main.yml          # 变量缺省
     tasks/main.yml             # 入口：断言 → 源准备 → 护栏 → 安装 → 清理
     tasks/guard.yml            # 既有安装只读预检 + 幂等命中判定

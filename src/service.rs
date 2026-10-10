@@ -1,6 +1,6 @@
-//! systemd service registration: `xkeeper service install|uninstall`.
+//! systemd service registration: `ak service install|uninstall`.
 //!
-//! Linux only — writes a unit file (default `/etc/systemd/system/xkeeper.service`,
+//! Linux only — writes a unit file (default `/etc/systemd/system/ak.service`,
 //! override with `--unit-file`), then drives `systemctl` to reload/enable/start
 //! it. Windows builds keep the subcommands discoverable but fail at runtime with
 //! a clear error. All template rendering, path validation and write decisions
@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 
 /// Default `--unit-file` value.
 #[cfg_attr(windows, allow(dead_code))]
-pub const DEFAULT_UNIT_FILE: &str = "/etc/systemd/system/xkeeper.service";
+pub const DEFAULT_UNIT_FILE: &str = "/etc/systemd/system/ak.service";
 /// Fallback stop budget when the config cannot be loaded.
 #[cfg_attr(windows, allow(dead_code))]
 const FALLBACK_TIMEOUT_STOP_SEC: u64 = 90;
@@ -90,7 +90,7 @@ pub fn render_unit(
 ) -> String {
     let mut s = String::new();
     s.push_str("[Unit]\n");
-    s.push_str("Description=xkeeper process keeper\n");
+    s.push_str("Description=appkeeper process keeper\n");
     s.push_str("After=network.target\n");
     s.push('\n');
     s.push_str("[Service]\n");
@@ -353,10 +353,10 @@ fn unix_uninstall(opts: &ServiceOptions) -> Result<()> {
 
     // stop and disable failures are non-fatal: the goal is a clean removal.
     if let Err(e) = systemctl(&["stop", &format!("{unit_name}.service")]) {
-        eprintln!("xkeeper: warning: {e:#}");
+        eprintln!("ak: warning: {e:#}");
     }
     if let Err(e) = systemctl(&["disable", &format!("{unit_name}.service")]) {
-        eprintln!("xkeeper: warning: {e:#}");
+        eprintln!("ak: warning: {e:#}");
     }
     std::fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
     println!("unit removed: {}", path.display());
@@ -394,12 +394,12 @@ mod tests {
 
     #[test]
     fn unit_file_accepts_legal_and_rejects_illegal() {
-        assert!(is_valid_unit_file(Path::new("/etc/systemd/system/xkeeper.service")));
+        assert!(is_valid_unit_file(Path::new("/etc/systemd/system/ak.service")));
         assert!(is_valid_unit_file(Path::new("xk-prod_1.service")));
         assert!(is_valid_unit_file(Path::new("a.service")));
         assert!(is_valid_unit_file(Path::new("my-app_v2.service")));
         for bad in [
-            "xkeeper",             // missing .service
+            "appkeeper",             // missing .service
             ".service",            // empty stem
             "ends..service",       // stem ends with '.'
             "my app.service",      // space in stem
@@ -422,19 +422,19 @@ mod tests {
     #[test]
     fn renders_unit_without_user() {
         let unit = render_unit(
-            Path::new("/usr/local/bin/xkeeper"),
-            Path::new("/etc/xkeeper/daemon.toml"),
+            Path::new("/usr/local/bin/ak"),
+            Path::new("/etc/appkeeper/daemon.toml"),
             None,
             90,
         );
         assert_eq!(
             unit,
             "[Unit]\n\
-             Description=xkeeper process keeper\n\
+             Description=appkeeper process keeper\n\
              After=network.target\n\
              \n\
              [Service]\n\
-             ExecStart=/usr/local/bin/xkeeper run --config /etc/xkeeper/daemon.toml\n\
+             ExecStart=/usr/local/bin/ak run --config /etc/appkeeper/daemon.toml\n\
              Restart=always\n\
              RestartSec=3\n\
              KillSignal=SIGTERM\n\
@@ -448,13 +448,13 @@ mod tests {
     #[test]
     fn renders_unit_with_user_and_quoted_paths() {
         let unit = render_unit(
-            Path::new("/opt/my tools/xkeeper"),
-            Path::new("/etc/my conf/xkeeper.toml"),
+            Path::new("/opt/my tools/appkeeper"),
+            Path::new("/etc/my conf/appkeeper.toml"),
             Some("svc-xk"),
             60,
         );
         assert!(unit.contains(
-            "ExecStart=\"/opt/my tools/xkeeper\" run --config \"/etc/my conf/xkeeper.toml\"\n"
+            "ExecStart=\"/opt/my tools/appkeeper\" run --config \"/etc/my conf/appkeeper.toml\"\n"
         ));
         assert!(unit.contains("User=svc-xk\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
@@ -491,12 +491,12 @@ mod tests {
             out
         }
         let unit = render_unit(
-            Path::new("/usr/local/bin/xkeeper"),
-            Path::new("/etc/xkeeper/daemon.toml"),
+            Path::new("/usr/local/bin/ak"),
+            Path::new("/etc/appkeeper/daemon.toml"),
             None,
             90,
         );
-        let out = render_unit_display("/etc/systemd/system/xkeeper.service", &unit, true);
+        let out = render_unit_display("/etc/systemd/system/ak.service", &unit, true);
         assert!(out.contains("\x1b[1;36m[Unit]\x1b[0m"));
         assert!(out.contains("\x1b[1mExecStart=\x1b[0m"));
         assert!(out.starts_with("\x1b[2m╭─"));
@@ -541,7 +541,7 @@ mod tests {
     fn timeout_falls_back_when_config_unloadable() {
         let dir = temp_dir("fallback");
         std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("xkeeper.toml");
+        let config = dir.join("appkeeper.toml");
         std::fs::write(&config, "not [valid toml").unwrap();
         assert_eq!(compute_timeout_stop_sec(&config), FALLBACK_TIMEOUT_STOP_SEC);
         std::fs::remove_dir_all(&dir).ok();
@@ -552,7 +552,7 @@ mod tests {
         let dir = temp_dir("apps");
         let apps = dir.join("apps");
         std::fs::create_dir_all(&apps).unwrap();
-        let config = dir.join("xkeeper.toml");
+        let config = dir.join("appkeeper.toml");
         std::fs::write(&config, "[daemon]\napp_dir = \"apps\"\n").unwrap();
         std::fs::write(
             apps.join("demo.toml"),

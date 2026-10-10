@@ -12,8 +12,8 @@ export type RefreshMs = (typeof REFRESH_CHOICES_MS)[number]
 export const RATE_WINDOW_CHOICES_S = [1, 10, 60, 300] as const
 export type RateWindowS = (typeof RATE_WINDOW_CHOICES_S)[number]
 
-const REFRESH_KEY = 'xkeeper.refresh_ms'
-const WINDOW_KEY = 'xkeeper.rate_window_s'
+const REFRESH_KEY = 'ak.refresh_ms'
+const WINDOW_KEY = 'ak.rate_window_s'
 
 function loadNumber(key: string, allowed: readonly number[], fallback: number): number {
   try {

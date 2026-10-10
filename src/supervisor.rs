@@ -486,7 +486,7 @@ impl Supervisor {
             metrics: Arc::new(crate::metrics::MetricsTable::new()),
             actions: crate::action::ActionRuns::new(),
             webui: WebuiControl::new(),
-            config_path: Mutex::new(config_dir.join("xkeeper.toml")),
+            config_path: Mutex::new(config_dir.join("appkeeper.toml")),
             started: std::time::Instant::now(),
             interval,
         }))
@@ -1061,11 +1061,11 @@ impl Supervisor {
                 || old_daemon.host != new_config.daemon.host
             {
                 doc.daemon_hints
-                    .push("daemon host/port changed: restart xkeeper to apply".into());
+                    .push("daemon host/port changed: restart appkeeper to apply".into());
             }
             if old_daemon.auth_token != new_config.daemon.auth_token {
                 doc.daemon_hints
-                    .push("daemon auth_token changed: restart xkeeper to apply".into());
+                    .push("daemon auth_token changed: restart appkeeper to apply".into());
             }
         }
         // Refresh file stamps (all files we parsed).
@@ -1361,12 +1361,12 @@ impl Supervisor {
             {
                 result
                     .daemon_hints
-                    .push("daemon host/port changed: restart xkeeper to apply".into());
+                    .push("daemon host/port changed: restart appkeeper to apply".into());
             }
             if old_daemon.auth_token != new_config.daemon.auth_token {
                 result
                     .daemon_hints
-                    .push("daemon auth_token changed: restart xkeeper to apply".into());
+                    .push("daemon auth_token changed: restart appkeeper to apply".into());
             }
             st.config = new_config.clone();
             st.apps = new_records.clone();
@@ -1496,7 +1496,7 @@ impl Supervisor {
         }
         info!("shutdown requested, stopping all programs...");
         self.shutdown_all();
-        info!("all programs stopped, xkeeper exits");
+        info!("all programs stopped, appkeeper exits");
     }
 }
 
@@ -1857,7 +1857,7 @@ pub fn render_pending(doc: &PendingDoc) -> String {
     for e in &doc.errors {
         out.push(format!("  {e}"));
     }
-    out.push("run `xkeeper apply` to apply".into());
+    out.push("run `ak apply` to apply".into());
     out.join("\n")
 }
 
@@ -1958,7 +1958,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
         // Pin log_dir per test: the built-in default is a shared
-        // /tmp/xkeeper/logs, where the persisted user-stop record
+        // /tmp/appkeeper/logs, where the persisted user-stop record
         // (state.json) would leak across concurrently running tests.
         std::fs::write(
             &cfg_path,
@@ -1968,7 +1968,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let app_file = dir.join("xkeeper.toml");
+        let app_file = dir.join("appkeeper.toml");
         std::fs::write(&app_file, toml_text).unwrap();
         link_for_test(
             &app_file,
@@ -3063,7 +3063,7 @@ mod tests {
         .unwrap();
         let out = sup.cmd_reload().unwrap();
         assert!(
-            out.contains("daemon host/port changed: restart xkeeper to apply"),
+            out.contains("daemon host/port changed: restart appkeeper to apply"),
             "daemon hint still renders: {out}"
         );
         assert!(out.contains("webui:"), "webui note appended: {out}");
@@ -3160,7 +3160,7 @@ mod tests {
             format!("[daemon]\nlog_dir = {:?}\n", logs.to_string_lossy()),
         )
         .unwrap();
-        let app_file = dir.join("xkeeper.toml");
+        let app_file = dir.join("appkeeper.toml");
         std::fs::write(
             &app_file,
             "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n\

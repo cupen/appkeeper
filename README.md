@@ -1,11 +1,11 @@
-# xkeeper
+# appkeeper
 
 跨平台、应用层的轻量级进程守护工具，Rust 单二进制，TOML 分层配置。
 Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖、健康检查、
 日志轮转与跟随、本地控制平面（HTTP API + CLI），内置 Web UI 另立变更。
 
 ```text
-         ┌────────────────────────── xkeeper run ──────────────────────────┐
+         ┌────────────────────────── ak run ──────────────────────────┐
          │  supervisor loop（7 态状态机 × N 程序）                          │
          │    spawn/stop/restart · startsecs/startretries · 退避重启        │
          │    priority/depends_on 启动编排 · reload · shutdown              │
@@ -14,32 +14,32 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
          │  └─ control API  127.0.0.1:7310 /v1/*（可选 Bearer 鉴权）         │
          └───────────────△─────────────────────────────────────────────────┘
                          │ HTTP JSON
-   xkeeper run（daemon | <名> | -- <命令行>）· status/stop/restart/log/pid/reload/apply/shutdown
-   xkeeper add/remove/list        ← 离线可用，在线时自动同步
+   ak run（daemon | <名> | -- <命令行>）· status/stop/restart/log/pid/reload/apply/shutdown
+   ak add/remove/list        ← 离线可用，在线时自动同步
 ```
 
 ## 模型：daemon 全局 + app 分布 + app_dir 注册
 
-- **daemon 根配置**（全局唯一）：Linux `/etc/xkeeper/daemon.toml`，Windows
-  `%APPDATA%\xkeeper\daemon.toml`，`-c/--config` 可覆盖；**文件可以不存在**——
-  xkeeper 以内置默认值空启动。只放全局内容：`[daemon]`（含 `app_dir` 注册
+- **daemon 根配置**（全局唯一）：Linux `/etc/appkeeper/daemon.toml`，Windows
+  `%APPDATA%\appkeeper\daemon.toml`，`-c/--config` 可覆盖；**文件可以不存在**——
+  appkeeper 以内置默认值空启动。只放全局内容：`[daemon]`（含 `app_dir` 注册
   目录）、可选 `[app-default]`（所有应用共享的默认值）与可选 `[webui]`
   （内嵌 Web 控制台，缺省关闭）。任何应用专属条目都会被未知字段校验拒绝。
 - **app 配置**（每个应用一份）：放在应用自己的部署目录，默认名
-  `xkeeper.toml`，由部署人维护。`[program.<name>]` map 接口，键即程序名，
+  `appkeeper.toml`，由部署人维护。`[program.<name>]` map 接口，键即程序名，
   绝大多数字段可省略。
-- **注册即链接**：在部署目录执行 `xkeeper add .`（名字默认取目录名），
+- **注册即链接**：在部署目录执行 `ak add .`（名字默认取目录名），
   `app_dir` 里出现 `<name>.toml` 链接指向配置本体——这就是注册记录；
-  `xkeeper list` 扫描它，`xkeeper remove` 删除它（部署文件永不删除）。
+  `ak list` 扫描它，`ak remove` 删除它（部署文件永不删除）。
   Windows 无符号链接权限时降级为硬链接（见下方"注意"）。
-- **裸程序脚手架**：`xkeeper add ./path/to/proc --name abc` 对可执行程序直接
+- **裸程序脚手架**：`ak add ./path/to/proc --name abc` 对可执行程序直接
   生成 `app_dir/abc.toml`（真实文件，注册记录即文件本身）：command 写绝对
   路径，`work_dir` 缺省为执行 add 时的目录，另有 `--args "<字符串>"`/
   `--env K=V`（可重复）/`--workdir <路径>`/`--restart=<字面量>`。重复执行同名
   add 会以本次参数 **全量再生**该文件（文件上的手改会被覆盖），内容有差异时
-  提示需先 `xkeeper apply`；`--apply` 在注册后立即对该 app 应用。`xkeeper remove`
+  提示需先 `ak apply`；`--apply` 在注册后立即对该 app 应用。`ak remove`
   对这类生成记录连带删除文件并打印路径。
-- **命令行即注册（run ad-hoc）**：`xkeeper run -- <命令行>` / `run --cmd "<字符串>"`
+- **命令行即注册（run ad-hoc）**：`ak run -- <命令行>` / `run --cmd "<字符串>"`
   复用同一脚手架引擎——首 token 解析为绝对路径写入 `command`，其余按 shell
   词法作 `args`，缺省名取命令 stem，注册后立即以该 app 范围 apply。等价于
   「add 脚手架 + 自动 apply」，是冷启动的最短路径（见「快速上手」路径一）。
@@ -54,10 +54,10 @@ daemon `[app-default]` > 内置默认。`priority` 为应用级字段；`restart
 
 | 术语 | 定义 |
 | --- | --- |
-| daemon（守护进程） | 全局唯一的 xkeeper 监督进程本体，持有 daemon 配置与 `app_dir`，唯一执行监督循环的实体 |
-| app（应用） | 注册的部署单元；配置本体为部署目录中的 `xkeeper.toml`，注册记录为 `app_dir` 中的链接。app 不是进程，是程序的容器 |
+| daemon（守护进程） | 全局唯一的 appkeeper 监督进程本体，持有 daemon 配置与 `app_dir`，唯一执行监督循环的实体 |
+| app（应用） | 注册的部署单元；配置本体为部署目录中的 `appkeeper.toml`，注册记录为 `app_dir` 中的链接。app 不是进程，是程序的容器 |
 | program（程序） | app 配置 `[program.<name>]` 定义的被守护子进程，有独立状态机与日志流；名称跨全部已注册应用**全局唯一**，任一面板用程序名即可无歧义寻址 |
-| action（动作） | 面向 daemon/app/program 发出的执行指令；分**内置动作**（start/stop/restart/signal/reload/shutdown，实现于 xkeeper 自身）与**自定义动作**（配置声明、映射为 shell 命令执行） |
+| action（动作） | 面向 daemon/app/program 发出的执行指令；分**内置动作**（start/stop/restart/signal/reload/shutdown，实现于 appkeeper 自身）与**自定义动作**（配置声明、映射为 shell 命令执行） |
 
 标识符规则：app 名、程序名、动作名统一只允许英文字母、数字、下划线与连字符
 （`[A-Za-z0-9_-]+`）。点号、空格、非 ASCII 一律校验拒绝——`gateway.api`
@@ -68,44 +68,44 @@ daemon `[app-default]` > 内置默认。`priority` 为应用级字段；`restart
 ## 快速上手
 
 ```bash
-cargo build --release          # 产物: target/release/xkeeper(.exe)
+cargo build --release          # 产物: target/release/appkeeper(.exe)
 
-xkeeper config --init          # 可选：初始化 daemon 配置（8 个已知键的默认值 + 注释模板），
+ak config --init          # 可选：初始化 daemon 配置（8 个已知键的默认值 + 注释模板），
                                #   已存在则拒绝；连带创建 app 注册目录与 example.toml.sample
-xkeeper config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
+ak config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
 # 路径一：冷启动一条命令跑起来（命令行注册 + 自动后台拉起守护进程 + 立即生效）
-xkeeper run -- python -m http.server 8000 --name web
-xkeeper run --cmd "node server.js" --name api   # 等价写法（shell 词法切分，适合不便传 -- 的场景）
-xkeeper run web                                 # 之后启动/重启已注册程序
-xkeeper stop web                                # 停止（`restart = "unless-stopped"` 会记住这次用户停止）
+ak run -- python -m http.server 8000 --name web
+ak run --cmd "node server.js" --name api   # 等价写法（shell 词法切分，适合不便传 -- 的场景）
+ak run web                                 # 之后启动/重启已注册程序
+ak stop web                                # 停止（`restart = "unless-stopped"` 会记住这次用户停止）
 
 # 路径二：注册部署（离线可用，适合生产部署目录）
-# 1. 在你的应用部署目录写一个 xkeeper.toml（见 examples/demo-app）
+# 1. 在你的应用部署目录写一个 appkeeper.toml（见 examples/demo-app）
 # 2. 注册（空配置也能先跑起来）；或从可执行程序直接脚手架生成：
-cd /opt/myapp && xkeeper add . --name myapp --restart always
-xkeeper add /opt/srv/web-server --name abc --args "--port 8080" --env LOG=debug --apply
-xkeeper list
+cd /opt/myapp && ak add . --name myapp --restart always
+ak add /opt/srv/web-server --name abc --args "--port 8080" --env LOG=debug --apply
+ak list
 
 # 3. 启动守护进程（默认空无一物，只拉起已注册应用）
-xkeeper run                    # 前台；Ctrl+C 优雅停机
-xkeeper run --detach           # 后台：就绪后打印监听地址与日志路径即返回
+ak run                    # 前台；Ctrl+C 优雅停机
+ak run --detach           # 后台：就绪后打印监听地址与日志路径即返回
 
 # 4. 控制
-xkeeper status                 # 人读表格（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）
-xkeeper status --json          # 脚本消费：等价 GET /v1/status 的 pretty JSON
-xkeeper stop myapp-程序名
-xkeeper log web api --tail 50 -f   # 多程序聚合（>1 名时行首加 [名] 前缀）
-xkeeper log web --stream both      # 合并 stdout/stderr
-xkeeper signal <程序名> USR1     # 向子进程投递白名单信号（unix）
-xkeeper restart --app myapp     # 对整个 app 扇出（按启动排序，停止逆序）
-xkeeper action api flush        # 执行自定义动作（退出码透传）
-xkeeper reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
-xkeeper apply                  # 应用待应用变更（apply all 等价；apply demo / apply demo web 限定范围）
-xkeeper apply --restart        # 无变更的程序也重启（手动停止的保持停止）
-xkeeper remove web             # 注销：删除注册记录与生成文件（部署目录文件不动）
-xkeeper shutdown
+ak status                 # 人读表格（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）
+ak status --json          # 脚本消费：等价 GET /v1/status 的 pretty JSON
+ak stop myapp-程序名
+ak log web api --tail 50 -f   # 多程序聚合（>1 名时行首加 [名] 前缀）
+ak log web --stream both      # 合并 stdout/stderr
+appkeeper signal <程序名> USR1     # 向子进程投递白名单信号（unix）
+ak restart --app myapp     # 对整个 app 扇出（按启动排序，停止逆序）
+appkeeper action api flush        # 执行自定义动作（退出码透传）
+ak reload                 # 重扫配置并检出待应用变更（pending），不触碰任何进程
+ak apply                  # 应用待应用变更（apply all 等价；apply demo / apply demo web 限定范围）
+ak apply --restart        # 无变更的程序也重启（手动停止的保持停止）
+ak remove web             # 注销：删除注册记录与生成文件（部署目录文件不动）
+ak shutdown
 ```
 
 > **`run` 是统一入口动词**：裸 `run`（可加 `--detach`）是守护进程；
@@ -114,15 +114,15 @@ xkeeper shutdown
 > 旧 `start` 动词已移除，调用会报未知子命令并提示改用 `run`。
 >
 > 冷启动时程序是否被拉起取决于其 `restart` 策略：`no` 只注册不拉起，
-> 其余策略拉起。`xkeeper config --init` 生成的 `[app-default] restart = "always"`
+> 其余策略拉起。`ak config --init` 生成的 `[app-default] restart = "always"`
 > 让上面路径一开箱即跑；若你手写 daemon 配置且未设 `[app-default]`，级联到底的
-> 默认是 `no`——此时需 `xkeeper run web` 手动启动，或在 `[app-default]` 显式
+> 默认是 `no`——此时需 `ak run web` 手动启动，或在 `[app-default]` 显式
 > 写 `restart = "always"`。
 >
 > **`--restart=no`**：命令行注册形态加 `--restart=no` 时只注册、不拉起
-> （覆盖「先登记、暂不运行」），之后 `xkeeper run <名>` 可随时启动。
+> （覆盖「先登记、暂不运行」），之后 `ak run <名>` 可随时启动。
 
-> `all` 是 apply 的全量保留字：`xkeeper apply all` 与裸 `xkeeper apply`
+> `all` 是 apply 的全量保留字：`ak apply all` 与裸 `ak apply`
 > 严格等价，因此应用名不能叫 `all`（add 与 run ad-hoc 会拒绝并说明保留字）。
 
 ## 配置示例
@@ -132,7 +132,7 @@ daemon（`examples/daemon.toml`，带注释模板在 `conf/daemon.toml`；app �
 ```toml
 [daemon]
 log_level = "info"
-log_dir = "/var/log/xkeeper" # 可选；缺省 /tmp/xkeeper/logs，必须为绝对路径
+log_dir = "/var/log/appkeeper" # 可选；缺省 /tmp/appkeeper/logs，必须为绝对路径
 monitor_interval = 1.0
 host = "127.0.0.1"          # 控制平面仅回环
 port = 7310
@@ -154,7 +154,7 @@ restart_backoff = 1.0
 >   正常关机不写入）。
 >
 > 宽容写法：布尔 `false` ≡ `"no"`；四层级联到底均未设置 ≡ 内置默认 `no`。
-> `xkeeper config --init` 生成的 `[app-default]` 显式写 `restart = "always"`
+> `ak config --init` 生成的 `[app-default]` 显式写 `restart = "always"`
 > 以保持开箱守护体验。
 >
 > **迁移**：旧字段 `autorestart`（`never`→`no`，其余原值）与 `autostart`
@@ -172,8 +172,8 @@ restart_backoff = 1.0
 ### Web 控制台开关（`[webui]` 段）
 
 内嵌 Web 控制台是**配置驱动**的可选段：daemon 配置里存在 `[webui]` 段即开启，
-缺省关闭。无需任何额外子命令——`xkeeper run` 启动时按配置伺服，运行中改动
-由 `xkeeper reload` 热生效（开启/关闭/换址重绑；端口被占用时降级运行并在
+缺省关闭。无需任何额外子命令——`ak run` 启动时按配置伺服，运行中改动
+由 `ak reload` 热生效（开启/关闭/换址重绑；端口被占用时降级运行并在
 reload 输出中说明，守护进程不受影响）：
 
 ```toml
@@ -182,12 +182,12 @@ listen = "127.0.0.1:9877"   # 缺省 127.0.0.1:9877
 ```
 
 ```bash
-xkeeper config --set webui.listen=127.0.0.1:9877   # 一次性写入（等价手改 [webui] 段）
-xkeeper reload                                     # 守护在线时热开启；输出附 webui: 结果行
-xkeeper config --delete webui                      # 删整段 = 关闭控制台；reload 热关闭
+ak config --set webui.listen=127.0.0.1:9877   # 一次性写入（等价手改 [webui] 段）
+ak reload                                     # 守护在线时热开启；输出附 webui: 结果行
+ak config --delete webui                      # 删整段 = 关闭控制台；reload 热关闭
 ```
 
-app（部署目录 `xkeeper.toml`，`examples/demo-app/xkeeper.toml`）：
+app（部署目录 `appkeeper.toml`，`examples/demo-app/appkeeper.toml`）：
 
 ```toml
 [app]                       # 可选；add 的微调 flag 写在这里，部署人可手改
@@ -211,30 +211,30 @@ restart_on_unhealthy = true # unhealthy 触发与崩溃一致的重启
 
 ## 日志
 
-未配置 `daemon.log_dir` 时，日志固定写入 `/tmp/xkeeper/logs`，且 `log_dir`
+未配置 `daemon.log_dir` 时，日志固定写入 `/tmp/appkeeper/logs`，且 `log_dir`
 必须是绝对路径。每个程序的 stdout 与 stderr 分别按大小轮转：缺省单文件
 `50MB`，保留 2 个轮转文件（当前文件加 `.1`、`.2`，每流最多 3 个文件）。设置
 `log_max_size = "0"` 可禁用该程序的轮转。
 
 `/tmp` 可能是 tmpfs，或被系统的临时文件清理机制删除；需要跨重启保留日志时，
-请显式配置绝对目录，例如 `/var/log/xkeeper`。多实例部署也应使用不同的绝对目录。
+请显式配置绝对目录，例如 `/var/log/appkeeper`。多实例部署也应使用不同的绝对目录。
 
-升级前依赖默认相对 `logs` 目录的部署，新日志会改写到 `/tmp/xkeeper/logs`，旧日志
+升级前依赖默认相对 `logs` 目录的部署，新日志会改写到 `/tmp/appkeeper/logs`，旧日志
 仍留在 `<daemon 配置目录>/logs`，不会自动迁移。已有 `log_dir = "logs"` 等相对路径
 配置会被拒绝启动，需改为绝对路径。
 
-## daemon 配置管理（`xkeeper config`）
+## daemon 配置管理（`ak config`）
 
 daemon 配置的脚本化管理入口，纯本地文件操作（不依赖运行中的守护进程）。
 动作由 flag 指定，一次调用只执行一类动作；无任何动作 flag 时打印用法并以 0 退出：
 
 ```bash
-xkeeper config --init                        # 全新初始化（拒绝覆盖既有文件）
-xkeeper config --get port                    # 查询生效值：文件显式值优先，未设置回退内置默认（单键只打印值）
-xkeeper config --get port --get host         # 多键查询：每行 key=value
-xkeeper config --set port=8080 --set log_level=debug   # 白名单强类型写入（可重复）
-xkeeper config --delete port                 # 删除（回到「未配置」态；幂等；点路径 daemon.port 等价）
-xkeeper config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存后校验
+ak config --init                        # 全新初始化（拒绝覆盖既有文件）
+ak config --get port                    # 查询生效值：文件显式值优先，未设置回退内置默认（单键只打印值）
+ak config --get port --get host         # 多键查询：每行 key=value
+ak config --set port=8080 --set log_level=debug   # 白名单强类型写入（可重复）
+ak config --delete port                 # 删除（回到「未配置」态；幂等；点路径 daemon.port 等价）
+ak config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存后校验
 ```
 
 - **白名单强类型**：`--set`/`--get`/`--delete` 接受 `[daemon]` 表的 8 个已知键
@@ -249,9 +249,9 @@ xkeeper config --edit                        # $VISUAL/$EDITOR 全文编辑 + �
 - **删除即回退默认**：删除有默认值的键后回到「未配置」态；目标本不存在时幂等成功
   （文件不变）；未知键/未知表拒绝。删除整段 `--delete webui` 即关闭 Web 控制台。
 - **缺失文件语义**：`--get` 等价全默认回答；`--set`/`--delete` 拒绝并提示先执行
-  `xkeeper config --init`；`--edit` 先创建再打开。
+  `ak config --init`；`--edit` 先创建再打开。
 - **在线提示**：写动作成功后对既有控制面地址发一次短超时探活——在线则提示执行
-  `xkeeper reload` 生效，离线提示下次启动生效。探测失败不阻塞动作本身。
+  `ak reload` 生效，离线提示下次启动生效。探测失败不阻塞动作本身。
 
 app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[app-default]` 仅在
 `--init` 模板中以注释形式提示。
@@ -259,7 +259,7 @@ app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[ap
 ## 配置变更：检出与应用（两阶段）
 
 编辑 app 配置或 daemon 配置后，守护进程会在一个巡检周期内自动检出差异
-（pending），**不会**触碰任何进程。`xkeeper apply` 显式应用：
+（pending），**不会**触碰任何进程。`ak apply` 显式应用：
 
 - `apply` 应用全部 pending；`apply all` 与缺省严格等价（`all` 为全量保留字，
   不可用作应用名）；`apply <app>` / `apply <app> <program>` 限定范围，
@@ -270,9 +270,9 @@ app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[ap
   fatal）保持停止，崩溃退避中的（backoff）立即拉起；
 - 无待应用变更时 `apply` 什么都不做（幂等，退出码 0）。
 
-`xkeeper reload` 现在只「重扫 + 检出 + 输出预览」。**迁移说明**：依赖
-「reload 即生效」的脚本请改为 `xkeeper reload && xkeeper apply`（或直接
-`xkeeper apply`）。`xkeeper add/remove` 在线同步同样进入 pending，需
+`ak reload` 现在只「重扫 + 检出 + 输出预览」。**迁移说明**：依赖
+「reload 即生效」的脚本请改为 `ak reload && ak apply`（或直接
+`ak apply`）。`ak add/remove` 在线同步同样进入 pending，需
 `apply` 后才拉起/停止对应程序。
 
 ## 状态机与重启语义
@@ -306,18 +306,18 @@ app 配置不进入 `config` 的键空间（继续走 add/apply 体系）；`[ap
 | --- | --- | --- |
 | daemon | shutdown、reload | 既有命令，语义不变 |
 | program | start、stop、restart | 既有命令；signal 见下 |
-| program | 自定义动作 | `xkeeper action <program> <动作名>`，配置声明见下 |
-| app | start、stop、restart 扇出 | `xkeeper run\|stop\|restart --app <名>` |
+| program | 自定义动作 | `appkeeper action <program> <动作名>`，配置声明见下 |
+| app | start、stop、restart 扇出 | `ak run\|stop\|restart --app <名>` |
 
 **app 扇出**：作用于该 app 全部程序，排序复用启动规则——启动按依赖拓扑序
 （同名次按字典序），停止按逆序；逐程序复用既有 start/stop/restart 逻辑，
 所以扇出 start 会拉起手动停止的程序（并清除 user_stopped 标记），输出逐程序
-结果。裸 `xkeeper run <程序名>` 与旧 `xkeeper start <程序名>` 语义一致。
+结果。裸 `ak run <程序名>` 与旧 `ak start <程序名>` 语义一致。
 
-**signal（内置动作，unix）**：`xkeeper signal <程序名> <SIGNAL>` 向该程序的
+**signal（内置动作，unix）**：`appkeeper signal <程序名> <SIGNAL>` 向该程序的
 子进程 pid 投递信号（不投进程组——清理进程组是 stop 的语义）。白名单：
 `TERM INT HUP QUIT USR1 USR2`（大小写不敏感，可带 `SIG` 前缀）；白名单外
-（含 KILL/STOP/CONT）报错——需要停止请用 `xkeeper stop`。投递成功不改变
+（含 KILL/STOP/CONT）报错——需要停止请用 `ak stop`。投递成功不改变
 程序状态机；Windows 上明确报平台不支持。
 
 ### 自定义动作
@@ -339,7 +339,7 @@ command = """
 set -e
 cd /opt/myapp
 git pull && ./build.sh
-xkeeper restart api          # 动作中链式控制命令：CLI 自动读取 daemon 配置连接控制面
+ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 配置连接控制面
 """
 ```
 
@@ -378,29 +378,29 @@ xkeeper restart api          # 动作中链式控制命令：CLI 自动读取 da
 `GET /v1/programs/{name}/logs?stream=out|err&tail=N&follow=1` 支持流式跟随。
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达。
-例外：`xkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
+例外：`appkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
 ### 统一入口动词 `run`
 
-`xkeeper run` 承载三种形态，分派规则如下：
+`ak run` 承载三种形态，分派规则如下：
 
 | 形态 | 调用 | 行为 |
 | --- | --- | --- |
-| daemon | `xkeeper run` / `xkeeper run --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
-| 启动 | `xkeeper run <name>` / `xkeeper run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app（对已 running 程序返回 409，未知程序 404） |
-| ad-hoc | `xkeeper run -- <cmd...>` / `xkeeper run --cmd "<字符串>"` | 命令行注册并立即生效（首 token 解析为绝对路径；守护离线时自动后台拉起） |
+| daemon | `ak run` / `ak run --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
+| 启动 | `ak run <name>` / `ak run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app（对已 running 程序返回 409，未知程序 404） |
+| ad-hoc | `ak run -- <cmd...>` / `ak run --cmd "<字符串>"` | 命令行注册并立即生效（首 token 解析为绝对路径；守护离线时自动后台拉起） |
 
 - ad-hoc 形态与 `name`/`--app`/`--detach` 互斥；`--detach` 仅 daemon 形态合法。
 - ad-hoc 的脚手架 flag：`--name`（缺省取命令 stem）、`--description`、
   `--restart=<no|always|unless-stopped|on-failure>`、`--restart-backoff`、
   `--env K=V`（可重复）、`--workdir <路径>`；`--args` 不存在（命令行本身即参数）。
-- 旧 `start` 动词已移除：`xkeeper start web` 报未知子命令并提示 `xkeeper run web`。
+- 旧 `start` 动词已移除：`ak start web` 报未知子命令并提示 `ak run web`。
 - 旧 flag `--autostart`/`--no-autostart`/`--autorestart` 已移除，统一
   `--restart=<字面量>`（add 与 run ad-hoc 共用）。
 
 **后台拉起协议**（`run --detach` 与「立即生效」入口共用）：派生
-`xkeeper run -c <配置>`（unix `process_group(0)` / Windows
+`ak run -c <配置>`（unix `process_group(0)` / Windows
 `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`），stdio 追加写
 `{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`，总超时 ~10s。
 就绪即成功（并发拉起只留一个实例，端口竞争败者自灭）；超时以非零码退出并
@@ -410,13 +410,13 @@ Web 控制台与控制面同属一个守护进程：存在 `[webui]` 配置段�
 「Web 控制台开关」）另开一个回环端口，伺服内嵌 UI、`/api/*` 查询与 `/ws`
 WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
 
-### 交互式 shell（`xkeeper shell`）
+### 交互式 shell（`appkeeper shell`）
 
 supervisorctl 风格的终端入口，经控制面 API 与守护进程通信（纯客户端，不改变守护行为）：
 
 ```bash
-xkeeper shell                        # 进入 REPL（行编辑 + 历史，Ctrl+C 中断当前行，exit/quit 离开）
-xkeeper shell -e "status"            # 单命令模式：执行一条后退出（脚本友好，退出码同 CLI 约定）
+appkeeper shell                        # 进入 REPL（行编辑 + 历史，Ctrl+C 中断当前行，exit/quit 离开）
+appkeeper shell -e "status"            # 单命令模式：执行一条后退出（脚本友好，退出码同 CLI 约定）
 ```
 
 内置命令：`status`（对齐表格：NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）、
@@ -425,14 +425,14 @@ xkeeper shell -e "status"            # 单命令模式：执行一条后退出�
 `signal <program> <SIGNAL>`、`pid <name>`、`log <name> [-f] [--tail N] [--stream out|err]`、
 `pending`、`apply [<app> [<program>]] [--restart]`、`shutdown`、`open`（用系统浏览器打开 webui 控制台）、`help`/`?`、`exit`/`quit`。
 
-### 一键打开控制台（`xkeeper shell` 的 `open` 动词）
+### 一键打开控制台（`appkeeper shell` 的 `open` 动词）
 
 控制台默认关闭：先在 daemon 配置里加 `[webui]` 段（或
-`xkeeper config --set webui.listen=127.0.0.1:9877`），守护在线时
-`xkeeper reload` 热开启（离线则下次 `xkeeper run` 自动伺服），然后：
+`ak config --set webui.listen=127.0.0.1:9877`），守护在线时
+`ak reload` 热开启（离线则下次 `ak run` 自动伺服），然后：
 
 ```bash
-xkeeper shell -e "open"     # 探活 GET /api/health 可达才调起系统浏览器；不可达给出开启提示
+appkeeper shell -e "open"     # 探活 GET /api/health 可达才调起系统浏览器；不可达给出开启提示
 ```
 
 ## Web UI
@@ -441,7 +441,7 @@ xkeeper shell -e "open"     # 探活 GET /api/health 可达才调起系统浏览
 
 `webui/` 是一个 Vite + TypeScript + Lit 的 SPA：
 
-- **Lit 3**（Web Components / Shadow DOM）渲染全部界面，视图即自定义元素 `<xkeeper-*>`；
+- **Lit 3**（Web Components / Shadow DOM）渲染全部界面，视图即自定义元素 `<appkeeper-*>`；
 - **Web Awesome** 提供 Web Components 基础控件，主题经 `webui/src/styles/wa-overrides.css`
   映射到仓库自己的 design tokens（`tokens.css`，indigo 品牌、暗色优先）；
 - **pnpm** 管理依赖，**vitest**（happy-dom/jsdom 环境）跑组件测试，TypeScript `strict` 模式；
@@ -455,7 +455,7 @@ Node 工具链即可一次 `cargo build --release` 得到带完整 UI 的二进�
 **debug 构建默认跳过前端工具链**（不调 pnpm，Rust 调试迭代不被拖慢）：debug 下
 rust-embed 在运行时直接读取磁盘上的 `webui/dist`——手动 `pnpm build` 一次后，
 改前端再 `pnpm build` 即可，无需重新编译 Rust；`dist` 缺失时伺服占位页。
-需要 debug 下自动构建可设 `XKEEPER_WEBUI_BUILD=force`。
+需要 debug 下自动构建可设 `AK_WEBUI_BUILD=force`。
 
 ### 开发调试（pnpm dev）
 
@@ -464,7 +464,7 @@ rust-embed 在运行时直接读取磁盘上的 `webui/dist`——手动 `pnpm b
 
 ```bash
 # 终端 A：后端（API + 内嵌 UI）——daemon 配置含 [webui] 段即伺服控制台
-cargo run -- run                    # 配置未开控制台时，先: xkeeper config --set webui.listen=127.0.0.1:9877
+cargo run -- run                    # 配置未开控制台时，先: ak config --set webui.listen=127.0.0.1:9877
 
 # 终端 B：前端热更新开发服务器
 cd webui
@@ -474,7 +474,7 @@ pnpm test                           # vitest 组件测试
 ```
 
 `/ws` WebSocket 推送同样经 dev server 代理，dev 模式下实时状态与日志可用；
-代理目标可用 `XKEEPER_WEBUI_DEV_BACKEND` 覆盖（默认 `http://127.0.0.1:9877`）。
+代理目标可用 `AK_WEBUI_DEV_BACKEND` 覆盖（默认 `http://127.0.0.1:9877`）。
 
 前端改完后 `pnpm build` 产出 `dist/`，再 `cargo build --release` 即把新 UI 嵌入
 二进制（debug 构建则运行时直接读盘，无需重编）。
@@ -483,20 +483,20 @@ pnpm test                           # vitest 组件测试
 
 ```bash
 cargo build --release
-# 产物: target/release/xkeeper(.exe) —— 单文件，自带全部前端资源
+# 产物: target/release/appkeeper(.exe) —— 单文件，自带全部前端资源
 ```
 
 - 发布产物是**单个二进制**：运行时不需要 Node、不需要静态文件目录。
 - 没有 Node 工具链时 `cargo build` 不会失败：build.rs 写入一个占位页并给出 warning。
-- 设置 `XKEEPER_WEBUI_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
-  直接使用磁盘上已有的 `webui/dist/`；旧变量 `XKEEPER_FRONTEND_BUILD` 仍被兼容识别。
+- 设置 `AK_WEBUI_BUILD=skip` 可跳过前端构建（CI 无 Node 环境时），
+  直接使用磁盘上已有的 `webui/dist/`；旧变量 `AK_WEBUI_BUILD` 仍被兼容识别。
 
 ### Ansible 部署
 
 Ansible role 部署见 [.ansible/README.md](.ansible/README.md)：默认免 inventory，
 本机一条命令完成"分发二进制 → 装 daemon 配置 → 注册 systemd 服务"，也可直接引用
-`roles/xkeeper` 扩展到多主机。默认部署对既有 xkeeper 安装零影响——检测到
-既有安装立即停止并说明原因，需显式设置 `xkeeper_force_overwrite: true` 才允许覆盖。
+`roles/appkeeper` 扩展到多主机。默认部署对既有 appkeeper 安装零影响——检测到
+既有安装立即停止并说明原因，需显式设置 `appkeeper_force_overwrite: true` 才允许覆盖。
 
 ### API 概览
 
@@ -540,7 +540,7 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 
 ## 从 v0.1 迁移
 
-v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>` 时被
+v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `ak add <旧文件>` 时被
 自动识别并转换：程序转写为 `[program.*]` 注册为一个应用，`[daemon]` 段提示
 并入 daemon 配置，原文件不修改。
 
@@ -548,9 +548,9 @@ v0.1 单文件配置（`[daemon]` + `[[program]]`）在 `xkeeper add <旧文件>
 
 应用名、程序名与自定义动作名现在只允许 `[A-Za-z0-9_-]`（英文字母、数字、
 下划线、连字符）。含点号、空格或非 ASCII 字符的既有名字升级后会被
-validate/reload 拒绝。迁移步骤：升级二进制 → `xkeeper validate`（暴露全部
-违规名）→ 改名（`xkeeper.toml` 中的表键与 `depends_on` 引用）→
-`xkeeper reload && xkeeper apply`。
+validate/reload 拒绝。迁移步骤：升级二进制 → `ak validate`（暴露全部
+违规名）→ 改名（`appkeeper.toml` 中的表键与 `depends_on` 引用）→
+`ak reload && ak apply`。
 
 回滚提示：`[program.<名>.action.*]` 动作表是新增配置结构，旧版本二进制
 会因未知字段拒绝整个 app 配置——回滚前先移除这些表再降级。
@@ -560,8 +560,8 @@ validate/reload 拒绝。迁移步骤：升级二进制 → `xkeeper validate`�
 本版把「跑」收敛到 `run` 一个动词、启动/重启策略收敛到单一 `restart` 字段，
 含三处 BREAKING：
 
-- **`start` 动词移除**：`xkeeper start <名>` → `xkeeper run <名>`；
-  `xkeeper start --app <app>` → `xkeeper run --app <app>`（报错信息自带提示）；
+- **`start` 动词移除**：`ak start <名>` → `ak run <名>`；
+  `ak start --app <app>` → `ak run --app <app>`（报错信息自带提示）；
   `shell` 内置动词同步由 `start` 改为 `run`。
 - **`status` 默认输出改为人读表格**：脚本消费请加 `--json`，其输出与本变更前
   的默认 pretty JSON 逐字节等价。
@@ -572,35 +572,35 @@ validate/reload 拒绝。迁移步骤：升级二进制 → `xkeeper validate`�
 
 另：`add --apply` 与 run 的 ad-hoc 形态在守护进程离线时不再报错，而是**自动
 后台拉起守护进程**后继续生效（曾依赖「离线报错」的自动化需知悉）；无 systemd
-等场景可用 `xkeeper run --detach` 直接后台常驻，`xkeeper shutdown` 统一管理。
+等场景可用 `ak run --detach` 直接后台常驻，`ak shutdown` 统一管理。
 
-## 作为系统服务运行（守护 xkeeper 本身）
+## 作为系统服务运行（守护 appkeeper 本身）
 
 Linux (systemd) 一条命令安装/卸载（需要 root）：
 
 ```bash
-sudo xkeeper service install            # 生成 /etc/systemd/system/xkeeper.service + daemon-reload + enable
-sudo xkeeper service install --now      # 安装后立即 start
-sudo xkeeper service uninstall          # stop + disable + 删除 unit + daemon-reload
+sudo ak service install            # 生成 /etc/systemd/system/ak.service + daemon-reload + enable
+sudo ak service install --now      # 安装后立即 start
+sudo ak service uninstall          # stop + disable + 删除 unit + daemon-reload
 ```
 
-可选参数：`-c/--config <daemon 配置>`（全局参数；写入 unit 的 ExecStart，缺省 `/etc/xkeeper/daemon.toml`）、
+可选参数：`-c/--config <daemon 配置>`（全局参数；写入 unit 的 ExecStart，缺省 `/etc/appkeeper/daemon.toml`）、
 `--unit-file <path>`（unit 文件完整路径，必须以 `.service` 结尾，默认
-`/etc/systemd/system/xkeeper.service`）、`--user <name>`（服务运行用户）、
+`/etc/systemd/system/ak.service`）、`--user <name>`（服务运行用户）、
 `--force`（目标 unit 已存在且内容不同时覆盖）。重复安装内容一致时幂等跳过。
 `TimeoutStopSec` 按已注册程序的最大 `stop_timeout` 自动估算（2×最大值 + 10s，
 配置不可加载时 90s）；需要定制可直接修改生成后的 unit 文件再
 `systemctl daemon-reload`。
 
-Windows 暂不支持 `xkeeper service`（nssm 仍可用）：
+Windows 暂不支持 `ak service`（nssm 仍可用）：
 
 ```bat
-nssm install xkeeper D:\tools\xkeeper\xkeeper.exe
-nssm set xkeeper AppParameters run
-nssm start xkeeper
+nssm install appkeeper D:\tools\appkeeper\ak.exe
+nssm set appkeeper AppParameters run
+nssm start appkeeper
 ```
 
-xkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）由内核
+appkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）由内核
 兜底清理；Unix 上子进程位于独立进程组，正常路径按进程组终止。
 
 ## 平台差异与注意
@@ -609,31 +609,31 @@ xkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）�
   Object 兜底）；Unix 先 SIGTERM 等待 `stop_timeout` 再 kill 整个进程组。
 - Windows 符号链接需要管理员/开发者模式：无权限时 `app_dir` 降级为硬链接。
   硬链接会被 `sed -i` 等"替换文件式"编辑断开——编辑配置后重跑一次
-  `xkeeper add .` 刷新链接即可（幂等）；symlink 模式不受影响。
-- Linux 上 `/etc/xkeeper/daemon.toml` 需 root 写权限：非 root 用户执行 add/remove
+  `ak add .` 刷新链接即可（幂等）；symlink 模式不受影响。
+- Linux 上 `/etc/appkeeper/daemon.toml` 需 root 写权限：非 root 用户执行 add/remove
   请用 sudo，或 `-c/--config` 指向用户级 daemon 配置。
 - 单行 `command` 只做词法拆分（空白 + 引号），不经过 shell；需要 shell 语义
   显式写 `bash -c "..."`。自定义动作的 `command` 相反，整体交给平台 shell
   （unix `/bin/sh -c`、Windows `cmd /C`），见「动作」一节。
 - `signal` 动作仅 unix：Windows 上返回明确的平台不支持错误。
 
-## 性能基准（`xkeeper-bench`）
+## 性能基准（`appkeeper-bench`）
 
-独立二进制 `xkeeper-bench`（workspace 成员 crate，随 workspace 一同构建）对真实
-xkeeper daemon 做负载基准测量：按 case 拉起负载、从既有 `/v1` 控制面与磁盘日志
+独立二进制 `appkeeper-bench`（workspace 成员 crate，随 workspace 一同构建）对真实
+appkeeper daemon 做负载基准测量：按 case 拉起负载、从既有 `/v1` 控制面与磁盘日志
 **纯外部**采集指标，输出人类可读报告（stdout）与 `--json` 机器可读结果（rows/s、
 bytes/s、峰值/均值 RSS、轮转次数、wall time、逐行完整性校验）。退出码只反映运行
 成败，不做阈值门禁——版本间回归请自行对比两次 JSON。
 
 ```bash
 # 自带隔离环境（缺省）：临时 workspace 拉起自己的 daemon 与负载程序，结束自动清理
-xkeeper-bench --case firehose --duration 10
+appkeeper-bench --case firehose --duration 10
 
 # 连接已运行的 daemon（同机；daemon 开启 Bearer 鉴权时加 --token）
-xkeeper-bench --case firehose --connect 127.0.0.1:7310 --token <tok>
+appkeeper-bench --case firehose --connect 127.0.0.1:7310 --token <tok>
 
 # 导出机器可读报告
-xkeeper-bench --case rotation --log-rows 200000 --json report.json
+appkeeper-bench --case rotation --log-rows 200000 --json report.json
 ```
 
 四个 case（`--case`，必选）：
@@ -659,7 +659,7 @@ xkeeper-bench --case rotation --log-rows 200000 --json report.json
   workspace/日志，临时 app 仍会卸载）。
 - **`--connect` 注意**：负载经由目标 daemon 写真实磁盘日志，量界参数请量力设置；
   bench 与 daemon 必须同机（需读取其 app_dir 与 log_dir）；目标上已存在
-  `xkeeper-bench-` 前缀 app 时拒绝开跑，绝不触碰非 bench 创建的 app 或文件。
+  `appkeeper-bench-` 前缀 app 时拒绝开跑，绝不触碰非 bench 创建的 app 或文件。
 - **与 `cargo run -p xtask -- stress` 的关系**：stress 是零反压/WS 背压的
   **验证**工具（CI 断言口径），bench 是面向用户的**测量**工具（对比 JSON 口径），
   两者实现独立、互不依赖。
@@ -678,15 +678,15 @@ app 扇出排序、legacy 导入、日志轮转与环形缓冲、7 态状态机
 （真实子进程：重启/启动预算/策略/停止/落盘）、tcp/http/exec 探测。
 
 跨进程验收（真实 daemon + CLI + HTTP，含动作全链路/signal/--app 扇出/
-字符集拒绝场景，以及 xkeeper-bench 的 firehose 冒烟 + JSON 报告 + 清理断言；
+字符集拒绝场景，以及 appkeeper-bench 的 firehose 冒烟 + JSON 报告 + 清理断言；
 `--no-browser` 跳过浏览器段）：
 
 ```bash
 cargo run -p xtask -- e2e --no-browser
 ```
 
-xkeeper-bench 自身的完整周期集成测试（真实 daemon，每条数秒）默认忽略：
+appkeeper-bench 自身的完整周期集成测试（真实 daemon，每条数秒）默认忽略：
 
 ```bash
-cargo test -p xkeeper-bench --test integration -- --ignored --test-threads=1
+cargo test -p appkeeper-bench --test integration -- --ignored --test-threads=1
 ```

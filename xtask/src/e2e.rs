@@ -21,7 +21,7 @@
 //!      then online: `--app` fan-out order + user_stopped coverage, custom
 //!      action success with variable substitution, work_dir resolution,
 //!      timeout tree kill, same-action mutual exclusion, chained
-//!      `xkeeper restart` inside an action, stopped-program pid→empty,
+//!      `ak restart` inside an action, stopped-program pid→empty,
 //!      signal whitelist in/out + not-running (unix).
 //!   K. config subcommand (add-config-subcommand): init (defaults + comments
 //!      + app dir + example.toml.sample), get (defaults / file values /
@@ -32,7 +32,7 @@
 //!      keys ride the same engine (K16: set/get/delete on webui.listen and
 //!      the whole [webui] table).
 //! - webui lifecycle pass (config-driven-webui): the daemon boots with
-//!   `xkeeper run` and a `[webui]` section in daemon.toml; W1 deletes the
+//!   `ak run` and a `[webui]` section in daemon.toml; W1 deletes the
 //!   section + reload → connection refused, W2 sets a new listen + reload →
 //!   serving on the new address, W3 restores the listen + reload → rebind,
 //!   W4/W5 occupy then free the listen → reload degrades with a note and
@@ -105,19 +105,19 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
         ),
     )?;
     std::fs::write(
-        root.join("app-alpha/xkeeper.toml"),
+        root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     std::fs::write(
-        root.join("app-beta/xkeeper.toml"),
+        root.join("app-beta/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     link_registration(
-        &root.join("app-alpha/xkeeper.toml"),
+        &root.join("app-alpha/appkeeper.toml"),
         &root.join("apps/alpha.toml"),
     )?;
     link_registration(
-        &root.join("app-beta/xkeeper.toml"),
+        &root.join("app-beta/appkeeper.toml"),
         &root.join("apps/beta.toml"),
     )?;
     Ok(Workspace {
@@ -216,11 +216,11 @@ fn cli(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<String> {
         .arg(ws.config_arg())
         .args(args)
         .output()
-        .with_context(|| format!("run xkeeper {:?}", args))?;
+        .with_context(|| format!("run appkeeper {:?}", args))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         bail!(
-            "xkeeper {:?} failed ({}): {}{}",
+            "appkeeper {:?} failed ({}): {}{}",
             args,
             out.status,
             stdout,
@@ -237,7 +237,7 @@ fn cli_try(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<(bool, i32, Stri
         .arg(ws.config_arg())
         .args(args)
         .output()
-        .with_context(|| format!("run xkeeper {:?}", args))?;
+        .with_context(|| format!("run appkeeper {:?}", args))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -255,7 +255,7 @@ fn cli_try_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<(bool, i32, Stri
         .arg(cfg)
         .args(args)
         .output()
-        .with_context(|| format!("run xkeeper {:?} (cfg {})", args, cfg.display()))?;
+        .with_context(|| format!("run appkeeper {:?} (cfg {})", args, cfg.display()))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -270,7 +270,7 @@ fn cli_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<String> {
     let (ok, _code, combined) = cli_try_cfg(bin, cfg, args)?;
     if !ok {
         bail!(
-            "xkeeper {:?} (cfg {}) failed: {combined}",
+            "appkeeper {:?} (cfg {}) failed: {combined}",
             args,
             cfg.display()
         );
@@ -529,7 +529,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "empty --env key registers nothing",
     )?;
 
-    step("G0c. `xkeeper status` with no daemon is unreachable (exit 3)");
+    step("G0c. `ak status` with no daemon is unreachable (exit 3)");
     let (ok, code, combined) = cli_try(bin, ws, &["status"])?;
     expect(
         !ok && code == 3,
@@ -625,7 +625,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
 // -- config subcommand pass (add-config-subcommand) -------------------------------
 
-/// Offline scenarios for `xkeeper config` (runs BEFORE the daemon exists, so
+/// Offline scenarios for `ak config` (runs BEFORE the daemon exists, so
 /// write actions report the offline note). Uses its own config paths under
 /// `cfgcmd/` so the workspace's daemon.toml stays untouched for the daemon
 /// pass. Covers: init → get defaults → set → get file values → illegal sets
@@ -775,7 +775,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(
         combined.contains("config --init"),
-        "the error points at `xkeeper config --init`",
+        "the error points at `ak config --init`",
     )?;
     expect(!fresh.exists(), "nothing was created by the refused set")?;
 
@@ -917,7 +917,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the init-produced app_dir lists no apps (.sample ignored)",
     )?;
 
-    step("K13. bare `xkeeper config` prints the five-action usage and exits 0");
+    step("K13. bare `ak config` prints the five-action usage and exits 0");
     let out = cli_cfg(bin, &cfg, &["config"])?;
     for flag in ["--set", "--get", "--delete", "--edit", "--init"] {
         expect(
@@ -941,7 +941,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(
         combined.contains("config --init"),
-        "the error points at `xkeeper config --init`",
+        "the error points at `ak config --init`",
     )?;
     expect(
         !missing.exists(),
@@ -999,7 +999,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("A. disk edit only enters pending (no process action)");
     std::fs::write(
-        ws.root.join("app-alpha/xkeeper.toml"),
+        ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     // Periodic detection window (monitor_interval 0.5s).
@@ -1020,7 +1020,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     let out = cli(bin, ws, &["reload"])?;
     expect(
-        out.contains("worker") && out.contains("run `xkeeper apply`"),
+        out.contains("worker") && out.contains("run `ak apply`"),
         "reload prints a preview, applies nothing",
     )?;
     expect(
@@ -1031,7 +1031,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("B. scoped apply leaves other apps untouched");
     // Give beta a pending change too.
     std::fs::write(
-        ws.root.join("app-beta/xkeeper.toml"),
+        ws.root.join("app-beta/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
     let job_pid = pid_of(ws, "job")?.expect("job running");
@@ -1098,7 +1098,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let gamma = ws.root.join("app-gamma");
     std::fs::create_dir_all(&gamma)?;
     std::fs::write(
-        gamma.join("xkeeper.toml"),
+        gamma.join("appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.gamma]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     let out = cli(
@@ -1132,7 +1132,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Re-sync disk with the running definitions so the browser pass starts
     // from a clean slate (worker currently runs sleep 200000 after step B).
     std::fs::write(
-        ws.root.join("app-alpha/xkeeper.toml"),
+        ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     wait_pending_empty(ws)
@@ -1268,7 +1268,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         ],
     )?;
     expect(
-        out.contains("changed") && out.contains("xkeeper apply abc"),
+        out.contains("changed") && out.contains("ak apply abc"),
         "changed re-add points at the remedy",
     )?;
     let out = cli(
@@ -1298,7 +1298,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Give alpha a pending change; delta's app-scoped --apply must not touch it.
     let worker_before = pid_of(ws, "worker")?;
     std::fs::write(
-        ws.root.join("app-alpha/xkeeper.toml"),
+        ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
     cli(bin, ws, &["reload"])?; // publish the pending preview
@@ -1328,7 +1328,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // Restore alpha's disk to the applied content so no pending leaks on.
     std::fs::write(
-        ws.root.join("app-alpha/xkeeper.toml"),
+        ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
     cli(bin, ws, &["reload"])?;
@@ -1362,8 +1362,8 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli(bin, ws, &["remove", "gamma"])?;
     expect(out.contains("unregistered"), "gamma unregistered")?;
     expect(
-        ws.root.join("app-gamma/xkeeper.toml").is_file(),
-        "gamma's xkeeper.toml still exists",
+        ws.root.join("app-gamma/appkeeper.toml").is_file(),
+        "gamma's appkeeper.toml still exists",
     )?;
     // Apply the removals: the stopped programs disappear from the status.
     cli(bin, ws, &["apply"])?;
@@ -1399,7 +1399,7 @@ fn revamp_pass(bin: &Path) -> Result<()> {
 fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
     step("R1. `start` is gone (BREAKING) with a `run` hint; `run <name>` starts");
     let (ok, _code, combined) = cli_try(bin, ws, &["start", "web"])?;
-    expect(!ok, "`xkeeper start web` is rejected")?;
+    expect(!ok, "`ak start web` is rejected")?;
     expect(
         combined.contains("start") && combined.contains("run"),
         &format!("the error names the removed verb and the replacement: {combined:?}"),
@@ -1574,7 +1574,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     step("R6. legacy field aliases read; same-layer mixing is rejected");
     let alias_dir = ws.root.join("alias-app");
     std::fs::create_dir_all(&alias_dir)?;
-    let alias_file = alias_dir.join("xkeeper.toml");
+    let alias_file = alias_dir.join("appkeeper.toml");
     std::fs::write(
         &alias_file,
         "[app]\nautostart = true\nautorestart = \"on-failure\"\n[program.p]\ncommand = 'sleep 100'\n",
@@ -1623,7 +1623,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         // silent). `sh` is unix-only.
         let echo_dir = ws.root.join("echo-app");
         std::fs::create_dir_all(&echo_dir)?;
-        let echo_file = echo_dir.join("xkeeper.toml");
+        let echo_file = echo_dir.join("appkeeper.toml");
         std::fs::write(
             &echo_file,
             "[app]\nrestart = \"always\"\n\n[program.echo-a]\ncommand = 'sh'\nargs = ['-c', 'while true; do echo a-line; sleep 0.2; done']\nstartsecs = 0.2\n\n[program.echo-b]\ncommand = 'sh'\nargs = ['-c', 'while true; do echo b-line; sleep 0.2; done']\nstartsecs = 0.2\n",
@@ -1748,7 +1748,7 @@ fn detach_pass(bin: &Path) -> Result<()> {
 /// Write the scenario app used by the actions pass: one long-running service
 /// with a custom-action toolbox, a USR1/USR2-trapping program and a plain
 /// sleeper, chained by dependencies so the fan-out order is observable.
-/// The `xkeeper` binary path and daemon config path are baked into the
+/// The `appkeeper` binary path and daemon config path are baked into the
 /// chained-restart action (the CLI reads connection info from the config).
 fn setup_actions_app(ws: &Workspace, bin: &Path) -> Result<()> {
     let dir = ws.root.join("acts");
@@ -1820,8 +1820,8 @@ restart = "no"
         bin = bin_s,
         cfg = cfg_s,
     );
-    std::fs::write(dir.join("xkeeper.toml"), text)?;
-    link_registration(&dir.join("xkeeper.toml"), &ws.root.join("apps/acts.toml"))?;
+    std::fs::write(dir.join("appkeeper.toml"), text)?;
+    link_registration(&dir.join("appkeeper.toml"), &ws.root.join("apps/acts.toml"))?;
     Ok(())
 }
 
@@ -1830,7 +1830,7 @@ restart = "no"
 /// variable, built-in reserved word, timeout range.
 fn actions_offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("H0. action declarations pass validate");
-    let acts_file = ws.root.join("acts/xkeeper.toml");
+    let acts_file = ws.root.join("acts/appkeeper.toml");
     let out = cli(bin, ws, &["validate", &acts_file.to_string_lossy()])?;
     expect(
         out.contains("OK") && out.contains("program(s)"),
@@ -1840,7 +1840,7 @@ fn actions_offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("H1. illegal identifier names are refused (dots, spaces, non-ASCII)");
     let bad_dir = ws.root.join("badcase");
     std::fs::create_dir_all(&bad_dir)?;
-    let bad_file = bad_dir.join("xkeeper.toml");
+    let bad_file = bad_dir.join("appkeeper.toml");
     std::fs::write(&bad_file, "[program.\"my.web\"]\ncommand = 'sleep 1'\n")?;
     let (ok, code, combined) = cli_try(bin, ws, &["validate", &bad_file.to_string_lossy()])?;
     expect(!ok, "a dotted program name fails validate")?;
@@ -2013,7 +2013,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     }
 
     if cfg!(unix) {
-        step("H5b. `xkeeper log -f` streams new lines and stays alive (unix)");
+        step("H5b. `ak log -f` streams new lines and stays alive (unix)");
         // logger (started by the fan-out above) echoes `tick` every 0.2s.
         let follow_path = ws.root.join("follow.out");
         let follow = std::fs::File::create(&follow_path)?;
@@ -2133,7 +2133,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         &format!("both lines of the multi-line command executed: {out:?}"),
     )?;
 
-    step("H6c. `xkeeper action` passes the action's own exit code through");
+    step("H6c. `appkeeper action` passes the action's own exit code through");
     let (ok, code, combined) = cli_try(bin, ws, &["action", "svc", "fail3"])?;
     expect(
         !ok && code == 3,
@@ -2226,7 +2226,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "mutual exclusion left the program untouched",
     )?;
 
-    step("H10. an action can chain `xkeeper restart` via the control plane");
+    step("H10. an action can chain `ak restart` via the control plane");
     let out = cli(bin, ws, &["action", "svc", "chained"])?;
     expect(
         out.contains(&format!("old_svc_pid={svc_pid}")),
@@ -2403,7 +2403,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "shell restart replaced the process like the CLI does",
     )?;
 
-    // shell -e passes the action's own exit code through (like `xkeeper action`).
+    // shell -e passes the action's own exit code through (like `appkeeper action`).
     let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "action svc fail3"])?;
     expect(
         !ok && code == 3,
@@ -2627,23 +2627,23 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
-// -- bench smoke (add-xkeeper-bench) ----------------------------------------------
+// -- bench smoke (add-appkeeper-bench) ----------------------------------------------
 
 /// Build the bench binary quietly; returns its path (same profile as the
 /// daemon binary we just built).
 fn build_bench() -> Result<PathBuf> {
     let root = repo_root();
     let status = Command::new("cargo")
-        .args(["build", "--quiet", "-p", "xkeeper-bench"])
+        .args(["build", "--quiet", "-p", "appkeeper-bench"])
         .current_dir(&root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("failed to run cargo build -p xkeeper-bench")?;
+        .context("failed to run cargo build -p appkeeper-bench")?;
     if !status.success() {
-        bail!("cargo build -p xkeeper-bench failed");
+        bail!("cargo build -p appkeeper-bench failed");
     }
-    Ok(root.join("target/debug/xkeeper-bench"))
+    Ok(root.join("target/debug/appkeeper-bench"))
 }
 
 /// Temp dirs that follow the bench spawn-workspace naming
@@ -2675,11 +2675,11 @@ fn bench_workspaces() -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Bench smoke: a short firehose run of the real `xkeeper-bench` binary
+/// Bench smoke: a short firehose run of the real `appkeeper-bench` binary
 /// (spawning its own isolated daemon on a random port) — verifies the bench
 /// wiring, the JSON report contract and the cleanup guarantee.
 fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
-    step("L. bench smoke: xkeeper-bench firehose cycles its own isolated daemon");
+    step("L. bench smoke: appkeeper-bench firehose cycles its own isolated daemon");
     let bench = build_bench()?;
     let json = ws.root.join("bench-report.json");
     let out = Command::new(&bench)
@@ -2696,12 +2696,12 @@ fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             json.to_str().unwrap(),
         ])
         .output()
-        .context("run xkeeper-bench")?;
+        .context("run appkeeper-bench")?;
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     expect(
         out.status.success(),
-        &format!("xkeeper-bench exits 0 ({stderr})"),
+        &format!("appkeeper-bench exits 0 ({stderr})"),
     )?;
     expect(
         stdout.contains("rows/s") && stdout.contains("integrity"),
@@ -2720,8 +2720,8 @@ fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(v["integrity"]["pass"] == true, "integrity passed")?;
     expect(
-        v["bin_versions"]["xkeeper"].is_string(),
-        "the xkeeper version is recorded in the report",
+        v["bin_versions"]["ak"].is_string(),
+        "the appkeeper version is recorded in the report",
     )?;
     expect(
         v["wall_time_secs"].as_f64().unwrap_or(0.0) > 0.0,
@@ -2734,7 +2734,7 @@ fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(v["rotation_count"] == 0, "firehose rotates nothing")?;
     expect(
-        v["programs"][0]["name"] == "xkeeper-bench-firehose",
+        v["programs"][0]["name"] == "appkeeper-bench-firehose",
         "the load program carries the bench prefix",
     )?;
     if cfg!(unix) {
@@ -2847,14 +2847,14 @@ page.setDefaultTimeout(10_000);
 try {{
   await page.goto(URL);
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const bar = app?.shadowRoot?.querySelector('xkeeper-overview-bar');
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
     return !!bar?.shadowRoot?.querySelector('.bar');
   }});
   // No pending initially: the badge must not exist.
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const bar = app?.shadowRoot?.querySelector('xkeeper-overview-bar');
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
     return bar && !bar.shadowRoot.querySelector('.pending');
   }});
   ok('console loads with no pending badge');
@@ -2876,8 +2876,8 @@ try {{
   ].join('\n'));
 
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const bar = app?.shadowRoot?.querySelector('xkeeper-overview-bar');
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
     const badge = bar?.shadowRoot?.querySelector('.pending .badge');
     return badge && badge.textContent.includes('待应用变更');
   }});
@@ -2887,16 +2887,16 @@ try {{
   await page.goto(URL + '#/app/alpha').catch(() => {{}});
   // SPA uses history routing; drive the tree link instead.
   await page.evaluate(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const tree = app?.shadowRoot?.querySelector('xkeeper-console-tree');
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
     const link = [...(tree?.shadowRoot?.querySelectorAll('a') ?? [])].find((a) =>
       a.getAttribute('href')?.includes('/app/alpha'),
     );
     link?.click();
   }});
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const view = app?.shadowRoot?.querySelector('xkeeper-app-overview');
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
     return !!view?.shadowRoot?.querySelector('.apply-strip button');
   }});
   ok('alpha view shows the apply strip');
@@ -2904,15 +2904,15 @@ try {{
   // Confirm dialog: auto-accept.
   page.on('dialog', (d) => d.accept());
   await page.evaluate(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const view = app?.shadowRoot?.querySelector('xkeeper-app-overview');
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
     view?.shadowRoot?.querySelector('.apply-strip button')?.click();
   }});
 
   // Result text renders with the per-program action.
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const view = app?.shadowRoot?.querySelector('xkeeper-app-overview');
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
     const fb = view?.shadowRoot?.querySelector('.apply-strip .feedback');
     return fb && fb.textContent.includes('update-and-restart');
   }});
@@ -2920,8 +2920,8 @@ try {{
 
   // Badge cleared after the (alpha-scoped) apply.
   await page.waitForFunction(() => {{
-    const app = document.querySelector('xkeeper-app');
-    const bar = app?.shadowRoot?.querySelector('xkeeper-overview-bar');
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
     return bar && !bar.shadowRoot.querySelector('.pending');
   }});
   ok('badge clears after the scoped apply');
@@ -2935,7 +2935,7 @@ console.log('BROWSER PASS OK');
         // into the JS string literal (node fs accepts `/` everywhere).
         alpha = ws
             .root
-            .join("app-alpha/xkeeper.toml")
+            .join("app-alpha/appkeeper.toml")
             .display()
             .to_string()
             .replace('\\', "/"),

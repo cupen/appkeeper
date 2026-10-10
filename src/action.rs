@@ -375,11 +375,11 @@ mod tests {
     #[test]
     fn executes_and_captures_output() {
         let (cmd, expect) = if cfg!(windows) {
-            ("echo xkeeper-action-ok", "xkeeper-action-ok")
+            ("echo appkeeper-action-ok", "appkeeper-action-ok")
         } else {
             (
-                "echo xkeeper-action-ok; echo err-line >&2",
-                "xkeeper-action-ok",
+                "echo appkeeper-action-ok; echo err-line >&2",
+                "appkeeper-action-ok",
             )
         };
         let r = execute(&spec(cmd, 10), "p", "a", cmd, &work_dir("exec"));
