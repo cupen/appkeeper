@@ -132,6 +132,73 @@ ak shutdown
 > `all` 是 apply 的全量保留字：`ak apply all` 与裸 `ak apply`
 > 严格等价，因此应用名不能叫 `all`（add 与 run ad-hoc 会拒绝并说明保留字）。
 
+## 安装与校验
+
+发布产物在 GitHub Releases 页面（仓库的 Releases 页签），每次发布包含三个归档，
+文件名以 Rust target 三元组区分，包内恰含可执行文件（`ak` / `ak.exe`）、
+`LICENSE` 与 `README.md`：
+
+| 平台 | 目标 | 归档 |
+| --- | --- | --- |
+| Linux（musl，静态链接） | `x86_64-unknown-linux-musl` | `ak-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux（glibc） | `x86_64-unknown-linux-gnu` | `ak-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows | `x86_64-pc-windows-msvc` | `ak-<version>-x86_64-pc-windows-msvc.zip` |
+
+**musl 包适用于 alpine 等没有 glibc 的环境**（静态链接，单文件，不依赖系统 C 库）；
+glibc 包适用于常见的 glibc 发行版（Debian/Ubuntu/RHEL 等）。
+
+### Linux
+
+```bash
+version=0.1.0
+target=x86_64-unknown-linux-musl   # 或 x86_64-unknown-linux-gnu
+
+# 下载归档与校验和清单（SHA256SUMS 覆盖全部三个归档）
+curl -LO "https://github.com/cupen/xkeeper/releases/download/v${version}/ak-${version}-${target}.tar.gz"
+curl -LO "https://github.com/cupen/xkeeper/releases/download/v${version}/SHA256SUMS"
+
+# 校验完整性：只校验已下载的归档，全部输出 OK 且退出码为 0
+sha256sum -c SHA256SUMS --ignore-missing
+
+tar -xzf "ak-${version}-${target}.tar.gz"
+"./ak-${version}-${target}/ak" --version   # 自检：输出版本号应与 tag 一致
+```
+
+### Windows（PowerShell）
+
+```powershell
+$version = "0.1.0"
+$zip = "ak-$version-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "https://github.com/cupen/xkeeper/releases/download/v$version/$zip" -OutFile $zip
+Invoke-WebRequest "https://github.com/cupen/xkeeper/releases/download/v$version/SHA256SUMS" -OutFile SHA256SUMS
+# 校验和内容同样内嵌在 release 说明的代码块里，可肉眼比对
+Expand-Archive $zip -DestinationPath .
+.\ak-$version-x86_64-pc-windows-msvc\ak.exe --version
+```
+
+`SHA256SUMS` 为标准 `sha256sum` 格式（每行 `<hash>  <文件名>`），同一份内容也以
+代码块形式内嵌在 release 说明正文中，不方便装工具的用户可以直接对照。
+
+### 发布流程（维护者）
+
+版本号真源是 `Cargo.toml` 的 `version` 字段；发布流水线只做只读校验，**不会**自动
+改写它。顺序必须是「先改版本、再打 tag」：
+
+```bash
+# 1. 在 Cargo.toml 里把 version 改成要发布的版本（如 0.2.0）
+# 2. 提交
+git commit -am "chore(release): 0.2.0"
+# 3. 打 tag：tag 必须与 Cargo.toml 的 version 逐字符一致（前导 v 除外）
+git tag v0.2.0
+# 4. 推送 tag，触发发布流水线
+git push origin v0.2.0
+```
+
+流水线先跑质量门禁（ubuntu + windows 各一次 `cargo test`），再并行编译三个目标，
+最后一次性创建公开 release（tag 含 `-rc`/`-beta`/`-alpha` 时标记为 prerelease）。
+**tag 与 `Cargo.toml` 版本不一致会被流水线拒绝**（不构建、不发布），此时按上面
+顺序改好 `Cargo.toml` 并重新打 tag 即可。
+
 ## 配置示例
 
 daemon（`examples/daemon.toml`，带注释模板在 `conf/daemon.toml`；app 模板在 `conf/app.toml`）：

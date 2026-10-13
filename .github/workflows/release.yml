@@ -1,0 +1,342 @@
+name: release
+
+# Only tag pushes shaped like `v<version>` trigger a release (design D1). No
+# workflow_dispatch, no `release: published` — the tag is the intent.
+on:
+  push:
+    tags: ['v*']
+
+# Least privilege: the release needs to write releases/assets, nothing else
+# (design D6, spec "发布形态与权限"). Credentials come from the repo-scoped
+# GITHUB_TOKEN; no personal access token is involved.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # D4: one gate job in front of the build matrix. Both platforms run the full
+  # test suite; the build matrix only starts when both are green.
+  verify:
+    name: verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags must be present for the version gate (`GITHUB_REF_NAME` is the
+          # tag itself, but full history keeps tag lookups honest).
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # D2: the tag is the version source of truth, checked read-only. A drift
+      # fails the run before anything is built or published; Cargo.toml is
+      # never rewritten by CI.
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          tag_version="${tag#v}"
+          # Read the version from the [package] section only: a bare `version =`
+          # grep would silently pick up a future [workspace.package] version.
+          cargo_version="$(awk '
+            /^\[/ { in_pkg = ($0 == "[package]") ; next }
+            in_pkg && /^version[[:space:]]*=/ {
+              sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+            }
+          ' Cargo.toml)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error::could not read [package].version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$cargo_version" ]; then
+            {
+              echo "::error::tag/Cargo.toml version mismatch"
+              echo "  tag version        : $tag_version  (from tag '$tag')"
+              echo "  Cargo.toml version : $cargo_version"
+              echo "Fix: set the intended version in Cargo.toml, commit, then tag that same version:"
+              echo "  (edit Cargo.toml version) && git commit -am 'release' && git tag v<version> && git push origin v<version>"
+              echo "CI never rewrites Cargo.toml — the tag must match it, not the other way round."
+            } >&2
+            exit 1
+          fi
+          echo "version OK: tag '$tag' matches Cargo.toml version '$cargo_version'"
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # D9: native builds on the OS that owns each target. Windows is a single
+  # matrix entry, so the msvc target is scheduled exactly once.
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            bin: ak
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin: ak
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin: ak.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      # D5: the release build must embed the real console. build.rs silently
+      # falls back to a placeholder when the frontend toolchain is missing, so
+      # the toolchain is installed here (Node 22 + the pnpm version pinned in
+      # webui/package.json) and the placeholder is asserted against later.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p appkeeper --bin ak
+
+      # spec: 「musl 产物不依赖 glibc」— the musl target must produce a static
+      # binary that runs without glibc. `ldd` on a static binary reports
+      # "not a dynamic executable"; a dynamic one would list libc. Also assert
+      # the binary actually runs in this (glibc) runner.
+      - name: Assert musl artifact is statically linked
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          if ldd "$bin" 2>&1 | grep -qi 'libc\.so\|libc\.musl'; then
+            echo "::error::$bin is dynamically linked — the musl artifact must be static"
+            ldd "$bin" || true
+            exit 1
+          fi
+          # `ldd` exits non-zero for a static binary; that is the expected path.
+          echo "musl artifact is statically linked (no libc dependency)"
+          "$bin" --version
+
+      # D5 (cont.): a successful cargo build is not proof the real UI is inside.
+      # Assert the bundle exists and the placeholder marker does not; either
+      # failure fails the job.
+      - name: Assert real webui bundle (not the placeholder)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f webui/dist/index.html ]; then
+            echo "::error::webui/dist/index.html is missing — the frontend was not built (build.rs placeholder path)"
+            exit 1
+          fi
+          if [ -f webui/dist/.ak-placeholder ]; then
+            echo "::error::webui/dist/.ak-placeholder is present — the release binary would embed the placeholder page, not the real console"
+            exit 1
+          fi
+          echo "webui bundle is real (index.html present, no placeholder marker)"
+
+      - name: Package archive (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="ak-${version}-${TARGET}"
+          staged="staging/${name}"
+          mkdir -p "$staged"
+          cp "target/${TARGET}/release/${BIN}" "$staged/${BIN}"
+          cp LICENSE README.md "$staged/"
+          mkdir -p dist
+          tar -czf "dist/${name}.tar.gz" -C staging "${name}"
+          ls -l "dist/${name}.tar.gz"
+          echo "ARCHIVE_NAME=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      # Windows: use PowerShell's Compress-Archive (Git Bash on the Windows
+      # runner has no `zip`, and GNU tar there cannot write zip).
+      - name: Package archive (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          $version = "${{ github.ref_name }}".Substring(1)
+          $name = "ak-$version-$env:TARGET"
+          $staged = "staging/$name"
+          New-Item -ItemType Directory -Force -Path $staged | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:BIN" "$staged/$env:BIN"
+          Copy-Item LICENSE, README.md -Destination $staged
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $staged -DestinationPath "dist/$name.zip" -Force
+          Get-ChildItem "dist/$name.zip"
+          "ARCHIVE_NAME=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Sanity: the built binary reports the same version the tag carries
+      # (spec "跨平台构建矩阵": ak --version output matches the tag). Native
+      # execution only; the windows runner runs ak.exe, the Linux runners run
+      # the just-built binary directly (both are the host architecture).
+      - name: Self-check binary version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$("target/${{ matrix.target }}/release/${{ matrix.bin }}" --version)"
+          echo "ak --version -> $actual"
+          if [ "$actual" != "ak $expected" ]; then
+            echo "::error::binary reports '$actual', expected 'ak $expected'"
+            exit 1
+          fi
+          echo "binary version matches the tag"
+
+      # D3/D6: one artifact per target, named by the Rust target triple.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+
+  # D6: gather all archives, checksum them, and publish once with the runner's
+  # preinstalled gh CLI. No continue-on-error anywhere, so a failed verify or
+  # build means this job never runs (spec "单目标失败阻断发布").
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Require all three archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            "ak-${version}-x86_64-unknown-linux-musl.tar.gz"
+            "ak-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "ak-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          missing=0
+          for f in "${expected[@]}"; do
+            if [ ! -f "assets/$f" ]; then
+              echo "::error::missing archive: $f"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Not publishing: the archive set is incomplete."
+            exit 1
+          fi
+          echo "all three archives present:"
+          ls -l assets
+
+      # D7: one SHA256SUMS, standard sha256sum format (`<hash>  <name>`), names
+      # only (no paths) so it validates from a flat download directory.
+      - name: Compute SHA256SUMS
+        shell: bash
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          for f in ak-*.tar.gz ak-*.zip; do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+          # The format must be exactly two-space separated hash/name pairs.
+          awk 'NF != 2 || $1 !~ /^[0-9a-f]{64}$/ { exit 1 }' SHA256SUMS
+
+      - name: Assemble release notes
+        shell: bash
+        env:
+          # `gh api` needs a token; the generate-notes endpoint is a repo-scoped
+          # read that the default token covers.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          # Auto-generated commit list (empty on the very first tag is fine).
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="${GITHUB_REF_NAME}" \
+            --jq '.body' > /tmp/generated-notes.md || : > /tmp/generated-notes.md
+
+          {
+            echo "## 变更"
+            echo
+            cat /tmp/generated-notes.md
+            echo
+            echo "## 资产"
+            echo
+            echo "| 平台 | 架构 | 文件 |"
+            echo "| --- | --- | --- |"
+            echo "| Linux (musl, 静态) | x86_64 | \`ak-${version}-x86_64-unknown-linux-musl.tar.gz\` |"
+            echo "| Linux (glibc) | x86_64 | \`ak-${version}-x86_64-unknown-linux-gnu.tar.gz\` |"
+            echo "| Windows | x86_64 | \`ak-${version}-x86_64-pc-windows-msvc.zip\` |"
+            echo
+            echo "## 校验和"
+            echo
+            echo '```'
+            cat assets/SHA256SUMS
+            echo '```'
+            echo
+            echo "校验：下载全部归档与 \`SHA256SUMS\` 到同一目录后运行 \`sha256sum -c SHA256SUMS\`。"
+          } > /tmp/release-notes.md
+
+          cat /tmp/release-notes.md
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          args=(
+            "$tag"
+            --title "appkeeper $tag"
+            --notes-file /tmp/release-notes.md
+            --verify-tag
+            --repo "${GITHUB_REPOSITORY}"
+          )
+          # D8: pre-release tags are marked as such; everything else is a
+          # normal public release (never a draft).
+          case "$version" in
+            *-rc*|*-beta*|*-alpha*) args+=(--prerelease) ;;
+          esac
+          # D6: all assets in one call, no concurrent writers.
+          gh release create "${args[@]}" \
+            "assets/ak-${version}-x86_64-unknown-linux-musl.tar.gz" \
+            "assets/ak-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            "assets/ak-${version}-x86_64-pc-windows-msvc.zip" \
+            "assets/SHA256SUMS"
