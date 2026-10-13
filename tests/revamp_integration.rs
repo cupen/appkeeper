@@ -73,6 +73,7 @@ impl Ws {
 
     /// Append a raw section (e.g. `[app-default]\nrestart = "always"`) after
     /// the `[daemon]` table — the `config --init` out-of-box shape.
+    #[allow(dead_code)]
     fn append_raw(&self, raw: &str) {
         let mut text = std::fs::read_to_string(self.cfg()).unwrap();
         text.push('\n');
@@ -161,6 +162,36 @@ impl Ws {
             return None;
         }
         out.trim().parse::<u32>().ok()
+    }
+
+    /// Raw control-plane POST with a JSON body; returns (status, body). The
+    /// response is read to EOF (the endpoints under test answer with a
+    /// Content-Length or a chunked stream).
+    fn post_json(&self, path: &str, body: &serde_json::Value) -> (u16, String) {
+        let body = body.to_string();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut s =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("connect the control plane");
+        let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
+        s.write_all(req.as_bytes()).expect("write the request");
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let payload = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, payload)
     }
 
     fn wait_running(&self, name: &str) {
@@ -329,34 +360,381 @@ fn always_pull_up_after_manual_stop_and_restart() {
     ws.wait_running("al");
 }
 
-// -- run ad-hoc offline cold start ------------------------------------------
+// -- run ad-hoc offline (run-daemon-first) ----------------------------------
 
-/// background-daemon: the ad-hoc form pulls the daemon up when it is offline,
-/// registers the command line, and takes effect immediately (exit 0).
+/// background-daemon / control-plane: the ad-hoc form is daemon-first — when
+/// the daemon is offline it exits 3 and MUST NOT pull a daemon up or write
+/// anything into app_dir (run-daemon-first).
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
-fn run_adhoc_offline_cold_start() {
-    let ws = Ws::new("adhoc-cold");
-    // The out-of-box shape: `config --init` writes [app-default] restart = "always",
-    // which is what makes a cold-start command actually run (the built-in
-    // cascade default is `no`).
-    ws.append_raw("[app-default]\nrestart = \"always\"\n");
+fn run_adhoc_offline_exits_3_without_pull_up() {
+    let ws = Ws::new("adhoc-offline");
     assert!(!ws.health(), "the daemon must start offline");
 
     let sleep = sleep_bin();
     let (ok, code, out) = ws.cli(&["run", "--", &sleep, "--name", "cold"]);
-    assert!(ok, "offline run -- must succeed (exit {code}): {out}");
+    assert!(!ok, "offline run -- must fail: {out}");
+    assert_eq!(code, 3, "offline run exits 3: {out}");
     assert!(
-        !out.contains("daemon is offline") && !out.contains("daemon unreachable"),
-        "no more 'daemon offline' error: {out}"
+        out.contains("unreachable") || out.contains("daemon"),
+        "the error explains the daemon is unreachable: {out}"
     );
     assert!(
-        ws.root.join("apps/cold.toml").is_file(),
-        "the ad-hoc registration was written"
+        !ws.root.join("apps/cold.toml").exists(),
+        "no registration is written while offline"
     );
-    ws.wait_health(true);
-    ws.wait_running("cold");
+    // No daemon was pulled up: the control port stays free.
+    assert!(
+        !ws.health(),
+        "run must NOT start the daemon in the background"
+    );
     ws.shutdown();
+}
+
+// -- run daemon-first: online register-and-start ----------------------------
+
+/// The `app_dir` entries (file names, sorted).
+fn app_dir_entries(ws: &Ws) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(ws.root.join("apps"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Assert nothing was left behind for `name` (no record, no placeholder) and
+/// no stray `.toml.pending` anywhere in `app_dir` (app-registry spec).
+fn assert_no_residue(ws: &Ws, name: &str) {
+    assert!(
+        !ws.root.join("apps").join(format!("{name}.toml")).exists(),
+        "{name}.toml must not exist: {:?}",
+        app_dir_entries(ws)
+    );
+    assert!(
+        !ws.root
+            .join("apps")
+            .join(format!("{name}.toml.pending"))
+            .exists(),
+        "{name}.toml.pending must not exist: {:?}",
+        app_dir_entries(ws)
+    );
+    assert!(
+        app_dir_entries(ws)
+            .iter()
+            .all(|f| !f.ends_with(".toml.pending")),
+        "no placeholder residue at all: {:?}",
+        app_dir_entries(ws)
+    );
+}
+
+/// control-plane / app-registry: a successful ad-hoc `run --` prints
+/// `{program, config_path, pid}` and lands the record only after the program
+/// is judged started. `run <name>` then reports the same three fields, and
+/// `--json` is the machine-readable form.
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn run_daemon_first_returns_program_config_pid() {
+    let ws = Ws::new("rdf-success");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let sleep = sleep_bin();
+
+    let out = ws.cli_ok(&["run", "--", &sleep, "300", "--name", "web"]);
+    assert!(out.contains("web"), "the report names the program: {out:?}");
+    assert!(
+        out.contains("apps/web.toml"),
+        "the report names the config path: {out:?}"
+    );
+    let pid = ws.pid_of("web").expect("web is running");
+    assert!(
+        out.contains(&pid.to_string()),
+        "the report carries the live pid ({pid}): {out:?}"
+    );
+    assert!(
+        ws.root.join("apps/web.toml").is_file(),
+        "the registration landed: {:?}",
+        app_dir_entries(&ws)
+    );
+
+    // `run <name>` on the stopped program renders the same fields.
+    ws.cli_ok(&["stop", "web"]);
+    ws.wait_stopped("web");
+    let out = ws.cli_ok(&["run", "web"]);
+    assert!(
+        out.contains("web") && out.contains("apps/web.toml") && out.contains("pid="),
+        "run <name> renders name/config/pid: {out:?}"
+    );
+
+    // `--json` is one machine-readable object.
+    ws.cli_ok(&["stop", "web"]);
+    ws.wait_stopped("web");
+    let out = ws.cli_ok(&["run", "web", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("run --json parses as JSON");
+    assert_eq!(v["name"], "web");
+    assert!(
+        v["config_path"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("web.toml"),
+        "json config_path: {v}"
+    );
+    assert!(v["pid"].as_u64().is_some(), "json pid: {v}");
+    assert_eq!(v["status"], "started");
+
+    ws.shutdown();
+    drop(d);
+}
+
+/// app-registry: every failure path leaves no `.toml` or `.toml.pending`
+/// residue — unresolvable command (exit 2), early exit before `startsecs`,
+/// cross-app name collision, and the reserved `all`. A same-name ad-hoc
+/// re-submission is not a failure: it regenerates (idempotent or restart).
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn run_daemon_first_failures_leave_no_residue() {
+    let ws = Ws::new("rdf-residue");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let sleep = sleep_bin();
+
+    // Unresolvable command → exit 2, nothing written.
+    let (ok, code, out) = ws.cli(&["run", "--", "definitely-not-a-real-cmd", "--x"]);
+    assert!(!ok, "unresolvable command must fail: {out}");
+    assert_eq!(code, 2, "command resolution failure exits 2: {out}");
+    assert_no_residue(&ws, "definitely-not-a-real-cmd");
+
+    // Exits before startsecs → non-zero, nothing written.
+    let (ok, code, out) = ws.cli(&["run", "--", &sleep, "0.05", "--name", "flaky"]);
+    assert!(!ok, "early exit must fail: {out}");
+    assert_ne!(code, 0, "early exit is non-zero: {out}");
+    assert!(
+        out.contains("startsecs") || out.contains("startup"),
+        "the error names the startup failure: {out:?}"
+    );
+    assert_no_residue(&ws, "flaky");
+
+    // A cross-app program-name collision is refused (control-plane spec:
+    // 名称冲突被拒绝 — 与其他应用冲突). Register an app that owns the
+    // program name `clash`, then ad-hoc `--name clash`.
+    ws.cli_ok(&["run", "--", &sleep, "300", "--name", "web"]);
+    let owner = ws.root.join("owner-app");
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(
+        owner.join("appkeeper.toml"),
+        format!("[program.clash]\ncommand = \"{sleep}\"\nargs = [\"300\"]\nstartsecs = 0.2\n"),
+    )
+    .unwrap();
+    ws.cli_ok(&["add", owner.to_str().unwrap(), "--name", "owner"]);
+    ws.cli_ok(&["apply", "owner"]);
+    let (ok, code, out) = ws.cli(&["run", "--", &sleep, "301", "--name", "clash"]);
+    assert!(!ok && code != 0, "cross-app collision must fail: {out}");
+    assert!(
+        out.contains("already registered"),
+        "the collision is explained: {out:?}"
+    );
+    assert!(
+        out.contains("owner"),
+        "the error names the owning app: {out:?}"
+    );
+    assert_no_residue(&ws, "clash");
+
+    // A same-name ad-hoc re-submission is NOT a collision: it regenerates
+    // (app-registry: 同名全量再生). Identical content is idempotent.
+    let web_pid = ws.pid_of("web").expect("web is running");
+    let (ok, _code, out) = ws.cli(&["run", "--", &sleep, "300", "--name", "web"]);
+    assert!(ok, "identical same-name re-run succeeds: {out}");
+    assert_eq!(ws.pid_of("web"), Some(web_pid), "idempotent, no restart");
+    // Changed content restarts with a new pid and rewrites the record.
+    let (ok, _code, out) = ws.cli(&["run", "--", &sleep, "301", "--name", "web"]);
+    assert!(ok, "changed same-name re-run succeeds: {out}");
+    let web_text = std::fs::read_to_string(ws.root.join("apps/web.toml")).unwrap();
+    assert!(web_text.contains("301"), "the record was regenerated: {web_text:?}");
+    assert_ne!(ws.pid_of("web"), Some(web_pid), "the process restarted");
+    assert!(
+        !ws.root.join("apps/web.toml.pending").exists(),
+        "regeneration leaves no placeholder"
+    );
+
+    // Reserved `all`.
+    let (ok, _code, out) = ws.cli(&["run", "--", &sleep, "302", "--name", "all"]);
+    assert!(!ok, "reserved `all` must fail: {out}");
+    assert!(
+        out.contains("reserved"),
+        "the reserved word is explained: {out:?}"
+    );
+    assert_no_residue(&ws, "all");
+
+    ws.shutdown();
+    drop(d);
+}
+
+/// app-registry (D2): while the startup judgement is pending only the
+/// non-`.toml` placeholder exists — `ak list` and the pending projection never
+/// see a half-written registration.
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn run_daemon_first_staging_is_invisible_to_scanners() {
+    let ws = Ws::new("rdf-atomic");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let sleep = sleep_bin();
+
+    // The built-in startsecs is 3.0s: the staging window is comfortably long.
+    let out_path = ws.root.join("atomic.out");
+    let out = std::fs::File::create(&out_path).unwrap();
+    let mut child = Command::new(bin())
+        .arg("--config")
+        .arg(ws.cfg())
+        .args(["run", "--", &sleep, "400", "--name", "atomic"])
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the ad-hoc run");
+
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !ws.root.join("apps/atomic.toml").exists(),
+        "no record while the judgement is pending"
+    );
+    assert!(
+        ws.root.join("apps/atomic.toml.pending").is_file(),
+        "the placeholder exists mid-flight: {:?}",
+        app_dir_entries(&ws)
+    );
+    let listed = ws.cli_ok(&["list"]);
+    assert!(
+        !listed.contains("atomic"),
+        "`ak list` excludes the in-flight app: {listed:?}"
+    );
+
+    // A reload mid-flight must not disturb the staging.
+    ws.cli_ok(&["reload"]);
+    let status = child.wait().expect("wait for the ad-hoc run");
+    assert!(status.success(), "the ad-hoc run still succeeds ({status})");
+    assert!(
+        ws.root.join("apps/atomic.toml").is_file()
+            && !ws.root.join("apps/atomic.toml.pending").exists(),
+        "the placeholder became the record: {:?}",
+        app_dir_entries(&ws)
+    );
+    assert!(ws.pid_of("atomic").is_some(), "atomic is running");
+
+    ws.shutdown();
+    drop(d);
+}
+
+/// app-registry (D4): a failed rename keeps the process and prints the full
+/// config; a re-run detects the residual, refuses non-interactively without
+/// restarting, and (via the control-plane commit) re-lands the record with the
+/// pid unchanged.
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn run_daemon_first_partial_failure_and_residual() {
+    let ws = Ws::new("rdf-residual");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let sleep = sleep_bin();
+
+    // Force the rename to fail after startup succeeded: a directory named
+    // `<name>.toml` makes the same-directory rename fail with EISDIR.
+    std::fs::create_dir_all(ws.root.join("apps/weird.toml")).unwrap();
+    let (ok, code, out) = ws.cli(&["run", "--", &sleep, "400", "--name", "weird"]);
+    assert!(!ok && code != 0, "the partial failure is non-zero: {out}");
+    assert!(
+        out.contains("registration was not written"),
+        "it explains the process is unregistered: {out:?}"
+    );
+    assert!(
+        out.contains("command") && out.contains("args") && out.contains("work_dir"),
+        "it prints the full config: {out:?}"
+    );
+    let pid = ws.pid_of("weird").expect("the process was kept running");
+    assert!(
+        ws.root.join("apps/weird.toml.pending").is_file(),
+        "the placeholder is kept for diagnosis"
+    );
+
+    // A non-interactive re-run refuses and must not restart the process.
+    let (ok, code, out) = ws.cli(&["run", "--", &sleep, "400", "--name", "weird"]);
+    assert!(!ok && code != 0, "a non-TTY re-run refuses: {out}");
+    assert!(
+        out.contains("already running") && out.contains("not registered"),
+        "it reports the residual: {out:?}"
+    );
+    assert_eq!(ws.pid_of("weird"), Some(pid), "the refusal did not restart");
+    assert!(
+        !ws.root.join("apps/weird.toml").is_file(),
+        "the refusal wrote no record"
+    );
+
+    // Confirm the residual through the control plane: the record lands and the
+    // process is reused (pid unchanged).
+    std::fs::remove_dir(ws.root.join("apps/weird.toml")).unwrap();
+    let (status, body) = ws.post_json("/v1/run/commit", &serde_json::json!({ "name": "weird" }));
+    assert_eq!(status, 200, "commit answers 200: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["pid"].as_u64(), Some(u64::from(pid)), "the pid is reused");
+    assert!(
+        ws.root.join("apps/weird.toml").is_file()
+            && !ws.root.join("apps/weird.toml.pending").exists(),
+        "the record landed: {:?}",
+        app_dir_entries(&ws)
+    );
+    assert_eq!(
+        ws.pid_of("weird"),
+        Some(pid),
+        "the process was not restarted"
+    );
+
+    ws.shutdown();
+    drop(d);
+}
+
+/// configuration / process-management: the built-in defaults changed to
+/// `app_dir = "app.d"` and `startsecs = 3.0`; an explicit value still wins.
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn defaults_are_app_d_and_startsecs_three() {
+    let ws = Ws::new("rdf-defaults");
+    // A fresh config that does NOT pin `app_dir`: `config --get` answers the
+    // built-in default.
+    let fresh = ws.root.join("fresh.toml");
+    std::fs::write(&fresh, "[daemon]\nport = 7310\n").unwrap();
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(&fresh)
+        .args(["config", "--get", "app_dir"])
+        .output()
+        .expect("run config --get app_dir");
+    assert!(out.status.success(), "config --get succeeds");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "app.d",
+        "app_dir default is app.d"
+    );
+
+    // The built-in startsecs is 3.0: a program with no explicit startsecs takes
+    // ~3s to be judged started. `run <name>` blocks for that window, so the
+    // elapsed time is the observable proof.
+    ws.write_app(
+        "defaults",
+        &format!("[program.d3]\ncommand = \"{SLEEP}\"\nrestart = \"no\"\n"),
+    );
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let t0 = Instant::now();
+    ws.cli_ok(&["run", "d3"]);
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(2700),
+        "the built-in startsecs is ~3s (run blocked {elapsed:?})"
+    );
+    ws.shutdown();
+    drop(d);
 }
 
 // -- daemon --detach --------------------------------------------------------

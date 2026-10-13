@@ -76,10 +76,12 @@ ak config --init          # 可选：初始化 daemon 配置（8 个已知键的
 ak config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
 
-# 路径一：冷启动一条命令跑起来（命令行注册 + 自动后台拉起守护进程 + 立即生效）
-ak run -- python -m http.server 8000 --name web
+# 路径一：命令行注册（daemon-first：守护进程先启动成功、再落盘注册）
+ak daemon --detach                         # 先起守护进程（run 全形态离线退出 3，不隐式拉起）
+ak run -- python -m http.server 8000 --name web   # 启动成功即落盘，回传 {程序名, 配置路径, PID}
 ak run --cmd "node server.js" --name api   # 等价写法（shell 词法切分，适合不便传 -- 的场景）
-ak run web                                 # 之后启动/重启已注册程序
+ak run --json -- node server.js --name api # --json：机器可读结构（name/config_path/pid/status）
+ak run web                                 # 之后启动/重启已注册程序（阻塞至启动成功）
 ak stop web                                # 停止（`restart = "unless-stopped"` 会记住这次用户停止）
 
 # 路径二：注册部署（离线可用，适合生产部署目录）
@@ -112,9 +114,11 @@ ak shutdown
 > **`daemon` 是唯一守护入口，`run` 是纯客户端动词**（docker run 式心智：
 > 客户端动词向守护进程发指令）：
 > `ak daemon` 前台守护，`ak daemon --detach` 后台守护；
-> `run <名>` / `run --app <app>` 启动已注册程序或整个 app；
-> `run -- <命令行>` / `run --cmd "<字符串>"` 注册一条新命令行并立即生效
-> （守护进程离线时自动后台拉起）。
+> `run <名>` / `run --app <app>` 启动已注册程序或整个 app（阻塞至启动成功，
+> 回传 `{程序名, 配置路径, PID}`，支持 `--json`）；
+> `run -- <命令行>` / `run --cmd "<字符串>"` 由守护进程先启动成功、再落盘注册
+> 并立即生效；**`run` 全形态在守护进程离线时退出 3，不隐式拉起**
+> （`add --apply` 的隐式拉起协议保留不变）。
 > 旧守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）
 > 已移除并被拦截（退出码 2，按形态给迁移提示——systemd 旧 ExecStart 场景
 > 提示用 `ak service install --force --now` 重新生成 unit）；
@@ -145,7 +149,7 @@ host = "127.0.0.1"          # 控制平面仅回环
 port = 7310
 auth_token = ""             # 非空则要求 Bearer 鉴权
 log_buffer_lines = 1000
-app_dir = "apps"            # 注册目录，缺省 daemon 配置同级 apps/
+app_dir = "app.d"           # 注册目录，缺省 daemon 配置同级 app.d/（旧默认 apps/）
 
 [app-default]               # 可选：全体应用默认值
 restart = "always"          # 启动/重启策略：no | on-failure | always | unless-stopped
@@ -376,9 +380,12 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
 
 守护进程在 `host:port`（默认回环 7310）提供 JSON API：
 `GET /v1/health|status|programs|programs/{name}|programs/{name}/logs`，
-`POST /v1/programs/{name}/start|stop|restart`、`/v1/programs/{name}/signal`（白名单信号）、
+`POST /v1/programs/{name}/start|stop|restart`（`?wait=1` 阻塞至启动判定，
+`run <name>` 使用）、`/v1/programs/{name}/signal`（白名单信号）、
 `/v1/programs/{name}/actions/{动作}`（同步执行自定义动作，返回退出码/耗时/超时标记/输出尾部）、
-`/v1/apps/{name}/start|stop|restart`（app 扇出，返回逐程序结果）、
+`/v1/apps/{name}/start|stop|restart`（app 扇出，返回逐程序结果；`?wait=1` 逐程序阻塞至启动判定）、
+`POST /v1/run`（ad-hoc 注册并启动：请求体为临时定义，chunked NDJSON 流式回传进度与终帧；
+无健康探测时仅回传终帧）、`POST /v1/run/commit|abort`（残留态补落盘 / 放弃）、
 `/v1/reload`（检出 pending 并返回预览）、
 `GET /v1/pending`、`POST /v1/apply`、`/v1/shutdown`。
 配置 `auth_token` 后除 `/v1/health` 外都要求 `Authorization: Bearer <token>`。
@@ -390,14 +397,30 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 
 ### 守护入口 `daemon` 与客户端动词 `run`
 
-`ak daemon` 是唯一守护入口；`ak run` 是纯客户端动词，承载两种客户端形态：
+`ak daemon` 是唯一守护入口；`ak run` 是纯客户端动词，**全部四种形态统一为
+daemon-first**（run-daemon-first）：CLI 只把意图交给守护进程，由守护进程启动
+程序（ad-hoc 形态再落盘注册）并回传结果；CLI 不自行读写 `app_dir`，也不自行
+拉起守护进程。
 
 | 形态 | 调用 | 行为 |
 | --- | --- | --- |
 | daemon | `ak daemon` / `ak daemon --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
-| 启动 | `ak run <name>` / `ak run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app（对已 running 程序返回 409，未知程序 404） |
-| ad-hoc | `ak run -- <cmd...>` / `ak run --cmd "<字符串>"` | 命令行注册并立即生效（首 token 解析为绝对路径；守护离线时自动后台拉起） |
+| 启动 | `ak run <name>` / `ak run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app；**阻塞至守护进程判定启动成功**（对已 running 程序返回 409，未知程序 404） |
+| ad-hoc | `ak run -- <cmd...>` / `ak run --cmd "<字符串>"` | 守护进程**先启动并确认启动成功、再落盘注册**；首 token 解析为绝对路径；立即生效 |
 
+- **统一返回**：每种形态都打印所涉程序的 `{程序名, 配置路径, PID}`——单程序
+  一行；`run --app` 扇出逐程序一行（全部成功才 0，任一失败非零并列出失败项）。
+- **`--json`**：输出等价的机器可读结构（单程序对象 / 扇出数组），字段含
+  `name`、`config_path`、`pid`、`status`，供脚本消费。
+- **离线退出 3**：守护进程未运行时 `run` 的**全部形态**报「守护进程不可达」并
+  以 3 退出，MUST NOT 隐式后台拉起（`add --apply` 的隐式拉起协议保留不变）。
+- **失败不留残留**：命令解析失败（退出 2）、`startsecs` 内退出、健康探测未通过、
+  `startretries` 耗尽等任一失败都不在 `app_dir` 留下 `.toml` 或 `.pending` 残留。
+- **流式进度**：ad-hoc 注册在配置了健康探测时逐帧回传进度（阶段 + 预估等待
+  上限），CLI 逐行打印；无健康探测时仅回传终帧。
+- **部分失败与残留态**：启动成功但落盘重试仍失败时保留运行中的进程、以非零码
+  退出并打印完整配置信息；再次以相同参数 `run` 会提示「已启动但未注册」并询问
+  是否重新落盘（确认复用现有进程、PID 不变；非 TTY 默认拒绝）。
 - ad-hoc 形态与 `name`/`--app` 互斥；裸 `ak run`（无任何操作数）报
   「nothing to run」用法错误并列出三种客户端形态，退出码 2。
 - 旧守护形态的 `run` 在参数解析前拦截（退出码 2）：`run --detach` 提示改用
@@ -406,16 +429,18 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 - ad-hoc 的脚手架 flag：`--name`（缺省取命令 stem）、`--description`、
   `--restart=<no|always|unless-stopped|on-failure>`、`--restart-backoff`、
   `--env K=V`（可重复）、`--workdir <路径>`；`--args` 不存在（命令行本身即参数）。
+  `--restart=no` 只注册不拉起（无启动判定，`pid` 为 null）。
 - 旧 `start` 动词已移除：`ak start web` 报未知子命令并提示 `ak run web`。
 - 旧 flag `--autostart`/`--no-autostart`/`--autorestart` 已移除，统一
   `--restart=<字面量>`（add 与 run ad-hoc 共用）。
 
-**后台拉起协议**（`daemon --detach` 与「立即生效」入口共用）：派生
+**后台拉起协议**（`daemon --detach` 与 `add --apply` 共用）：派生
 `ak daemon -c <配置>`（unix `process_group(0)` / Windows
 `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`），stdio 追加写
 `{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`，总超时 ~10s。
 就绪即成功（并发拉起只留一个实例，端口竞争败者自灭）；超时以非零码退出并
-指明日志位置。守护进程为全局单例，不与调用方生命周期绑定。
+指明日志位置。守护进程为全局单例，不与调用方生命周期绑定。`run` 的**全部形态
+不再享有该隐式拉起**（离线一律退出 3）。
 
 Web 控制台与控制面同属一个守护进程：存在 `[webui]` 配置段时（见上文
 「Web 控制台开关」）另开一个回环端口，伺服内嵌 UI、`/api/*` 查询与 `/ws`
@@ -548,6 +573,41 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 第一层即 app-registry 的注册应用。服务端已按 `openspec/specs/webui-api`
 （变更 `webui-api`）实现：控制台 REST + WebSocket 实时推送，与控制面共享状态
 投影与命令队列；前端界面将在后续变更中按规格落地。
+
+## 升级注意（run-daemon-first：run 全形态 daemon-first）
+
+本版把 `ak run` 的**全部四种形态**（`run <name>` / `run --app <app>` /
+`run -- <cmd...>` / `run --cmd "<string>"`）统一为 **daemon-first**：CLI 不再
+自行写注册目录或自行拉起进程，而是把意图交给守护进程，由守护进程先启动、
+确认启动成功、再落盘注册，并把结果回传 CLI。含三处 BREAKING 与两处默认值
+变更：
+
+- **run 全形态离线退出码 3，不再隐式拉起守护进程**：守护进程未运行时
+  `ak run <name>` 与 `ak run -- <cmd...>` 均以 3 报「守护进程不可达」，
+  MUST NOT 后台拉起。曾依赖 run 冷启动自动拉起守护进程的自动化需改为
+  先 `ak daemon --detach`（或 `ak add --apply`，其隐式拉起协议保留不变）。
+- **ad-hoc 注册落盘顺序反转**：守护进程**先启动程序并确认启动成功，再写入
+  `app_dir`**。命令解析失败、`startsecs` 内退出、健康探测未通过、`startretries`
+  耗尽等任一失败都不再在 `app_dir` 留下任何注册文件或占位残留（此前会留下
+  半成品注册，需人工清理）。
+- **run 统一返回 `{程序名, 配置路径, PID}`**：单程序一行；`run --app` 扇出
+  逐程序一行（全部成功才 0，任一失败非零并列出失败项）；`--json` 输出等价
+  机器可读结构（单程序对象 / 扇出数组），供脚本消费。
+- **`[daemon] app_dir` 默认名由 `apps` 改为 `app.d`**（生产默认
+  `/etc/appkeeper/app.d`）。已装机实例若依赖默认 `apps` 目录，升级后守护进程
+  会在新默认目录 `app.d` 下找不到既有注册，表现为「程序全没了」。迁移方式二选一：
+  1. 在 daemon 配置显式写回 `app_dir = "apps"`（零迁移，推荐已装机实例）；
+  2. 把既有 `apps/*.toml` 迁移到 `app.d/` 后重新 `ak reload && ak apply`。
+  显式配置始终完全覆盖默认值。
+- **`startsecs` 内置默认由 1.0 秒改为 3.0 秒**（四层级联均未设置时生效）。
+  所有程序的「启动成功」判定窗口与启动失败重试节奏都会随之变慢/变长，
+  `run` 的等待也更久。依赖旧节奏的部署请在 `[app-default]`、`[app]` 或
+  `[program.*]` 显式声明 `startsecs`。
+
+**残留态处理**：若「启动成功但落盘失败」（如 `app_dir` 暂时不可写）留下
+未注册的进程，再次以相同参数 `run` 会提示「已启动但未注册」并询问是否
+重新落盘——确认则只补落盘（复用现有进程，PID 不变），拒绝则非零退出且
+不写盘（非 TTY 默认拒绝）。此时 `ak status` 仍可见该程序在运行。
 
 ## 从 v0.1 迁移
 

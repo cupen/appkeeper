@@ -288,12 +288,59 @@ fn add_config(
     Ok(AddResult::registered(name, link))
 }
 
-/// The executable-derived values one scaffold generation renders.
-struct ScaffoldSpec {
-    command: PathBuf,
-    args: Vec<String>,
-    env: std::collections::BTreeMap<String, String>,
-    work_dir: PathBuf,
+/// The executable-derived values one scaffold generation renders. Public so
+/// the daemon can reuse [`render_scaffold`] without going through the
+/// CLI-side `add` path (run-daemon-first: the daemon renders the ad-hoc
+/// registration itself).
+#[derive(Debug, Clone)]
+pub struct ScaffoldSpec {
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub work_dir: PathBuf,
+    /// Optional health check (run-daemon-first: the ad-hoc endpoint accepts
+    /// one so the streaming-progress scenario is reachable).
+    pub health_check: Option<String>,
+}
+
+/// Refuse to scaffold over a registration that is not our own generated file
+/// in `app_dir`: a link to an external deployment config, a stale/dangling
+/// link, or a multi-link (hard link) file would clobber a file the user owns.
+/// A plain single-link file inside `app_dir` is our own prior generation and
+/// is the intended regeneration target.
+///
+/// Shared by [`add_scaffold`] and the daemon-side ad-hoc regeneration
+/// (run-daemon-first: same-name re-submission regenerates the record).
+pub fn guard_scaffold_overwrite(target: &Path, app_dir: &Path, name: &str) -> Result<()> {
+    let Ok(md) = std::fs::symlink_metadata(target) else {
+        return Ok(()); // nothing there: a fresh generation
+    };
+    if md.is_symlink() {
+        let dir_canon = app_dir.canonicalize().ok();
+        match target.canonicalize() {
+            // Our own generation (the record is a real file inside app_dir).
+            Ok(real) if dir_canon.as_deref() == real.parent() => Ok(()),
+            Ok(real) => bail!(
+                "app {name:?} is already registered from {} — run `ak remove {name}` \
+                 first (scaffolding would overwrite that file)",
+                real.display()
+            ),
+            Err(_) => bail!(
+                "stale registration {} cannot be resolved — run `ak remove {name}` first",
+                target.display()
+            ),
+        }
+    } else if md.is_file() && file_link_count(target, &md) > 1 {
+        // A plain multi-link file in app_dir is a hard link (the Windows
+        // `make_link` fallback) — its other name may be an external config
+        // the write would clobber.
+        bail!(
+            "app {name:?} is registered via a hard link (possibly to an external config) — \
+             run `ak remove {name}` before scaffolding over it"
+        )
+    } else {
+        Ok(())
+    }
 }
 
 /// Scaffold flow: render a single-program app config from an executable and
@@ -324,35 +371,11 @@ fn add_scaffold(
     let dir = app_dir(config, config_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create app_dir {}", dir.display()))?;
-    let dir_canon = dir.canonicalize()?;
     let target = link_path(config, config_dir, &name);
     // Never write through a registration that lives outside app_dir: a
     // link pointing at an external deployment file would clobber that file
     // on regeneration.
-    if let Ok(md) = std::fs::symlink_metadata(&target) {
-        if md.is_symlink() {
-            match target.canonicalize() {
-                Ok(real) if real.parent() == Some(&dir_canon) => {} // our own generation
-                Ok(real) => bail!(
-                    "app {name:?} is already registered from {} — run `ak remove {name}` \
-                     first (scaffolding would overwrite that file)",
-                    real.display()
-                ),
-                Err(_) => bail!(
-                    "stale registration {} cannot be resolved — run `ak remove {name}` first",
-                    target.display()
-                ),
-            }
-        } else if file_link_count(&target, &md) > 1 {
-            // A plain multi-link file in app_dir is a hard link (the
-            // Windows `make_link` fallback) — its other name may be an
-            // external config the write would clobber.
-            bail!(
-                "app {name:?} is registered via a hard link (possibly to an external config) — \
-                 run `ak remove {name}` before scaffolding over it"
-            );
-        }
-    }
+    guard_scaffold_overwrite(&target, &dir, &name)?;
 
     // Working directory: explicit --workdir wins, else the directory the
     // add command ran in; always written as an absolute path.
@@ -369,6 +392,7 @@ fn add_scaffold(
             .unwrap_or_else(|| opts.args.as_deref().map(split_command).unwrap_or_default()),
         env: opts.env.clone().unwrap_or_default(),
         work_dir,
+        health_check: None,
     };
 
     let text = render_scaffold(&name, &spec, opts)?;
@@ -581,7 +605,10 @@ fn warn_if_not_executable(_exe: &Path) {}
 /// the single-program `AppRaw` (guaranteed re-readable). When the command
 /// path contains whitespace it is rendered as a single-line quoted command
 /// (quote-aware splitting recovers it — see `config::split_command`).
-fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result<String> {
+///
+/// Pure: given a definition it returns the exact text the scaffold writes,
+/// so the daemon-side ad-hoc commit can reuse it (run-daemon-first task 2.1).
+pub fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result<String> {
     let command_str = spec.command.display().to_string();
     let (command, args) = if command_str.contains(char::is_whitespace) {
         (render_command_line(&command_str, &spec.args)?, None)
@@ -604,6 +631,7 @@ fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result
         } else {
             Some(spec.env.clone())
         },
+        health_check: spec.health_check.clone(),
         ..Default::default()
     };
     let raw = AppRaw {
@@ -644,6 +672,186 @@ fn render_command_line(command: &str, args: &[String]) -> Result<String> {
         }
     }
     Ok(parts.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// daemon-side commit engine (run-daemon-first: 「启动成功后再落盘」)
+// ---------------------------------------------------------------------------
+
+/// Placeholder suffix for the staged registration file. The suffix MUST NOT
+/// end in `.toml`, otherwise [`list`] would treat the half-written file as a
+/// registration record (D2 / app-registry spec). It is appended to the final
+/// name: `web.toml.pending`.
+pub const PENDING_SUFFIX: &str = "toml.pending";
+
+/// Bounded retry budget for the atomic rename (transient IO tolerance).
+pub const COMMIT_RETRIES: u32 = 3;
+
+/// `app_dir/<name>.toml.pending` — the placeholder path for `name`.
+pub fn pending_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
+    crate::config::resolve_path(&config.daemon.app_dir, config_dir)
+        .join(format!("{name}.{PENDING_SUFFIX}"))
+}
+
+/// Establish the placeholder for `name`: write `text` into
+/// `app_dir/<name>.toml.pending` (creating `app_dir` if needed) and fsync it.
+/// Returning Ok proves write access and disk availability **before** any
+/// process is started (app-registry spec: 无法建立占位时不启动进程).
+pub fn stage_placeholder(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+    text: &str,
+) -> Result<PathBuf> {
+    let dir = app_dir(config, config_dir);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create app_dir {}", dir.display()))?;
+    let ph = pending_path(config, config_dir, name);
+    write_synced(&ph, text).with_context(|| {
+        format!(
+            "cannot write the registration placeholder {} — fix write access to app_dir {}",
+            ph.display(),
+            dir.display()
+        )
+    })?;
+    Ok(ph)
+}
+
+/// Write `text` to `path` and fsync the file so a crash cannot leave a
+/// truncated placeholder that a later rename would publish as a record.
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
+}
+
+/// What a successful commit did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The placeholder was renamed onto the target record.
+    Committed { path: PathBuf },
+    /// The target already held byte-identical content: nothing was written
+    /// (idempotent re-registration, task 2.4).
+    Unchanged { path: PathBuf },
+}
+
+impl CommitOutcome {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn path(&self) -> &Path {
+        match self {
+            CommitOutcome::Committed { path } | CommitOutcome::Unchanged { path } => path,
+        }
+    }
+
+    pub fn unchanged(&self) -> bool {
+        matches!(self, CommitOutcome::Unchanged { .. })
+    }
+}
+
+/// Failure of the commit step, distinguishing the two recovery paths
+/// (run-daemon-first D4 / app-registry spec):
+#[derive(Debug)]
+pub enum CommitFailure {
+    /// The placeholder could not be established: nothing was started and no
+    /// residue is left. The caller aborts and returns the error.
+    Stage(String),
+    /// Startup already succeeded but the atomic rename kept failing: the
+    /// process is kept running, the placeholder is left for diagnosis, and
+    /// the target path is named so the user can finish by hand.
+    Rename { target: PathBuf, error: String },
+}
+
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitFailure::Stage(e) => write!(f, "{e}"),
+            CommitFailure::Rename { target, error } => write!(
+                f,
+                "process started but the registration could not be written to {}: {error}",
+                target.display()
+            ),
+        }
+    }
+}
+
+/// Commit a staged definition: if the target `<name>.toml` already holds
+/// byte-identical content, do nothing and report no change; otherwise rename
+/// the placeholder onto the target, retrying a bounded number of times on
+/// transient IO errors (app-registry spec: 目标已存在且内容一致时幂等成功).
+///
+/// The caller must have established the placeholder first
+/// ([`stage_placeholder`]); the rename is same-directory and therefore atomic
+/// — a scanner sees either no record or the complete one.
+pub fn commit_staged(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+    text: &str,
+) -> std::result::Result<CommitOutcome, CommitFailure> {
+    commit_with(
+        config,
+        config_dir,
+        name,
+        text,
+        COMMIT_RETRIES,
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+/// Retryable body of [`commit_staged`] with an injectable rename so tests can
+/// drive the bounded-retry and partial-failure paths.
+fn commit_with(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+    text: &str,
+    retries: u32,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::result::Result<CommitOutcome, CommitFailure> {
+    let target = link_path(config, config_dir, name);
+    // Idempotency: identical content already on disk → no write, no rename.
+    // (Checked before the placeholder matters: the caller may have staged
+    // and this short-circuits the swap.)
+    if matches!(std::fs::read_to_string(&target), Ok(old) if old == text) {
+        let _ = std::fs::remove_file(pending_path(config, config_dir, name));
+        return Ok(CommitOutcome::Unchanged { path: target });
+    }
+    let ph = pending_path(config, config_dir, name);
+    if !ph.exists() {
+        return Err(CommitFailure::Stage(format!(
+            "placeholder {} is missing (nothing was staged)",
+            ph.display()
+        )));
+    }
+    let mut last = String::new();
+    for attempt in 0..=retries {
+        // Windows `rename` refuses to clobber an existing target; removing it
+        // first keeps the observable contract (target is either absent or
+        // complete) — the placeholder holds the full content meanwhile.
+        if cfg!(windows) && target.exists() {
+            let _ = std::fs::remove_file(&target);
+        }
+        match rename(&ph, &target) {
+            Ok(()) => return Ok(CommitOutcome::Committed { path: target }),
+            Err(e) => {
+                last = e.to_string();
+                if attempt < retries {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    Err(CommitFailure::Rename {
+        target,
+        error: last,
+    })
+}
+
+/// Remove a placeholder left behind by an aborted or failed staging
+/// (startup judgement failed, user declined, …). Missing is fine.
+pub fn discard_placeholder(config: &DaemonConfig, config_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(pending_path(config, config_dir, name));
 }
 
 /// What one `registry::remove` call did.
@@ -821,7 +1029,7 @@ mod tests {
         let r = add(&config, &tmp, &exe, &o).unwrap();
         assert!(r.scaffolded && r.changed, "first generation is changed");
 
-        let file = tmp.join("apps").join("abc.toml");
+        let file = tmp.join("app.d").join("abc.toml");
         assert_eq!(r.file, file);
         let md = std::fs::symlink_metadata(&file).unwrap();
         assert!(md.is_file(), "record must be a real file, not a link");
@@ -872,7 +1080,7 @@ mod tests {
         let config = DaemonConfig::default();
         let r = add(&config, &tmp, &exe, &AddOptions::default()).unwrap();
         assert_eq!(r.app, "web-server");
-        assert!(tmp.join("apps").join("web-server.toml").exists());
+        assert!(tmp.join("app.d").join("web-server.toml").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1017,20 +1225,20 @@ mod tests {
         .unwrap();
         let r = add(&config, &tmp, &deploy, &opts("myapp")).unwrap();
         assert!(!r.scaffolded);
-        assert!(tmp.join("apps").join("myapp.toml").exists());
+        assert!(tmp.join("app.d").join("myapp.toml").exists());
 
         // .toml file → existing file registration flow.
         let cfg_file = tmp.join("external.toml");
         std::fs::write(&cfg_file, "[program.b]\ncommand = \"true\"\n").unwrap();
         let r = add(&config, &tmp, &cfg_file, &opts("ext")).unwrap();
         assert!(!r.scaffolded);
-        assert!(tmp.join("apps").join("ext.toml").exists());
+        assert!(tmp.join("app.d").join("ext.toml").exists());
 
         // Other regular file → scaffold.
         let exe = make_exe(&tmp, "proc");
         let r = add(&config, &tmp, &exe, &opts("scaf")).unwrap();
         assert!(r.scaffolded);
-        assert!(tmp.join("apps").join("scaf.toml").exists());
+        assert!(tmp.join("app.d").join("scaf.toml").exists());
 
         // Missing path → same error as before.
         let err = add(&config, &tmp, &tmp.join("nope"), &opts("x")).unwrap_err();
@@ -1098,7 +1306,7 @@ mod tests {
         let err = add(&config, &tmp, &exe, &opts("shared")).unwrap_err();
         assert!(err.to_string().contains("duplicated"), "{err:#}");
         assert!(
-            !tmp.join("apps").join("shared.toml").exists(),
+            !tmp.join("app.d").join("shared.toml").exists(),
             "failed scaffold writes nothing"
         );
 
@@ -1152,7 +1360,7 @@ mod tests {
             assert!(removed.deleted_file, "hardlink record is removed in place");
         }
         assert!(body.exists(), "deployment config untouched");
-        assert!(!tmp.join("apps").join("myapp.toml").exists());
+        assert!(!tmp.join("app.d").join("myapp.toml").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1213,7 +1421,7 @@ mod tests {
         let err = add(&config, &tmp, &dir_all, &AddOptions::default()).unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err:#}");
         assert!(
-            !tmp.join("apps").join("all.toml").exists(),
+            !tmp.join("app.d").join("all.toml").exists(),
             "nothing registered under the reserved name"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1248,7 +1456,7 @@ mod tests {
         }
         let tmp = std::env::temp_dir().join(format!("xk-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let app_dir = tmp.join("apps");
+        let app_dir = tmp.join("app.d");
         std::fs::create_dir_all(&app_dir).unwrap();
         let deploy = tmp.join("myapp");
         std::fs::create_dir_all(&deploy).unwrap();
@@ -1381,6 +1589,180 @@ mod tests {
                 .to_string()
                 .contains("reserved")
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- commit engine (run-daemon-first section 2) -------------------------
+
+    #[allow(dead_code)]
+    fn spec_for(exe: &Path, args: &[&str]) -> ScaffoldSpec {
+        ScaffoldSpec {
+            command: exe.to_path_buf(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: Default::default(),
+            work_dir: exe.parent().unwrap().to_path_buf(),
+            health_check: None,
+        }
+    }
+
+    /// 2.1: the extracted render function is byte-identical to what the
+    /// scaffold flow writes through `add`.
+    #[test]
+    fn render_scaffold_matches_add_output() {
+        let tmp = tmp_dir("render-pure");
+        let exe = make_exe(&tmp, "proc");
+        let config = DaemonConfig::default();
+        let o = AddOptions {
+            args: Some("--port 8080".into()),
+            restart: Some(RestartPolicy::OnFailure),
+            ..opts("abc")
+        };
+        let r = add(&config, &tmp, &exe, &o).unwrap();
+        let written = std::fs::read_to_string(&r.file).unwrap();
+
+        let resolved = exe.canonicalize().unwrap();
+        // `add` defaults work_dir to the add-time cwd; mirror that here.
+        let spec = ScaffoldSpec {
+            command: display_absolute(resolved),
+            args: vec!["--port".into(), "8080".into()],
+            env: Default::default(),
+            work_dir: std::env::current_dir().unwrap(),
+            health_check: None,
+        };
+        let rendered = render_scaffold("abc", &spec, &o).unwrap();
+        assert_eq!(rendered, written, "pure render must match the scaffold write");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.2: stage writes a placeholder whose name is NOT scanned as a
+    /// registration (does not end in `.toml`), and commit atomically renames
+    /// it into the real record.
+    #[test]
+    fn stage_and_commit_atomic_rename() {
+        let tmp = tmp_dir("commit");
+        let config = DaemonConfig::default();
+        let text = "# generated\n[program.web]\ncommand = 'true'\n";
+        let ph = stage_placeholder(&config, &tmp, "web", text).unwrap();
+        assert!(ph.exists(), "placeholder written");
+        assert_eq!(ph.file_name().unwrap(), "web.toml.pending");
+        assert_ne!(ph.extension().unwrap(), "toml", "placeholder invisible to list()");
+        assert!(
+            list(&config, &tmp).unwrap().is_empty(),
+            "placeholder is not a registration record"
+        );
+
+        let outcome = commit_staged(&config, &tmp, "web", text).unwrap();
+        assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+        assert!(!ph.exists(), "placeholder consumed by the rename");
+        let target = tmp.join("app.d").join("web.toml");
+        assert_eq!(outcome.path(), target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), text);
+        let listed = list(&config, &tmp).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "web");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.3: a placeholder that cannot be established errors immediately and
+    /// leaves nothing behind (unix, non-root).
+    #[test]
+    #[cfg(unix)]
+    fn stage_fails_when_app_dir_not_writable() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tmp_dir("stage-ro");
+        let dir = tmp.join("app.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let config = DaemonConfig::default();
+        let err = stage_placeholder(&config, &tmp, "web", "[program.web]\ncommand='true'\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("app_dir"), "{err:#}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "no residue after a failed stage"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.3: rename retries a bounded number of times; when it keeps failing
+    /// the outcome is a partial failure naming the target, and the placeholder
+    /// is deliberately kept for diagnosis.
+    #[test]
+    fn commit_retries_then_reports_partial_failure() {
+        let tmp = tmp_dir("rename-fail");
+        let config = DaemonConfig::default();
+        let text = "[program.web]\ncommand = 'true'\n";
+        stage_placeholder(&config, &tmp, "web", text).unwrap();
+        let attempts = std::cell::Cell::new(0u32);
+        let fail = |_from: &Path, _to: &Path| -> std::io::Result<()> {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("boom"))
+        };
+        let err = commit_with(&config, &tmp, "web", text, 2, fail).unwrap_err();
+        match err {
+            CommitFailure::Rename { target, error } => {
+                assert_eq!(target, tmp.join("app.d").join("web.toml"));
+                assert!(error.contains("boom"), "{error}");
+            }
+            other => panic!("expected a rename failure, got {other:?}"),
+        }
+        assert_eq!(attempts.get(), 3, "initial attempt + 2 retries");
+        assert!(
+            pending_path(&config, &tmp, "web").exists(),
+            "placeholder kept for diagnosis"
+        );
+        assert!(
+            !tmp.join("app.d").join("web.toml").exists(),
+            "no half-written record"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.4: re-committing identical content is a no-op — the target's mtime is
+    /// untouched and no second write happens.
+    #[test]
+    fn commit_is_idempotent_on_identical_content() {
+        let tmp = tmp_dir("idem");
+        let config = DaemonConfig::default();
+        let text = "[program.web]\ncommand = 'true'\n";
+        stage_placeholder(&config, &tmp, "web", text).unwrap();
+        commit_staged(&config, &tmp, "web", text).unwrap();
+        let target = tmp.join("app.d").join("web.toml");
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        // A second run stages again (the caller always stages), then commits
+        // the same text: no write, no rename.
+        stage_placeholder(&config, &tmp, "web", text).unwrap();
+        let outcome = commit_staged(&config, &tmp, "web", text).unwrap();
+        assert!(outcome.unchanged(), "identical content → unchanged");
+        assert_eq!(outcome.path(), target);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            mtime,
+            "mtime untouched"
+        );
+        assert!(
+            !pending_path(&config, &tmp, "web").exists(),
+            "the redundant placeholder is discarded"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.3: `discard_placeholder` removes a leftover placeholder and is
+    /// idempotent when there is nothing to remove.
+    #[test]
+    fn discard_placeholder_is_idempotent() {
+        let tmp = tmp_dir("discard");
+        let config = DaemonConfig::default();
+        stage_placeholder(&config, &tmp, "web", "x").unwrap();
+        assert!(pending_path(&config, &tmp, "web").exists());
+        discard_placeholder(&config, &tmp, "web");
+        assert!(!pending_path(&config, &tmp, "web").exists());
+        discard_placeholder(&config, &tmp, "web"); // no panic / no error
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

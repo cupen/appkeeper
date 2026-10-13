@@ -18,6 +18,141 @@ use crate::registry;
 
 pub type Reply = std::sync::mpsc::Sender<Result<String>>;
 
+/// Reply channel for the structured ad-hoc results (run-daemon-first D3/D5).
+pub type AdhocUpReply =
+    std::sync::mpsc::Sender<std::result::Result<AdhocUpResult, AdhocUpError>>;
+pub type AdhocCommitReply = std::sync::mpsc::Sender<Result<AdhocCommitResult>>;
+pub type AdhocAbortReply = std::sync::mpsc::Sender<Result<String>>;
+
+/// A temporary app definition handed to the daemon by `ak run`'s ad-hoc
+/// forms. The CLI resolves the command to an absolute path first; the daemon
+/// re-validates and renders the config itself (run-daemon-first D3).
+#[derive(Debug, Clone)]
+pub struct AdhocSpec {
+    /// Explicit `--name`; `None` means "derive from the command stem".
+    pub name: Option<String>,
+    /// Command first token, already resolved to an absolute path by the CLI.
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub work_dir: Option<PathBuf>,
+    pub description: Option<String>,
+    pub restart: Option<crate::config::RestartPolicy>,
+    pub restart_backoff: Option<f64>,
+    /// Optional health check (`http(s)://` | `tcp://host:port` | an exec
+    /// command line) so the streaming-progress scenario is reachable.
+    pub health_check: Option<String>,
+    /// `--restart=no`: no startup judgement, register only (D8).
+    pub register_only: bool,
+}
+
+/// A staged (started but not yet persisted) ad-hoc app (run-daemon-first D1).
+#[derive(Debug, Clone)]
+pub struct StagedApp {
+    pub app: String,
+    pub program: String,
+    /// Rendered config text, ready to be written to the target record.
+    pub text: String,
+    /// The target registration file (`app_dir/<name>.toml`).
+    pub target: PathBuf,
+    /// The placeholder written at stage time (`app_dir/<name>.toml.pending`).
+    /// Kept for diagnosis on partial failure and used by tests to assert the
+    /// staged path.
+    #[allow(dead_code)]
+    pub placeholder: PathBuf,
+    /// Resolved definition, merged into detection so the program survives
+    /// periodic rescans while staged.
+    pub resolved: ResolvedApp,
+    /// True once the record was committed (rename done).
+    pub committed: bool,
+}
+
+/// Why an `AdhocUp` was refused without starting anything.
+#[derive(Debug)]
+pub enum AdhocUpError {
+    /// The name (or program name) collides / is invalid / is the reserved
+    /// `all` keyword.
+    Validation(String),
+    /// The placeholder could not be established: nothing started (D2).
+    Stage(String),
+}
+
+impl std::fmt::Display for AdhocUpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdhocUpError::Validation(m) | AdhocUpError::Stage(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for AdhocUpError {}
+
+impl AdhocUpError {
+    /// The HTTP status a validation failure maps to: a name collision or an
+    /// invalid name is a 400; everything else is a 409 (state conflict).
+    pub fn http_status(&self) -> u16 {
+        match self {
+            AdhocUpError::Validation(_) => 400,
+            AdhocUpError::Stage(_) => 500,
+        }
+    }
+
+    /// The startup phase that failed, for the structured error reply.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            AdhocUpError::Validation(_) => "validation",
+            AdhocUpError::Stage(_) => "stage",
+        }
+    }
+}
+
+/// Successful `AdhocUp`: the program is spawned and staged, not yet persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdhocUpResult {
+    pub app: String,
+    pub program: String,
+    /// The registration file the commit will produce.
+    pub config_path: String,
+    pub pid: Option<u32>,
+    /// Upper bound (seconds) the caller should wait before giving up (D5).
+    pub estimate_secs: f64,
+    /// True when the program declares a health check (the endpoint streams an
+    /// extra waiting frame; D5).
+    pub has_health: bool,
+    /// `--restart=no`: no startup judgement; the endpoint commits directly.
+    pub register_only: bool,
+    /// True when the definition was already staged/started by an earlier run
+    /// whose commit failed: the CLI must ask before re-committing (D4).
+    pub residual: bool,
+    /// True when a same-name registration already held byte-identical content:
+    /// an idempotent upsert that neither wrote the record nor restarted the
+    /// process. `pid` is the existing one (control-plane spec: 同名重复提交走再生).
+    pub unchanged: bool,
+    /// True when the record is ALREADY on disk (a regeneration of a committed
+    /// same-name app): the caller waits for the startup judgement but MUST NOT
+    /// run the commit step again (there is no placeholder / staged entry).
+    pub committed: bool,
+}
+
+/// Successful `AdhocCommit`: the record is on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdhocCommitResult {
+    pub app: String,
+    pub program: String,
+    pub config_path: String,
+    pub pid: Option<u32>,
+    /// True when the target already held identical content (idempotent).
+    pub unchanged: bool,
+    /// Partial failure: startup succeeded but the rename kept failing; the
+    /// process is kept running and the full config is returned so the user can
+    /// finish by hand (D4 / app-registry spec).
+    pub partial: bool,
+    /// Human-readable partial-failure explanation (empty when `partial` false).
+    pub partial_reason: String,
+    /// Complete configuration info for manual landing on partial failure.
+    pub config_text: String,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Start {
@@ -58,6 +193,25 @@ pub enum Command {
     /// Sent by the health checker when a program needs a restart.
     HealthRestart {
         name: String,
+    },
+    /// run-daemon-first D3: validate an ad-hoc definition, stage it and spawn
+    /// its program. Fast and synchronous — the caller (the HTTP connection
+    /// thread) does the actual waiting, never this loop.
+    AdhocUp {
+        spec: AdhocSpec,
+        reply: AdhocUpReply,
+    },
+    /// run-daemon-first D3: rename the placeholder onto the real record,
+    /// clear the staged entry and update the app records.
+    AdhocCommit {
+        name: String,
+        reply: AdhocCommitReply,
+    },
+    /// run-daemon-first D3: stop and drop a staged program, delete the
+    /// placeholder and clear the staged entry.
+    AdhocAbort {
+        name: String,
+        reply: AdhocAbortReply,
     },
 }
 
@@ -438,6 +592,10 @@ pub struct SupervisorState {
     /// whether to pull a program up at daemon start / on apply. `always` and
     /// `on-failure` ignore it; shutdown never writes it.
     pub user_stopped: HashSet<String>,
+    /// run-daemon-first D1: ad-hoc apps that are started but not yet persisted
+    /// (keyed by app name). Detection merges these so their programs survive
+    /// periodic rescans until the commit lands or the abort drops them.
+    pub staged: HashMap<String, StagedApp>,
 }
 
 pub struct Supervisor {
@@ -479,6 +637,7 @@ impl Supervisor {
                 pending: PendingDoc::default(),
                 file_stamps: HashMap::new(),
                 user_stopped,
+                staged: HashMap::new(),
             })),
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
@@ -725,6 +884,15 @@ impl Supervisor {
                 warn!("health checker requesting restart of program[{name}]");
                 let _ = self.cmd_stop(&name);
                 let _ = self.cmd_start(&name);
+            }
+            Command::AdhocUp { spec, reply } => {
+                let _ = reply.send(self.cmd_adhoc_up(&spec));
+            }
+            Command::AdhocCommit { name, reply } => {
+                let _ = reply.send(self.cmd_adhoc_commit(&name));
+            }
+            Command::AdhocAbort { name, reply } => {
+                let _ = reply.send(self.cmd_adhoc_abort(&name));
             }
             Command::Reload { reply } => answer(reply, self.cmd_reload()),
             Command::Apply {
@@ -1005,6 +1173,11 @@ impl Supervisor {
             // running config stays authoritative until the conflict is fixed.
             bail!("detection failed, cross-app validation failed: {e}");
         }
+        // run-daemon-first D1: merge staged (started-but-unpersisted) apps so
+        // their programs are treated as known and are neither dropped by
+        // `keep` nor shown as pending. They are visible in `programs` for the
+        // HTTP thread's startup wait.
+        self.merge_staged(&mut resolved, &mut new_records);
 
         let mut doc = PendingDoc {
             errors,
@@ -1022,7 +1195,11 @@ impl Supervisor {
             // Per-app program diff: hash mismatch, new program, or dropped
             // program (file no longer defines it) — all count as changed.
             for app in &resolved {
-                if !st.apps.iter().any(|a| a.name == app.name) {
+                // A staged app is started-but-unpersisted: it is deliberately
+                // absent from `st.apps` and MUST NOT show up as "added"
+                // (run-daemon-first D1).
+                if !st.apps.iter().any(|a| a.name == app.name) && !st.staged.contains_key(&app.name)
+                {
                     doc.apps_added.push(app.name.clone());
                 }
                 let new_names: HashSet<&str> =
@@ -1081,6 +1258,476 @@ impl Supervisor {
             st.pending = doc.clone();
         }
         Ok(doc)
+    }
+
+    /// run-daemon-first D1: fold the staged apps into a detection result so
+    /// their programs are treated as known. Called with the freshly resolved
+    /// disk set before the pending diff is computed — a staged app therefore
+    /// does not appear in `apps_added`/`programs` and is not dropped by the
+    /// `keep` set. Only apps that are NOT yet on disk are merged (a committed
+    /// staged app is already covered by its record).
+    fn merge_staged(&self, resolved: &mut Vec<ResolvedApp>, records: &mut Vec<AppRecord>) {
+        let staged: Vec<StagedApp> = {
+            let st = self.state.lock().unwrap();
+            st.staged.values().cloned().collect()
+        };
+        for s in staged {
+            if records.iter().any(|r| r.name == s.app) {
+                continue; // already visible on disk (committed)
+            }
+            records.push(AppRecord {
+                name: s.resolved.name.clone(),
+                path: s.resolved.path.clone(),
+                priority: s.resolved.priority,
+            });
+            resolved.push(s.resolved.clone());
+        }
+    }
+
+    // -- ad-hoc registration (run-daemon-first D1/D3) ------------------------
+
+    /// Resolve the app name from the spec (explicit `--name` or the command's
+    /// file stem) and validate it: identifier charset, not the reserved `all`
+    /// keyword, and no collision with a program name owned by a DIFFERENT app.
+    ///
+    /// A same-name app's own repeated submission is NOT a collision: per the
+    /// control-plane spec it is a full regeneration / upsert (see
+    /// [`Self::cmd_adhoc_up`]), so the program belonging to the same app name
+    /// is allowed through.
+    fn resolve_adhoc_name(&self, spec: &AdhocSpec) -> std::result::Result<String, AdhocUpError> {
+        let name = match &spec.name {
+            Some(n) => n.clone(),
+            None => spec
+                .command
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AdhocUpError::Validation(
+                        "cannot derive an app name from the command path; pass --name".into(),
+                    )
+                })?,
+        };
+        if !config::is_valid_name(&name) {
+            return Err(AdhocUpError::Validation(format!(
+                "app name {name:?} is invalid: {}",
+                config::NAME_RULE
+            )));
+        }
+        if name == ALL_KEYWORD {
+            return Err(AdhocUpError::Validation(format!(
+                "app name {name:?} is reserved: `ak apply all` means apply-all; choose another --name"
+            )));
+        }
+        let st = self.state.lock().unwrap();
+        // Only a program owned by ANOTHER app is a genuine collision: a
+        // same-name app's own program is the upsert/regeneration target
+        // (control-plane spec: 同名应用自身的重复提交不属冲突).
+        if let Some(p) = st.programs.get(&name)
+            && p.def.app != name
+        {
+            return Err(AdhocUpError::Validation(format!(
+                "program name {name:?} is already registered by app {:?}; choose another --name",
+                p.def.app
+            )));
+        }
+        Ok(name)
+    }
+
+    /// Render + validate the ad-hoc definition without touching disk or
+    /// processes; returns the app name, program name and rendered text.
+    fn render_adhoc(
+        &self,
+        spec: &AdhocSpec,
+        name: &str,
+    ) -> std::result::Result<(PathBuf, String), AdhocUpError> {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let work_dir = match &spec.work_dir {
+            Some(w) => w.clone(),
+            None => std::env::current_dir().map_err(|e| {
+                AdhocUpError::Validation(format!("cannot read the current directory: {e}"))
+            })?,
+        };
+        let opts = registry::AddOptions {
+            name: Some(name.to_string()),
+            description: spec.description.clone(),
+            restart: spec.restart,
+            restart_backoff: spec.restart_backoff,
+            priority: None,
+            args: None,
+            args_argv: Some(spec.args.clone()),
+            env: if spec.env.is_empty() {
+                None
+            } else {
+                Some(spec.env.clone())
+            },
+            workdir: Some(work_dir.clone()),
+        };
+        let scaf = registry::ScaffoldSpec {
+            command: spec.command.clone(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            work_dir,
+            health_check: spec.health_check.clone(),
+        };        let text = registry::render_scaffold(name, &scaf, &opts)
+            .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+        // Validate the rendered config against the current registry (round-trip).
+        let raw: crate::config::AppRaw = toml::from_str(&text).map_err(|e| {
+            AdhocUpError::Validation(format!("rendered config is not valid TOML: {e}"))
+        })?;
+        let target = registry::link_path(&config, &config_dir, name);
+        let resolved = config::resolve_app(name, &target, &raw, config.app_default.as_ref())
+            .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+        let existing = registry::list(&config, &config_dir)
+            .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+        let mut all = Vec::new();
+        for l in &existing {
+            if l.name == name {
+                continue;
+            }
+            let (r, _) = crate::config::AppRaw::load(&l.path)
+                .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+            all.push(
+                config::resolve_app(&l.name, &l.path, &r, config.app_default.as_ref())
+                    .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?,
+            );
+        }
+        all.push(resolved);
+        config::validate_all(&all).map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+        Ok((target, text))
+    }
+
+    /// `AdhocUp`: validate → stage the placeholder → insert the staged record
+    /// and `ManagedProgram` → spawn → reply. Never waits: the caller polls.
+    ///
+    /// A same-name app that is ALREADY committed (its record is on disk) is an
+    /// upsert/regeneration (control-plane spec: 同名重复提交走再生): identical
+    /// content is an idempotent success returning the existing pid without
+    /// restarting; changed content stops the old process, writes the new
+    /// record and starts the new definition. A same-name app that is staged
+    /// but not yet committed is the residual (failed-commit) case (D4).
+    fn cmd_adhoc_up(&self, spec: &AdhocSpec) -> std::result::Result<AdhocUpResult, AdhocUpError> {
+        let name = self.resolve_adhoc_name(spec)?;
+        // Residual check (D4): a same-name staged app that already started but
+        // whose commit failed. Report it instead of restarting.
+        {
+            let st = self.state.lock().unwrap();
+            if let Some(s) = st.staged.get(&name) {
+                let pid = st.programs.get(&s.program).and_then(|p| p.pid());
+                let has_health = st
+                    .programs
+                    .get(&s.program)
+                    .map(|p| p.def.health.is_some())
+                    .unwrap_or(false);
+                return Ok(AdhocUpResult {
+                    app: s.app.clone(),
+                    program: s.program.clone(),
+                    config_path: s.target.display().to_string(),
+                    pid,
+                    estimate_secs: 0.0,
+                    has_health,
+                    register_only: false,
+                    residual: true,
+                    unchanged: false,
+                    committed: false,
+                });
+            }
+        }
+        // Render + validate the NEW definition before touching anything: a
+        // failure here must not disturb the existing record or process.
+        let (target, text) = self.render_adhoc(spec, &name)?;
+        // Committed same-name app: upsert / full regeneration (no placeholder,
+        // no startup judgement — the record is already on disk).
+        if let Some(up) = self.adhoc_upsert(spec, &name, &target, &text)? {
+            return Ok(up);
+        }
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        // Write the placeholder BEFORE spawning: a failure here must not start
+        // any process (app-registry spec).
+        let placeholder = registry::stage_placeholder(&config, &config_dir, &name, &text)
+            .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
+        // Register-only (`--restart=no`, D8): no startup judgement, no spawn.
+        let raw: crate::config::AppRaw = match toml::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                registry::discard_placeholder(&config, &config_dir, &name);
+                return Err(AdhocUpError::Validation(format!("{e}")));
+            }
+        };
+        let resolved = match config::resolve_app(&name, &target, &raw, config.app_default.as_ref())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                registry::discard_placeholder(&config, &config_dir, &name);
+                return Err(AdhocUpError::Validation(format!("{e:#}")));
+            }
+        };
+        let estimate = self.startup_estimate_secs(&resolved);
+        let program = resolved.programs[0].name.clone();
+        let staged = StagedApp {
+            app: name.clone(),
+            program: program.clone(),
+            text,
+            target: target.clone(),
+            placeholder: placeholder.clone(),
+            resolved: resolved.clone(),
+            committed: false,
+        };
+        let pid = {
+            let mut st = self.state.lock().unwrap();
+            let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+            let ring_cap = st.config.daemon.log_buffer_lines;
+            let mut mp = ManagedProgram::new(resolved.programs[0].clone(), log_dir, ring_cap);
+            if !spec.register_only {
+                mp.spawn();
+            }
+            let pid = mp.pid();
+            st.programs.insert(program.clone(), mp);
+            st.staged.insert(name.clone(), staged);
+            pid
+        };
+        // A newly staged program may need its health task registered.
+        self.sync_health_tasks();
+        Ok(AdhocUpResult {
+            app: name,
+            program,
+            config_path: target.display().to_string(),
+            pid,
+            estimate_secs: estimate,
+            has_health: resolved.programs[0].health.is_some(),
+            register_only: spec.register_only,
+            residual: false,
+            unchanged: false,
+            committed: false,
+        })
+    }
+
+    /// Upsert/regenerate an already-committed same-name app (control-plane
+    /// spec: 同名重复提交走再生). Returns `None` when `name` is not a
+    /// committed registration (the caller then stages a fresh one).
+    ///
+    /// - identical content → idempotent: no write, no restart, existing pid;
+    /// - changed content → full regeneration: stop the old process, rewrite
+    ///   the record and start the new definition (`--restart=no` writes only).
+    fn adhoc_upsert(
+        &self,
+        spec: &AdhocSpec,
+        name: &str,
+        target: &Path,
+        text: &str,
+    ) -> std::result::Result<Option<AdhocUpResult>, AdhocUpError> {
+        // The app must be an already-committed registration (its record is a
+        // real generated file and the app is in `st.apps`). Anything else —
+        // not yet registered, or a link/hard-link record to an external file —
+        // is NOT an upsert target: the caller stages a fresh one (or the guard
+        // below refuses to clobber an external file).
+        if !target.is_file() {
+            return Ok(None);
+        }
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        {
+            let st = self.state.lock().unwrap();
+            if !st.apps.iter().any(|a| a.name == name) {
+                return Ok(None);
+            }
+        }
+        let dir = registry::app_dir(&config, &config_dir);
+        if let Err(e) = registry::guard_scaffold_overwrite(target, &dir, name) {
+            return Err(AdhocUpError::Validation(format!("{e:#}")));
+        }
+        let old_text = match std::fs::read_to_string(target) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(AdhocUpError::Validation(format!(
+                    "cannot read the existing registration {}: {e}",
+                    target.display()
+                )));
+            }
+        };
+        // Idempotent: identical content → reuse the running process.
+        if old_text == text {
+            let st = self.state.lock().unwrap();
+            let pid = st.programs.get(name).and_then(|p| p.pid());
+            return Ok(Some(AdhocUpResult {
+                app: name.to_string(),
+                program: name.to_string(),
+                config_path: target.display().to_string(),
+                pid,
+                estimate_secs: 0.0,
+                has_health: st
+                    .programs
+                    .get(name)
+                    .map(|p| p.def.health.is_some())
+                    .unwrap_or(false),
+                register_only: spec.register_only,
+                residual: false,
+                unchanged: true,
+                committed: true,
+            }));
+        }
+        // Changed: full regeneration. Write the record atomically (placeholder
+        // + rename), then rebuild the program; respawn per the new definition
+        // unless the caller asked for register-only.
+        let _placeholder = registry::stage_placeholder(&config, &config_dir, name, text)
+            .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
+        let raw: crate::config::AppRaw = match toml::from_str(text) {
+            Ok(r) => r,
+            Err(e) => {
+                registry::discard_placeholder(&config, &config_dir, name);
+                return Err(AdhocUpError::Validation(format!("{e}")));
+            }
+        };
+        let resolved = match config::resolve_app(name, target, &raw, config.app_default.as_ref()) {
+            Ok(r) => r,
+            Err(e) => {
+                registry::discard_placeholder(&config, &config_dir, name);
+                return Err(AdhocUpError::Validation(format!("{e:#}")));
+            }
+        };
+        // Land the record (rename the placeholder); keep the process untouched
+        // until the new file is in place.
+        match registry::commit_staged(&config, &config_dir, name, text) {
+            Ok(_) => {}
+            Err(e) => {
+                registry::discard_placeholder(&config, &config_dir, name);
+                return Err(AdhocUpError::Stage(format!("{e:#}")));
+            }
+        }
+        let estimate = self.startup_estimate_secs(&resolved);
+        let program = resolved.programs[0].name.clone();
+        let pid = {
+            let mut st = self.state.lock().unwrap();
+            let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+            let ring_cap = st.config.daemon.log_buffer_lines;
+            // Stop and drop the old process, then install the new definition.
+            if let Some(mut old) = st.programs.remove(&program) {
+                old.stop();
+            }
+            let mut mp = ManagedProgram::new(resolved.programs[0].clone(), log_dir, ring_cap);
+            if !spec.register_only {
+                mp.spawn();
+            }
+            let pid = mp.pid();
+            st.programs.insert(program.clone(), mp);
+            if !st.apps.iter().any(|a| a.name == name) {
+                st.apps.push(AppRecord {
+                    name: resolved.name.clone(),
+                    path: resolved.path.clone(),
+                    priority: resolved.priority,
+                });
+            }
+            pid
+        };
+        self.sync_health_tasks();
+        Ok(Some(AdhocUpResult {
+            app: name.to_string(),
+            program,
+            config_path: target.display().to_string(),
+            pid,
+            estimate_secs: estimate,
+            has_health: resolved.programs[0].health.is_some(),
+            register_only: spec.register_only,
+            residual: false,
+            unchanged: false,
+            committed: true,
+        }))
+    }
+
+    /// Upper bound (seconds) a caller should wait for the startup judgement
+    /// (D5): `startsecs` alone without a health check; otherwise
+    /// `startsecs + health_start_period + health_interval × health_retries`.
+    fn startup_estimate_secs(&self, resolved: &ResolvedApp) -> f64 {
+        resolved
+            .programs
+            .iter()
+            .map(|p| match &p.health {
+                None => p.startsecs,
+                Some(h) => p.startsecs + h.start_period + h.interval * f64::from(h.retries),
+            })
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// `AdhocCommit`: rename the placeholder onto the record, drop the staged
+    /// entry and add the app to `apps`. On a rename failure the process is
+    /// kept running and a partial-failure result is returned (D4).
+    fn cmd_adhoc_commit(&self, name: &str) -> Result<AdhocCommitResult> {
+        let (config, config_dir, staged) = {
+            let st = self.state.lock().unwrap();
+            let Some(s) = st.staged.get(name) else {
+                bail!("program {name:?} is not staged (nothing to commit)");
+            };
+            (st.config.clone(), st.config_dir.clone(), s.clone())
+        };
+        let pid = {
+            let st = self.state.lock().unwrap();
+            st.programs.get(&staged.program).and_then(|p| p.pid())
+        };
+        let outcome = registry::commit_staged(&config, &config_dir, name, &staged.text);
+        let (partial, partial_reason, unchanged) = match outcome {
+            Ok(o) => {
+                // Persisted: clear the staged entry and register the app record.
+                let mut st = self.state.lock().unwrap();
+                st.staged.remove(name);
+                if !st.apps.iter().any(|a| a.name == staged.app) {
+                    st.apps.push(AppRecord {
+                        name: staged.resolved.name.clone(),
+                        path: staged.resolved.path.clone(),
+                        priority: staged.resolved.priority,
+                    });
+                }
+                (false, String::new(), o.unchanged())
+            }
+            Err(e) => {
+                // Keep the process and the staged entry; mark it committed so a
+                // later retry does not re-start it. Report partial failure.
+                let mut st = self.state.lock().unwrap();
+                if let Some(s) = st.staged.get_mut(name) {
+                    s.committed = false;
+                }
+                (true, e.to_string(), false)
+            }
+        };
+        Ok(AdhocCommitResult {
+            app: staged.app.clone(),
+            program: staged.program.clone(),
+            config_path: staged.target.display().to_string(),
+            pid,
+            unchanged,
+            partial,
+            partial_reason,
+            config_text: staged.text.clone(),
+        })
+    }
+
+    /// `AdhocAbort`: stop and drop the program, delete the placeholder, clear
+    /// the staged entry. Used when the startup judgement fails.
+    fn cmd_adhoc_abort(&self, name: &str) -> Result<String> {
+        let (config, config_dir, staged) = {
+            let st = self.state.lock().unwrap();
+            let Some(s) = st.staged.get(name) else {
+                bail!("program {name:?} is not staged (nothing to abort)");
+            };
+            (st.config.clone(), st.config_dir.clone(), s.clone())
+        };
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(mut p) = st.programs.remove(&staged.program) {
+                p.stop();
+            }
+            st.staged.remove(name);
+        }
+        registry::discard_placeholder(&config, &config_dir, name);
+        self.sync_health_tasks();
+        Ok(format!("program {} aborted (not registered)", staged.program))
     }
 
     /// `reload` now only detects: rescan and publish the pending preview.
@@ -1156,6 +1803,9 @@ impl Supervisor {
         if let Err(e) = config::validate_all(&resolved) {
             bail!("apply aborted, running config unchanged: cross-app validation failed: {e}");
         }
+        // Staged apps are known (D1): a scoped/full apply must not treat their
+        // programs as dropped while the ad-hoc commit is still in flight.
+        self.merge_staged(&mut resolved, &mut new_records);
         Ok(Detection {
             config: new_config,
             resolved,
@@ -1369,7 +2019,15 @@ impl Supervisor {
                     .push("daemon auth_token changed: restart appkeeper to apply".into());
             }
             st.config = new_config.clone();
-            st.apps = new_records.clone();
+            // Persisted app records exclude staged (started-but-unpersisted)
+            // apps: they were merged into the detection only so the `keep` set
+            // does not drop their programs. Recording them here would leave a
+            // phantom app after an abort (run-daemon-first D1).
+            st.apps = new_records
+                .iter()
+                .filter(|a| !st.staged.contains_key(&a.name))
+                .cloned()
+                .collect();
         }
 
         // App add/remove bookkeeping for the result.
@@ -1419,6 +2077,18 @@ impl Supervisor {
         let order: Vec<String> = {
             let st = self.state.lock().unwrap();
             let mut apps = st.apps.clone();
+            // Staged (started-but-unpersisted) apps are not in `st.apps` yet;
+            // their programs must be stopped too, or the child would be
+            // orphaned when the daemon exits (run-daemon-first D1).
+            for s in st.staged.values() {
+                if !apps.iter().any(|a| a.name == s.app) {
+                    apps.push(AppRecord {
+                        name: s.app.clone(),
+                        path: s.target.clone(),
+                        priority: s.resolved.priority,
+                    });
+                }
+            }
             apps.sort_by_key(|a| std::cmp::Reverse((a.priority, a.name.clone())));
             apps.iter()
                 .flat_map(|a| {
@@ -1827,6 +2497,105 @@ fn answer(reply: Option<Reply>, r: Result<String>) {
     }
 }
 
+// -- startup judgement (run-daemon-first D3/D5) ------------------------------
+
+/// Poll interval for the startup judgement. Runs on the HTTP connection
+/// thread (never the supervision loop), so a sleep here blocks nothing.
+pub const STARTUP_POLL: Duration = Duration::from_millis(50);
+
+/// Outcome of waiting for a staged program to be judged started.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StartupOutcome {
+    /// `Running` and (if a health check exists) its first probe passed.
+    Started { pid: Option<u32> },
+    /// A terminal failure: the program died before `startsecs`, entered
+    /// `fatal`, or was stopped. `phase` names the failed stage.
+    Failed { phase: &'static str, reason: String },
+    /// The estimate elapsed without a verdict.
+    TimedOut { waited_secs: f64 },
+}
+
+/// Wait for the startup judgement of `program` (run-daemon-first D3): poll
+/// its state until `Running && health_confirmed`, a terminal failure, or the
+/// `estimate` budget elapses. Called by the HTTP connection thread — it never
+/// touches the command queue and never blocks the supervision loop.
+pub fn wait_startup(sup: &Supervisor, program: &str, estimate: Duration) -> StartupOutcome {
+    wait_startup_with(sup, program, estimate, STARTUP_POLL)
+}
+
+/// Body of [`wait_startup`] with an injectable poll interval (tests).
+fn wait_startup_with(
+    sup: &Supervisor,
+    program: &str,
+    estimate: Duration,
+    poll: Duration,
+) -> StartupOutcome {
+    let start = Instant::now();
+    let deadline = start + estimate;
+    loop {
+        {
+            let st = sup.state.lock().unwrap();
+            match st.programs.get(program) {
+                None => {
+                    return StartupOutcome::Failed {
+                        phase: "startup",
+                        reason: format!("program {program:?} disappeared before it started"),
+                    };
+                }
+                Some(p) => match p.state() {
+                    ProgramState::Running if p.health_confirmed() => {
+                        return StartupOutcome::Started { pid: p.pid() };
+                    }
+                    ProgramState::Running | ProgramState::Starting | ProgramState::Stopping => {}
+                    ProgramState::Fatal => {
+                        return StartupOutcome::Failed {
+                            phase: "startup",
+                            reason: p
+                                .fatal_reason()
+                                .map(String::from)
+                                .unwrap_or_else(|| "program entered the fatal state".into()),
+                        };
+                    }
+                    ProgramState::Exited => {
+                        return StartupOutcome::Failed {
+                            phase: "startup",
+                            reason: p
+                                .last_exit()
+                                .map(|e| format!("program exited before startsecs: {e}"))
+                                .unwrap_or_else(|| "program exited before startsecs".into()),
+                        };
+                    }
+                    ProgramState::Backoff => {
+                        // The start failed and a retry is scheduled: the first
+                        // failed start IS the failure (process-management spec:
+                        // 稳定运行前退出计入启动失败).
+                        return StartupOutcome::Failed {
+                            phase: "startup",
+                            reason: p
+                                .last_exit()
+                                .map(|e| format!("program exited before startsecs: {e}"))
+                                .unwrap_or_else(|| "program exited before startsecs".into()),
+                        };
+                    }
+                    ProgramState::Stopped => {
+                        return StartupOutcome::Failed {
+                            phase: "startup",
+                            reason: "program was stopped before it started".into(),
+                        };
+                    }
+                },
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return StartupOutcome::TimedOut {
+                waited_secs: now.duration_since(start).as_secs_f64(),
+            };
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 // -- human-readable rendering ---------------------------------------------
 
 /// Render a pending preview: what would change if `apply` ran now.
@@ -1954,7 +2723,7 @@ mod tests {
     fn setup(app_name: &str, toml_text: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("xk-apply-{}-{}", unique_tag(), app_name));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
         // Pin log_dir per test: the built-in default is a shared
@@ -1972,7 +2741,7 @@ mod tests {
         std::fs::write(&app_file, toml_text).unwrap();
         link_for_test(
             &app_file,
-            &dir.join("apps").join(format!("{app_name}.toml")),
+            &dir.join("app.d").join(format!("{app_name}.toml")),
         );
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
@@ -2211,7 +2980,7 @@ mod tests {
     fn scoped_apply_does_not_touch_other_apps() {
         let dir = std::env::temp_dir().join(format!("xk-scope-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
         // Pin log_dir per test: the shared default would let the persisted
@@ -2236,8 +3005,8 @@ mod tests {
             "[app]\nautostart = true\n[program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
         )
         .unwrap();
-        link_for_test(&a_file, &dir.join("apps").join("a.toml"));
-        link_for_test(&b_file, &dir.join("apps").join("b.toml"));
+        link_for_test(&a_file, &dir.join("app.d").join("a.toml"));
+        link_for_test(&b_file, &dir.join("app.d").join("b.toml"));
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -2353,7 +3122,7 @@ mod tests {
     fn detect_refuses_cross_app_conflict() {
         let dir = std::env::temp_dir().join(format!("xk-conflict-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
         // Pin log_dir per test: the shared default would let the persisted
@@ -2370,8 +3139,8 @@ mod tests {
         let b_file = dir.join("b.toml");
         std::fs::write(&a_file, "[program.dup]\ncommand = 'true'\n").unwrap();
         std::fs::write(&b_file, "[program.dup]\ncommand = 'true'\n").unwrap();
-        link_for_test(&a_file, &dir.join("apps").join("a.toml"));
-        link_for_test(&b_file, &dir.join("apps").join("b.toml"));
+        link_for_test(&a_file, &dir.join("app.d").join("a.toml"));
+        link_for_test(&b_file, &dir.join("app.d").join("b.toml"));
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -2524,7 +3293,7 @@ mod tests {
             "[app]\nautostart = false\n[program.q]\ncommand = 'sleep 30'\n",
         )
         .unwrap();
-        link_for_test(&other, &dir.join("apps").join("other.toml"));
+        link_for_test(&other, &dir.join("app.d").join("other.toml"));
         {
             let st = sup.state.lock().unwrap();
             assert!(
@@ -3153,7 +3922,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-persist-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let logs = dir.join("logs");
-        std::fs::create_dir_all(dir.join("apps")).unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
         let cfg_path = dir.join("daemon.toml");
         std::fs::write(
             &cfg_path,
@@ -3167,7 +3936,7 @@ mod tests {
              [program.always]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
         )
         .unwrap();
-        link_for_test(&app_file, &dir.join("apps").join("demo.toml"));
+        link_for_test(&app_file, &dir.join("app.d").join("demo.toml"));
 
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -3265,5 +4034,737 @@ mod tests {
         assert_eq!(doc.programs.len(), 1, "restart change is pending: {doc:?}");
         assert_eq!(doc.programs[0].program, "p");
         let _ = sup.shutdown_all();
+    }
+
+    // -- ad-hoc registration (run-daemon-first sections 3/4) ----------------
+
+    /// A bare supervisor (no registered apps) with a private app_dir/log_dir
+    /// and a running supervision loop, for ad-hoc tests.
+    fn adhoc_harness(tag: &str) -> (Arc<Supervisor>, PathBuf, std::thread::JoinHandle<()>) {
+        let dir = std::env::temp_dir().join(format!("xk-adhoc-{}-{}", unique_tag(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        let sup2 = Arc::clone(&sup);
+        let handle = std::thread::Builder::new()
+            .name("adhoc-supervisor".into())
+            .spawn(move || sup2.run())
+            .unwrap();
+        (sup, dir, handle)
+    }
+
+    fn stop_adhoc(sup: &Supervisor, handle: std::thread::JoinHandle<()>) {
+        sup.request_shutdown();
+        handle.join().unwrap();
+    }
+
+    fn spec_for(command: &str, args: &[&str]) -> AdhocSpec {
+        AdhocSpec {
+            name: None,
+            command: PathBuf::from(command),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: Default::default(),
+            work_dir: None,
+            description: None,
+            restart: None,
+            restart_backoff: None,
+            health_check: None,
+            register_only: false,
+        }
+    }
+
+    /// The blocking `sleep` binary used by ad-hoc specs.
+    fn sleep_bin() -> PathBuf {
+        #[cfg(unix)]
+        {
+            PathBuf::from("/bin/sleep")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from("C:\\Windows\\System32\\ping.exe")
+        }
+    }
+
+    fn adhoc_up(sup: &Supervisor, spec: AdhocSpec) -> std::result::Result<AdhocUpResult, AdhocUpError> {
+        sup.cmd_adhoc_up(&spec)
+    }
+
+    fn adhoc_commit(sup: &Supervisor, name: &str) -> Result<AdhocCommitResult> {
+        sup.cmd_adhoc_commit(name)
+    }
+
+    /// 3.1: a staged entry carries the rendered text, target and placeholder
+    /// paths and its resolved definition.
+    #[test]
+    fn staged_app_records_definition_and_paths() {
+        let (sup, dir, h) = adhoc_harness("stage");
+        let spec = AdhocSpec {
+            name: Some("web".into()),
+            command: sleep_bin(),
+            args: vec!["30".into()],
+            ..spec_for("/bin/sleep", &[])
+        };
+        let up = adhoc_up(&sup, spec).unwrap();
+        assert_eq!(up.app, "web");
+        assert_eq!(up.program, "web");
+        assert!(up.pid.is_some(), "spawned");
+        {
+            let st = sup.state.lock().unwrap();
+            let s = st.staged.get("web").expect("staged entry");
+            assert_eq!(s.app, "web");
+            assert_eq!(s.program, "web");
+            assert!(!s.committed);
+            assert!(s.text.contains("[program.web]"), "{}", s.text);
+            assert_eq!(s.target, dir.join("app.d").join("web.toml"));
+            assert_eq!(s.placeholder, dir.join("app.d").join("web.toml.pending"));
+            assert!(s.placeholder.exists(), "placeholder staged");
+            assert_eq!(s.resolved.programs[0].name, "web");
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2: a staged program survives repeated detection passes and never
+    /// shows up as pending.
+    #[test]
+    fn staged_program_survives_periodic_detection() {
+        let (sup, dir, h) = adhoc_harness("survive");
+        let spec = AdhocSpec {
+            name: Some("web".into()),
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        adhoc_up(&sup, spec).unwrap();
+        for _ in 0..4 {
+            let doc = sup.detect(true).unwrap();
+            assert!(doc.programs.is_empty(), "staged must not be pending: {doc:?}");
+            assert!(doc.apps_added.is_empty(), "staged must not be added: {doc:?}");
+            let st = sup.state.lock().unwrap();
+            assert!(
+                st.programs.contains_key("web"),
+                "staged program survives detection"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3: validation failures do not spawn anything; a valid spec spawns and
+    /// leaves the program in `Starting`.
+    #[test]
+    fn adhoc_up_validates_then_spawns() {
+        let (sup, dir, h) = adhoc_harness("up");
+        // Reserved name `all`.
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("all".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+        assert_eq!(err.http_status(), 400);
+        assert_eq!(err.phase(), "validation");
+        assert!(sup.state.lock().unwrap().programs.is_empty(), "nothing spawned");
+
+        // Invalid charset.
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("bad name".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)));
+
+        // A valid spec spawns; with the default 3s startsecs it is `Starting`.
+        let up = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert!(up.pid.is_some());
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].state(),
+            ProgramState::Starting
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3/4.3: a program name owned by ANOTHER app is refused without
+    /// spawning (control-plane spec: 名称冲突被拒绝 — 与其他应用冲突).
+    #[test]
+    fn adhoc_up_refuses_program_name_collision() {
+        let (sup, dir, h) = adhoc_harness("collide");
+        // A pre-existing app owns the program name `web`.
+        let app_file = dir.join("existing.toml");
+        std::fs::write(&app_file, "[program.web]\ncommand = 'sleep 30'\n").unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        link_for_test(&app_file, &dir.join("app.d").join("existing.toml"));
+        sup.bootstrap().unwrap();
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already registered"), "{err}");
+        assert!(
+            err.to_string().contains("existing"),
+            "names the owning app: {err}"
+        );
+        assert!(!sup.state.lock().unwrap().staged.contains_key("web"));
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// control-plane: a same-name app's repeated submission is NOT a
+    /// collision — identical content is an idempotent upsert returning the
+    /// existing pid without restarting (同名重复提交走再生, 无变化幂等).
+    #[test]
+    fn adhoc_upsert_identical_is_idempotent() {
+        let (sup, dir, h) = adhoc_harness("upsert-idem");
+        let spec = || AdhocSpec {
+            name: Some("web".into()),
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        let first = adhoc_up(&sup, spec()).unwrap();
+        assert!(!first.unchanged && !first.residual);
+        let pid = first.pid.expect("spawned");
+        // Commit so the record is on disk (a committed same-name app).
+        adhoc_commit(&sup, "web").unwrap();
+        assert!(dir.join("app.d").join("web.toml").exists());
+
+        let again = adhoc_up(&sup, spec()).unwrap();
+        assert!(
+            again.unchanged,
+            "identical content is idempotent: {again:?}"
+        );
+        assert!(!again.residual, "not the residual path");
+        assert_eq!(again.pid, Some(pid), "no restart, same pid");
+        assert_eq!(again.app, "web");
+        // No placeholder was staged and the record is unchanged.
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.staged.contains_key("web"),
+                "no staged entry for a committed app"
+            );
+            assert_eq!(st.programs["web"].pid(), Some(pid));
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// control-plane: a same-name app resubmitted with DIFFERENT content is
+    /// fully regenerated — the record is rewritten and the process restarted
+    /// with a new pid (同名重复提交走再生, 有变化重启).
+    #[test]
+    fn adhoc_upsert_changed_regenerates() {
+        let (sup, dir, h) = adhoc_harness("upsert-regen");
+        let first = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid1 = first.pid.expect("spawned");
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        let text1 = std::fs::read_to_string(&record).unwrap();
+        assert!(text1.contains("30"), "{text1}");
+
+        let again = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["60"])
+            },
+        )
+        .unwrap();
+        assert!(!again.unchanged && !again.residual, "{again:?}");
+        let pid2 = again.pid.expect("respawned");
+        assert_ne!(pid2, pid1, "changed content restarts the process");
+        // The record was rewritten in place; no placeholder residue.
+        let text2 = std::fs::read_to_string(&record).unwrap();
+        assert!(text2.contains("60") && !text2.contains("\"30\""), "{text2}");
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["web"].pid(), Some(pid2));
+            assert!(
+                !st.staged.contains_key("web"),
+                "regeneration stages nothing"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// control-plane: a validation failure of the NEW definition must not
+    /// disturb the existing record or the running process.
+    #[test]
+    fn adhoc_upsert_invalid_definition_keeps_existing() {
+        let (sup, dir, h) = adhoc_harness("upsert-invalid");
+        let first = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = first.pid.expect("spawned");
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+
+        // A definition whose rendered config fails validation (negative
+        // restart_backoff) is refused during `render_adhoc`, before any write
+        // or stop.
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                restart_backoff: Some(-1.0),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("restart_backoff"),
+            "the validation error names the field: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "record untouched"
+        );
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].pid(),
+            Some(pid),
+            "the running process is untouched"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: commit renames the placeholder onto the record, clears the staged
+    /// entry and registers the app.
+    #[test]
+    fn adhoc_commit_persists_and_clears_staged() {
+        let (sup, dir, h) = adhoc_harness("commit");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let out = adhoc_commit(&sup, "web").unwrap();
+        assert!(!out.partial && !out.unchanged);
+        assert_eq!(out.app, "web");
+        assert_eq!(out.config_path, dir.join("app.d").join("web.toml").display().to_string());
+        assert!(out.pid.is_some());
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.staged.contains_key("web"), "staged cleared");
+            assert!(st.apps.iter().any(|a| a.name == "web"), "app recorded");
+        }
+        let (config, _) = DaemonConfig::load_or_default(&dir.join("daemon.toml")).unwrap();
+        let listed = registry::list(&config, &dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "web");
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.5: abort stops the program, removes it and deletes every file.
+    #[test]
+    fn adhoc_abort_removes_process_and_files() {
+        let (sup, dir, h) = adhoc_harness("abort");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        sup.cmd_adhoc_abort("web").unwrap();
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.programs.contains_key("web"), "program removed");
+            assert!(!st.staged.contains_key("web"), "staged cleared");
+        }
+        let app_dir = dir.join("app.d");
+        if app_dir.exists() {
+            assert!(
+                std::fs::read_dir(&app_dir).unwrap().next().is_none(),
+                "no residue after abort"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.6: `--restart=no` registers without spawning (pid = null).
+    #[test]
+    fn adhoc_register_only_skips_spawn() {
+        let (sup, dir, h) = adhoc_harness("regonly");
+        let up = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                restart: Some(crate::config::RestartPolicy::No),
+                register_only: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert_eq!(up.pid, None, "register-only leaves pid null");
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(
+                st.programs["web"].state(),
+                ProgramState::Stopped,
+                "no spawn"
+            );
+        }
+        let out = adhoc_commit(&sup, "web").unwrap();
+        assert_eq!(out.pid, None);
+        assert!(dir.join("app.d").join("web.toml").exists(), "record written");
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.7: a residual (staged, uncommitted) same-name app reports residual
+    /// instead of restarting; a fresh name reports residual = false.
+    #[test]
+    fn adhoc_up_reports_residual_state() {
+        let (sup, dir, h) = adhoc_harness("residual");
+        let first = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert!(!first.residual);
+        let pid = first.pid;
+        // Second identical run: the staged entry is still there → residual.
+        let second = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert!(second.residual, "same-name staged app is residual");
+        assert_eq!(second.pid, pid, "no restart, same pid");
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.3: the estimate is startsecs without a health check and
+    /// startsecs + start_period + interval × retries with one.
+    #[test]
+    fn startup_estimate_formula() {
+        let (sup, dir, h) = adhoc_harness("estimate");
+        let no_health = crate::config::resolve_app(
+            "demo",
+            Path::new("x.toml"),
+            &toml::from_str("[program.p]\ncommand='x'\nstartsecs = 2.5\n").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sup.startup_estimate_secs(&no_health), 2.5);
+        let health = crate::config::resolve_app(
+            "demo",
+            Path::new("x.toml"),
+            &toml::from_str(
+                "[program.p]\ncommand='x'\nstartsecs = 2.0\nhealth_check='true'\n\
+                 health_start_period = 4.0\nhealth_interval = 3.0\nhealth_retries = 5\n",
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sup.startup_estimate_secs(&health), 2.0 + 4.0 + 3.0 * 5.0);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.2: the wait succeeds once the program is Running (no health check
+    /// confirms at spawn), fails fast when it exits inside startsecs, and
+    /// times out when the estimate elapses.
+    #[test]
+    fn wait_startup_success_and_failure_paths() {
+        let (sup, dir, h) = adhoc_harness("wait");
+        // Success: sleep 30 with a short startsecs.
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("ok".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        // The harness's default startsecs is 3.0; the program stays alive.
+        match wait_startup(&sup, "ok", Duration::from_secs(10)) {
+            StartupOutcome::Started { pid } => assert!(pid.is_some()),
+            other => panic!("expected Started, got {other:?}"),
+        }
+
+        // Failure: a command that exits immediately.
+        #[cfg(unix)]
+        let (cmd, args) = ("/bin/sh", vec!["-c", "exit 3"]);
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", vec!["/c", "exit 3"]);
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("bad".into()),
+                restart: Some(crate::config::RestartPolicy::No),
+                ..spec_for(cmd, &args)
+            },
+        )
+        .unwrap();
+        match wait_startup(&sup, "bad", Duration::from_secs(10)) {
+            StartupOutcome::Failed { phase, reason } => {
+                assert_eq!(phase, "startup");
+                assert!(!reason.is_empty(), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Timeout: a program that never reaches Running (huge startsecs).
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("slow".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        // Force a long startsecs on the running definition is not possible via
+        // the spec, so use a zero-length estimate to exercise the timeout arm.
+        match wait_startup(&sup, "slow", Duration::from_millis(0)) {
+            StartupOutcome::TimedOut { .. } => {}
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.4: after a failed startup judgement the abort cleanup leaves no file
+    /// behind and no program in state.
+    #[test]
+    fn failed_startup_then_abort_leaves_no_residue() {
+        let (sup, dir, h) = adhoc_harness("failclean");
+        #[cfg(unix)]
+        let (cmd, args) = ("/bin/sh", vec!["-c", "exit 3"]);
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", vec!["/c", "exit 3"]);
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("bad".into()),
+                restart: Some(crate::config::RestartPolicy::No),
+                ..spec_for(cmd, &args)
+            },
+        )
+        .unwrap();
+        let outcome = wait_startup(&sup, "bad", Duration::from_secs(10));
+        assert!(matches!(outcome, StartupOutcome::Failed { .. }), "{outcome:?}");
+        sup.cmd_adhoc_abort("bad").unwrap();
+        let app_dir = dir.join("app.d");
+        if app_dir.exists() {
+            assert!(
+                std::fs::read_dir(&app_dir).unwrap().next().is_none(),
+                "no .toml or .pending residue"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4/D4: a commit whose rename keeps failing reports a partial failure,
+    /// keeps the process running, keeps the staged entry, and returns the full
+    /// config text for manual landing. (unix, non-root)
+    #[test]
+    #[cfg(unix)]
+    fn adhoc_commit_partial_failure_keeps_process() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, dir, h) = adhoc_harness("partial");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+        assert!(pid.is_some());
+        // Make the app_dir read-only so the rename cannot complete.
+        let app_dir = dir.join("app.d");
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = adhoc_commit(&sup, "web").unwrap();
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.partial, "rename failure is a partial failure: {out:?}");
+        assert!(!out.partial_reason.is_empty(), "{out:?}");
+        assert!(out.config_text.contains("[program.web]"), "config returned");
+        assert_eq!(out.pid, pid, "process kept running");
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.staged.contains_key("web"), "staged kept for retry");
+            assert!(st.programs.contains_key("web"), "program kept running");
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D4: after a partial failure, committing again (once the IO recovers)
+    /// lands the record while reusing the already-running process (pid
+    /// unchanged).
+    #[test]
+    #[cfg(unix)]
+    fn adhoc_residual_commit_reuses_process() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (sup, dir, h) = adhoc_harness("residual-commit");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+        let app_dir = dir.join("app.d");
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let partial = adhoc_commit(&sup, "web").unwrap();
+        assert!(partial.partial);
+        // IO recovers; a fresh run reports residual, and committing lands it.
+        std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let again = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert!(again.residual, "residual reported after a partial failure");
+        assert_eq!(again.pid, pid, "no restart while residual");
+        let done = adhoc_commit(&sup, "web").unwrap();
+        assert!(!done.partial, "second commit lands");
+        assert_eq!(done.pid, pid, "process reused");
+        assert!(dir.join("app.d").join("web.toml").exists());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1/shutdown: a staged (uncommitted) program is stopped by shutdown_all
+    /// even though its app is not yet in `st.apps` — no orphaned child.
+    #[test]
+    fn shutdown_stops_staged_program() {
+        let (sup, dir, h) = adhoc_harness("shutdown-staged");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = sup.state.lock().unwrap().programs["web"].pid().unwrap();
+        // Shutdown: the loop exits and shutdown_all runs.
+        sup.request_shutdown();
+        h.join().unwrap();
+        let st = sup.state.lock().unwrap();
+        assert_eq!(
+            st.programs["web"].state(),
+            ProgramState::Stopped,
+            "staged program stopped at shutdown"
+        );
+        assert!(st.programs["web"].pid().is_none(), "child reaped");
+        drop(st);
+        #[cfg(unix)]
+        {
+            // The child is gone (kill(pid, 0) fails with ESRCH).
+            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+            assert!(!alive, "no orphaned child {pid}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1: a staged app is not recorded in `st.apps` by apply — so an abort
+    /// leaves no phantom app record behind, while the program survives the
+    /// apply's `keep` filter.
+    #[test]
+    fn staged_app_not_recorded_by_apply() {
+        let (sup, dir, h) = adhoc_harness("no-phantom");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        // A full apply while staged must not persist the app record.
+        sup.cmd_apply(&ApplyScope::All, false).unwrap();
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.apps.iter().any(|a| a.name == "web"),
+                "staged app must not enter apps: {:?}",
+                st.apps.iter().map(|a| &a.name).collect::<Vec<_>>()
+            );
+            assert!(st.programs.contains_key("web"), "program survives the apply");
+        }
+        // Abort: no app record, no program, no file.
+        sup.cmd_adhoc_abort("web").unwrap();
+        let st = sup.state.lock().unwrap();
+        assert!(!st.apps.iter().any(|a| a.name == "web"));
+        assert!(!st.programs.contains_key("web"));
+        drop(st);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

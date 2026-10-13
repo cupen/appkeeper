@@ -7,20 +7,26 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 ## Architecture
 
 - `src/main.rs` — CLI 入口：`daemon`（唯一守护入口，可 `--detach` 后台拉起；
-  daemon 配置含 `[webui]` 段时伺服内嵌控制台）| `run`（纯客户端动词：
-  `<名>`/`--app` 启动、`--`/`--cmd` ad-hoc 注册；守护形态的 `run` 在参数解析前
+  daemon 配置含 `[webui]` 段时伺服内嵌控制台）| `run`（纯客户端动词，**daemon-first**：
+  `<名>`/`--app` 启动、`--`/`--cmd` ad-hoc 注册全部经控制面 API 由守护进程执行，
+  统一返回 `{程序名, 配置路径, PID}` 并支持 `--json`；ad-hoc 注册「先启动成功、
+  后落盘」，守护离线一律退出码 3 且不隐式拉起；守护形态的 `run` 在参数解析前
   拦截并给迁移提示）| `validate` | `config`（daemon 配置本地管理：init/set/get/
   delete/edit 五动作，白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
   `status/stop/restart/log/pid/reload/shutdown`
   走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
-  `apply all` 中 `all` 为全量保留字，不可作应用名）。
+  `apply all` 中 `all` 为全量保留字，不可作应用名；`add --apply` 保留离线隐式拉起）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
-  `src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件）；`src/config.rs` — 分层配置
+  新增「暂存应用」`staged`（已启动未落盘的 ad-hoc app，检测合并使巡检不清理）与
+  `AdhocUp/AdhocCommit/AdhocAbort` 命令；启动判定等待（`wait_startup`）跑在 HTTP
+  连接线程而非命令处理器；`src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件
+  + 占位 `*.toml.pending` 与原子 rename 落盘引擎）；`src/config.rs` — 分层配置
   （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
-  `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端。
+  `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端（含 ad-hoc NDJSON 流式读取）。
 - `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
-  状态投影（`StatusDoc`/`ProgramInfo`）由此导出。
+  状态投影（`StatusDoc`/`ProgramInfo`，含 `config_path`/`health_confirmed`）由此导出；
+  `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册。
 - `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
   bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
   外部采集（daemon 侧零改动）；轮转对账/清理契约见 README「性能基准」。

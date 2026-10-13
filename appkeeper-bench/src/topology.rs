@@ -238,7 +238,7 @@ pub fn spawn_site(daemon_bin: Option<&Path>) -> Result<Site> {
 }
 
 fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
-    for d in ["apps", "logs", "counts"] {
+    for d in ["app.d", "logs", "counts"] {
         std::fs::create_dir_all(root.join(d))
             .with_context(|| format!("create workspace dir {}", root.join(d).display()))?;
     }
@@ -246,10 +246,12 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
     // Forward slashes so the TOML basic string stays valid on Windows.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
     // No [webui] section: the bench environment never serves the console.
+    // `app_dir` is explicit so the bench workspace is independent of the
+    // built-in default name (run-daemon-first changed it to `app.d`).
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\n",
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"app.d\"\n",
         ),
     )
     .with_context(|| format!("write daemon.toml in {}", root.display()))?;
@@ -276,7 +278,7 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
         guard.as_ref().map(|c| c.id())
     };
     Ok(Site {
-        app_dir: root.join("apps"),
+        app_dir: root.join("app.d"),
         log_dir: root.join("logs"),
         count_dir: root.join("counts"),
         client,

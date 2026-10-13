@@ -114,6 +114,19 @@ impl Client {
         self.call("POST", &format!("/v1/programs/{name}/{action}"))
     }
 
+    /// `run <name>`: start and block until the daemon's startup judgement
+    /// (`?wait=1`, run-daemon-first control-plane spec: run 阻塞至守护进程返回).
+    pub fn start_and_wait(&self, name: &str) -> Result<serde_json::Value> {
+        let r = self
+            .agent
+            .request(
+                "POST",
+                &format!("{}/v1/programs/{name}/start?wait=1", self.base),
+            )
+            .timeout(Duration::from_secs(15 * 60));
+        self.send(r, &serde_json::json!({}))
+    }
+
     /// Run a program's declared custom action. Long actions must not hit the
     /// agent's default total timeout, so the request gets its own bound.
     pub fn custom_action(&self, program: &str, action: &str) -> Result<serde_json::Value> {
@@ -139,6 +152,16 @@ impl Client {
     /// App-level fan-out (start|stop|restart), expanded server-side.
     pub fn app_action(&self, app: &str, verb: &str) -> Result<serde_json::Value> {
         self.call("POST", &format!("/v1/apps/{app}/{verb}"))
+    }
+
+    /// `run --app`: fan out and block until every program's startup judgement
+    /// (`?wait=1`).
+    pub fn app_start_and_wait(&self, app: &str) -> Result<serde_json::Value> {
+        let r = self
+            .agent
+            .request("POST", &format!("{}/v1/apps/{app}/start?wait=1", self.base))
+            .timeout(Duration::from_secs(15 * 60));
+        self.send(r, &serde_json::json!({}))
     }
 
     pub fn reload(&self) -> Result<serde_json::Value> {
@@ -255,6 +278,99 @@ impl Client {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    // -- ad-hoc run (run-daemon-first section 6) ----------------------------
+
+    /// Call `/v1/run` and stream its NDJSON progress frames to `on_frame`,
+    /// returning the terminal frame. Each frame is a decoded JSON value;
+    /// `on_frame` is invoked in arrival order. A non-2xx answer is surfaced as
+    /// an api error (the control plane answered; the daemon is reachable).
+    pub fn adhoc_run(
+        &self,
+        body: &serde_json::Value,
+        mut on_frame: impl FnMut(&serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let mut r = self
+            .agent
+            .post(&format!("{}/v1/run", self.base))
+            .timeout(Duration::from_secs(15 * 60))
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/x-ndjson");
+        if !self.token.is_empty() {
+            r = r.set("Authorization", &format!("Bearer {}", self.token));
+        }
+        let resp = match r.send_string(&body.to_string()) {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => return Err(unreachable(e)),
+        };
+        if resp.status() != 200 {
+            let code = resp.status();
+            let text = resp.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or(text);
+            anyhow::bail!("api error {code}: {msg}");
+        }
+        let mut reader = resp.into_reader();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut last = serde_json::Value::Null;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            on_frame(&v);
+                            last = v;
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Flush a trailing frame without a newline.
+        let tail = String::from_utf8_lossy(&pending);
+        let tail = tail.trim();
+        if !tail.is_empty()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(tail)
+        {
+            on_frame(&v);
+            last = v;
+        }
+        Ok(last)
+    }
+
+    /// Confirm re-landing of a residual (staged, unpersisted) app without
+    /// restarting it (run-daemon-first D4).
+    pub fn adhoc_commit(&self, name: &str) -> Result<serde_json::Value> {
+        self.call_with_body(
+            "POST",
+            "/v1/run/commit",
+            &serde_json::json!({ "name": name }),
+        )
+    }
+
+    /// Abort a staged app: stop the process, delete the placeholder. Part of
+    /// the control-plane surface; the CLI's decline path keeps the process
+    /// running instead, so this is currently only exercised by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn adhoc_abort(&self, name: &str) -> Result<serde_json::Value> {
+        self.call_with_body(
+            "POST",
+            "/v1/run/abort",
+            &serde_json::json!({ "name": name }),
+        )
     }
 }
 
@@ -380,5 +496,129 @@ mod tests {
             .expect("404 must error");
         assert!(err.to_string().contains("404"), "{err:#}");
         server.join().unwrap();
+    }
+
+    // -- ad-hoc run streaming (run-daemon-first task 6.1) -------------------
+
+    /// A fake server emitting NDJSON frames (one split across chunks) is
+    /// framed into whole JSON values, and the terminal frame is returned.
+    #[test]
+    fn adhoc_run_parses_frames_and_returns_terminal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
+            // Frame 1 split across two chunks; frame 2 whole.
+            for chunk in [
+                "{\"phase\":\"sta",
+                "ged\",\"estimate_secs\":3}\n{\"ok\":true,\"program\":\"web\",\"pid\":42}\n",
+            ] {
+                let framed = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+            }
+            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
+            let _ = std::io::Write::flush(&mut sock);
+        });
+        let c = Client::from_config(&config_with_port(port));
+        let mut seen = Vec::new();
+        let last = c
+            .adhoc_run(&serde_json::json!({"command": "/bin/true"}), |f| {
+                seen.push(f.clone())
+            })
+            .unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["phase"], "staged");
+        assert_eq!(last["ok"], true);
+        assert_eq!(last["pid"], 42);
+        server.join().unwrap();
+    }
+
+    /// A 4xx answer is surfaced as an api error (the control plane answered).
+    #[test]
+    fn adhoc_run_surfaces_api_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let body = "{\"error\":\"app name \\\"all\\\" is reserved\"}";
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+        });
+        let c = Client::from_config(&config_with_port(port));
+        let err = c
+            .adhoc_run(&serde_json::json!({"command": "/bin/true"}), |_| {})
+            .expect_err("400 must error");
+        assert!(err.to_string().contains("400"), "{err:#}");
+        assert!(err.to_string().contains("reserved"), "{err:#}");
+        server.join().unwrap();
+    }
+
+    /// The residual confirm/decline surface posts to /v1/run/commit and
+    /// /v1/run/abort with the program name.
+    #[test]
+    fn adhoc_commit_and_abort_post_name() {
+        for (path, call) in [
+            ("/v1/run/commit", 0),
+            ("/v1/run/abort", 1),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                // Read until the body has arrived (headers + Content-Length).
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = std::io::Read::read(&mut sock, &mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.strip_prefix("Content-Length: ")
+                                    .or_else(|| l.strip_prefix("content-length: "))
+                            })
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).to_string();
+                assert!(req.contains(path), "path in request: {req}");
+                assert!(req.contains("\"name\":\"web\""), "name in body: {req}");
+                let body = "{\"result\":\"ok\"}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+            });
+            let c = Client::from_config(&config_with_port(port));
+            let v = if call == 0 {
+                c.adhoc_commit("web").unwrap()
+            } else {
+                c.adhoc_abort("web").unwrap()
+            };
+            assert_eq!(v["result"], "ok");
+            server.join().unwrap();
+        }
     }
 }

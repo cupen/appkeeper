@@ -56,6 +56,10 @@ export interface ProgramInfo {
   args: string[]
   /** Working directory (empty = inherited). */
   work_dir: string
+  /** App config file path (run-daemon-first D7; additive, may be absent). */
+  config_path?: string | null
+  /** Health positively confirmed (run-daemon-first D6; additive). */
+  health_confirmed?: boolean
 }
 
 export interface PendingProgram {

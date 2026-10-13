@@ -505,7 +505,10 @@ impl Default for DaemonSettings {
             port: 7310,
             auth_token: String::new(),
             log_buffer_lines: 1000,
-            app_dir: PathBuf::from("apps"),
+            // Registry default name (run-daemon-first D9): `app.d` under the
+            // daemon config's directory (production default
+            // `/etc/appkeeper/app.d`). An explicit `app_dir` overrides it.
+            app_dir: PathBuf::from("app.d"),
         }
     }
 }
@@ -944,11 +947,14 @@ pub fn resolve_program(
         .or(meta.as_ref().and_then(|m| m.backoff_reset_after))
         .or(defaults.and_then(|d| d.backoff_reset_after))
         .unwrap_or(60.0);
+    // Built-in default startsecs (run-daemon-first D9/process-management):
+    // a program must survive 3s to count as started. Any explicit layer
+    // (program / app / app-default) still overrides this.
     let startsecs = raw
         .startsecs
         .or(meta.as_ref().and_then(|m| m.startsecs))
         .or(defaults.and_then(|d| d.startsecs))
-        .unwrap_or(1.0);
+        .unwrap_or(3.0);
     let startretries = raw
         .startretries
         .or(meta.as_ref().and_then(|m| m.startretries))
@@ -2253,6 +2259,53 @@ mod tests {
         assert_eq!(p.log_rotate_keep, 2); // built-in default
     }
 
+    /// run-daemon-first D9 / configuration spec: the built-in `app_dir` name
+    /// is `app.d` (production default /etc/appkeeper/app.d), and an explicit
+    /// `app_dir = "apps"` still fully overrides it.
+    #[test]
+    fn app_dir_defaults_to_app_d_and_explicit_wins() {
+        assert_eq!(DaemonSettings::default().app_dir, PathBuf::from("app.d"));
+        // No explicit key → the default name.
+        let cfg: DaemonConfig = toml::from_str("[daemon]\nlog_dir = \"/tmp/x\"\n").unwrap();
+        assert_eq!(cfg.daemon.app_dir, PathBuf::from("app.d"));
+        // Explicit value (including the old name) wins.
+        let cfg: DaemonConfig = toml::from_str("[daemon]\napp_dir = \"apps\"\n").unwrap();
+        assert_eq!(cfg.daemon.app_dir, PathBuf::from("apps"));
+        let cfg: DaemonConfig = toml::from_str("[daemon]\napp_dir = \"/srv/app.d\"\n").unwrap();
+        assert_eq!(cfg.daemon.app_dir, PathBuf::from("/srv/app.d"));
+    }
+
+    /// run-daemon-first D9 / process-management spec: the built-in `startsecs`
+    /// default is 3.0 when all four cascade layers are unset, and any explicit
+    /// declaration overrides it.
+    #[test]
+    fn startsecs_defaults_to_three_and_explicit_wins() {
+        // Four layers unset (program / app / app-default / built-in).
+        let a = app_of("[program.api]\ncommand = 'x'\n").unwrap();
+        assert_eq!(a.programs[0].startsecs, 3.0);
+        // The [app] layer overrides.
+        let a = app_of("[app]\nstartsecs = 1.0\n[program.api]\ncommand = 'x'\n").unwrap();
+        assert_eq!(a.programs[0].startsecs, 1.0);
+        // The [app-default] layer overrides.
+        let raw: AppRaw = toml::from_str("[program.api]\ncommand = 'x'\n").unwrap();
+        let defaults = AppDefaults {
+            startsecs: Some(7.5),
+            ..Default::default()
+        };
+        let app = resolve_app(
+            "demo",
+            Path::new("/opt/demo/appkeeper.toml"),
+            &raw,
+            Some(&defaults),
+        )
+        .unwrap();
+        assert_eq!(app.programs[0].startsecs, 7.5);
+        // The program layer wins over all.
+        let a = app_of("[app]\nstartsecs = 1.0\n[program.api]\ncommand = 'x'\nstartsecs = 0.5\n")
+            .unwrap();
+        assert_eq!(a.programs[0].startsecs, 0.5);
+    }
+
     #[test]
     fn log_rotation_defaults_and_opt_out() {
         let a = app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"0\"\n").unwrap();
@@ -2893,7 +2946,7 @@ log_buffer_lines = 7
         assert!(text.contains("[app-default]"));
         assert!(text.contains("restart = \"always\""));
         assert!(text.contains("auth_token = \"\""));
-        assert!(text.contains("app_dir = \"apps\""));
+        assert!(text.contains("app_dir = \"app.d\""));
         assert!(
             text.contains("resolves against the directory of THIS config file"),
             "app_dir relative-resolution note present"
@@ -2918,7 +2971,7 @@ log_buffer_lines = 7
         );
         assert!(rep.app_dir.is_dir());
         assert!(rep.sample_created);
-        let sample = tmp.join("conf/apps/example.toml.sample");
+        let sample = tmp.join("conf/app.d/example.toml.sample");
         assert_eq!(rep.sample_file, sample);
         assert!(sample.is_file());
         let sample_text = std::fs::read_to_string(&sample).unwrap();

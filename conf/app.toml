@@ -18,7 +18,7 @@ restart = "always"         # no | on-failure | always | unless-stopped
 # max_restart_backoff = 30.0
 # max_restarts = 0         # 0 = 不限次数
 # backoff_reset_after = 60.0   # 稳定运行超过该秒数后重置退避计数
-# startsecs = 1.0          # 存活满该秒数才算启动成功
+# startsecs = 3.0          # 存活满该秒数才算启动成功（内置默认 3.0）
 # startretries = 3         # 启动失败重试预算，耗尽后进入 fatal 不再拉起
 # stop_timeout = 10.0      # 优雅停止的最长等待（秒），超时强杀
 # restart_on_unhealthy = false # 健康探测连续失败时是否重启
@@ -42,7 +42,7 @@ command = "/opt/myapp/myserver --port 8080"
 # depends_on = []
 
 # —— 以下与 [app] 表同名的字段含义一致，写在程序上优先级最高 ——
-# startsecs = 1.0
+# startsecs = 3.0
 # startretries = 3
 # stop_timeout = 10.0
 # restart = "always"
