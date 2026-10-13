@@ -127,7 +127,7 @@ fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(workspace.join("daemon.toml"))
-        .arg("run")
+        .arg("daemon")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

@@ -1,11 +1,11 @@
 //! Background daemon spawn + readiness polling (background-daemon spec).
 //!
-//! Two entry points share this module: the explicit `ak run --detach`
+//! Two entry points share this module: the explicit `ak daemon --detach`
 //! and the implicit pull-up performed by the "take effect now" entries
 //! (`add --apply` and the run ad-hoc form) when the daemon is offline.
 //!
-//! Protocol (design D6): spawn `current_exe() run -c <config>` in a detached
-//! process group (unix `process_group(0)`, windows
+//! Protocol (design D6): spawn `current_exe() daemon -c <config>` in a
+//! detached process group (unix `process_group(0)`, windows
 //! `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`), redirect stdout/stderr
 //! (append) to `{log_dir}/daemon.out.log`, then poll `/v1/health` every
 //! ~200ms for up to ~10s. There is no lock file: a second instance loses the
@@ -82,7 +82,16 @@ pub fn wait_ready(client: &Client, timeout: Duration) -> bool {
     }
 }
 
-/// Spawn `ak run -c <config>` detached, with stdout/stderr appended to
+/// Build the re-exec command for the background daemon: `ak daemon -c
+/// <config>`. `daemon` is the only daemon entry (daemon-subcommand spec);
+/// pure so the argv contract is unit-testable.
+fn daemon_command(exe: &Path, config_path: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon").arg("-c").arg(config_path);
+    cmd
+}
+
+/// Spawn `ak daemon -c <config>` detached, with stdout/stderr appended to
 /// `log_path`. Returns the child pid for diagnostics.
 pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
     let exe = std::env::current_exe().context("cannot locate the appkeeper executable")?;
@@ -99,11 +108,8 @@ pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
         .try_clone()
         .with_context(|| format!("cannot duplicate {}", log_path.display()))?;
 
-    let mut cmd = Command::new(exe);
-    cmd.arg("run")
-        .arg("-c")
-        .arg(config_path)
-        .stdin(Stdio::null())
+    let mut cmd = daemon_command(&exe, config_path);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     #[cfg(unix)]
@@ -222,6 +228,31 @@ mod tests {
             "the timeout names where the daemon's output went"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The re-exec argv targets the `daemon` subcommand (daemon-subcommand
+    /// spec): `daemon -c <config>` — the old `run` entry would be intercepted
+    /// with exit 2 before clap, silently breaking the pull-up protocol.
+    #[test]
+    fn reexec_targets_the_daemon_subcommand() {
+        let cmd = daemon_command(
+            Path::new("/usr/local/bin/ak"),
+            Path::new("/etc/appkeeper/daemon.toml"),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["daemon", "-c", "/etc/appkeeper/daemon.toml"],
+            "the background daemon must be re-exec'd via `ak daemon -c <config>`"
+        );
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            "/usr/local/bin/ak",
+            "the program is the current executable path"
+        );
     }
 
     /// `spawn_detached` creates the log file (append) and reports a pid; the

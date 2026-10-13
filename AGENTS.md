@@ -6,10 +6,12 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 
 ## Architecture
 
-- `src/main.rs` — CLI 入口：`run`（唯一守护入口；daemon 配置含 `[webui]` 段时
-  伺服内嵌控制台）| `validate` | `config`（daemon 配置本地管理：init/set/get/
+- `src/main.rs` — CLI 入口：`daemon`（唯一守护入口，可 `--detach` 后台拉起；
+  daemon 配置含 `[webui]` 段时伺服内嵌控制台）| `run`（纯客户端动词：
+  `<名>`/`--app` 启动、`--`/`--cmd` ad-hoc 注册；守护形态的 `run` 在参数解析前
+  拦截并给迁移提示）| `validate` | `config`（daemon 配置本地管理：init/set/get/
   delete/edit 五动作，白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
-  `status/start/stop/restart/log/pid/reload/shutdown`
+  `status/stop/restart/log/pid/reload/shutdown`
   走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
   `apply all` 中 `all` 为全量保留字，不可作应用名）。
@@ -46,7 +48,7 @@ cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--r
                                        #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
                                        #   + appkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
-cargo run -- run                       # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
+cargo run -- daemon                    # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
                                        #   config --set webui.listen=... + reload 可热开启）
 cargo run -- status                    # 控制面 CLI（默认端口 7310）
 

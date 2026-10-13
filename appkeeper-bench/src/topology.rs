@@ -261,7 +261,7 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
     let child = Command::new(bin)
         .arg("--config")
         .arg(root.join("daemon.toml"))
-        .arg("run")
+        .arg("daemon")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()

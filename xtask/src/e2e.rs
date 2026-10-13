@@ -157,7 +157,7 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(ws.root.join("daemon.toml"))
-        .arg("run")
+        .arg("daemon")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -256,6 +256,23 @@ fn cli_try_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<(bool, i32, Stri
         .args(args)
         .output()
         .with_context(|| format!("run appkeeper {:?} (cfg {})", args, cfg.display()))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code().unwrap_or(-1);
+    Ok((out.status.success(), code, combined))
+}
+
+/// Run the CLI with the exact argv given (no `--config` prefix). The removed
+/// daemon-form interception happens before clap, so those scenarios exercise
+/// the real command line from the spec instead of the helper's global flag.
+fn cli_try_raw(bin: &Path, args: &[&str]) -> Result<(bool, i32, String)> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .with_context(|| format!("run appkeeper {:?}", args))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -560,6 +577,62 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the shell reports the daemon as unreachable",
     )?;
 
+    step("G0c4. removed daemon forms of `run` are intercepted pre-clap (daemon-subcommand)");
+    // The interception reads argv before clap, so the config path is never
+    // resolved — the exact spec command lines can be run against a dead daemon.
+    let cfg = ws.root.join("daemon-run-form.toml"); // never read, never created
+    // `run --detach` → exit 2, hint points at `ak daemon --detach`.
+    let (ok, code, combined) = cli_try_raw(bin, &["run", "--detach"])?;
+    expect(
+        !ok && code == 2,
+        &format!("`run --detach` is intercepted with exit 2, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("daemon --detach"),
+        "the detach-form hint names `ak daemon --detach`",
+    )?;
+    // Config-only forms (the old systemd ExecStart signature) → exit 2 and the
+    // extra unit-regeneration hint, with `--config` in either position.
+    for args in [
+        &["run", "--config", cfg.to_str().unwrap()][..],
+        &["run", &format!("--config={}", cfg.to_str().unwrap())][..],
+        &["--config", cfg.to_str().unwrap(), "run"][..],
+    ] {
+        let (ok, code, combined) = cli_try_raw(bin, args)?;
+        expect(
+            !ok && code == 2,
+            &format!("{args:?} is intercepted with exit 2, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("ak daemon") && combined.contains("service install --force --now"),
+            &format!("{args:?} hint names `ak daemon` and the unit regeneration command"),
+        )?;
+    }
+    // Bare `run` carries no daemon marker: it reaches dispatch and reports the
+    // three-form usage error (design D4), not the migration interceptor.
+    let (ok, code, combined) = cli_try_raw(bin, &["run"])?;
+    expect(
+        !ok && code == 2,
+        &format!("bare `run` exits 2 with the usage error, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("run <name>")
+            && combined.contains("run --app")
+            && combined.contains("run --"),
+        "the bare-run error lists all three client forms",
+    )?;
+    // `run <name>` is a client call: with the daemon still down it reports
+    // unreachable (exit 3) instead of the interception (exit 2).
+    let (ok, code, combined) = cli_try_raw(bin, &["run", "web"])?;
+    expect(
+        !ok && code == 3,
+        &format!("`run web` stays a client call (unreachable, exit 3), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("unreachable") && !combined.contains("daemon form of `run`"),
+        "`run <name>` is not caught by the daemon-form guard",
+    )?;
+
     step("G0d. a relative daemon.log_dir fails validate AND refuses daemon startup");
     let bad_cfg = ws.root.join("daemon-bad.toml");
     std::fs::write(&bad_cfg, "[daemon]\nlog_dir = \"logs\"\n")?;
@@ -575,7 +648,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&bad_cfg)
-        .arg("run")
+        .arg("daemon")
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -1429,6 +1502,10 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         combined.contains("404") || combined.contains("unknown program"),
         "the error carries the 404/unknown-program message",
     )?;
+    expect(
+        combined.contains("run -- <cmd...>"),
+        "the 404 points at the ad-hoc `run --` registration form",
+    )?;
 
     step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
     let sleep = find_sleep()?;
@@ -1692,11 +1769,11 @@ fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
     }
 }
 
-/// `run --detach` in its own isolated workspace: cold start becomes ready,
+/// `daemon --detach` in its own isolated workspace: cold start becomes ready,
 /// prints the address + log path, and a second detach reports the
 /// already-running instance (no second process).
 fn detach_pass(bin: &Path) -> Result<()> {
-    step("R9. `run --detach` cold start + second instance reports already-running");
+    step("R9. `daemon --detach` cold start + second instance reports already-running");
     let root = std::env::temp_dir().join(format!("xk-xtask-detach-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("logs"))?;
@@ -1709,8 +1786,11 @@ fn detach_pass(bin: &Path) -> Result<()> {
         ),
     )?;
     let cfg = root.join("daemon.toml");
-    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["run", "--detach"])?;
-    expect(ok, &format!("run --detach exits 0, got {code}: {combined}"))?;
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "--detach"])?;
+    expect(
+        ok,
+        &format!("daemon --detach exits 0, got {code}: {combined}"),
+    )?;
     expect(
         combined.contains(&format!("127.0.0.1:{port}")),
         &format!("the ready message prints the listen address: {combined:?}"),
@@ -1724,10 +1804,10 @@ fn detach_pass(bin: &Path) -> Result<()> {
         "the background log file exists",
     )?;
     // A second detach sees the healthy instance and does not fail.
-    let (ok, _code, combined) = cli_try_cfg(bin, &cfg, &["run", "--detach"])?;
+    let (ok, _code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "--detach"])?;
     expect(
         ok,
-        "a second run --detach succeeds against the live instance",
+        "a second daemon --detach succeeds against the live instance",
     )?;
     expect(
         combined.contains("already running"),
@@ -2581,7 +2661,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             let mut child = Command::new(bin)
                 .arg("--config")
                 .arg(&cfg2)
-                .arg("run")
+                .arg("daemon")
                 .stdout(Stdio::from(out))
                 .stderr(Stdio::from(err))
                 .spawn()?;

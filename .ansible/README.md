@@ -106,6 +106,28 @@ ansible-playbook site.yml -e appkeeper_force_overwrite=true -e ...
 对已部署且内容未变的机器原样重跑是安全无害的：不产生文件变更、不重启服务。
 内容有变化（升级版本/换配置）时按上节规则：未设强制变量则拦截，设置后覆盖并重启。
 
+## 跨版本升级：ExecStart 变更后必须重新生成 unit（daemon-subcommand 起）
+
+`ak service install` 生成的 systemd unit `ExecStart` 已由
+`<bin> run --config <path>` 改为 `<bin> daemon --config <path>`（守护入口收敛到
+显式子命令 `ak daemon`，守护形态的 `run` 在参数解析前拦截）。**已装机机器升级
+二进制后，旧 unit 无法拉起服务**：systemd 执行旧 `ExecStart` 会被拦截（退出码
+2），journal 中可见自救提示（改用 `ak daemon` 并重新生成 unit）。
+
+升级步骤（二选一）：
+
+- **ansible 流**：分发新二进制后设 `appkeeper_force_overwrite: true` 重跑
+  playbook——默认流不带 `--force`，`ak service install` 会因 unit 内容差异
+  拒绝写入而任务失败（失败可见，不会静默留下旧 unit）；设强制变量后覆盖
+  unit 并按需重启。
+- **手动流**：在目标机执行 `sudo ak service install --force --now`，
+  一步完成重新生成与重启。
+
+**回滚须同时恢复旧 unit**：unit 已改为 `daemon --config` 后换回旧二进制同样
+起不来（旧二进制没有 `daemon` 子命令）——回滚时用旧二进制执行
+`sudo ak service install --force` 恢复旧 unit，与新二进制同批操作，不要只换
+二进制。
+
 ## 目录结构
 
 ```

@@ -1,7 +1,7 @@
 # shell-client Specification
 
 ## Purpose
-定义 `appkeeper shell` 交互式客户端能力：作为根进程（`ak run` 守护）的终端入口，
+定义 `appkeeper shell` 交互式客户端能力：作为根进程（`ak daemon` 守护）的终端入口，
 在 REPL 中浏览被守护 app/程序的清单与状态、执行控制动作，并通过 `appkeeper system webui`
 辅助用户打开 Web 控制台。shell 不改变守护进程行为，全部经现有控制面 API 通信。
 

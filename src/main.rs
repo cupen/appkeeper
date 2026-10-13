@@ -1,9 +1,9 @@
 //! appkeeper — a cross-platform, application-layer process keeper with a TOML
 //! layered config (global daemon config + per-app deployment files).
 //!
-//! `ak run` is the daemon; everything else is a client: control
-//! subcommands talk to the loopback HTTP API, and add/remove/list manage the
-//! app registry (app_dir links).
+//! `ak daemon` is the daemon entry (the only one); everything else is a
+//! client: `run` is a client verb (control-plane actions over the loopback
+//! HTTP API), and add/remove/list manage the app registry (app_dir links).
 
 mod action;
 mod api;
@@ -60,15 +60,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// The single "run" verb (control-plane spec). Bare `run` (optionally
-    /// `--detach`) is the daemon; `run <name>` / `run --app <app>` starts an
-    /// already-registered program or fans out over a whole app; the ad-hoc
-    /// form (`run -- <cmd...>` or `run --cmd "<string>"`) registers a command
-    /// line and takes effect immediately.
-    ///
-    /// The web console is config-driven: add a `[webui]` section to the
-    /// daemon config (or `ak config --set webui.listen=...` + reload)
-    /// to enable it
+    /// The single daemon entry point. Bare `daemon` runs the supervisor in
+    /// the foreground (Ctrl+C / SIGTERM for a graceful stop); `--detach`
+    /// starts it in the background and returns once it is serving
+    /// (background-daemon spec). The web console is config-driven: add a
+    /// `[webui]` section to the daemon config (or `ak config --set
+    /// webui.listen=...` + reload) to enable it.
+    Daemon {
+        /// Start the daemon in the background (prints the listen address and
+        /// the background log path once the daemon is ready)
+        #[arg(long = "detach")]
+        detach: bool,
+    },
+    /// The client "run" verb (control-plane spec): `run <name>` /
+    /// `run --app <app>` starts an already-registered program or fans out
+    /// over a whole app; the ad-hoc form (`run -- <cmd...>` or
+    /// `run --cmd "<string>"`) registers a command line and takes effect
+    /// immediately. The removed daemon forms of `run` are intercepted before
+    /// clap (see `reject_removed_run`).
     Run {
         /// Start this already-registered program
         #[arg(value_name = "NAME")]
@@ -76,9 +85,6 @@ enum Cmd {
         /// Start every program of this app, in the established order
         #[arg(long = "app", conflicts_with = "name")]
         app: Option<String>,
-        /// Run the daemon in the background (daemon form only)
-        #[arg(long = "detach")]
-        detach: bool,
         /// (ad-hoc) register this command line as a new app; everything after
         /// `--` (the clap end-of-flags separator) is the command.
         /// Mutually exclusive with `--cmd`
@@ -308,6 +314,10 @@ fn main() {
     // spec). Intercept it before clap so the error carries the migration hint
     // instead of a generic "unknown subcommand".
     reject_removed_start();
+    // The daemon form of `run` was removed in favour of the explicit `daemon`
+    // subcommand (daemon-subcommand spec). Intercepted before clap for the
+    // same reason — the error must carry the per-form migration hint.
+    reject_removed_run();
     let cli = Cli::parse();
     let code = match dispatch(&cli) {
         Ok(()) => EXIT_OK,
@@ -344,6 +354,100 @@ fn reject_removed_start() {
     }
 }
 
+/// The removed daemon form of `run` (design D2): the first subcommand token is
+/// `run` and every other token is only the `-c/--config` flag (either position,
+/// `--config=<path>` included) or `--detach` — no positional, no `--`/`--cmd`,
+/// i.e. the old daemon signature. At least one such marker token is required:
+/// bare `ak run` has no daemon marker, so it stays legal input and reaches
+/// dispatch, which reports the "nothing to run" usage error (design D4).
+/// Returns `Some(detach)` when the signature matches, `None` otherwise (client
+/// forms and anything unknown are left to clap).
+fn daemon_run_form(args: &[String]) -> Option<bool> {
+    let mut detach = false;
+    // Any daemon marker seen anywhere. Global flags may precede the subcommand
+    // (`ak -c x.toml run` is the intercepted signature too — the config-only
+    // form is intercepted in either position).
+    let mut marker = false;
+    // Tokens before the subcommand: global flags. Unknown flags are not ours
+    // to judge (skipped without marking, like reject_removed_start does).
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => {
+                marker = true;
+                i += 2; // skip the value (reject_removed_start's approach)
+            }
+            "--detach" => {
+                marker = true;
+                detach = true;
+                i += 1;
+            }
+            _ if args[i].starts_with("--config=") => {
+                marker = true;
+                i += 1;
+            }
+            _ if args[i].starts_with('-') => i += 1,
+            _ => break, // first non-flag token = the subcommand
+        }
+    }
+    if args.get(i).map(String::as_str) != Some("run") {
+        return None;
+    }
+    // Everything after `run` must be config/detach flags only: a positional,
+    // `--`, `--cmd` or any other flag means a client form — never intercepted.
+    let mut j = i + 1;
+    while j < args.len() {
+        match args[j].as_str() {
+            "-c" | "--config" => {
+                marker = true;
+                j += 2;
+            }
+            "--detach" => {
+                marker = true;
+                detach = true;
+                j += 1;
+            }
+            _ if args[j].starts_with("--config=") => {
+                marker = true;
+                j += 1;
+            }
+            _ => return None,
+        }
+    }
+    if !marker {
+        // Bare `run`: no daemon marker — not the daemon form (see design D4).
+        return None;
+    }
+    Some(detach)
+}
+
+/// Exit-2 interception of the removed daemon form of `run`, with per-form
+/// hints (daemon-subcommand spec): the detached form points at
+/// `ak daemon --detach`; the bare/config-only form (the systemd old-ExecStart
+/// signature) additionally tells the operator to regenerate the unit.
+fn reject_removed_run() {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let Some(detach) = daemon_run_form(&args) else {
+        return;
+    };
+    if detach {
+        eprintln!(
+            "ak: error: the daemon form of `run` has been removed — use \
+             `ak daemon --detach` to start the daemon in the background"
+        );
+    } else {
+        eprintln!(
+            "ak: error: the daemon form of `run` has been removed — use `ak daemon` to \
+             start the daemon. a systemd unit with the old ExecStart must be regenerated: \
+             ak service install --force --now"
+        );
+    }
+    std::process::exit(EXIT_CONFIG);
+}
+
 /// Platform default location for the daemon config.
 pub(crate) fn default_config_path() -> PathBuf {
     #[cfg(unix)]
@@ -374,19 +478,28 @@ fn config_path_of(cli: &Cli) -> PathBuf {
 fn dispatch(cli: &Cli) -> Result<()> {
     // Client subcommands don't reach the daemon's logger init; without
     // this, warnings from the registry/config layers would be dropped
-    // silently. `run` (and bare `appkeeper`) init their own logger from the
-    // config's log_level.
-    if !matches!(&cli.cmd, None | Some(Cmd::Run { .. })) {
+    // silently. `daemon` (and bare `appkeeper`) init their own logger from
+    // the config's log_level.
+    if !matches!(
+        &cli.cmd,
+        None | Some(Cmd::Run { .. }) | Some(Cmd::Daemon { .. })
+    ) {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init()
             .ok();
     }
     let config_path = config_path_of(cli);
     match &cli.cmd {
+        Some(Cmd::Daemon { detach }) => {
+            if *detach {
+                run_detach(&config_path)
+            } else {
+                run_daemon(&config_path)
+            }
+        }
         Some(Cmd::Run {
             name,
             app,
-            detach,
             cmd,
             cmd_str,
             scaffold_name,
@@ -399,13 +512,13 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }) => {
             let adhoc = !cmd.is_empty() || cmd_str.is_some();
             if adhoc {
-                // The ad-hoc form conflicts with the start/daemon forms
-                // (design D10); clap cannot express this across optional
-                // positionals cleanly, so reject here.
-                if name.is_some() || app.is_some() || *detach {
+                // The ad-hoc form conflicts with the start forms (design D10);
+                // clap cannot express this across optional positionals
+                // cleanly, so reject here.
+                if name.is_some() || app.is_some() {
                     eprintln!(
                         "ak: error: the ad-hoc command form (`--`/`--cmd`) cannot be \
-                         combined with a program name, --app, or --detach"
+                         combined with a program name or --app"
                     );
                     std::process::exit(EXIT_CONFIG);
                 }
@@ -421,13 +534,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     workdir.as_deref(),
                 )
             } else if name.is_some() || app.is_some() {
-                if *detach {
-                    eprintln!(
-                        "ak: error: --detach is only valid for the bare daemon form \
-                         (`ak run --detach`)"
-                    );
-                    std::process::exit(EXIT_CONFIG);
-                }
                 // Strategy flags describe a new registration; accepting them
                 // here would silently drop them (design D10: ad-hoc only).
                 if restart.is_some() || restart_backoff.is_some() {
@@ -442,13 +548,26 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     (None, Some(a)) => fanout_cmd(&config_path, a, "start"),
                     (None, None) => unreachable!("checked above"),
                 }
-            } else if *detach {
-                run_detach(&config_path)
             } else {
-                run_daemon(&config_path)
+                // Design D4: bare `run` has no operand — in the new semantics
+                // `run` is a client verb only, so there is nothing to run.
+                // clap cannot express "at least one of the optional forms",
+                // so this lives next to the ad-hoc conflict check.
+                eprintln!(
+                    "ak: error: nothing to run — `run` is a client verb; use one of:\n  {}",
+                    run_client_forms_hint()
+                );
+                std::process::exit(EXIT_CONFIG);
             }
         }
-        None => run_daemon(&config_path),
+        None => {
+            // Bare `ak` is a legal exploratory call (design D1): print the
+            // full help to stdout and exit 0. Not clap's
+            // arg_required_else_help — that goes to stderr with exit 2.
+            let mut cmd = Cli::command();
+            let _ = cmd.print_help();
+            Ok(())
+        }
         Some(Cmd::Validate { path }) => validate(&config_path, path.as_deref()),
         Some(Cmd::Config {
             set,
@@ -818,7 +937,7 @@ fn log_cmd(
     Ok(())
 }
 
-/// `ak run --detach`: spawn the daemon in the background and report once
+/// `ak daemon --detach`: spawn the daemon in the background and report once
 /// it is serving (background-daemon spec). Non-zero exit on timeout / bind
 /// conflict, naming the background log.
 fn run_detach(config_path: &Path) -> Result<()> {
@@ -1089,6 +1208,14 @@ fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The three client forms listed by the bare-`run` usage error (design D4 /
+/// control-plane spec).
+fn run_client_forms_hint() -> &'static str {
+    "ak run <name>        start an already-registered program\n  \
+     ak run --app <app>   start every program of one app\n  \
+     ak run -- <cmd...>   (or `--cmd \"<string>\"`) register and run a new command line"
 }
 
 /// `ak run <name>`: start an already-registered program. An unknown name
@@ -1510,7 +1637,7 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 }
 
 // -- daemon -----------------------------------------------------------------
-/// `run` is the only daemon entry. The web console is config-driven: its
+/// `daemon` is the only daemon entry. The web console is config-driven: its
 /// initial state comes from the `[webui]` section of the daemon config
 /// (absent = off), and `ak reload` converges it later at runtime.
 fn run_daemon(config_path: &Path) -> Result<()> {
@@ -2137,8 +2264,9 @@ mod config_cmd_tests {
 }
 
 // ---------------------------------------------------------------------------
-// tests: the unified `run` verb, `log` multi-name and `status --json`
-// (cli-revamp tasks 2.1 / 2.2 / 2.3)
+// tests: the client `run` verb, the `daemon` entry, the removed daemon-form
+// interception, `log` multi-name and `status --json`
+// (cli-revamp tasks 2.1 / 2.2 / 2.3; daemon-subcommand tasks 1.x / 2.x / 4.1)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2160,42 +2288,93 @@ mod cli_verb_tests {
             .to_string()
     }
 
-    /// Bare `run` (daemon) and `run --detach` parse; `--detach` rides along.
+    /// `daemon` is the daemon entry (daemon-subcommand spec): bare parses as
+    /// the foreground form, `--detach` rides along for the background form.
     #[test]
-    fn run_daemon_forms_parse() {
-        match parse(&["run"]).cmd {
-            Some(Cmd::Run {
-                name,
-                app,
-                detach,
-                cmd,
-                cmd_str,
-                ..
-            }) => {
-                assert!(name.is_none() && app.is_none());
-                assert!(!detach && cmd.is_empty() && cmd_str.is_none());
-            }
-            other => panic!("expected Run, got {other:?}"),
+    fn daemon_subcommand_parses() {
+        match parse(&["daemon"]).cmd {
+            Some(Cmd::Daemon { detach }) => assert!(!detach, "bare daemon is foreground"),
+            other => panic!("expected Daemon, got {other:?}"),
         }
-        let cli = parse(&["run", "--detach"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Run { detach: true, .. })));
+        let cli = parse(&["daemon", "--detach"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true })));
+        // The global `-c/--config` keeps working in both positions.
+        let cli = parse(&["-c", "/tmp/x.toml", "daemon", "--detach"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true })));
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/x.toml")));
+    }
+
+    /// Bare `ak` (cmd = None) prints the full help to stdout and exits 0 —
+    /// it must never start the daemon (design D1 / control-plane spec).
+    #[test]
+    fn bare_ak_is_help_exit_zero() {
+        let cli = Cli::try_parse_from(["appkeeper"]).unwrap();
+        assert!(cli.cmd.is_none(), "no subcommand parses to cmd = None");
+        // dispatch prints `render_help` to stdout and returns Ok (exit 0).
+        dispatch(&cli).expect("bare `ak` must be a successful no-op");
+        // The help the branch renders is the full `ak --help` text, which
+        // lists both the daemon entry and the client verb.
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("daemon"), "help lists the daemon entry");
+        assert!(help.contains("run"), "help lists the run verb");
+    }
+
+    /// The removed daemon form of `run` is recognized before clap (design D2):
+    /// signature = first subcommand `run` + only `-c/--config` (both positions,
+    /// `--config=<path>` included) and `--detach`. Client forms never match.
+    #[test]
+    fn daemon_form_run_signature_detection() {
+        let s = |xs: &[&str]| -> Option<bool> {
+            daemon_run_form(&xs.iter().map(|x| x.to_string()).collect::<Vec<_>>())
+        };
+        // Daemon-form signatures: detached, config-only, mixed. Bare `run`
+        // has no daemon marker — it must reach dispatch for the
+        // "nothing to run" usage error (design D4), not this interceptor.
+        assert_eq!(s(&["run"]), None);
+        assert_eq!(s(&["run", "--detach"]), Some(true));
+        assert_eq!(s(&["run", "-c", "/tmp/x.toml"]), Some(false));
+        assert_eq!(s(&["run", "--config", "/tmp/x.toml"]), Some(false));
+        assert_eq!(s(&["run", "--config=/tmp/x.toml"]), Some(false));
+        assert_eq!(s(&["-c", "/tmp/x.toml", "run"]), Some(false));
+        assert_eq!(s(&["--config=/tmp/x.toml", "run"]), Some(false));
+        assert_eq!(s(&["--detach", "run"]), Some(true));
+        assert_eq!(s(&["run", "--detach", "-c", "/tmp/x.toml"]), Some(true));
+        // A client operand after `run` wins even when a global --config
+        // precedes it: client forms are never intercepted.
+        assert_eq!(s(&["-c", "/tmp/x.toml", "run", "web"]), None);
+        assert_eq!(s(&["-c", "/tmp/x.toml", "run", "--", "node"]), None);
+        // Client forms are never intercepted.
+        assert_eq!(s(&["run", "web"]), None);
+        assert_eq!(s(&["run", "--app", "demo"]), None);
+        assert_eq!(s(&["run", "--", "node", "x"]), None);
+        assert_eq!(s(&["run", "--cmd", "node x"]), None);
+        assert_eq!(s(&["run", "--name", "web"]), None);
+        assert_eq!(s(&["run", "start"]), None);
+        // Other subcommands and empty argv are untouched.
+        assert_eq!(s(&["status"]), None);
+        assert_eq!(s(&["daemon", "--detach"]), None);
+        assert_eq!(s(&[]), None);
+    }
+
+    /// The bare-`run` usage error (design D4) lists the three client forms:
+    /// `run <name>` / `run --app <app>` / `run -- <cmd...>`.
+    #[test]
+    fn nothing_to_run_hint_lists_all_three_client_forms() {
+        let hint = run_client_forms_hint();
+        assert!(hint.contains("ak run <name>"), "{hint}");
+        assert!(hint.contains("ak run --app <app>"), "{hint}");
+        assert!(hint.contains("ak run -- <cmd...>"), "{hint}");
     }
 
     /// `run <name>` and `run --app <app>` are the start forms; both at once is
-    /// rejected (name xor app).
+    /// rejected (name xor app). The daemon-only `--detach` flag is gone.
     #[test]
     fn run_start_forms_parse_and_conflict() {
         let cli = parse(&["run", "web"]);
         match cli.cmd {
-            Some(Cmd::Run {
-                name,
-                app,
-                detach,
-                cmd,
-                ..
-            }) => {
+            Some(Cmd::Run { name, app, cmd, .. }) => {
                 assert_eq!(name.as_deref(), Some("web"));
-                assert!(app.is_none() && !detach && cmd.is_empty());
+                assert!(app.is_none() && cmd.is_empty());
             }
             other => panic!("expected Run, got {other:?}"),
         }

@@ -11,7 +11,7 @@
 //! Coverage targets the cli-revamp BREAKING/high-risk surfaces not pinned by
 //! the unit tests: the shutdown-does-not-write-a-record contract, the
 //! `unless-stopped` record across repeated daemon restarts, `always` pull-up
-//! after a manual stop, the offline `run --` cold start, `run --detach`
+//! after a manual stop, the offline `run --` cold start, `daemon --detach`
 //! timeout against an occupied port, and `log` dual-stream / multi-program
 //! follow aggregation.
 
@@ -120,7 +120,7 @@ impl Ws {
         let child = Command::new(bin())
             .arg("--config")
             .arg(self.cfg())
-            .arg("run")
+            .arg("daemon")
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -359,7 +359,7 @@ fn run_adhoc_offline_cold_start() {
     ws.shutdown();
 }
 
-// -- run --detach -----------------------------------------------------------
+// -- daemon --detach --------------------------------------------------------
 
 /// background-daemon: two concurrent implicit pull-ups end with exactly one
 /// daemon serving, and both callers succeed (the loser self-terminates on the
@@ -376,9 +376,9 @@ fn concurrent_pull_up_yields_one_daemon() {
             let out = Command::new(bin())
                 .arg("--config")
                 .arg(&cfg)
-                .args(["run", "--detach"])
+                .args(["daemon", "--detach"])
                 .output()
-                .expect("spawn run --detach");
+                .expect("spawn daemon --detach");
             (
                 out.status.success(),
                 String::from_utf8_lossy(&out.stdout).to_string()
@@ -403,7 +403,7 @@ fn concurrent_pull_up_yields_one_daemon() {
 }
 
 /// background-daemon: when the control port is occupied by a foreign process
-/// the background daemon cannot bind, so `run --detach` exits non-zero and
+/// the background daemon cannot bind, so `daemon --detach` exits non-zero and
 /// names the background log — no silent success.
 ///
 /// The holder answers HTTP with 500 (so the health probe fails fast) yet keeps
@@ -412,7 +412,7 @@ fn concurrent_pull_up_yields_one_daemon() {
 /// by `detach_readiness_is_bounded`.)
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
-fn run_detach_times_out_when_port_is_occupied() {
+fn daemon_detach_times_out_when_port_is_occupied() {
     let ws = Ws::new("detach-occupied");
     let holder = std::net::TcpListener::bind(("127.0.0.1", ws.port)).unwrap();
     std::thread::spawn(move || {
@@ -424,8 +424,8 @@ fn run_detach_times_out_when_port_is_occupied() {
             );
         }
     });
-    let (ok, code, out) = ws.cli(&["run", "--detach"]);
-    assert!(!ok, "run --detach must fail on an occupied port: {out}");
+    let (ok, code, out) = ws.cli(&["daemon", "--detach"]);
+    assert!(!ok, "daemon --detach must fail on an occupied port: {out}");
     assert_ne!(code, 0, "non-zero exit, got {code}");
     assert!(
         out.contains("daemon.out.log"),
@@ -450,7 +450,7 @@ fn detach_readiness_is_bounded() {
         }
     });
     let t0 = Instant::now();
-    let (_ok, _code, _out) = ws.cli(&["run", "--detach"]);
+    let (_ok, _code, _out) = ws.cli(&["daemon", "--detach"]);
     let elapsed = t0.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),

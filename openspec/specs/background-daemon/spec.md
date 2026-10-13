@@ -1,7 +1,7 @@
 # background-daemon Specification
 
 ## Purpose
-定义 appkeeper 守护进程的后台化能力：`ak run --detach` 显式后台运行入口，以及「立即生效」入口（`add --apply` 与 run 的 ad-hoc 形态 `--`/`--cmd`）在守护进程离线时的隐式拉起协议（就绪判定、竞态容忍、失败语义），使「一条命令从冷启动跑起来」成立，同时守护进程保持全局单例语义。
+定义 appkeeper 守护进程的后台化能力：`ak daemon --detach` 显式后台运行入口，以及「立即生效」入口（`add --apply` 与 run 的 ad-hoc 形态 `--`/`--cmd`）在守护进程离线时的隐式拉起协议（就绪判定、竞态容忍、失败语义），使「一条命令从冷启动跑起来」成立，同时守护进程保持全局单例语义。
 
 ## Requirements
 

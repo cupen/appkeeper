@@ -137,5 +137,5 @@ pub(crate) fn build_daemon() -> Result<PathBuf> {
     if !status.success() {
         bail!("cargo build failed");
     }
-    Ok(root.join("target/debug/appkeeper"))
+    Ok(root.join(format!("target/debug/ak{}", std::env::consts::EXE_SUFFIX)))
 }

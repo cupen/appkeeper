@@ -95,7 +95,7 @@ pub fn render_unit(
     s.push('\n');
     s.push_str("[Service]\n");
     s.push_str(&format!(
-        "ExecStart={} run --config {}\n",
+        "ExecStart={} daemon --config {}\n",
         quote_exec_arg(&exe.display().to_string()),
         quote_exec_arg(&config_path.display().to_string())
     ));
@@ -434,7 +434,7 @@ mod tests {
              After=network.target\n\
              \n\
              [Service]\n\
-             ExecStart=/usr/local/bin/ak run --config /etc/appkeeper/daemon.toml\n\
+             ExecStart=/usr/local/bin/ak daemon --config /etc/appkeeper/daemon.toml\n\
              Restart=always\n\
              RestartSec=3\n\
              KillSignal=SIGTERM\n\
@@ -454,7 +454,7 @@ mod tests {
             60,
         );
         assert!(unit.contains(
-            "ExecStart=\"/opt/my tools/appkeeper\" run --config \"/etc/my conf/appkeeper.toml\"\n"
+            "ExecStart=\"/opt/my tools/appkeeper\" daemon --config \"/etc/my conf/appkeeper.toml\"\n"
         ));
         assert!(unit.contains("User=svc-xk\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));

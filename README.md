@@ -5,7 +5,7 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
 日志轮转与跟随、本地控制平面（HTTP API + CLI），内置 Web UI 另立变更。
 
 ```text
-         ┌────────────────────────── ak run ──────────────────────────┐
+         ┌───────────────────────── ak daemon ─────────────────────────┐
          │  supervisor loop（7 态状态机 × N 程序）                          │
          │    spawn/stop/restart · startsecs/startretries · 退避重启        │
          │    priority/depends_on 启动编排 · reload · shutdown              │
@@ -14,7 +14,8 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
          │  └─ control API  127.0.0.1:7310 /v1/*（可选 Bearer 鉴权）         │
          └───────────────△─────────────────────────────────────────────────┘
                          │ HTTP JSON
-   ak run（daemon | <名> | -- <命令行>）· status/stop/restart/log/pid/reload/apply/shutdown
+   ak daemon（唯一守护入口，可 --detach）· ak run（<名> | --app | -- <命令行>）
+   · status/stop/restart/log/pid/reload/apply/shutdown
    ak add/remove/list        ← 离线可用，在线时自动同步
 ```
 
@@ -89,8 +90,8 @@ ak add /opt/srv/web-server --name abc --args "--port 8080" --env LOG=debug --app
 ak list
 
 # 3. 启动守护进程（默认空无一物，只拉起已注册应用）
-ak run                    # 前台；Ctrl+C 优雅停机
-ak run --detach           # 后台：就绪后打印监听地址与日志路径即返回
+ak daemon                 # 前台；Ctrl+C 优雅停机
+ak daemon --detach        # 后台：就绪后打印监听地址与日志路径即返回
 
 # 4. 控制
 ak status                 # 人读表格（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）
@@ -108,10 +109,16 @@ ak remove web             # 注销：删除注册记录与生成文件（部署�
 ak shutdown
 ```
 
-> **`run` 是统一入口动词**：裸 `run`（可加 `--detach`）是守护进程；
-> `run <名>` / `run --app <app>` 启动已注册程序或整个 app；`run -- <命令行>` /
-> `run --cmd "<字符串>"` 注册一条新命令行并立即生效（守护进程离线时自动后台拉起）。
-> 旧 `start` 动词已移除，调用会报未知子命令并提示改用 `run`。
+> **`daemon` 是唯一守护入口，`run` 是纯客户端动词**（docker run 式心智：
+> 客户端动词向守护进程发指令）：
+> `ak daemon` 前台守护，`ak daemon --detach` 后台守护；
+> `run <名>` / `run --app <app>` 启动已注册程序或整个 app；
+> `run -- <命令行>` / `run --cmd "<字符串>"` 注册一条新命令行并立即生效
+> （守护进程离线时自动后台拉起）。
+> 旧守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）
+> 已移除并被拦截（退出码 2，按形态给迁移提示——systemd 旧 ExecStart 场景
+> 提示用 `ak service install --force --now` 重新生成 unit）；
+> 旧 `start` 动词同样已移除，调用会报未知子命令并提示改用 `run`。
 >
 > 冷启动时程序是否被拉起取决于其 `restart` 策略：`no` 只注册不拉起，
 > 其余策略拉起。`ak config --init` 生成的 `[app-default] restart = "always"`
@@ -172,7 +179,7 @@ restart_backoff = 1.0
 ### Web 控制台开关（`[webui]` 段）
 
 内嵌 Web 控制台是**配置驱动**的可选段：daemon 配置里存在 `[webui]` 段即开启，
-缺省关闭。无需任何额外子命令——`ak run` 启动时按配置伺服，运行中改动
+缺省关闭。无需任何额外子命令——`ak daemon` 启动时按配置伺服，运行中改动
 由 `ak reload` 热生效（开启/关闭/换址重绑；端口被占用时降级运行并在
 reload 输出中说明，守护进程不受影响）：
 
@@ -381,17 +388,21 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 例外：`appkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
-### 统一入口动词 `run`
+### 守护入口 `daemon` 与客户端动词 `run`
 
-`ak run` 承载三种形态，分派规则如下：
+`ak daemon` 是唯一守护入口；`ak run` 是纯客户端动词，承载两种客户端形态：
 
 | 形态 | 调用 | 行为 |
 | --- | --- | --- |
-| daemon | `ak run` / `ak run --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
+| daemon | `ak daemon` / `ak daemon --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
 | 启动 | `ak run <name>` / `ak run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app（对已 running 程序返回 409，未知程序 404） |
 | ad-hoc | `ak run -- <cmd...>` / `ak run --cmd "<字符串>"` | 命令行注册并立即生效（首 token 解析为绝对路径；守护离线时自动后台拉起） |
 
-- ad-hoc 形态与 `name`/`--app`/`--detach` 互斥；`--detach` 仅 daemon 形态合法。
+- ad-hoc 形态与 `name`/`--app` 互斥；裸 `ak run`（无任何操作数）报
+  「nothing to run」用法错误并列出三种客户端形态，退出码 2。
+- 旧守护形态的 `run` 在参数解析前拦截（退出码 2）：`run --detach` 提示改用
+  `ak daemon --detach`；仅带 `--config` 的形态（systemd 旧 ExecStart 特征）
+  额外提示用 `ak service install --force --now` 重新生成 unit。
 - ad-hoc 的脚手架 flag：`--name`（缺省取命令 stem）、`--description`、
   `--restart=<no|always|unless-stopped|on-failure>`、`--restart-backoff`、
   `--env K=V`（可重复）、`--workdir <路径>`；`--args` 不存在（命令行本身即参数）。
@@ -399,8 +410,8 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进
 - 旧 flag `--autostart`/`--no-autostart`/`--autorestart` 已移除，统一
   `--restart=<字面量>`（add 与 run ad-hoc 共用）。
 
-**后台拉起协议**（`run --detach` 与「立即生效」入口共用）：派生
-`ak run -c <配置>`（unix `process_group(0)` / Windows
+**后台拉起协议**（`daemon --detach` 与「立即生效」入口共用）：派生
+`ak daemon -c <配置>`（unix `process_group(0)` / Windows
 `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`），stdio 追加写
 `{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`，总超时 ~10s。
 就绪即成功（并发拉起只留一个实例，端口竞争败者自灭）；超时以非零码退出并
@@ -429,7 +440,7 @@ appkeeper shell -e "status"            # 单命令模式：执行一条后退出
 
 控制台默认关闭：先在 daemon 配置里加 `[webui]` 段（或
 `ak config --set webui.listen=127.0.0.1:9877`），守护在线时
-`ak reload` 热开启（离线则下次 `ak run` 自动伺服），然后：
+`ak reload` 热开启（离线则下次 `ak daemon` 自动伺服），然后：
 
 ```bash
 appkeeper shell -e "open"     # 探活 GET /api/health 可达才调起系统浏览器；不可达给出开启提示
@@ -464,7 +475,7 @@ rust-embed 在运行时直接读取磁盘上的 `webui/dist`——手动 `pnpm b
 
 ```bash
 # 终端 A：后端（API + 内嵌 UI）——daemon 配置含 [webui] 段即伺服控制台
-cargo run -- run                    # 配置未开控制台时，先: ak config --set webui.listen=127.0.0.1:9877
+cargo run -- daemon                 # 配置未开控制台时，先: ak config --set webui.listen=127.0.0.1:9877
 
 # 终端 B：前端热更新开发服务器
 cd webui
@@ -572,7 +583,33 @@ validate/reload 拒绝。迁移步骤：升级二进制 → `ak validate`（暴�
 
 另：`add --apply` 与 run 的 ad-hoc 形态在守护进程离线时不再报错，而是**自动
 后台拉起守护进程**后继续生效（曾依赖「离线报错」的自动化需知悉）；无 systemd
-等场景可用 `ak run --detach` 直接后台常驻，`ak shutdown` 统一管理。
+等场景可用 `ak daemon --detach` 直接后台常驻，`ak shutdown` 统一管理。
+
+## 升级注意（daemon-subcommand：守护入口收敛到 `ak daemon`）
+
+本版把守护入口收敛到显式子命令 `ak daemon`，`run` 收敛为纯客户端动词，
+裸 `ak` 改为输出 help 并以 0 退出（不再启动守护进程）。含四处 BREAKING：
+
+- **裸 `ak` 不再启动守护进程**：输出与 `ak --help` 等价的完整 help（stdout），
+  退出码 0——误敲一个 `ak` 不再挂起终端。
+- **守护形态的 `run` 移除并被拦截**（退出码 2，提示自带迁移指引）：
+  裸 `ak run` → `ak daemon`；`ak run --detach` → `ak daemon --detach`；
+  仅带 `--config` 的 `ak run`（systemd 旧 ExecStart 特征）→ `ak daemon`，
+  并提示重新生成 unit。裸 `ak run` 在新语义下报「nothing to run」并列出
+  三种客户端形态。
+- **`service install` 生成的 unit `ExecStart` 变更**：
+  `<bin> run --config <path>` → `<bin> daemon --config <path>`。
+- **内部自动后台拉起改传 `daemon`**（`add --apply` 与 run ad-hoc 的离线
+  隐式拉起），拉起协议本身不变。
+
+**已装机 systemd unit 必须重新生成**：升级二进制后，旧 unit（ExecStart 仍为
+`run --config`）拉起会被拦截（服务启动失败，journal 里可见自救提示）。升级
+步骤：分发新二进制 → 执行 `sudo ak service install --force --now` 重新生成并
+重启（ansible 部署设 `appkeeper_force_overwrite: true` 重跑 playbook）。
+
+**回滚提示**：unit 已改为 `daemon --config` 后换回旧二进制同样起不来（旧
+二进制没有 `daemon` 子命令）——回滚必须同时用旧二进制执行
+`sudo ak service install --force` 恢复旧 unit，两者同批操作。
 
 ## 作为系统服务运行（守护 appkeeper 本身）
 
@@ -596,7 +633,7 @@ Windows 暂不支持 `ak service`（nssm 仍可用）：
 
 ```bat
 nssm install appkeeper D:\tools\appkeeper\ak.exe
-nssm set appkeeper AppParameters run
+nssm set appkeeper AppParameters daemon
 nssm start appkeeper
 ```
 
