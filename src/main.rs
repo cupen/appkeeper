@@ -289,8 +289,8 @@ enum ServiceCmd {
     /// Generate the systemd unit, daemon-reload and enable it
     Install {
         /// Also start the service right after installing
-        #[arg(long)]
-        now: bool,
+        #[arg(long, visible_alias = "now")]
+        start: bool,
         /// Overwrite an existing unit whose content differs
         #[arg(long)]
         force: bool,
@@ -300,6 +300,9 @@ enum ServiceCmd {
         /// Run the service as this user (User= in the unit)
         #[arg(long)]
         user: Option<String>,
+        /// systemd Restart= policy written into the unit
+        #[arg(long, value_name = "POLICY", default_value_t = service::RestartPolicy::Always)]
+        restart: service::RestartPolicy,
     },
     /// Stop, disable and remove the systemd unit
     Uninstall {
@@ -769,22 +772,24 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
         Some(Cmd::Service { cmd }) => {
-            let (action, unit_file, user, force, now) = match cmd {
+            let (action, unit_file, user, force, start, restart) = match cmd {
                 ServiceCmd::Install {
-                    now,
+                    start,
                     force,
                     unit_file,
                     user,
-                } => ("install", unit_file, user, *force, *now),
+                    restart,
+                } => ("install", unit_file, user, *force, *start, *restart),
                 ServiceCmd::Uninstall { unit_file } => {
-                    ("uninstall", unit_file, &None, false, false)
+                    ("uninstall", unit_file, &None, false, false, service::RestartPolicy::Always)
                 }
             };
             let opts = service::ServiceOptions {
                 unit_file: unit_file.clone(),
                 user: user.clone(),
                 force,
-                now,
+                start,
+                restart,
             };
             if action == "install" {
                 service::install(&config_path, &opts)?;

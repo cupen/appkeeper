@@ -6,9 +6,11 @@
 //! a clear error. All template rendering, path validation and write decisions
 //! are platform-independent pure functions so they are testable everywhere.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use clap::ValueEnum;
 
 /// Default `--unit-file` value.
 #[cfg_attr(windows, allow(dead_code))]
@@ -19,6 +21,42 @@ const FALLBACK_TIMEOUT_STOP_SEC: u64 = 90;
 
 // The pure helpers below run on unix in production but are exercised by the
 // unit tests on every platform, hence the windows dead_code allowance.
+/// systemd `Restart=` policies accepted by `service install --restart`.
+/// Variants render as their exact systemd spelling in the unit file; the
+/// ValueEnum derive lists the same names as `[possible values:]` in `--help`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RestartPolicy {
+    /// Never restart (systemd's own default)
+    No,
+    /// Restart on clean exit only
+    OnSuccess,
+    /// Restart on non-zero exit, signal, timeout or watchdog
+    OnFailure,
+    /// Restart on signal, timeout or watchdog — not on plain exit codes
+    OnAbnormal,
+    /// Restart on watchdog timeout only
+    OnWatchdog,
+    /// Restart on abnormal termination by signal only
+    OnAbort,
+    /// Restart regardless of exit status (also after clean exit)
+    Always,
+}
+
+impl fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::OnSuccess => "on-success",
+            RestartPolicy::OnFailure => "on-failure",
+            RestartPolicy::OnAbnormal => "on-abnormal",
+            RestartPolicy::OnWatchdog => "on-watchdog",
+            RestartPolicy::OnAbort => "on-abort",
+            RestartPolicy::Always => "always",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(windows, allow(dead_code))]
 pub struct ServiceOptions {
@@ -29,7 +67,9 @@ pub struct ServiceOptions {
     /// Overwrite an existing unit with different content.
     pub force: bool,
     /// `systemctl start` right after install.
-    pub now: bool,
+    pub start: bool,
+    /// `Restart=` policy written into the unit (`--restart`, default `always`).
+    pub restart: RestartPolicy,
 }
 
 // -- platform-independent pure logic ----------------------------------------
@@ -86,6 +126,7 @@ pub fn render_unit(
     exe: &Path,
     config_path: &Path,
     user: Option<&str>,
+    restart: RestartPolicy,
     timeout_stop_sec: u64,
 ) -> String {
     let mut s = String::new();
@@ -99,7 +140,7 @@ pub fn render_unit(
         quote_exec_arg(&exe.display().to_string()),
         quote_exec_arg(&config_path.display().to_string())
     ));
-    s.push_str("Restart=always\n");
+    s.push_str(&format!("Restart={restart}\n"));
     s.push_str("RestartSec=3\n");
     s.push_str("KillSignal=SIGTERM\n");
     s.push_str(&format!("TimeoutStopSec={timeout_stop_sec}\n"));
@@ -299,6 +340,7 @@ fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
         &exe,
         &config_abs,
         opts.user.as_deref(),
+        opts.restart,
         compute_timeout_stop_sec(config_path),
     );
 
@@ -321,7 +363,7 @@ fn unix_install(config_path: &Path, opts: &ServiceOptions) -> Result<()> {
 
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", &format!("{unit_name}.service")])?;
-    if opts.now {
+    if opts.start {
         systemctl(&["start", &format!("{unit_name}.service")])?;
         println!("service {unit_name} started");
     }
@@ -425,6 +467,7 @@ mod tests {
             Path::new("/usr/local/bin/ak"),
             Path::new("/etc/appkeeper/daemon.toml"),
             None,
+            RestartPolicy::Always,
             90,
         );
         assert_eq!(
@@ -451,6 +494,7 @@ mod tests {
             Path::new("/opt/my tools/appkeeper"),
             Path::new("/etc/my conf/appkeeper.toml"),
             Some("svc-xk"),
+            RestartPolicy::Always,
             60,
         );
         assert!(unit.contains(
@@ -458,6 +502,41 @@ mod tests {
         ));
         assert!(unit.contains("User=svc-xk\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
+    }
+
+    #[test]
+    fn render_honours_restart_policy() {
+        let unit = render_unit(
+            Path::new("/usr/local/bin/ak"),
+            Path::new("/etc/appkeeper/daemon.toml"),
+            None,
+            RestartPolicy::OnFailure,
+            90,
+        );
+        assert!(unit.contains("Restart=on-failure\n"));
+        assert!(!unit.contains("Restart=always\n"));
+    }
+
+    #[test]
+    fn restart_policy_displays_systemd_names() {
+        let pairs = [
+            (RestartPolicy::No, "no"),
+            (RestartPolicy::OnSuccess, "on-success"),
+            (RestartPolicy::OnFailure, "on-failure"),
+            (RestartPolicy::OnAbnormal, "on-abnormal"),
+            (RestartPolicy::OnWatchdog, "on-watchdog"),
+            (RestartPolicy::OnAbort, "on-abort"),
+            (RestartPolicy::Always, "always"),
+        ];
+        for (policy, name) in pairs {
+            assert_eq!(policy.to_string(), name);
+            // the CLI value spelling must match what lands in the unit
+            assert_eq!(
+                policy.to_possible_value().unwrap().get_name(),
+                name,
+                "ValueEnum name drifted from Display for {name}"
+            );
+        }
     }
 
     #[test]
@@ -494,6 +573,7 @@ mod tests {
             Path::new("/usr/local/bin/ak"),
             Path::new("/etc/appkeeper/daemon.toml"),
             None,
+            RestartPolicy::Always,
             90,
         );
         let out = render_unit_display("/etc/systemd/system/ak.service", &unit, true);

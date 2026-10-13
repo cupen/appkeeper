@@ -617,13 +617,19 @@ Linux (systemd) 一条命令安装/卸载（需要 root）：
 
 ```bash
 sudo ak service install            # 生成 /etc/systemd/system/ak.service + daemon-reload + enable
-sudo ak service install --now      # 安装后立即 start
+sudo ak service install --start    # 安装后立即 start（--now 是等价别名）
+sudo ak service install --start --restart on-failure
+                                   # 按指定 systemd 重启策略安装并启动
 sudo ak service uninstall          # stop + disable + 删除 unit + daemon-reload
 ```
 
 可选参数：`-c/--config <daemon 配置>`（全局参数；写入 unit 的 ExecStart，缺省 `/etc/appkeeper/daemon.toml`）、
 `--unit-file <path>`（unit 文件完整路径，必须以 `.service` 结尾，默认
 `/etc/systemd/system/ak.service`）、`--user <name>`（服务运行用户）、
+`--restart <POLICY>`（unit 的 `Restart=` 策略，取 systemd 的 restart 策略值：
+`no` / `on-success` / `on-failure` / `on-abnormal` / `on-watchdog` / `on-abort` /
+`always`，缺省 `always`——崩溃即被 systemd 重新拉起；完整列表见
+`ak service install --help`）、
 `--force`（目标 unit 已存在且内容不同时覆盖）。重复安装内容一致时幂等跳过。
 `TimeoutStopSec` 按已注册程序的最大 `stop_timeout` 自动估算（2×最大值 + 10s，
 配置不可加载时 90s）；需要定制可直接修改生成后的 unit 文件再
