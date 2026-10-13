@@ -13,7 +13,7 @@ pub struct DaemonPaths {
     pub log_dir: PathBuf,
 }
 
-/// Defaults mirroring `config::DaemonSettings::default()` (app_dir "apps"
+/// Defaults mirroring `config::DaemonSettings::default()` (app_dir "app.d"
 /// relative to the config dir; a fixed absolute default log dir).
 pub fn default_log_dir() -> PathBuf {
     if cfg!(windows) {
@@ -54,7 +54,7 @@ pub fn discover(config_source: &Path) -> Result<DaemonPaths> {
         .and_then(|d| d.get("app_dir"))
         .and_then(|s| s.as_str())
         .map(|s| resolve(s, &config_dir))
-        .unwrap_or_else(|| resolve("apps", &config_dir));
+        .unwrap_or_else(|| resolve("app.d", &config_dir));
     let log_dir = daemon
         .and_then(|d| d.get("log_dir"))
         .and_then(|s| s.as_str())
@@ -93,12 +93,21 @@ mod tests {
 
     #[test]
     fn relative_app_dir_resolves_against_config_dir() {
-        let f = write_tmp("relative", "[daemon]\napp_dir = \"apps\"\n");
+        let f = write_tmp("relative", "[daemon]\napp_dir = \"app.d\"\n");
         let p = discover(&f).unwrap();
         let dir = f.parent().unwrap();
-        assert_eq!(p.app_dir, dir.join("apps"));
+        assert_eq!(p.app_dir, dir.join("app.d"));
         assert_eq!(p.log_dir, default_log_dir(), "log_dir falls back to the default");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With no explicit `app_dir`, the built-in default name is `app.d`.
+    #[test]
+    fn default_app_dir_is_app_d() {
+        let f = write_tmp("default", "[daemon]\nlog_dir = \"/tmp/x\"\n");
+        let p = discover(&f).unwrap();
+        assert_eq!(p.app_dir, f.parent().unwrap().join("app.d"));
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
     }
 
     #[test]

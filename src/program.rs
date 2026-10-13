@@ -61,6 +61,12 @@ pub struct ManagedProgram {
     total_exits: u64,
     health_fails: u32,
     unhealthy: bool,
+    /// True once the program's health has been positively confirmed: for a
+    /// program without a health check this is set at spawn time; for one with
+    /// a health check it is set by the first successful probe
+    /// (run-daemon-first D6 — `unhealthy: false` alone cannot distinguish
+    /// "not probed yet" from "probed and healthy").
+    health_confirmed: bool,
     /// Set by an explicit stop; cleared on the next start. A user-stopped
     /// program must not be auto-started again by dependency evaluation.
     user_stopped: bool,
@@ -90,6 +96,7 @@ impl ManagedProgram {
             total_exits: 0,
             health_fails: 0,
             unhealthy: false,
+            health_confirmed: false,
             user_stopped: false,
             last_exit: None,
             last_code: None,
@@ -117,6 +124,14 @@ impl ManagedProgram {
 
     pub fn unhealthy(&self) -> bool {
         self.unhealthy
+    }
+
+    /// Has the program's health been positively confirmed? A program without
+    /// a health check is confirmed as soon as it spawns (nothing to wait on);
+    /// one with a check is confirmed by its first successful probe
+    /// (run-daemon-first D6).
+    pub fn health_confirmed(&self) -> bool {
+        self.health_confirmed
     }
 
     /// True when an explicit user stop requested this program to stay down.
@@ -213,6 +228,9 @@ impl ManagedProgram {
                 self.child = Some(child);
                 self.start_time = Some(Instant::now());
                 self.state = ProgramState::Starting;
+                // No health check → nothing to confirm; a checked program
+                // stays unconfirmed until its first successful probe.
+                self.health_confirmed = self.def.health.is_none();
                 info!("program[{name}] starting (pid {pid})");
             }
             Err(e) => {
@@ -317,6 +335,9 @@ impl ManagedProgram {
         self.pumps = None;
         self.unhealthy = false;
         self.health_fails = 0;
+        // The dead process's confirmation is stale; the next spawn re-derives
+        // it (no-health programs confirm immediately).
+        self.health_confirmed = false;
         let _ = status;
     }
 
@@ -419,6 +440,7 @@ impl ManagedProgram {
         self.job = None;
         self.pumps = None;
         self.unhealthy = false;
+        self.health_confirmed = false;
         self.state = ProgramState::Stopped;
         info!("program[{}] stopped", self.def.name);
     }
@@ -429,6 +451,9 @@ impl ManagedProgram {
         match healthy {
             true => {
                 self.health_fails = 0;
+                // First successful probe confirms health (run-daemon-first D6);
+                // the startup judgement waits on `Running && health_confirmed`.
+                self.health_confirmed = true;
                 if self.unhealthy {
                     self.unhealthy = false;
                     info!("program[{}] is healthy again", self.def.name);
@@ -644,6 +669,46 @@ mod tests {
             p.total_exits() >= 1 && p.state() == ProgramState::Running
         });
         assert_eq!(p.state(), ProgramState::Running);
+        p.stop();
+        let _ = std::fs::remove_dir_all(p.log_dir.clone());
+    }
+
+    // -- health_confirmed (run-daemon-first task 4.1) ------------------------
+
+    /// A program without a health check is confirmed the moment it spawns.
+    #[test]
+    fn health_confirmed_immediately_without_health_check() {
+        let mut p = make(&slow_exit("restart = \"always\"\n"), "hc-none");
+        assert!(!p.health_confirmed(), "not confirmed before spawn");
+        p.spawn();
+        assert!(
+            p.health_confirmed(),
+            "no health check → nothing to wait on, confirmed at spawn"
+        );
+        p.stop();
+        assert!(!p.health_confirmed(), "confirmation resets with the child");
+        let _ = std::fs::remove_dir_all(p.log_dir.clone());
+    }
+
+    /// A program with a health check stays unconfirmed until its first
+    /// successful probe, then flips to confirmed.
+    #[test]
+    fn health_confirmed_only_after_first_successful_probe() {
+        let mut p = make(
+            &format!(
+                "[program.t]\ncommand = \"{}\"\nstartsecs = 0.05\nhealth_check = \"true\"\nhealth_interval = 0.1\nhealth_retries = 1\n",
+                if cfg!(windows) { "cmd /c ping -n 30 127.0.0.1" } else { "sleep 30" }
+            ),
+            "hc-check",
+        );
+        p.spawn();
+        assert!(!p.health_confirmed(), "checked program starts unconfirmed");
+        // A failing probe before confirmation does not confirm it.
+        p.record_health(false, Instant::now());
+        assert!(!p.health_confirmed(), "a failed probe must not confirm");
+        // The first success confirms.
+        p.record_health(true, Instant::now());
+        assert!(p.health_confirmed(), "first success confirms health");
         p.stop();
         let _ = std::fs::remove_dir_all(p.log_dir.clone());
     }

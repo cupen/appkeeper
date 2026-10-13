@@ -121,6 +121,10 @@ enum Cmd {
         /// (default: the directory `run` is invoked in)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
+        /// Machine-readable output: a single program object, or an array for
+        /// `run --app` fan-out (run-daemon-first control-plane spec)
+        #[arg(long = "json")]
+        json: bool,
     },
     /// Validate the daemon config + all registered apps, or one app file
     Validate {
@@ -511,7 +515,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             restart_backoff,
             envs,
             workdir,
-            ..
+            json,
         }) => {
             let adhoc = !cmd.is_empty() || cmd_str.is_some();
             if adhoc {
@@ -535,6 +539,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     *restart_backoff,
                     envs,
                     workdir.as_deref(),
+                    *json,
                 )
             } else if name.is_some() || app.is_some() {
                 // Strategy flags describe a new registration; accepting them
@@ -547,8 +552,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     std::process::exit(EXIT_CONFIG);
                 }
                 match (name, app) {
-                    (Some(n), _) => start_or_hint(&config_path, n),
-                    (None, Some(a)) => fanout_cmd(&config_path, a, "start"),
+                    (Some(n), _) => start_or_hint(&config_path, n, *json),
+                    (None, Some(a)) => fanout_cmd(&config_path, a, "start", *json),
                     (None, None) => unreachable!("checked above"),
                 }
             } else {
@@ -615,12 +620,12 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }),
         Some(Cmd::Stop { name, app }) => match (name, app) {
             (Some(n), _) => action_cmd(&config_path, &n, "stop"),
-            (None, Some(a)) => fanout_cmd(&config_path, &a, "stop"),
+            (None, Some(a)) => fanout_cmd(&config_path, &a, "stop", false),
             (None, None) => unreachable!("clap enforces name xor app"),
         },
         Some(Cmd::Restart { name, app }) => match (name, app) {
             (Some(n), _) => action_cmd(&config_path, &n, "restart"),
-            (None, Some(a)) => fanout_cmd(&config_path, &a, "restart"),
+            (None, Some(a)) => fanout_cmd(&config_path, &a, "restart", false),
             (None, None) => unreachable!("clap enforces name xor app"),
         },
         Some(Cmd::Action { program, name }) => custom_action_cmd(&config_path, program, name),
@@ -1048,11 +1053,10 @@ fn split_adhoc_trailing(
     Ok((argv.to_vec(), flags))
 }
 
-/// `ak run -- <cmd...>` / `run --cmd "<string>"`: register the command
-/// line as a new app and take effect immediately (app-registry spec). The two
-/// entry forms normalize to the same argv; the first token is resolved to an
-/// absolute path; the rest become args. The scaffold engine is reused, so
-/// `--restart=no` registers without pulling up.
+/// `ak run -- <cmd...>` / `run --cmd "<string>"`: daemon-first ad-hoc
+/// registration (run-daemon-first). The CLI resolves the command line and
+/// hands it to the daemon, which starts the program, waits for the startup
+/// judgement, then lands the record. The CLI itself never writes `app_dir`.
 #[allow(clippy::too_many_arguments)]
 fn run_adhoc(
     config_path: &Path,
@@ -1064,6 +1068,7 @@ fn run_adhoc(
     restart_backoff: Option<f64>,
     envs: &[String],
     workdir: Option<&Path>,
+    json: bool,
 ) -> Result<()> {
     // For the `--` form the scaffold flags may ride after the command line
     // (`run -- node server.js --name worker`); split them out here.
@@ -1105,48 +1110,274 @@ fn run_adhoc(
         Ok(e) => e,
         Err(code) => std::process::exit(code),
     };
-    let restart_policy = match restart.map(config::parse_restart_cli) {
-        Some(Ok(v)) => Some(v),
-        Some(Err(e)) => {
-            eprintln!("ak: error: {e}");
-            std::process::exit(EXIT_CONFIG);
-        }
-        None => None,
-    };
+    // Command resolution stays client-side: a resolution failure is exit 2 and
+    // must leave `app_dir` untouched (app-registry spec).
     let (command, args) = match registry::resolve_command(&argv[0]) {
         Ok(p) => (p, argv[1..].to_vec()),
         Err(e) => {
-            // Command resolution failure: exit 2 with no registration artifact.
             eprintln!("ak: error: {e:#}");
             std::process::exit(EXIT_CONFIG);
         }
     };
+    let register_only = matches!(restart, Some("no"));
 
     let config = client::load_config(config_path)?;
-    let config_dir = config_dir_of(config_path);
-    let opts = AddOptions {
-        name: name.map(|s| s.to_string()),
-        description: description.map(|s| s.to_string()),
-        restart: restart_policy,
-        restart_backoff,
-        priority: None,
-        args: None,
-        args_argv: Some(args),
-        env: if env.is_empty() { None } else { Some(env) },
-        workdir: workdir.map(|p| p.to_path_buf()),
-    };
-    let result = registry::add(&config, &config_dir, &command, &opts)?;
-    print_add_result(&result);
-    // Take effect immediately: pull the daemon up when offline, then apply
-    // this app's scope (background-daemon spec).
-    match apply_after_add(&config, config_path, &result.app) {
-        AddApplyOutcome::Applied(text) => println!("{text}"),
-        AddApplyOutcome::Failed(msg, code) => {
-            eprintln!("ak: error: {msg}");
-            std::process::exit(code);
+    let c = client::Client::from_config(&config);
+    // daemon-first: offline is exit 3 and MUST NOT pull a daemon up.
+    if c.health().is_err() {
+        eprintln!(
+            "ak: error: daemon unreachable (is `ak daemon` active?) — `ak run` is \
+             daemon-first and does not start the daemon for you"
+        );
+        std::process::exit(EXIT_UNREACHABLE);
+    }
+    let body = serde_json::json!({
+        "name": name,
+        "command": command.display().to_string(),
+        "args": args,
+        "env": env,
+        "work_dir": workdir.map(|p| p.display().to_string()),
+        "description": description,
+        "restart": restart,
+        "restart_backoff": restart_backoff,
+        "register_only": register_only,
+    });
+    let mut residual: Option<serde_json::Value> = None;
+    let frames = c.adhoc_run(&body, |frame| {
+        if json {
+            return; // --json: suppress human progress, only the final object prints
         }
+        if frame.get("residual").and_then(|r| r.as_bool()) == Some(true) {
+            residual = Some(frame.clone());
+            return;
+        }
+        print_progress_frame(frame);
+    });
+    let terminal = match frames {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ak: error: {e:#}");
+            std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    // Residual: prompt (or fail when non-interactive) and commit on confirm.
+    if terminal.get("residual").and_then(|r| r.as_bool()) == Some(true)
+        || residual.is_some()
+    {
+        let frame = residual.unwrap_or_else(|| terminal.clone());
+        return handle_residual(&c, &frame, json);
+    }
+    render_run_terminal(&terminal, json)
+}
+
+/// Print one human-readable progress frame (run-daemon-first task 6.6).
+fn print_progress_frame(frame: &serde_json::Value) {
+    if let Some(line) = progress_line(frame) {
+        println!("{line}");
+    }
+}
+
+/// The human-readable progress line for one frame, or `None` when the frame
+/// carries no progress (the terminal frame). Pure so it is unit-testable.
+fn progress_line(frame: &serde_json::Value) -> Option<String> {
+    match frame.get("phase").and_then(|p| p.as_str()) {
+        Some("staged") => {
+            let est = frame.get("estimate_secs").and_then(|e| e.as_f64()).unwrap_or(0.0);
+            Some(format!("starting (estimated wait up to {est:.0}s)..."))
+        }
+        Some("waiting_startsecs") => Some("waiting for startsecs...".to_string()),
+        Some("waiting_health") => {
+            let est = frame.get("estimate_secs").and_then(|e| e.as_f64()).unwrap_or(0.0);
+            Some(format!("waiting for the first health probe (up to {est:.0}s)..."))
+        }
+        _ => None,
+    }
+}
+
+/// What to do about a residual (started-but-unregistered) program.
+#[derive(Debug, PartialEq, Eq)]
+enum ResidualAction {
+    /// Re-land the registration (user confirmed).
+    Commit,
+    /// Refuse: non-interactive session, or the user declined.
+    Refuse(&'static str),
+}
+
+/// Decide the residual action from the session kind and the user's answer.
+/// Pure (task 6.7: non-TTY defaults to refusal).
+fn residual_decision(interactive: bool, answer: Option<&str>) -> ResidualAction {
+    if !interactive {
+        return ResidualAction::Refuse("non-interactive session defaults to refusing");
+    }
+    match answer.map(|a| a.trim().to_ascii_lowercase()) {
+        Some(a) if a == "y" || a == "yes" => ResidualAction::Commit,
+        _ => ResidualAction::Refuse("declined by the user"),
+    }
+}
+
+/// Handle the residual (already started, not persisted) state (task 6.7):
+/// prompt on a TTY, commit on confirm; refuse on decline or non-TTY.
+fn handle_residual(c: &client::Client, frame: &serde_json::Value, json: bool) -> Result<()> {
+    let program = frame
+        .get("program")
+        .and_then(|p| p.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let config_path = frame
+        .get("config_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pid = frame.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let answer = if interactive {
+        print!(
+            "program {program} is already running (pid {pid}) but not registered.\n\
+             Re-land its registration at {config_path}? [y/N] "
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        Some(line)
+    } else {
+        None
+    };
+    match residual_decision(interactive, answer.as_deref()) {
+        ResidualAction::Refuse(why) => {
+            eprintln!(
+                "ak: error: program {program} is already running (pid {pid}) but not \
+                 registered (config would be {config_path}); not re-landing ({why})"
+            );
+            std::process::exit(EXIT_ERROR);
+        }
+        ResidualAction::Commit => match c.adhoc_commit(&program) {
+            Ok(v) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    println!(
+                        "{}",
+                        v.get("result").and_then(|r| r.as_str()).unwrap_or("registered")
+                    );
+                    println!("  config: {}", v.get("config_path").and_then(|p| p.as_str()).unwrap_or(""));
+                    println!("  pid:    {pid}");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("ak: error: {e:#}");
+                std::process::exit(client::exit_code_of(&e));
+            }
+        },
+    }
+}
+
+/// Render the terminal frame of an ad-hoc run (task 6.4/6.8). A partial
+/// failure prints the full config for manual landing and exits non-zero.
+fn render_run_terminal(frame: &serde_json::Value, json: bool) -> Result<()> {
+    let (code, out, err) = run_terminal_render(frame, json);
+    for line in &out {
+        println!("{line}");
+    }
+    for line in &err {
+        eprintln!("{line}");
+    }
+    if code != EXIT_OK {
+        std::process::exit(code);
     }
     Ok(())
+}
+
+/// Pure rendering of the terminal frame into `(exit_code, stdout, stderr)`
+/// (task 6.4/6.8) so the branches are unit-testable.
+fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<String>, Vec<String>) {
+    let ok = frame.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+    if json {
+        // Machine-readable shape (task 6.4): name / config_path / pid / status.
+        // The full frame (error, partial, config_text) rides along so a
+        // script can diagnose a partial failure too.
+        let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("");
+        let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+        let pid = frame.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+        let mut obj = serde_json::json!({
+            "name": program,
+            "config_path": config_path,
+            "pid": pid,
+            "status": if ok { "started" } else { "failed" },
+        });
+        if !ok {
+            if let Some(e) = frame.get("error") {
+                obj["error"] = e.clone();
+            }
+            if let Some(p) = frame.get("phase") {
+                obj["phase"] = p.clone();
+            }
+            if frame.get("partial").and_then(|p| p.as_bool()) == Some(true) {
+                obj["partial"] = serde_json::Value::Bool(true);
+                if let Some(t) = frame.get("config_text") {
+                    obj["config_text"] = t.clone();
+                }
+            }
+        }
+        let text = serde_json::to_string_pretty(&obj).unwrap_or_default();
+        let code = if ok { EXIT_OK } else { EXIT_ERROR };
+        return (code, vec![text], Vec::new());
+    }
+    if !ok {
+        let phase = frame.get("phase").and_then(|p| p.as_str()).unwrap_or("startup");
+        let err = frame.get("error").and_then(|e| e.as_str()).unwrap_or("startup failed");
+        let mut stderr = vec![format!("ak: error: {phase}: {err}")];
+        if frame.get("partial").and_then(|p| p.as_bool()) == Some(true) {
+            stderr.extend(partial_config_lines(frame));
+        }
+        return (EXIT_ERROR, Vec::new(), stderr);
+    }
+    if frame.get("partial").and_then(|p| p.as_bool()) == Some(true) {
+        // Started but not persisted: report and exit non-zero with the config.
+        let err = frame
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("registration not written");
+        let mut stderr = vec![format!("ak: error: {err}")];
+        stderr.extend(partial_config_lines(frame));
+        return (EXIT_ERROR, Vec::new(), stderr);
+    }
+    let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
+    let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+    let pid = frame
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    (
+        EXIT_OK,
+        vec![
+            format!("program {program} started"),
+            format!("  config: {config_path}"),
+            format!("  pid:    {pid}"),
+        ],
+        Vec::new(),
+    )
+}
+
+/// The full configuration information lines of a partial failure (task 6.8).
+fn partial_config_lines(frame: &serde_json::Value) -> Vec<String> {
+    let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
+    let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+    let mut out = vec![
+        "the process is running but its registration was not written.".to_string(),
+        format!("  app/program: {program}"),
+        format!("  target file: {config_path}"),
+    ];
+    if let Some(text) = frame.get("config_text").and_then(|t| t.as_str())
+        && !text.is_empty()
+    {
+        out.push("--- write this config by hand ---".to_string());
+        out.push(text.trim_end_matches('\n').to_string());
+        out.push("--- end of config ---".to_string());
+    }
+    out
 }
 
 /// Render argv as one paste-able line (quoting mirrors the quote-aware
@@ -1226,16 +1457,14 @@ fn run_client_forms_hint() -> &'static str {
 /// `ak run <name>`: start an already-registered program. An unknown name
 /// is a control-plane 404; per the control-plane spec the error must also
 /// point at the ad-hoc form (a bare token can only ever be a program name —
-/// registering a new command line goes through `run --`).
-fn start_or_hint(config_path: &Path, name: &str) -> Result<()> {
+/// registering a new command line goes through `run --`). The startup
+/// response is rendered as `{程序名, 配置路径, PID}` (run-daemon-first D7).
+fn start_or_hint(config_path: &Path, name: &str, json: bool) -> Result<()> {
     let config = client::load_config(config_path)?;
     let c = client::Client::from_config(&config);
-    match c.action(name, "start") {
+    match c.start_and_wait(name) {
         Ok(v) => {
-            println!(
-                "{}",
-                v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
-            );
+            render_program_result(&v, name, json);
             Ok(())
         }
         Err(e) => {
@@ -1249,6 +1478,41 @@ fn start_or_hint(config_path: &Path, name: &str) -> Result<()> {
             std::process::exit(client::exit_code_of(&e));
         }
     }
+}
+
+/// Render one start response as `{程序名, 配置路径, PID}` (task 6.3/6.4).
+fn render_program_result(v: &serde_json::Value, name: &str, json: bool) {
+    let program = v.get("name").and_then(|n| n.as_str()).unwrap_or(name);
+    let config_path = v
+        .get("config_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let pid = v.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+    if json {
+        let obj = serde_json::json!({
+            "name": program,
+            "config_path": config_path,
+            "pid": pid,
+            "status": "started",
+        });
+        println!("{obj}");
+        return;
+    }
+    println!("{}", program_result_line(program, config_path, &pid, "started"));
+}
+
+/// One human-readable `run <name>` result line. Pure (task 6.3).
+fn program_result_line(
+    program: &str,
+    config_path: &str,
+    pid: &serde_json::Value,
+    status: &str,
+) -> String {
+    let pid_s = match pid {
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    };
+    format!("{program}  config={config_path}  pid={pid_s}  {status}")
 }
 
 /// `appkeeper action <program> <action>`: print the output tail and pass the
@@ -1289,15 +1553,101 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
 
 /// `ak start|stop|restart --app <name>`: app-level fan-out; the server
 /// expands it in the established order and reports per-program results.
-fn fanout_cmd(config_path: &Path, app: &str, verb: &str) -> Result<()> {
-    client_cmd(config_path, |c| {
-        let v = c.app_action(app, verb)?;
-        println!(
-            "{}",
-            v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
-        );
-        Ok(())
-    })
+/// For the `run --app` (start) verb the per-program `{name, config_path, pid,
+/// status}` is rendered and any failure exits non-zero (run-daemon-first 6.3).
+fn fanout_cmd(config_path: &Path, app: &str, verb: &str, json: bool) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let c = client::Client::from_config(&config);
+    let v = match if verb == "start" {
+        c.app_start_and_wait(app)
+    } else {
+        c.app_action(app, verb)
+    } {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ak: error: {e:#}");
+            std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    if verb == "start" {
+        return render_fanout_start(&v, json);
+    }
+    println!(
+        "{}",
+        v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+    );
+    Ok(())
+}
+
+/// Render a `run --app` fan-out: one line per program
+/// `{程序名, 配置路径, PID, 状态}`; all-success exits 0, any failure lists the
+/// failures and exits non-zero (task 6.3/6.4).
+fn render_fanout_start(v: &serde_json::Value, json: bool) -> Result<()> {
+    let (code, out, err) = fanout_start_render(v, json);
+    for line in &out {
+        println!("{line}");
+    }
+    for line in &err {
+        eprintln!("{line}");
+    }
+    if code != EXIT_OK {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Pure rendering of a `run --app` fan-out into `(exit_code, stdout, stderr)`
+/// (task 6.3/6.4).
+fn fanout_start_render(v: &serde_json::Value, json: bool) -> (i32, Vec<String>, Vec<String>) {
+    let programs = v
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut failed = Vec::new();
+    let mut entries = Vec::new();
+    for p in &programs {
+        let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let config_path = p.get("config_path").and_then(|c| c.as_str()).unwrap_or("");
+        let pid = p.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+        let result = p.get("result").and_then(|r| r.as_str()).unwrap_or("");
+        let ok = !result.starts_with("error");
+        if !ok {
+            failed.push(format!("{name}: {result}"));
+        }
+        entries.push(serde_json::json!({
+            "name": name,
+            "config_path": config_path,
+            "pid": pid,
+            "status": if ok { "started" } else { "failed" },
+            "result": result,
+        }));
+    }
+    let code = if failed.is_empty() { EXIT_OK } else { EXIT_ERROR };
+    if json {
+        let text = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
+        return (code, vec![text], Vec::new());
+    }
+    let mut out = Vec::new();
+    for e in &entries {
+        let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let config_path = e.get("config_path").and_then(|c| c.as_str()).unwrap_or("");
+        let pid = e.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+        let status = e.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        let result = e.get("result").and_then(|x| x.as_str()).unwrap_or("");
+        out.push(format!(
+            "{} ({result})",
+            program_result_line(name, config_path, &pid, status)
+        ));
+    }
+    let mut err = Vec::new();
+    if !failed.is_empty() {
+        err.push(format!("ak: error: {} program(s) failed to start:", failed.len()));
+        for f in &failed {
+            err.push(format!("  {f}"));
+        }
+    }
+    (code, out, err)
 }
 
 // -- add --apply --------------------------------------------------------------
@@ -2175,7 +2525,7 @@ mod config_cmd_tests {
         let code = config_cmd(&path, &[], &[], &[], false, true).unwrap();
         assert_eq!(code, EXIT_OK);
         assert!(path.is_file());
-        assert!(dir.join("conf/apps/example.toml.sample").is_file());
+        assert!(dir.join("conf/app.d/example.toml.sample").is_file());
         // Second init on the existing config: exit 2, file untouched.
         let before = std::fs::read_to_string(&path).unwrap();
         let code = config_cmd(&path, &[], &[], &[], false, true).unwrap();
@@ -2580,5 +2930,220 @@ mod cli_verb_tests {
         assert_eq!(format_log_line("web", "hello", true), "[web] hello");
         // Empty lines keep the prefix too (a blank line still belongs to a stream).
         assert_eq!(format_log_line("api", "", true), "[api] ");
+    }
+
+    // -- run daemon-first (run-daemon-first section 6) ----------------------
+
+    /// 6.2: the ad-hoc CLI no longer writes app_dir itself — the code path
+    /// goes through the daemon endpoint. (The unit-visible proof is that the
+    /// old local registration call is gone from `run_adhoc`; this asserts the
+    /// source has no `registry::add` in the run path.)
+    #[test]
+    fn run_adhoc_no_longer_calls_local_registry_add() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn run_adhoc(")
+            .nth(1)
+            .expect("run_adhoc exists")
+            .split("\n/// Print one human-readable progress")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("registry::add("),
+            "run_adhoc must not write the registry locally"
+        );
+        assert!(
+            !body.contains("apply_after_add("),
+            "run_adhoc must not pull a daemon up"
+        );
+        assert!(
+            body.contains("adhoc_run("),
+            "run_adhoc goes through the daemon endpoint"
+        );
+        assert!(
+            body.contains("EXIT_UNREACHABLE"),
+            "run_adhoc exits 3 when the daemon is offline"
+        );
+        assert!(
+            !body.contains("ensure_daemon"),
+            "run_adhoc MUST NOT pull a daemon up (background-daemon spec)"
+        );
+    }
+
+    /// 7.1: `add --apply` keeps the implicit pull-up (`apply_after_add`), which
+    /// is the ONLY remaining caller of `daemonize::ensure_daemon` outside the
+    /// explicit `daemon --detach` entry.
+    #[test]
+    fn add_apply_keeps_implicit_pull_up() {
+        let src = include_str!("main.rs");
+        // The add branch still routes through apply_after_add.
+        let add_branch = src
+            .split("if *apply_now {")
+            .nth(1)
+            .expect("add --apply branch exists")
+            .split("\n        }\n")
+            .next()
+            .unwrap();
+        assert!(
+            add_branch.contains("apply_after_add("),
+            "add --apply keeps the implicit pull-up"
+        );
+        // apply_after_add still calls ensure_daemon (offline pull-up intact).
+        let apply_fn = src
+            .split("fn apply_after_add(")
+            .nth(1)
+            .expect("apply_after_add exists")
+            .split("\n// -- validate")
+            .next()
+            .unwrap();
+        assert!(
+            apply_fn.contains("ensure_daemon("),
+            "apply_after_add pulls the daemon up when offline"
+        );
+    }
+
+    /// 6.3/6.4: the single-program result renders `{name, config_path, pid}`
+    /// and the JSON form carries status.
+    #[test]
+    fn program_result_line_renders_fields() {
+        let line = program_result_line(
+            "web",
+            "/etc/appkeeper/app.d/web.toml",
+            &serde_json::json!(1234),
+            "started",
+        );
+        assert!(line.contains("web"), "{line}");
+        assert!(line.contains("/etc/appkeeper/app.d/web.toml"), "{line}");
+        assert!(line.contains("1234"), "{line}");
+        // A null pid renders as `null`, never a panic.
+        let line = program_result_line("web", "", &serde_json::Value::Null, "started");
+        assert!(line.contains("null"), "{line}");
+    }
+
+    /// 6.3/6.4: the fan-out renderer emits one line per program, all-success
+    /// exits 0, and the JSON form is an array with the four fields.
+    #[test]
+    fn fanout_start_render_success_and_json() {
+        let v = serde_json::json!({
+            "programs": [
+                {"name": "web", "config_path": "/d/web.toml", "pid": 11, "result": "program web is starting"},
+                {"name": "api", "config_path": "/d/api.toml", "pid": 22, "result": "program api is running"},
+            ]
+        });
+        let (code, out, err) = fanout_start_render(&v, false);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out[0].contains("web") && out[0].contains("/d/web.toml") && out[0].contains("11"));
+        assert!(err.is_empty());
+
+        let (code, out, _) = fanout_start_render(&v, true);
+        assert_eq!(code, EXIT_OK);
+        let arr: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 2);
+        for p in arr.as_array().unwrap() {
+            for f in ["name", "config_path", "pid", "status"] {
+                assert!(p.get(f).is_some(), "field {f}: {p}");
+            }
+        }
+        assert_eq!(arr[0]["status"], "started");
+    }
+
+    /// 6.3: a per-program failure exits non-zero and lists the failures.
+    #[test]
+    fn fanout_start_render_failure_is_nonzero() {
+        let v = serde_json::json!({
+            "programs": [
+                {"name": "web", "config_path": "/d/web.toml", "pid": 11, "result": "program web is running"},
+                {"name": "api", "config_path": null, "pid": null, "result": "error: program api is already fatal"},
+            ]
+        });
+        let (code, out, err) = fanout_start_render(&v, false);
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(out.len(), 2);
+        assert!(err.iter().any(|l| l.contains("api")), "{err:?}");
+        assert!(out[1].contains("failed"), "{out:?}");
+    }
+
+    /// 6.6: progress frames render human-readable lines; the terminal frame
+    /// has no phase and yields nothing.
+    #[test]
+    fn progress_line_covers_phases() {
+        assert!(progress_line(&serde_json::json!({"phase": "staged", "estimate_secs": 3}))
+            .unwrap()
+            .contains('3'));
+        assert!(progress_line(&serde_json::json!({"phase": "waiting_startsecs"}))
+            .unwrap()
+            .contains("startsecs"));
+        let health =
+            progress_line(&serde_json::json!({"phase": "waiting_health", "estimate_secs": 35}))
+                .unwrap();
+        assert!(health.contains("35"), "{health}");
+        assert!(progress_line(&serde_json::json!({"ok": true, "pid": 1})).is_none());
+    }
+
+    /// 6.7: the residual decision defaults to refusal when non-interactive,
+    /// commits only on an explicit yes, and refuses on anything else.
+    #[test]
+    fn residual_decision_branches() {
+        assert_eq!(
+            residual_decision(false, Some("y")),
+            ResidualAction::Refuse("non-interactive session defaults to refusing")
+        );
+        assert_eq!(residual_decision(true, Some("y")), ResidualAction::Commit);
+        assert_eq!(residual_decision(true, Some("yes\n")), ResidualAction::Commit);
+        assert_eq!(residual_decision(true, Some("n")), ResidualAction::Refuse("declined by the user"));
+        assert_eq!(residual_decision(true, None), ResidualAction::Refuse("declined by the user"));
+    }
+
+    /// 6.8: a partial failure renders the full config info and exits non-zero.
+    #[test]
+    fn run_terminal_partial_failure_prints_config() {
+        let frame = serde_json::json!({
+            "ok": false,
+            "partial": true,
+            "program": "web",
+            "config_path": "/d/web.toml",
+            "pid": 9,
+            "error": "process started but the registration could not be written",
+            "config_text": "[program.web]\ncommand = \"/srv/web\"\n",
+        });
+        let (code, out, err) = run_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_ERROR);
+        assert!(out.is_empty());
+        let joined = err.join("\n");
+        assert!(joined.contains("web"), "{joined}");
+        assert!(joined.contains("/d/web.toml"), "{joined}");
+        assert!(joined.contains("[program.web]"), "{joined}");
+        assert!(joined.contains("command"), "{joined}");
+    }
+
+    /// 6.4: a successful terminal frame prints program/config/pid and exits 0;
+    /// the JSON form is the frame itself.
+    #[test]
+    fn run_terminal_success_and_json() {
+        let frame = serde_json::json!({
+            "ok": true, "program": "web", "config_path": "/d/web.toml", "pid": 42,
+        });
+        let (code, out, err) = run_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        let joined = out.join("\n");
+        assert!(joined.contains("web") && joined.contains("42"), "{out:?}");
+        let (code, out, _) = run_terminal_render(&frame, true);
+        assert_eq!(code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["pid"], 42);
+        assert_eq!(v["name"], "web");
+        assert_eq!(v["config_path"], "/d/web.toml");
+        assert_eq!(v["status"], "started");
+        // A failed JSON frame exits non-zero and carries the reason.
+        let (code, out, _) = run_terminal_render(
+            &serde_json::json!({"ok": false, "phase": "startup", "error": "exited"}),
+            true,
+        );
+        assert_eq!(code, EXIT_ERROR);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "exited");
     }
 }

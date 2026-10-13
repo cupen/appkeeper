@@ -14,7 +14,7 @@ command = "ping -n 3600 127.0.0.1"   # single-line form; or command + args (mutu
 # args = ["-n", "3600", "127.0.0.1"]
 # work_dir = "."
 # env = { FOO = "bar" }
-# startsecs = 1.0           # must run this long to count as started
+# startsecs = 3.0           # must run this long to count as started (built-in default 3.0)
 # startretries = 3          # failed-start budget, exhausted -> fatal
 # depends_on = []           # program names; can cross apps
 # exit_codes = [0]          # "expected" codes for on-failure

@@ -31,6 +31,19 @@
 //!      and `--edit` through a fake $EDITOR (valid + invalid). The webui
 //!      keys ride the same engine (K16: set/get/delete on webui.listen and
 //!      the whole [webui] table).
+//!   RDF. run-daemon-first (run-daemon-first change): its own workspace with
+//!      an EMPTY app_dir. Offline every `run` form exits 3 without deriving a
+//!      daemon (RDF0). Online: `run --` / `run <name>` / `run --app` return
+//!      `{program, config_path, pid}` and `--json` is machine-readable
+//!      (RDF1-5), a single-program `run` blocks for `startsecs` (RDF6);
+//!      failure paths (unresolvable command, early exit, name collision,
+//!      reserved `all`) leave no `.toml`/`.toml.pending` residue (RDF7-10);
+//!      a mid-flight reload sees only the non-`.toml` placeholder (RDF11);
+//!      health-probed runs stream progress and either return a pid or fail
+//!      with no residue (RDF12-13); a failed rename keeps the process and
+//!      prints the full config, and a re-run detects the residual, refuses
+//!      non-interactively, then re-lands on confirm without restarting
+//!      (RDF14-16); the built-in `app_dir` default is `app.d` (RDF17).
 //! - webui lifecycle pass (config-driven-webui): the daemon boots with
 //!   `ak run` and a `[webui]` section in daemon.toml; W1 deletes the
 //!   section + reload → connection refused, W2 sets a new listen + reload →
@@ -97,11 +110,12 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     // pins its port for the browser pass. `[app-default] restart = "always"`
     // mirrors what `config --init` renders, so the scaffolded apps in this
     // workspace get the supervised experience (the built-in cascade default is
-    // `no`).
+    // `no`). `app_dir = "apps"` keeps this workspace on the explicit name the
+    // scenarios below use (run-daemon-first changed the built-in default).
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
         ),
     )?;
     std::fs::write(
@@ -622,8 +636,16 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the bare-run error lists all three client forms",
     )?;
     // `run <name>` is a client call: with the daemon still down it reports
-    // unreachable (exit 3) instead of the interception (exit 2).
-    let (ok, code, combined) = cli_try_raw(bin, &["run", "web"])?;
+    // unreachable (exit 3) instead of the interception (exit 2). A dead-port
+    // config keeps this hermetic — the bare form would read the machine's
+    // default config (/etc/appkeeper/daemon.toml), where a real daemon may be
+    // listening and answering 404 instead.
+    let dead_cfg = ws.root.join("daemon-dead.toml");
+    std::fs::write(
+        &dead_cfg,
+        format!("[daemon]\nhost = \"127.0.0.1\"\nport = {}\n", free_port()?),
+    )?;
+    let (ok, code, combined) = cli_try_cfg(bin, &dead_cfg, &["run", "web"])?;
     expect(
         !ok && code == 3,
         &format!("`run web` stays a client call (unreachable, exit 3), got {code}: {combined:?}"),
@@ -741,8 +763,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         text.contains("[app-default]") && text.contains("restart = \"always\""),
         "the [app-default] template section carries an explicit restart = \"always\"",
     )?;
-    expect(dir.join("apps").is_dir(), "the app registry dir is created")?;
-    let sample = dir.join("apps/example.toml.sample");
+    expect(
+        dir.join("app.d").is_dir(),
+        "the app registry dir is created",
+    )?;
+    let sample = dir.join("app.d/example.toml.sample");
     expect(sample.is_file(), "example.toml.sample is created")?;
     expect(out.contains("next:"), "init prints the next-step hint")?;
 
@@ -775,6 +800,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("K4. config --set writes strong-typed keys (offline note printed)");
+    // Point the config at a dead control port first: the reload-hint probe
+    // reads the pre-modification port, and the built-in default 7310 may be
+    // served by a real daemon on this host (which would flip the note online).
+    let dead = free_port()?;
+    cli_cfg(bin, &cfg, &["config", "--set", &format!("port={dead}")])?;
     let out = cli_cfg(
         bin,
         &cfg,
@@ -1512,12 +1542,12 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     let sleep_s = sleep.to_str().unwrap();
     let out = cli(bin, ws, &["run", "--", sleep_s, "123", "--name", "adhoc-a"])?;
     expect(
-        out.contains("generated"),
-        &format!("run -- registers and generates: {out:?}"),
+        out.contains("started") && out.contains("config:") && out.contains("pid:"),
+        &format!("run -- registers and reports {{program, config, pid}}: {out:?}"),
     )?;
     expect(
-        out.contains("start"),
-        &format!("the app takes effect immediately: {out:?}"),
+        out.contains("adhoc-a"),
+        &format!("the report names the new program: {out:?}"),
     )?;
     let a_cfg = ws.root.join("apps/adhoc-a.toml");
     expect(a_cfg.is_file(), "adhoc-a.toml generated")?;
@@ -1539,7 +1569,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         ],
     )?;
     expect(
-        out.contains("generated"),
+        out.contains("started"),
         &format!("--cmd registers too: {out:?}"),
     )?;
     let b_text = std::fs::read_to_string(ws.root.join("apps/adhoc-b.toml"))?;
@@ -1547,12 +1577,35 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         a_text.replace("adhoc-a", "adhoc-X") == b_text.replace("adhoc-b", "adhoc-X"),
         "`--` and `--cmd` produce the same registration modulo the name",
     )?;
-    // Re-running with a different arg regenerates (the new arg lands).
-    cli(bin, ws, &["run", "--", sleep_s, "456", "--name", "adhoc-a"])?;
+    // Re-running the SAME name is a full regeneration (app-registry: 同名
+    // ad-hoc 全量再生, immediate effect): the whole file is rewritten from
+    // this command line. Identical content is an idempotent success returning
+    // the existing pid with no restart.
+    let pid_before = pid_of(ws, "adhoc-a")?.expect("adhoc-a is running");
+    let out = cli(bin, ws, &["run", "--", sleep_s, "123", "--name", "adhoc-a"])?;
+    expect(
+        out.contains("started") && out.contains(&pid_before.to_string()),
+        &format!("identical re-run is idempotent (same pid {pid_before}): {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "adhoc-a")? == Some(pid_before),
+        "the identical re-run did not restart the process",
+    )?;
+    // Changed args → regenerated and restarted (new pid).
+    let out = cli(bin, ws, &["run", "--", sleep_s, "456", "--name", "adhoc-a"])?;
+    expect(
+        out.contains("started"),
+        &format!("the changed re-run succeeds: {out:?}"),
+    )?;
     let a_text2 = std::fs::read_to_string(&a_cfg)?;
     expect(
         a_text2.contains("456") && !a_text2.contains("123"),
         "re-running regenerates the whole file from the new command line",
+    )?;
+    let pid_after = pid_of(ws, "adhoc-a")?.expect("adhoc-a still running");
+    expect(
+        pid_after != pid_before,
+        "the changed definition restarted the process (new pid)",
     )?;
     // Command resolution failure exits 2 with no artifact.
     let (ok, code, combined) =
@@ -1738,6 +1791,841 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     expect(
         !ok && code == 1,
         &format!("logging an unknown program exits 1, got {code}"),
+    )?;
+
+    let _ = &mut *daemon;
+    Ok(())
+}
+
+// -- run-daemon-first scenario group ------------------------------------------
+
+/// run-daemon-first acceptance (tasks.md §8): its own workspace with an EMPTY
+/// `app_dir` so every residue assertion ("no `.toml`, no `.toml.pending`") is
+/// exact. The offline half runs before the daemon exists; the rest drives a
+/// daemon that this pass owns.
+fn run_daemon_first_pass(bin: &Path) -> Result<()> {
+    let ws = setup_runfirst_workspace()?;
+    let result = runfirst_scenarios(bin, &ws);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+/// A minimal isolated workspace: empty `apps/`, its own control + webui ports.
+/// No `[app-default]` section, so the built-in `startsecs` default (3.0) is
+/// exactly what the ad-hoc startup window uses.
+fn setup_runfirst_workspace() -> Result<Workspace> {
+    let root = std::env::temp_dir().join(format!("xk-xtask-e2e-runfirst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["apps", "logs", "fan-app", "slow-app", "mixed-app"] {
+        std::fs::create_dir_all(root.join(d)).context("create runfirst dirs")?;
+    }
+    let control_port = free_port()?;
+    let webui_port = free_port()?;
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+        ),
+    )?;
+    Ok(Workspace {
+        root,
+        control_port,
+        webui_port,
+    })
+}
+
+/// The app_dir entries (sorted) — the raw material for residue assertions.
+fn app_dir_files(ws: &Workspace) -> Vec<String> {
+    let dir = ws.root.join("apps");
+    let mut out: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Assert no residue for `name`: neither the record nor its placeholder, and
+/// no stray `.toml.pending` anywhere in `app_dir` (app-registry spec: 失败
+/// 不留残留).
+fn expect_no_residue(ws: &Workspace, name: &str) -> Result<()> {
+    let dir = ws.root.join("apps");
+    expect(
+        !dir.join(format!("{name}.toml")).exists(),
+        &format!("no {name}.toml residue"),
+    )?;
+    expect(
+        !dir.join(format!("{name}.toml.pending")).exists(),
+        &format!("no {name}.toml.pending residue"),
+    )?;
+    let stray: Vec<String> = app_dir_files(ws)
+        .into_iter()
+        .filter(|f| f.ends_with(".toml.pending"))
+        .collect();
+    expect(
+        stray.is_empty(),
+        &format!("no placeholder residue at all: {stray:?}"),
+    )
+}
+
+/// POST a JSON body to a control-plane path and return `(status, raw body)`.
+/// `-N` disables curl buffering so a chunked NDJSON stream arrives as-is.
+fn post_ndjson(ws: &Workspace, path: &str, body: &serde_json::Value) -> Result<(u16, String)> {
+    post_ndjson_at(ws.control_port, path, body)
+}
+
+/// [`post_ndjson`] against an explicit control port (secondary workspaces).
+fn post_ndjson_at(port: u16, path: &str, body: &serde_json::Value) -> Result<(u16, String)> {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-N",
+            "-o",
+            "-",
+            "-w",
+            "\n%{http_code}",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body.to_string(),
+        ])
+        .arg(format!("http://127.0.0.1:{port}{path}"))
+        .output()
+        .context("curl the ndjson endpoint")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+}
+
+/// Spawn the daemon against an explicit config on an explicit control port,
+/// waiting for `/v1/health`.
+fn spawn_daemon_at(bin: &Path, cfg: &Path, port: u16) -> Result<Daemon> {
+    let out = std::fs::File::create(cfg.with_extension("out.log"))?;
+    let err = out.try_clone()?;
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(cfg)
+        .arg("daemon")
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .context("spawn secondary daemon")?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            bail!("secondary daemon did not become healthy in 20s");
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            bail!("secondary daemon exited during startup");
+        }
+        if http_ok(&format!("http://127.0.0.1:{port}/v1/health")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Ok(Daemon { child })
+}
+
+/// pid of a program on an explicit control port.
+fn pid_of_at(port: u16, program: &str) -> Result<Option<u32>> {
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "-",
+            "-w",
+            "\n%{http_code}",
+            &format!("http://127.0.0.1:{port}/v1/programs/{program}"),
+        ])
+        .output()
+        .context("curl program")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "000"));
+    if code.trim() == "404" {
+        return Ok(None);
+    }
+    if !code.trim().starts_with('2') {
+        bail!("GET {program} -> {code}: {body}");
+    }
+    let v: serde_json::Value = serde_json::from_str(body)?;
+    Ok(v.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
+}
+
+/// Shut down a daemon on an explicit control port and reap it.
+fn shutdown_daemon_at(port: u16, daemon: &mut Daemon) {
+    let _ = Command::new("curl")
+        .args([
+            "-sf",
+            "-m",
+            "10",
+            "-X",
+            "POST",
+            &format!("http://127.0.0.1:{port}/v1/shutdown"),
+        ])
+        .output();
+    for _ in 0..60 {
+        if matches!(daemon.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
+}
+
+/// Parse the terminal (last non-empty) NDJSON frame of a streamed body.
+fn last_ndjson_frame(body: &str) -> Option<serde_json::Value> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .next_back()
+}
+
+/// Run the daemon-first scenarios: the offline half (8.4) first, then a daemon
+/// this pass spawns and shuts down itself.
+fn runfirst_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
+    runfirst_offline(bin, ws)?;
+    let mut daemon = spawn_daemon(bin, ws)?;
+    let result = runfirst_online(bin, ws, &mut daemon);
+    shutdown_daemon(ws, &mut daemon);
+    result
+}
+
+/// 8.4: with the daemon down, every `run` form exits 3, derives no daemon and
+/// leaves `app_dir` untouched (background-daemon / control-plane spec).
+fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_str().unwrap();
+    let before = app_dir_files(ws);
+
+    step("RDF0. offline `run` forms exit 3 and derive no daemon (background-daemon)");
+    expect(
+        !http_ok(&format!("http://127.0.0.1:{}/v1/health", ws.control_port)),
+        "the runfirst workspace starts with no daemon",
+    )?;
+    let cmd_form = format!("{sleep_s} 1");
+    let forms: [&[&str]; 4] = [
+        &["run", "web"],
+        &["run", "--", sleep_s, "--name", "cold"],
+        &["run", "--cmd", &cmd_form, "--name", "cold2"],
+        &["run", "--app", "ghost"],
+    ];
+    for args in forms {
+        let (ok, code, combined) = cli_try(bin, ws, args)?;
+        expect(
+            !ok && code == 3,
+            &format!("offline {args:?} exits 3, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("unreachable"),
+            &format!("{args:?} reports the daemon unreachable"),
+        )?;
+    }
+    expect(
+        !http_ok(&format!("http://127.0.0.1:{}/v1/health", ws.control_port)),
+        "no daemon was derived in the background",
+    )?;
+    expect(
+        app_dir_files(ws) == before,
+        &format!("app_dir is unchanged: {:?}", app_dir_files(ws)),
+    )?;
+    Ok(())
+}
+
+/// The online half of the daemon-first acceptance (§8.1–8.3, §8.5–8.6).
+fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_str().unwrap();
+    let apps = ws.root.join("apps");
+
+    // -- 8.1: run <name> / run --app / run -- --json / blocking -------------
+
+    step("RDF1. ad-hoc `run --` registers and returns {program, config, pid}");
+    let out = cli(bin, ws, &["run", "--", sleep_s, "300", "--name", "web"])?;
+    expect(
+        out.contains("web") && out.contains("apps/web.toml") && out.contains("pid:"),
+        &format!("run -- reports program/config/pid: {out:?}"),
+    )?;
+    expect(
+        apps.join("web.toml").is_file(),
+        "the registration landed in app_dir",
+    )?;
+    let web_pid = wait_running(ws, "web")?;
+    expect(
+        out.contains(&web_pid.to_string()),
+        &format!("the reported pid is the live one ({web_pid})"),
+    )?;
+
+    step("RDF2. `run <name>` returns name/config/pid for a stopped registered program");
+    cli(bin, ws, &["stop", "web"])?;
+    wait_state_in(ws, "web", &["stopped"])?;
+    let out = cli(bin, ws, &["run", "web"])?;
+    expect(
+        out.contains("web") && out.contains("apps/web.toml") && out.contains("pid="),
+        &format!("run <name> renders the three fields: {out:?}"),
+    )?;
+    let web2 = wait_running(ws, "web")?;
+    expect(
+        out.contains(&web2.to_string()),
+        &format!("the pid in the output is the live one ({web2})"),
+    )?;
+
+    step("RDF3. `run <name> --json` is a machine-readable single object");
+    cli(bin, ws, &["stop", "web"])?;
+    wait_state_in(ws, "web", &["stopped"])?;
+    let out = cli(bin, ws, &["run", "web", "--json"])?;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).context("run --json parses")?;
+    expect(
+        v.get("name").and_then(|n| n.as_str()) == Some("web"),
+        &format!("json carries name: {out:?}"),
+    )?;
+    expect(
+        v.get("config_path")
+            .and_then(|c| c.as_str())
+            .map(|c| c.ends_with("web.toml"))
+            .unwrap_or(false),
+        &format!("json carries config_path: {out:?}"),
+    )?;
+    expect(
+        v.get("pid").and_then(|p| p.as_u64()).is_some(),
+        &format!("json carries a numeric pid: {out:?}"),
+    )?;
+    expect(
+        v.get("status").and_then(|s| s.as_str()) == Some("started"),
+        &format!("json carries status: {out:?}"),
+    )?;
+
+    step("RDF4. ad-hoc `run --json -- <cmd>` is the same single object");
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--json", "--", sleep_s, "301", "--name", "json-web"],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).context("adhoc --json parses")?;
+    expect(
+        v.get("name").and_then(|n| n.as_str()) == Some("json-web")
+            && v.get("pid").and_then(|p| p.as_u64()).is_some(),
+        &format!("adhoc --json is a single object with name/pid: {out:?}"),
+    )?;
+
+    step("RDF5. `run --app` fans out one line per program; `--json` is an array");
+    std::fs::write(
+        ws.root.join("fan-app/appkeeper.toml"),
+        format!(
+            "[app]\nrestart = \"always\"\n\n[program.fa]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n\n[program.fb]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n"
+        ),
+    )?;
+    cli(
+        bin,
+        ws,
+        &[
+            "add",
+            ws.root.join("fan-app").to_str().unwrap(),
+            "--name",
+            "fan",
+        ],
+    )?;
+    cli(bin, ws, &["apply", "fan"])?;
+    wait_running(ws, "fa")?;
+    wait_running(ws, "fb")?;
+    let out = cli(bin, ws, &["run", "--app", "fan"])?;
+    let (pa, pb) = (out.find("fa "), out.find("fb "));
+    expect(
+        matches!((pa, pb), (Some(a), Some(b)) if a < b),
+        &format!("fan-out lists fa then fb, one line each: {out:?}"),
+    )?;
+    expect(
+        out.contains("config=") && out.contains("pid="),
+        &format!("each fan-out line carries config and pid: {out:?}"),
+    )?;
+    expect(
+        out.contains("appkeeper.toml"),
+        &format!("the config_path names the app's config body: {out:?}"),
+    )?;
+    let json = cli(bin, ws, &["run", "--app", "fan", "--json"])?;
+    let arr: serde_json::Value =
+        serde_json::from_str(json.trim()).context("fan-out json parses")?;
+    let arr = arr.as_array().context("fan-out --json is an array")?;
+    expect(arr.len() == 2, &format!("two entries, got {}", arr.len()))?;
+    for p in arr {
+        for f in ["name", "config_path", "pid", "status"] {
+            expect(p.get(f).is_some(), &format!("fan-out json has {f}: {p}"))?;
+        }
+    }
+
+    step("RDF5b. a partial fan-out failure exits non-zero and lists the failing program");
+    // `bad` exits before its (short) startsecs, so the `run --app` wait sees it
+    // as not-running and must report the app as failed.
+    std::fs::write(
+        ws.root.join("fan-app/appkeeper.toml"),
+        format!(
+            "[app]\nrestart = \"always\"\n\n[program.fa]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n\n[program.fb]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n"
+        ),
+    )?;
+    std::fs::write(
+        ws.root.join("mixed-app/appkeeper.toml"),
+        format!(
+            "[app]\nrestart = \"no\"\n\n[program.ok]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n\n[program.bad]\ncommand = \"{sleep_s}\"\nargs = [\"0.05\"]\nstartsecs = 2.0\n"
+        ),
+    )?;
+    cli(
+        bin,
+        ws,
+        &[
+            "add",
+            ws.root.join("mixed-app").to_str().unwrap(),
+            "--name",
+            "mixed",
+        ],
+    )?;
+    cli(bin, ws, &["apply", "mixed"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "--app", "mixed"])?;
+    expect(
+        !ok && code != 0,
+        &format!("a partial fan-out failure exits non-zero, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("bad"),
+        &format!("the failure lists the failing program: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("ok"),
+        &format!("the successful program is still reported: {combined:?}"),
+    )?;
+
+    step("RDF6. a single-program `run` blocks until the startup judgement returns");
+    std::fs::write(
+        ws.root.join("slow-app/appkeeper.toml"),
+        format!(
+            "[app]\nrestart = \"no\"\n\n[program.slow]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 1.5\n"
+        ),
+    )?;
+    cli(
+        bin,
+        ws,
+        &[
+            "add",
+            ws.root.join("slow-app").to_str().unwrap(),
+            "--name",
+            "slow",
+        ],
+    )?;
+    cli(bin, ws, &["apply", "slow"])?;
+    // `restart = "no"`: the app is registered but not started, so the `run`
+    // below is the first start and its 1.5s startsecs is a pure wait.
+    expect(
+        pid_of(ws, "slow")?.is_none(),
+        "slow is registered but stopped",
+    )?;
+    let t0 = Instant::now();
+    let out = cli(bin, ws, &["run", "slow"])?;
+    let elapsed = t0.elapsed();
+    expect(
+        elapsed >= Duration::from_millis(1400),
+        &format!("run blocked for the 1.5s startsecs (took {elapsed:?})"),
+    )?;
+    expect(
+        out.contains("pid=") && out.contains("slow"),
+        &format!("the blocked run still reports the result: {out:?}"),
+    )?;
+
+    // -- 8.2: failures leave no residue -------------------------------------
+
+    step("RDF7. a command that cannot be resolved exits 2 with no residue");
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--", "definitely-not-a-real-cmd", "--x"])?;
+    expect(
+        !ok && code == 2,
+        &format!("unresolvable command exits 2, got {code}: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "definitely-not-a-real-cmd")?;
+
+    step("RDF8. a program that exits before startsecs fails with no residue");
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--", sleep_s, "0.05", "--name", "flaky"])?;
+    expect(!ok, &format!("early-exit ad-hoc fails: {combined:?}"))?;
+    expect(code != 0, &format!("non-zero exit, got {code}"))?;
+    expect(
+        combined.contains("startsecs") || combined.contains("startup"),
+        &format!("the error names the startup failure: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "flaky")?;
+
+    step("RDF9. a cross-app program-name collision is refused with no residue");
+    // `owner` is a separate app that owns the program name `clash`; an ad-hoc
+    // `--name clash` collides with ANOTHER app and must be refused
+    // (control-plane spec: 名称冲突被拒绝 — 与其他应用冲突).
+    std::fs::create_dir_all(ws.root.join("owner-app"))?;
+    std::fs::write(
+        ws.root.join("owner-app/appkeeper.toml"),
+        format!("[program.clash]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n"),
+    )?;
+    cli(
+        bin,
+        ws,
+        &[
+            "add",
+            ws.root.join("owner-app").to_str().unwrap(),
+            "--name",
+            "owner",
+        ],
+    )?;
+    cli(bin, ws, &["apply", "owner"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "302", "--name", "clash"])?;
+    expect(
+        !ok && code != 0,
+        &format!("cross-app colliding --name is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("already registered"),
+        &format!("the error explains the collision: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("owner"),
+        &format!("the error names the owning app: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "clash")?;
+
+    step("RDF9b. a same-name ad-hoc re-submission regenerates (not refused)");
+    // `web` was ad-hoc registered in RDF1; re-submitting it is a full
+    // regeneration (app-registry: 同名全量再生), immediate effect.
+    let web_pid = pid_of(ws, "web")?.expect("web is running");
+    let out = cli(bin, ws, &["run", "--", sleep_s, "303", "--name", "web"])?;
+    expect(
+        out.contains("started"),
+        &format!("a same-name re-submission succeeds: {out:?}"),
+    )?;
+    let web_text = std::fs::read_to_string(apps.join("web.toml"))?;
+    expect(
+        web_text.contains("303"),
+        "the record was regenerated from the new command line",
+    )?;
+    expect(
+        pid_of(ws, "web")? != Some(web_pid),
+        "the changed definition restarted the process",
+    )?;
+
+    step("RDF10. the reserved `all` name is refused with no residue");
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "303", "--name", "all"])?;
+    expect(!ok, "run --name all is refused")?;
+    expect(
+        combined.contains("reserved"),
+        &format!("the error explains the reserved word: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "all")?;
+
+    // -- 8.3: atomic landing ------------------------------------------------
+
+    step("RDF11. mid-flight reload sees no half-written registration");
+    let atomic_out = ws.root.join("atomic.out");
+    let atomic_log = std::fs::File::create(&atomic_out)?;
+    let mut atomic = Command::new(bin)
+        .arg("--config")
+        .arg(ws.config_arg())
+        .args(["run", "--", sleep_s, "400", "--name", "atomic"])
+        .stdout(Stdio::from(atomic_log))
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn the atomic ad-hoc run")?;
+    // The startup window is the built-in 3s startsecs: sample it mid-flight.
+    std::thread::sleep(Duration::from_millis(800));
+    expect(
+        !apps.join("atomic.toml").exists(),
+        "no .toml record while the startup judgement is still pending",
+    )?;
+    expect(
+        apps.join("atomic.toml.pending").is_file(),
+        "the placeholder exists mid-flight (a scanner cannot see it as a record)",
+    )?;
+    let listed = cli(bin, ws, &["list"])?;
+    expect(
+        !listed.contains("atomic"),
+        &format!("`ak list` excludes the in-flight app: {listed:?}"),
+    )?;
+    let pending: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
+    expect(
+        pending["programs"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "the in-flight app is not in pending",
+    )?;
+    // A reload mid-flight must not disturb the staging.
+    cli(bin, ws, &["reload"])?;
+    let status = atomic.wait()?;
+    expect(
+        status.success(),
+        &format!("the ad-hoc run still succeeds after the mid-flight reload ({status})"),
+    )?;
+    expect(
+        apps.join("atomic.toml").is_file() && !apps.join("atomic.toml.pending").exists(),
+        "the placeholder was renamed onto the record",
+    )?;
+    let atomic_text = std::fs::read_to_string(&atomic_out).unwrap_or_default();
+    expect(
+        atomic_text.contains("atomic") && atomic_text.contains("pid:"),
+        &format!("the completed run reported its result: {atomic_text:?}"),
+    )?;
+
+    // -- 8.5: health probe progress and judgement ---------------------------
+
+    if cfg!(unix) {
+        step("RDF12. a health-probed ad-hoc run streams progress and returns the pid");
+        let body = serde_json::json!({
+            "name": "healthy",
+            "command": sleep_s,
+            "args": ["300"],
+            "health_check": "/bin/sh -c true",
+        });
+        let (code, stream) = post_ndjson(ws, "/v1/run", &body)?;
+        expect(
+            code == 200,
+            &format!("the health run answers 200, got {code}"),
+        )?;
+        expect(
+            stream.contains("\"phase\":\"staged\"") && stream.contains("estimate_secs"),
+            &format!("the stream carries the staged frame with an estimate: {stream:?}"),
+        )?;
+        expect(
+            stream.contains("waiting_health"),
+            &format!("the stream carries the waiting_health frame: {stream:?}"),
+        )?;
+        let terminal = last_ndjson_frame(&stream).context("a terminal frame exists")?;
+        expect(
+            terminal.get("ok").and_then(|o| o.as_bool()) == Some(true),
+            &format!("the terminal frame reports success: {terminal}"),
+        )?;
+        let hpid = terminal.get("pid").and_then(|p| p.as_u64());
+        expect(
+            hpid.is_some(),
+            &format!("the terminal frame carries a pid: {terminal}"),
+        )?;
+        expect(
+            apps.join("healthy.toml").is_file(),
+            "the health-probed app landed after the first successful probe",
+        )?;
+
+        step("RDF13. a health probe that never passes fails with no residue");
+        let body = serde_json::json!({
+            "name": "sickly",
+            "command": sleep_s,
+            "args": ["300"],
+            "health_check": "/bin/sh -c false",
+        });
+        let t0 = Instant::now();
+        let (code, stream) = post_ndjson(ws, "/v1/run", &body)?;
+        let elapsed = t0.elapsed();
+        expect(
+            code == 200,
+            &format!("the failing health run answers 200, got {code}"),
+        )?;
+        let terminal = last_ndjson_frame(&stream).context("a terminal frame exists")?;
+        expect(
+            terminal.get("ok").and_then(|o| o.as_bool()) == Some(false),
+            &format!("the terminal frame reports failure: {terminal}"),
+        )?;
+        expect(
+            terminal.get("phase").and_then(|p| p.as_str()) == Some("timeout"),
+            &format!("the failure is the health window timing out: {terminal}"),
+        )?;
+        expect(
+            elapsed >= Duration::from_secs(20),
+            &format!("it waited out the health window (took {elapsed:?})"),
+        )?;
+        expect_no_residue(ws, "sickly")?;
+        expect(
+            pid_of(ws, "sickly")?.is_none(),
+            "the failed health program was stopped and dropped",
+        )?;
+    } else {
+        println!("    (windows: health-probe scenarios need /bin/sh; skipping)");
+    }
+
+    step("RDF13b. without a health probe the endpoint emits no intermediate frame");
+    let body = serde_json::json!({
+        "name": "plain",
+        "command": sleep_s,
+        "args": ["300"],
+    });
+    let (code, stream) = post_ndjson(ws, "/v1/run", &body)?;
+    expect(
+        code == 200,
+        &format!("the plain run answers 200, got {code}"),
+    )?;
+    let frames: Vec<serde_json::Value> = stream
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    expect(
+        frames.len() == 1,
+        &format!("exactly one (terminal) frame without a health check: {stream:?}"),
+    )?;
+    expect(
+        frames[0].get("ok").and_then(|o| o.as_bool()) == Some(true),
+        &format!("the terminal frame reports success: {}", frames[0]),
+    )?;
+    expect(apps.join("plain.toml").is_file(), "the plain app landed")?;
+
+    step("RDF13c. an unusable app_dir refuses before starting any process");
+    // Point a fresh daemon's app_dir underneath a regular file: creating the
+    // directory fails deterministically (root- or permission-independent), so
+    // the placeholder can never be established. The endpoint must report a
+    // stage error and start nothing (app-registry spec: 占位建立失败不启动进程).
+    let blocker = ws.root.join("blocker");
+    std::fs::write(&blocker, "not a directory")?;
+    let ro_apps = blocker.join("apps");
+    let ro_cfg = ws.root.join("daemon-ro.toml");
+    let ro_port = free_port()?;
+    let ro_logs = ws.root.join("logs").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        &ro_cfg,
+        format!(
+            "[daemon]\nhost = \"127.0.0.1\"\nport = {ro_port}\nlog_dir = \"{ro_logs}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n",
+            ro_apps.display().to_string().replace('\\', "/"),
+        ),
+    )?;
+    let mut ro_daemon = spawn_daemon_at(bin, &ro_cfg, ro_port)?;
+    let (code, body) = post_ndjson_at(
+        ro_port,
+        "/v1/run",
+        &serde_json::json!({ "name": "ro", "command": sleep_s, "args": ["300"] }),
+    )?;
+    expect(
+        code == 500 || code == 400,
+        &format!("the unusable app_dir answers an error status, got {code}: {body:?}"),
+    )?;
+    expect(
+        body.contains("placeholder") || body.contains("app_dir") || body.contains("create"),
+        &format!("the error names the write failure: {body:?}"),
+    )?;
+    expect(
+        !ro_apps.exists(),
+        "no app_dir was created under the blocker",
+    )?;
+    expect(
+        pid_of_at(ro_port, "ro")?.is_none(),
+        "no process was started when the placeholder could not be written",
+    )?;
+    shutdown_daemon_at(ro_port, &mut ro_daemon);
+
+    // -- 8.6: partial failure + residual state ------------------------------
+
+    if cfg!(unix) {
+        step("RDF14. a failed rename keeps the process and prints the full config");
+        // Simulate an unwritable TARGET (robust even as root): a directory named
+        // `<name>.toml` makes the same-directory rename fail with EISDIR after
+        // startup already succeeded — exactly the partial-failure path.
+        std::fs::create_dir_all(apps.join("weird.toml"))?;
+        let (ok, code, combined) =
+            cli_try(bin, ws, &["run", "--", sleep_s, "400", "--name", "weird"])?;
+        expect(
+            !ok && code != 0,
+            &format!("the partial failure exits non-zero, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("registration was not written"),
+            &format!("it explains the process is running but unregistered: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("command")
+                && combined.contains("args")
+                && combined.contains("work_dir"),
+            &format!("it prints the full configuration to land by hand: {combined:?}"),
+        )?;
+        let weird_pid = pid_of(ws, "weird")?.expect("the process was kept running");
+        expect(
+            apps.join("weird.toml.pending").is_file(),
+            "the placeholder is kept for diagnosis",
+        )?;
+
+        step("RDF15. a re-run detects the residual state and asks (non-TTY refuses)");
+        let (ok, code, combined) =
+            cli_try(bin, ws, &["run", "--", sleep_s, "400", "--name", "weird"])?;
+        expect(
+            !ok && code != 0,
+            &format!("a non-interactive re-run refuses, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("already running") && combined.contains("not registered"),
+            &format!("it reports the residual state: {combined:?}"),
+        )?;
+        expect(
+            pid_of(ws, "weird")? == Some(weird_pid),
+            "the refusal did not restart the process",
+        )?;
+        expect(
+            !apps.join("weird.toml").is_file(),
+            "the refusal wrote no record",
+        )?;
+
+        step("RDF16. confirming the residual re-lands the record without restarting");
+        std::fs::remove_dir(apps.join("weird.toml"))?;
+        let cmd = format!(
+            "{} --config {} run -- {} 400 --name weird",
+            bin.display(),
+            ws.config_arg(),
+            sleep_s
+        );
+        let mut child = Command::new("script")
+            .args(["-qec", &cmd, "/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn the residual run under a pty")?;
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("piped stdin")
+                .write_all(b"y\n")?;
+        }
+        let confirm = child.wait_with_output()?;
+        let confirm_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&confirm.stdout),
+            String::from_utf8_lossy(&confirm.stderr)
+        );
+        expect(
+            confirm.status.success(),
+            &format!("the confirmed residual exits 0: {confirm_text:?}"),
+        )?;
+        expect(
+            confirm_text.contains("registered"),
+            &format!("the confirmation reports the registration: {confirm_text:?}"),
+        )?;
+        expect(
+            apps.join("weird.toml").is_file() && !apps.join("weird.toml.pending").exists(),
+            "the record landed and the placeholder is gone",
+        )?;
+        expect(
+            pid_of(ws, "weird")? == Some(weird_pid),
+            "the confirmed commit reused the running process (pid unchanged)",
+        )?;
+    } else {
+        println!("    (windows: the residual-confirmation scenario needs a pty; skipping)");
+    }
+
+    // -- default app_dir name (configuration spec) --------------------------
+
+    step("RDF17. the built-in app_dir default is app.d");
+    let defaults = ws.root.join("defaults");
+    std::fs::create_dir_all(&defaults)?;
+    let dcfg = defaults.join("daemon.toml");
+    std::fs::write(&dcfg, "[daemon]\nhost = \"127.0.0.1\"\nport = 1\n")?;
+    let out = cli_cfg(bin, &dcfg, &["config", "--get", "app_dir"])?;
+    expect(
+        out.trim() == "app.d",
+        &format!("config --get app_dir answers app.d, got {out:?}"),
     )?;
 
     let _ = &mut *daemon;
@@ -2079,11 +2967,11 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("H5. `run --app acts` fans out in dependency order");
     let out = cli(bin, ws, &["run", "--app", "acts"])?;
-    let (psvc, psig, ptrap) = (
-        out.find("  svc:"),
-        out.find("  signalee:"),
-        out.find("  trapper:"),
-    );
+    // run-daemon-first re-renders the `run --app` fan-out as one
+    // `{program}  config=...  pid=...  status (...)` line per program; the
+    // dependency order is asserted on the program name at each line start.
+    let pos = |p: &str| out.find(&format!("{p}  config="));
+    let (psvc, psig, ptrap) = (pos("svc"), pos("signalee"), pos("trapper"));
     expect(
         matches!((psvc, psig, ptrap), (Some(a), Some(b), Some(c)) if a < b && b < c),
         &format!("fan-out start lists svc < signalee < trapper: {out:?}"),
@@ -3047,6 +3935,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         cli_pass(&bin, &ws)?;
         actions_online_pass(&bin, &ws)?;
         revamp_pass(&bin)?;
+        run_daemon_first_pass(&bin)?;
         detach_pass(&bin)?;
         webui_pass(&bin, &ws)?;
         if args.no_browser {

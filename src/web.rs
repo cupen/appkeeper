@@ -37,7 +37,7 @@ use crate::api::{self, msg_type};
 use crate::assets;
 use crate::pump;
 use crate::pump::Stream;
-use crate::server::{ProgramInfo, StatusDoc, program_info, status_doc};
+use crate::server::{ProgramInfo, StatusDoc, status_doc};
 use crate::supervisor::{Command, Supervisor};
 
 /// Replay context when a client subscribes to a log stream.
@@ -126,7 +126,10 @@ async fn programs(State(sup): State<Arc<Supervisor>>) -> Json<serde_json::Value>
 async fn program_detail(State(sup): State<Arc<Supervisor>>, Path(name): Path<String>) -> Response {
     let st = sup.state.lock().unwrap();
     match st.programs.get(&name) {
-        Some(p) => Json(program_info(p, Some(&sup.metrics))).into_response(),
+        Some(p) => {
+            let st = sup.state.lock().unwrap();
+            Json(crate::server::program_info_state(&st, p, Some(&sup.metrics))).into_response()
+        }
         None => api_error(StatusCode::NOT_FOUND, &format!("unknown program {name:?}")),
     }
 }
@@ -734,6 +737,8 @@ mod tests {
             command: String::new(),
             args: Vec::new(),
             work_dir: String::new(),
+            config_path: None,
+            health_confirmed: true,
         };
         let b_changed = {
             let mut x = a.clone();
@@ -767,6 +772,8 @@ mod tests {
             command: String::new(),
             args: Vec::new(),
             work_dir: String::new(),
+            config_path: None,
+            health_confirmed: true,
         };
         let mut b = a.clone();
         b.cpu_percent = Some(37.5);

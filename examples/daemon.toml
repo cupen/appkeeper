@@ -11,7 +11,7 @@ host = "127.0.0.1"          # control API bind address (loopback by default)
 port = 7310                 # control API port
 auth_token = ""             # empty = no auth (loopback only); set a secret to require Bearer auth
 log_buffer_lines = 1000     # in-memory ring per stream, used by `ak log --tail/-f`
-app_dir = "apps"            # registration directory: one <name>.toml link per registered app
+app_dir = "app.d"           # registration directory: one <name>.toml link per registered app (default app.d; old default was apps)
 
 # Optional: defaults for every registered app (fields mirror program fields).
 # Program-explicit fields and the app's own [app] table override these.
