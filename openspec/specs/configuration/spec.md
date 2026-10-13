@@ -12,7 +12,7 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（监听地
 
 #### Scenario: 全新机器空启动
 
-- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `ak run`
+- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `ak daemon`
 - **THEN** 守护进程以默认设置启动，受管程序为空，控制平面正常可用，控制台不伺服
 
 #### Scenario: daemon 配置中的应用条目被拒绝
@@ -98,7 +98,7 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 #### Scenario: 相对 log_dir 拒绝启动
 
-- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `ak run` 或 `ak validate`
+- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `ak daemon` 或 `ak validate`
 - **THEN** 校验失败，错误信息指明 `daemon.log_dir` 必须为绝对路径，守护进程不启动
 
 #### Scenario: 非法字符名被拒绝
@@ -260,5 +260,5 @@ daemon 配置的 `[webui]` 段 SHALL 由 config 子命令按统一键表机制�
 
 #### Scenario: 段内未知键校验拒绝
 
-- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `ak validate` 或 `ak run`
+- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `ak validate` 或 `ak daemon`
 - **THEN** 校验失败并指明该未知字段，守护进程拒绝以该配置启动

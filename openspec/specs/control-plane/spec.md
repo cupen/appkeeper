@@ -104,11 +104,14 @@
 
 ### Requirement: CLI 控制命令
 
-单二进制 SHALL 同时承担守护进程与客户端两种角色。`ak run` 为统一入口动词：
+单二进制 SHALL 同时承担守护进程与客户端两种角色。守护进程 SHALL 由显式子命令 `ak daemon` 运行；`ak run` 为客户端动词（docker run 式心智：向守护进程发指令），SHALL NOT 承载任何守护入口语义：
 
-- 裸 `run`（可带 `--detach`）为守护进程形态（后台形态与拉起协议见 `background-daemon` 能力规范），无参数时前台运行的行为不变；
+- `daemon`（可带 `--detach`）为唯一守护形态：无 `--detach` 时前台运行（Ctrl+C / SIGTERM 优雅停机），后台形态与拉起协议见 `background-daemon` 能力规范；
 - `run <name>` / `run --app <app>` 为启动形态：启动已注册的程序或按既定顺序扇出启动整个 app 的程序，语义与控制面动作一致（经本地 API 操作守护进程；对已 `running` 程序启动返回 409，未知程序返回 404），即原 `start` 动词的语义——`start` 动词 SHALL 移除，调用 SHALL 得到未知子命令错误（含改用 `run` 的提示）；
-- run 的 ad-hoc 形态（`-- <命令行>` 或 `--cmd "<字符串>"`，二选一）：命令行注册并立即生效（注册语义见 `app-registry` 能力规范，离线拉起见 `background-daemon`）。
+- run 的 ad-hoc 形态（`-- <命令行>` 或 `--cmd "<字符串>"`，二选一）：命令行注册并立即生效（注册语义见 `app-registry` 能力规范，离线拉起见 `background-daemon`）；
+- 守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）SHALL 被移除并在参数解析前拦截：以退出码 2 失败，错误提示按形态分流——`--detach` 形态提示改用 `ak daemon --detach`；仅带 `--config` 的形态（systemd 旧 ExecStart 特征）SHALL 额外提示用 `ak service install --force --now` 重新生成 unit（见 `service-registration`）。
+
+裸 `ak`（无子命令）SHALL 输出与 `ak --help` 等价的完整 help 到 stdout 并以退出码 0 退出，MUST NOT 启动守护进程。新语义下裸 `ak run`（无程序名、无 `--app`、无 `--`/`--cmd`、无 `--detach`）SHALL 报用法错误并列出三种客户端形态（`run <name>` / `run --app <app>` / `run -- <cmd...>`），以退出码 2 退出。
 
 `ak status|stop|restart|reload|apply|log|pid|shutdown` 为其余控制子命令（通过本地 API 操作守护进程），`ak add|remove|list` 为应用注册子命令（离线直接读写 daemon 配置，在线时经控制 API 同步）。`ak apply` SHALL 支持范围参数（缺省全部 / `<app>` / `<app> <program>`）与 `--restart` 开关，输出逐程序的变更与动作结果。
 
@@ -118,7 +121,7 @@
 
 `appkeeper action <program> <action>` SHALL 执行自定义动作并输出退出码与输出尾部，CLI 退出码 SHALL 透传动作自身的退出码（调用失败为 1，守护不可达为 3）；`appkeeper signal <program> <SIGNAL>` SHALL 投递白名单信号；`stop|restart --app <name>` SHALL 执行 app 级扇出（服务端按序展开），裸 `<name>` 参数维持既有程序名语义不变（启动扇出由 `run --app` 承接）。
 
-控制命令 SHALL 使用如下退出码约定：0 成功（含 apply 无变更的幂等情形）；1 一般错误（如非法状态转换、未知程序、注册校验失败）；2 配置错误；3 守护进程不可达。
+控制命令 SHALL 使用如下退出码约定：0 成功（含 apply 无变更的幂等情形、裸 `ak` 的 help 输出）；1 一般错误（如非法状态转换、未知程序、注册校验失败）；2 配置错误（含被拦截的守护形态 `run` 与无操作数的裸 `run` 用法错误）；3 守护进程不可达。
 
 #### Scenario: 守护进程未运行
 
@@ -152,7 +155,7 @@
 
 #### Scenario: CLI 扇出启动
 
-- **WHEN** 执行 `ak start --app gateway`
+- **WHEN** 执行 `ak run --app gateway`
 - **THEN** 服务端按排序规则逐程序启动，输出逐程序结果；未知 app 报错退出码 1
 
 #### Scenario: run 启动已注册程序
@@ -169,6 +172,31 @@
 
 - **WHEN** 执行 `ak start web`
 - **THEN** 报未知子命令错误并提示改用 `ak run web`，退出非零
+
+#### Scenario: 裸 ak 输出 help
+
+- **WHEN** 执行 `ak`（不带任何子命令与参数）
+- **THEN** 完整 help 输出到 stdout（与 `ak --help` 等价，含子命令列表），退出码 0，不启动守护进程
+
+#### Scenario: daemon 前台守护
+
+- **WHEN** 执行 `ak daemon`
+- **THEN** 守护进程前台运行（与本变更之前裸 `ak run` 的行为一致），Ctrl+C 优雅停机
+
+#### Scenario: 守护形态 run 被拦截并提示
+
+- **WHEN** 执行 `ak run --detach`
+- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon --detach`，不启动任何守护进程
+
+#### Scenario: 仅带 config 的守护形态 run 提示 unit 重新生成
+
+- **WHEN** 执行 `ak run --config /etc/appkeeper/daemon.toml`（无其他操作数，systemd 旧 ExecStart 形态）
+- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon`，并提示既有 systemd unit 须以 `ak service install --force --now` 重新生成
+
+#### Scenario: 无操作数的裸 run 报用法错误
+
+- **WHEN** 执行 `ak run`（新语义下无程序名、无 `--app`、无 `--`/`--cmd`）
+- **THEN** 以退出码 2 失败，错误信息列出三种客户端形态（`run <name>` / `run --app <app>` / `run -- <cmd...>`）
 
 #### Scenario: status 默认输出人读表格
 

@@ -7,16 +7,16 @@
 
 ### Requirement: 后台运行守护进程（run --detach）
 
-`ak run --detach` SHALL 以后台方式启动守护进程：进程 SHALL 在分离的进程组中运行（调用方终端的 Ctrl+C / 退出不影响它），stdout/stderr SHALL 追加重定向到 daemon 配置 `log_dir` 下的守护进程后台日志文件。命令 SHALL 等待守护进程就绪（控制端口健康探测通过）后返回：就绪 SHALL 打印监听地址与后台日志路径并以 0 退出；就绪超时或启动失败 SHALL 以非零码退出并指明日志位置。端口冲突行为 SHALL 沿用「启动冲突处理」规范（明确报错，不静默成功）。不带 `--detach` 的裸 `run` MUST 保持前台语义不变。
+`ak daemon --detach` SHALL 以后台方式启动守护进程：进程 SHALL 在分离的进程组中运行（调用方终端的 Ctrl+C / 退出不影响它），stdout/stderr SHALL 追加重定向到 daemon 配置 `log_dir` 下的守护进程后台日志文件。命令 SHALL 等待守护进程就绪（控制端口健康探测通过）后返回：就绪 SHALL 打印监听地址与后台日志路径并以 0 退出；就绪超时或启动失败 SHALL 以非零码退出并指明日志位置。端口冲突行为 SHALL 沿用「启动冲突处理」规范（明确报错，不静默成功）。不带 `--detach` 的 `ak daemon` MUST 保持前台语义（与本变更之前裸 `ak run` 的行为一致）。`run --detach` 不再是合法入口：守护形态的 `run` 被拦截的语义见 `control-plane` 能力规范。
 
 #### Scenario: 后台启动并就绪
 
-- **WHEN** 执行 `ak run --detach` 且端口可用
+- **WHEN** 执行 `ak daemon --detach` 且端口可用
 - **THEN** 命令打印监听地址与后台日志路径后以 0 退出，守护进程在后台存活，调用方终端关闭后仍运行
 
 #### Scenario: 端口已占用时报错
 
-- **WHEN** 已有守护进程实例占用端口时执行 `ak run --detach`
+- **WHEN** 已有守护进程实例占用端口时执行 `ak daemon --detach`
 - **THEN** 以非零码退出，错误信息指出端口占用与已运行实例的可能，不产生第二个实例
 
 #### Scenario: 就绪超时
@@ -26,14 +26,14 @@
 
 #### Scenario: 前台语义不变
 
-- **WHEN** 执行 `ak run`（无 `--detach`）
-- **THEN** 行为与本变更之前完全一致：前台运行，Ctrl+C 优雅停机
+- **WHEN** 执行 `ak daemon`（无 `--detach`）
+- **THEN** 守护进程前台运行，Ctrl+C 优雅停机（与本变更之前裸 `ak run` 的行为一致）
 
 ### Requirement: 立即生效入口的隐式拉起协议
 
-`add --apply` 与 run 的 ad-hoc 形态（`--`/`--cmd`）在守护进程离线时 SHALL 自动后台拉起守护进程后继续应用（替代本变更之前 `--apply` 离线「报错 + 补救提示」的行为）：
+`add --apply` 与 run 的 ad-hoc 形态（`--`/`--cmd`）在守护进程离线时 SHALL 自动后台拉起守护进程后继续应用：
 
-- 拉起方式 SHALL 与 `run --detach` 一致（分离进程组、同一 `-c/--config` 配置解析、stdio 重定向到 `log_dir` 后台日志文件）。
+- 拉起方式 SHALL 与 `ak daemon --detach` 一致（分离进程组、同一 `-c/--config` 配置解析、stdio 重定向到 `log_dir` 后台日志文件）。
 - 就绪判定 SHALL 采用有界轮询健康探测：就绪后继续执行 apply；超时 SHALL 以非零码退出，错误信息指明日志位置与补救方式。
 - 竞态容忍：多个调用同时触发拉起时，因端口占用而退出的实例 SHALL 自行终止；任一调用只要轮询到健康的守护进程即视为就绪并继续，MUST NOT 因自身派生的实例退出而误报失败。
 - 守护进程在线时 MUST 直接执行 apply，不派生新实例。
