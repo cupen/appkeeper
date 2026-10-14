@@ -850,13 +850,21 @@ mod tests {
                 let _ = std::io::Read::read(&mut conn, &mut buf);
                 let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
                             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-                std::io::Write::write_all(&mut conn, head.as_bytes()).unwrap();
+                // Write failures are expected and ignored: in the `stop_early`
+                // case the client hangs up the moment its callback says stop,
+                // so the tail of this body legitimately hits EPIPE. A real
+                // server tolerates that; unwrapping here made this test flaky
+                // under parallel load.
+                let mut write = |bytes: &[u8]| {
+                    let _ = std::io::Write::write_all(&mut conn, bytes);
+                };
+                write(head.as_bytes());
                 for chunk in chunks {
                     let body = chunk.as_bytes();
                     let framed = format!("{:x}\r\n{}\r\n", body.len(), chunk);
-                    std::io::Write::write_all(&mut conn, framed.as_bytes()).unwrap();
+                    write(framed.as_bytes());
                 }
-                std::io::Write::write_all(&mut conn, b"0\r\n\r\n").unwrap();
+                write(b"0\r\n\r\n");
                 let _ = std::io::Write::flush(&mut conn);
             });
             let c = Client::from_config(&config_with_socket(&sock));

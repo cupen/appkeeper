@@ -994,6 +994,29 @@ mod tests {
         d
     }
 
+    /// Spell `target` relative to the process cwd, walking up with `..` when
+    /// it lives outside. Both operands must be absolute.
+    fn relative_from_cwd(target: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let (cwd_parts, tgt_parts): (Vec<_>, Vec<_>) = (
+            cwd.components().collect::<Vec<_>>(),
+            target.components().collect::<Vec<_>>(),
+        );
+        let common = cwd_parts
+            .iter()
+            .zip(tgt_parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut out = PathBuf::new();
+        for _ in common..cwd_parts.len() {
+            out.push("..");
+        }
+        for c in &tgt_parts[common..] {
+            out.push(c.as_os_str());
+        }
+        out
+    }
+
     fn opts(name: &str) -> AddOptions {
         AddOptions {
             name: Some(name.into()),
@@ -1498,14 +1521,20 @@ mod tests {
         let abs = resolve_command(exe.to_str().unwrap()).unwrap();
         assert!(abs.is_absolute(), "resolved absolute: {}", abs.display());
         assert_eq!(abs, display_absolute(exe.canonicalize().unwrap()));
-        // Relative path with a separator resolves too.
-        let rel = format!("./{}/proc", tmp.file_name().unwrap().to_string_lossy());
-        let prev = std::env::current_dir().unwrap();
-        // Resolve from the tmp parent so the relative form is valid.
-        std::env::set_current_dir(tmp.parent().unwrap()).unwrap();
+        // Relative path with a separator resolves too. `Path::canonicalize`
+        // resolves against the process cwd, so this test must not pretend to
+        // be somewhere else by calling `set_current_dir`: that is
+        // process-global state, and a parallel test asserting on the add-time
+        // cwd would read a directory that is no longer ours (this exact race
+        // made `render_scaffold_matches_add_output` flaky). Instead, build a
+        // genuinely cwd-relative spelling of the tmp executable.
+        let rel = format!("./{}", relative_from_cwd(&exe).display());
         let got = resolve_command(&rel);
-        std::env::set_current_dir(prev).unwrap();
-        assert!(got.unwrap().is_absolute());
+        assert!(
+            got.as_ref()
+                .is_ok_and(|g| g.is_absolute() && g.ends_with("proc")),
+            "a cwd-relative path resolves to an absolute one ({rel}): {got:?}"
+        );
         // A path that does not exist is a diagnostic error.
         let err = resolve_command("/no/such/binary-xyz")
             .unwrap_err()
