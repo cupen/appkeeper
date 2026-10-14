@@ -11,9 +11,9 @@ Linux 与 Windows 上行为一致：崩溃自动拉起、启动顺序与依赖�
          │    priority/depends_on 启动编排 · reload · shutdown              │
          │  ├─ pump×2/程序   输出接管 → 轮转落盘 + 环形缓冲 + follow 广播     │
          │  ├─ health checker tcp/http/exec 探测 → unhealthy/自动重启        │
-         │  └─ control API  127.0.0.1:7310 /v1/*（可选 Bearer 鉴权）         │
+         │  └─ control API  本地 socket /run/appkeeper/<uid>/ak.sock /v1/*  │
          └───────────────△─────────────────────────────────────────────────┘
-                         │ HTTP JSON
+                         │ HTTP/1.1 over 本地 socket（OS 管属主，无应用层鉴权）
    ak daemon（唯一守护入口，可 --detach）· ak run（<名> | --app | -- <命令行>）
    · status/stop/restart/log/pid/reload/apply/shutdown
    ak add/remove/list        ← 离线可用，在线时自动同步
@@ -71,7 +71,7 @@ daemon `[app-default]` > 内置默认。`priority` 为应用级字段；`restart
 ```bash
 cargo build --release          # 产物: target/release/appkeeper(.exe)
 
-ak config --init          # 可选：初始化 daemon 配置（8 个已知键的默认值 + 注释模板），
+ak config --init          # 可选：初始化 daemon 配置（6 个已知键的默认值 + 注释模板），
                                #   已存在则拒绝；连带创建 app 注册目录与 example.toml.sample
 ak config --edit          # 可选：用 $VISUAL/$EDITOR（缺省 vi/notepad）打开 daemon 配置，
                                #   不存在则创建；保存退出后自动校验，非法以退出码 2 报告
@@ -212,9 +212,8 @@ daemon（`examples/daemon.toml`，带注释模板在 `conf/daemon.toml`；app �
 log_level = "info"
 log_dir = "/var/log/appkeeper" # 可选；缺省 /tmp/appkeeper/logs，必须为绝对路径
 monitor_interval = 1.0
-host = "127.0.0.1"          # 控制平面仅回环
-port = 7310
-auth_token = ""             # 非空则要求 Bearer 鉴权
+# socket = "/run/appkeeper/1000/ak.sock"  # 可选；缺省 /run/appkeeper/<uid>/ak.sock
+                                           # （Windows 缺省 \\.\pipe\ak-<用户名>.sock）
 log_buffer_lines = 1000
 app_dir = "app.d"           # 注册目录，缺省 daemon 配置同级 app.d/（旧默认 apps/）
 
@@ -222,6 +221,12 @@ app_dir = "app.d"           # 注册目录，缺省 daemon 配置同级 app.d/�
 restart = "always"          # 启动/重启策略：no | on-failure | always | unless-stopped
 restart_backoff = 1.0
 ```
+
+> 旧键 `host` / `port` / `auth_token` 已随控制面改走本地 socket 而**移除**：
+> 配置文件里出现这三个键会被 `validate`/启动校验拒绝（见「升级注意」）。
+> 控制面不再监听任何 TCP 端口——「谁能控制守护进程」由操作系统的 socket
+> 属主直接回答（unix：socket `0600` + uid 目录 `0700`；Windows：命名管道
+> DACL），没有需要用户记得配置的默认关闭开关。
 
 > **`restart` 取代了旧的 `autostart` + `autorestart`**（docker 字面量语义）：
 > - `no`：退出不重启，守护启动/apply 不拉起；
@@ -257,12 +262,33 @@ reload 输出中说明，守护进程不受影响）：
 ```toml
 [webui]
 listen = "127.0.0.1:9877"   # 缺省 127.0.0.1:9877
+# auth_token = "<随机串>"    # 可选；配置后 /api/*（除 /api/health）与 /ws 要求凭据
 ```
 
 ```bash
 ak config --set webui.listen=127.0.0.1:9877   # 一次性写入（等价手改 [webui] 段）
 ak reload                                     # 守护在线时热开启；输出附 webui: 结果行
 ak config --delete webui                      # 删整段 = 关闭控制台；reload 热关闭
+```
+
+#### Web 控制台鉴权（可选）
+
+控制台必须保留 TCP（浏览器无法访问 unix socket），因此它是**控制面 socket
+之外唯一能执行 stop / apply 的入口**，鉴权模型与控制面不同（设计 D8）：
+
+- **未配置 `auth_token`（默认）**：`/api/*` 与 `/ws` 完全开放。这意味着
+  「开启 `[webui]` 且未配 token 时，任何能连到 `webui.listen` 的本地用户均可
+  执行 stop / apply」——socket 的属主隔离**不覆盖**控制台。`ak validate`
+  检测到这种组合会打印警告。
+- **配置 `auth_token`**：`/api/*`（除 `/api/health`）与 `/ws` 要求凭据。
+  浏览器做**一次性换票**：控制台收到 401 后弹出 token 输入框，`POST /api/auth`
+  （token 走 `X-Auth-Token` 请求头，不进 URL）换取一个 `HttpOnly` + `SameSite`
+  会话 cookie，之后所有请求（含 `/ws` 握手）凭 cookie 放行。token 本身不写入
+  URL、localStorage 或日志。
+
+```bash
+ak config --set webui.auth_token="$(openssl rand -hex 24)"
+ak reload
 ```
 
 app（部署目录 `appkeeper.toml`，`examples/demo-app/appkeeper.toml`）：
@@ -308,19 +334,22 @@ daemon 配置的脚本化管理入口，纯本地文件操作（不依赖运行�
 
 ```bash
 ak config --init                        # 全新初始化（拒绝覆盖既有文件）
-ak config --get port                    # 查询生效值：文件显式值优先，未设置回退内置默认（单键只打印值）
-ak config --get port --get host         # 多键查询：每行 key=value
-ak config --set port=8080 --set log_level=debug   # 白名单强类型写入（可重复）
-ak config --delete port                 # 删除（回到「未配置」态；幂等；点路径 daemon.port 等价）
+ak config --get socket                  # 查询生效值：文件显式值优先，未设置回退内置默认（单键只打印值）
+ak config --get socket --get log_dir    # 多键查询：每行 key=value
+ak config --set socket=/run/appkeeper/1000/ak.sock --set log_level=debug   # 白名单强类型写入（可重复）
+ak config --delete socket               # 删除（回到「未配置」态；幂等；点路径 daemon.socket 等价）
 ak config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存后校验
 ```
 
-- **白名单强类型**：`--set`/`--get`/`--delete` 接受 `[daemon]` 表的 8 个已知键
-  （`log_level`、`log_dir`、`monitor_interval`、`host`、`port`、`auth_token`、
-  `log_buffer_lines`、`app_dir`）与 `[webui]` 段的 `webui.listen`；`port` 限
-  1–65535 整数、`monitor_interval` 为正浮点、`log_buffer_lines` 为非负整数、
-  `log_level` ∈ trace|debug|info|warn|error、`webui.listen` 须为 host:port。
-  未知键或类型不符以退出码 2 拒绝，不落盘。
+- **白名单强类型**：`--set`/`--get`/`--delete` 接受 `[daemon]` 表的 6 个已知键
+  （`log_level`、`log_dir`、`monitor_interval`、`socket`、`log_buffer_lines`、
+  `app_dir`）与 `[webui]` 段的 `webui.listen` / `webui.auth_token`；
+  `socket` 为非空端点值（unix 限 107 字节内、空值拒绝），`monitor_interval`
+  为正浮点、`log_buffer_lines` 为非负整数、`log_level` ∈
+  trace|debug|info|warn|error、`webui.listen` 须为 host:port、
+  `webui.auth_token` 须为非空字符串。旧键 `host` / `port` / `auth_token`
+  已移除：set/get/delete 均以退出码 2 拒绝并指明改用 `socket`；配置文件里
+  出现这三个死键同样被校验拒绝。未知键或类型不符以退出码 2 拒绝，不落盘。
 - **读-改-写保留格式**：写入只改动目标键的值节点，未触碰键的顺序、值与注释原样保持。
 - **写后整体校验 + 原子落盘**：先写临时文件、整体校验通过后 rename 覆盖；校验失败
   回滚为原内容（磁盘不留半成品）。
@@ -429,7 +458,7 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
   `bash scripts/upgrade.sh` 调用外部脚本（相对路径按程序 `work_dir` 解析）。
 - **变量替换**：`${...}` 中以已知域开头的引用在 spawn 期替换——
   `program.<名>.pid|state|app|work_dir|log_dir`、`app.<名>.path`、
-  `daemon.pid|host|port|log_dir|app_dir`（程序名全局唯一，可跨程序引用）。
+  `daemon.pid|socket|log_dir|app_dir`（程序名全局唯一，可跨程序引用）。
   程序未运行时其 `pid` 替换为**空串**。`validate`/`reload` 会拒绝未知字段
   （拼错即报）；**非已知域的 `${...}` 原样保留给 shell**——`${HOME}` 等
   shell 变量不受影响。
@@ -441,11 +470,14 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
   `[program.<程序>.action.<动作>]`）；调用响应只带截断的输出尾部。动作不进
   状态投影，webui 不展示。
 - 动作执行不阻塞监督循环（独立工作线程）；动作命令等于配置作者在本机的
-  任意代码执行能力，与 health exec 同级信任模型，调用面受 Bearer 鉴权覆盖。
+  任意代码执行能力，与 health exec 同级信任模型，调用面受 socket 属主保护
+  （非属主用户连不上控制面）。
 
 ## 控制平面
 
-守护进程在 `host:port`（默认回环 7310）提供 JSON API：
+守护进程在**本地 socket**（unix 缺省 `/run/appkeeper/<uid>/ak.sock`，Windows
+`\\.\pipe\ak-<用户名>.sock`；`[daemon] socket` 可覆盖）上提供 HTTP/1.1 JSON API：
+
 `GET /v1/health|status|programs|programs/{name}|programs/{name}/logs`，
 `POST /v1/programs/{name}/start|stop|restart`（`?wait=1` 阻塞至启动判定，
 `run <name>` 使用）、`/v1/programs/{name}/signal`（白名单信号）、
@@ -455,10 +487,48 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
 无健康探测时仅回传终帧）、`POST /v1/run/commit|abort`（残留态补落盘 / 放弃）、
 `/v1/reload`（检出 pending 并返回预览）、
 `GET /v1/pending`、`POST /v1/apply`、`/v1/shutdown`。
-配置 `auth_token` 后除 `/v1/health` 外都要求 `Authorization: Bearer <token>`。
 `GET /v1/programs/{name}/logs?stream=out|err&tail=N&follow=1` 支持流式跟随。
 
-CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达。
+### 鉴权：身份由操作系统给出
+
+控制面**没有应用层鉴权，也没有任何 TCP 端口**：socket 文件权限 `0600`、
+所在 uid 目录 `0700`（Windows 命名管道以 DACL 显式收紧到运行账户 + SYSTEM +
+Administrators），内核在 connect 阶段直接拒绝非属主。同一台机器上 root 与
+普通用户可以各跑一个 daemon，端点互不可达、天然隔离。
+
+控制面连接失败有**专属区分**（退出码均为 3，但文案不同）：
+
+- 端点不存在 → 「守护进程不可达」（真没跑）；
+- 权限不足（端点在但属主是别的账户）→ 提示端点属主与当前用户不一致、
+  需更高权限——**不会**被表述成「守护进程未运行」，也无任何状态泄露。
+
+### 运维排障（HTTP 语义保留）
+
+socket 上承载的仍是标准 HTTP/1.1，端点集合与请求/响应结构与 TCP 时代一字不改，
+`curl --unix-socket` 可直接排障（unix）：
+
+```bash
+curl --unix-socket /run/appkeeper/$(id -u)/ak.sock http://localhost/v1/status
+curl --unix-socket /run/appkeeper/$(id -u)/ak.sock -X POST \
+     http://localhost/v1/programs/web/restart
+```
+
+Windows 无 `--unix-socket` 等价物，用 PowerShell 的 `NamedPipeClientStream`
+（调试工具缺口而非协议缺口）：
+
+```powershell
+$pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'ak-<用户名>.sock',
+    [System.IO.Pipes.PipeDirection]::InOut)
+$pipe.Connect(2000)
+$writer = [System.IO.StreamWriter]::new($pipe)
+$writer.Write("GET /v1/health HTTP/1.1`r`nHost: localhost`r`nConnection: close`r`n`r`n")
+$writer.Flush()
+$reader = [System.IO.StreamReader]::new($pipe)
+$reader.ReadToEnd()
+```
+
+CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达
+（含权限不足——见上文「专属区分」）。
 例外：`appkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
@@ -471,7 +541,7 @@ daemon-first**（run-daemon-first）：CLI 只把意图交给守护进程，由�
 
 | 形态 | 调用 | 行为 |
 | --- | --- | --- |
-| daemon | `ak daemon` / `ak daemon --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印监听地址与 `{log_dir}/daemon.out.log` 路径并返回 0） |
+| daemon | `ak daemon` / `ak daemon --detach` | 前台守护 / 后台守护（分离进程组，就绪后打印 socket 端点路径与 `{log_dir}/daemon.out.log` 路径并返回 0） |
 | 启动 | `ak run <name>` / `ak run --app <app>` | 经控制面 API 启动已注册程序 / 扇出启动整个 app；**阻塞至守护进程判定启动成功**（对已 running 程序返回 409，未知程序 404） |
 | ad-hoc | `ak run -- <cmd...>` / `ak run --cmd "<字符串>"` | 守护进程**先启动并确认启动成功、再落盘注册**；首 token 解析为绝对路径；立即生效 |
 
@@ -504,14 +574,17 @@ daemon-first**（run-daemon-first）：CLI 只把意图交给守护进程，由�
 **后台拉起协议**（`daemon --detach` 与 `add --apply` 共用）：派生
 `ak daemon -c <配置>`（unix `process_group(0)` / Windows
 `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`），stdio 追加写
-`{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`，总超时 ~10s。
-就绪即成功（并发拉起只留一个实例，端口竞争败者自灭）；超时以非零码退出并
-指明日志位置。守护进程为全局单例，不与调用方生命周期绑定。`run` 的**全部形态
+`{log_dir}/daemon.out.log`；以 ~200ms 间隔轮询 `/v1/health`（经控制面
+socket），总超时 ~10s。就绪即成功（并发拉起只留一个实例，socket 端点竞争
+败者自灭）；超时以非零码退出并指明日志位置。守护进程为全局单例（按
+uid / 用户名分层），不与调用方生命周期绑定。`run` 的**全部形态
 不再享有该隐式拉起**（离线一律退出 3）。
 
 Web 控制台与控制面同属一个守护进程：存在 `[webui]` 配置段时（见上文
-「Web 控制台开关」）另开一个回环端口，伺服内嵌 UI、`/api/*` 查询与 `/ws`
-WebSocket 推送——状态投影与本控制面完全一致（见下文 Web UI）。
+「Web 控制台开关」）另开一个回环 TCP 端口（浏览器无法访问 unix socket），
+伺服内嵌 UI、`/api/*` 查询与 `/ws` WebSocket 推送——状态投影与本控制面完全
+一致（见下文 Web UI）；控制台有自己独立的可选 `auth_token`（见上文
+「Web 控制台鉴权」），与控制面 socket 的 OS 鉴权互不相干。
 
 ### 交互式 shell（`appkeeper shell`）
 
@@ -609,12 +682,17 @@ HTTP API 与 WebSocket 同端口伺服。`/api/*` 与控制面 `/v1/*` 使用**�
 
 | 端点 | 说明 |
 |---|---|
-| `GET /api/health` | 存活探针 |
+| `GET /api/health` | 存活探针（不做鉴权） |
 | `GET /api/overview` | 守护进程概况 + 全部程序状态（JSON 快照） |
 | `GET /api/programs` | 程序状态列表 |
 | `GET /api/programs/{name}` | 单个程序详情 |
 | `GET /api/programs/{name}/logs?stream=out\|err&tail=n` | 日志末尾 n 行（取自内存环形缓冲） |
 | `POST /api/programs/{name}/start\|stop\|restart` | 控制命令（经命令队列由守护循环执行；非法迁移返回 409，响应 `{"result": …}`） |
+| `POST /api/auth` | 仅配置 `webui.auth_token` 后有意义：`X-Auth-Token` 头提交 token，换取 `HttpOnly` + `SameSite` 会话 cookie；URL 查询参数中的 token 不被接受 |
+
+未配置 `webui.auth_token` 时 `/api/*` 与 `/ws` 不做任何鉴权（见上文
+「Web 控制台鉴权」的隔离含义）；配置后除 `/api/health` 外全部要求会话
+cookie（或先换票），缺失/不匹配返回 401，`/ws` 拒绝握手。
 
 WebSocket `/ws`（二进制帧 = 1 字节类型 + 载荷，最高位=zlib 压缩标记）：
 
@@ -640,6 +718,38 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 第一层即 app-registry 的注册应用。服务端已按 `openspec/specs/webui-api`
 （变更 `webui-api`）实现：控制台 REST + WebSocket 实时推送，与控制面共享状态
 投影与命令队列；前端界面将在后续变更中按规格落地。
+
+## 升级注意（unix-socket-control-plane：控制面走本地 socket，鉴权归操作系统）
+
+本版把控制面传输层从 TCP 回环整体切换为**本地 socket**，并删除应用层 token。
+三处 BREAKING：
+
+- **守护进程不再监听任何控制面 TCP 端口**（默认 7310 消失）。防火墙/容器端口
+  映射里的相关条目失效；远程控制能力被移除（`run` 本就是纯客户端动词）。
+- **`[daemon]` 的 `host` / `port` / `auth_token` 三个键被删除**。既有配置文件
+  含其中任一键时 `validate`/启动校验**直接报错**（拒绝启动，不会静默忽略）。
+  迁移一行命令：
+
+  ```bash
+  ak config --delete host --delete port --delete auth_token   # 或手改 daemon.toml
+  ak validate   # 确认通过后再启动
+  ```
+
+  `validate` 的报错文案里也会给出同样的删除命令。
+- **客户端不再有 Bearer 鉴权**：身份由操作系统给出——unix socket `0600` +
+  uid 目录 `0700`（缺省 `/run/appkeeper/<uid>/ak.sock`），Windows 命名管道
+  DACL（运行账户 + SYSTEM + Administrators）。非 root 与多用户部署天然隔离；
+  新增可选 `[daemon] socket` 键覆盖缺省端点路径。
+
+配套变化：`daemon --detach` 就绪探测改走 socket（无 TCP 可探测）；systemd
+unit 新增 `RuntimeDirectory=appkeeper`（**已装机 unit 建议重新生成**
+`sudo ak service install --force --now`，旧 unit 也能用——守护进程会自建
+`/run/appkeeper` 目录链）；`appkeeper-bench` 的 `--connect/--token` 改为
+`--socket <path>`；排障方式见上文「运维排障」（`curl --unix-socket` /
+PowerShell `NamedPipeClientStream`）。
+
+**回滚提示**：换回旧版本二进制即可（旧版本里这三个键仍是合法键），无需清理
+配置；新版本在 `/run/appkeeper` 下留下的目录与 socket 文件不影响旧版启动。
 
 ## 升级注意（run-daemon-first：run 全形态 daemon-first）
 
@@ -762,6 +872,21 @@ sudo ak service uninstall          # stop + disable + 删除 unit + daemon-reloa
 配置不可加载时 90s）；需要定制可直接修改生成后的 unit 文件再
 `systemctl daemon-reload`。
 
+#### 非 root 与多用户部署
+
+生成的 unit 自带 `RuntimeDirectory=appkeeper`（systemd 挂 `/run/appkeeper`，
+`0755`，停机自动清理）——socket 的缺省端点 `/run/appkeeper/<uid>/ak.sock`
+建立在运行账户的 uid 子目录（`0700`，daemon 自建）之下：
+
+- `User=<name>` 的非 root unit：socket 落在 `/run/appkeeper/<该用户 uid>/ak.sock`，
+  无需 root 也可用；旧版 unit（无 `RuntimeDirectory`）同样可用——daemon 启动时
+  会自建整条目录链（`/run/appkeeper` 为 `0755`，uid 子目录为 `0700`）。
+- 同机多用户并存：root 与普通用户可各跑一个 daemon，uid 分层使两者端点互不
+  冲突、互不可达；客户端只连得属自己的端点，连别人的端点得到权限错误
+  （退出码 3 + 专属文案），不是「守护进程未运行」。
+- `[daemon] socket` 可显式覆盖端点路径（unix 限 107 字节内；指向自定义目录时
+  daemon 不会改动该目录的权限位）。
+
 Windows 暂不支持 `ak service`（nssm 仍可用）：
 
 ```bat
@@ -799,8 +924,8 @@ bytes/s、峰值/均值 RSS、轮转次数、wall time、逐行完整性校验�
 # 自带隔离环境（缺省）：临时 workspace 拉起自己的 daemon 与负载程序，结束自动清理
 appkeeper-bench --case firehose --duration 10
 
-# 连接已运行的 daemon（同机；daemon 开启 Bearer 鉴权时加 --token）
-appkeeper-bench --case firehose --connect 127.0.0.1:7310 --token <tok>
+# 连接已运行的 daemon（同机；指向其控制 socket）
+appkeeper-bench --case firehose --socket /run/appkeeper/$(id -u)/ak.sock
 
 # 导出机器可读报告
 appkeeper-bench --case rotation --log-rows 200000 --json report.json
@@ -827,9 +952,12 @@ appkeeper-bench --case rotation --log-rows 200000 --json report.json
 - **清理契约**：无论成功、失败或 Ctrl-C，自动卸载临时 app 并删除其日志文件
   （spawn 模式连临时 workspace 一并删除）；`--keep` 保留现场供检查（保留
   workspace/日志，临时 app 仍会卸载）。
-- **`--connect` 注意**：负载经由目标 daemon 写真实磁盘日志，量界参数请量力设置；
+- **`--socket` 注意**：负载经由目标 daemon 写真实磁盘日志，量界参数请量力设置；
   bench 与 daemon 必须同机（需读取其 app_dir 与 log_dir）；目标上已存在
   `appkeeper-bench-` 前缀 app 时拒绝开跑，绝不触碰非 bench 创建的 app 或文件。
+  隔离环境在短前缀临时目录里分配随机 socket 路径并启动后校验其权限位
+  （socket `0600`、目录 `0700`），不符即非零退出——被测守护进程的 per-user
+  隔离失效会直接判测量无效。
 - **与 `cargo run -p xtask -- stress` 的关系**：stress 是零反压/WS 背压的
   **验证**工具（CI 断言口径），bench 是面向用户的**测量**工具（对比 JSON 口径），
   两者实现独立、互不依赖。

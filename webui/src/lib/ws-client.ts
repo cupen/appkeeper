@@ -9,6 +9,12 @@
  *
  * The client is transport only: it reports events upward and holds no
  * domain state (the store merges snapshots/deltas).
+ *
+ * Credentials: the browser carries the console's session cookie on the
+ * handshake automatically (same origin, no `Sec-WebSocket-Protocol` hack and
+ * no token in the URL — a token in a URL lands in history and access logs).
+ * A refused handshake is reported through `handshakeRefused` so the store can
+ * route it into the same credential flow the HTTP calls use.
  */
 
 import {
@@ -29,6 +35,13 @@ export interface WsClientHandlers {
   gap(program: string, stream: 0 | 1, skipped: number): void
   error(message: string): void
   stateChange(state: WsState): void
+  /**
+   * The handshake was refused — the console asked for a credential (401 on
+   * the upgrade) or nothing is serving `/ws`. The caller decides which: it
+   * probes the REST surface, and only a 401 there raises the gate. That keeps
+   * a plain network blip from being reported as an auth problem.
+   */
+  handshakeRefused(): void
 }
 
 const BACKOFF_BASE_MS = 500
@@ -46,6 +59,8 @@ export class WsClient {
   private silenceTimer: ReturnType<typeof setTimeout> | null = null
   /** Serializes async frame decoding so ordering survives zlib inflation. */
   private decodeChain: Promise<void> = Promise.resolve()
+  /** Set once the socket has actually opened at least once. */
+  private everOpened = false
 
   constructor(url: string, handlers: WsClientHandlers) {
     this.url = url
@@ -92,6 +107,7 @@ export class WsClient {
 
     ws.onopen = () => {
       this.attempts = 0
+      this.everOpened = true
       this.armSilenceTimer()
       this.setState('open')
     }
@@ -116,6 +132,10 @@ export class WsClient {
         this.setState('closed')
         return
       }
+      // Refused before it ever opened: either the console wants a
+      // credential, or `/ws` is simply not reachable. The store probes the
+      // REST surface to tell those apart.
+      if (!this.everOpened) this.handlers.handshakeRefused()
       this.scheduleReconnect()
     }
   }

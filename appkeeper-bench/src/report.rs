@@ -104,7 +104,7 @@ fn render_params(p: &serde_json::Value) -> String {
         "rate",
         "duration",
         "programs",
-        "connect",
+        "socket",
     ];
     KEYS
         .iter()
@@ -181,7 +181,7 @@ mod tests {
             case: "firehose".into(),
             params: serde_json::json!({
                 "log_rows": 10000, "log_row_size": 128, "log_total_size": 0,
-                "rate": null, "duration": 30, "programs": 1, "connect": null
+                "rate": null, "duration": 30, "programs": 1, "socket": null
             }),
             programs: vec![ProgramMetrics {
                 name: "appkeeper-bench-firehose".into(),
@@ -257,7 +257,7 @@ mod tests {
         assert!(
             text.contains(
                 "params          : log_rows=10000, log_row_size=128, log_total_size=0, \
-                 rate=null, duration=30, programs=1, connect=null"
+                 rate=null, duration=30, programs=1, socket=null"
             ),
             "{text}"
         );

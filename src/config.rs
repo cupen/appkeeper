@@ -69,7 +69,10 @@ pub enum VarDomain {
 /// unique and cross-program references are allowed.
 pub const PROGRAM_VAR_FIELDS: [&str; 5] = ["pid", "state", "app", "work_dir", "log_dir"];
 pub const APP_VAR_FIELDS: [&str; 1] = ["path"];
-pub const DAEMON_VAR_FIELDS: [&str; 5] = ["pid", "host", "port", "log_dir", "app_dir"];
+/// `${daemon.socket}` replaced the removed `${daemon.host}` / `${daemon.port}`:
+/// the control endpoint is no longer an address you can dial, it is a path
+/// you cannot dial at all from a shell.
+pub const DAEMON_VAR_FIELDS: [&str; 4] = ["pid", "socket", "log_dir", "app_dir"];
 
 /// Parse the inside of one `${...}`. `None` = the content does not start with
 /// a known domain prefix, so it stays verbatim for the shell (e.g. `${HOME}`).
@@ -422,18 +425,27 @@ pub struct DaemonConfig {
 /// Built-in web console listen address (`webui.listen` default).
 pub const DEFAULT_WEBUI_LISTEN: &str = "127.0.0.1:9877";
 
-/// The optional `[webui]` section of the daemon config. Only `listen` exists
-/// for now; unknown keys are rejected like everywhere else.
+/// The optional `[webui]` section of the daemon config. `listen` selects the
+/// console's TCP address; `auth_token` (optional, empty by default) turns on
+/// the console's own credential check. The control plane has no token at all
+/// — its access is decided by the local IPC endpoint's owner
+/// (unix-socket-control-plane D1/D8). Unknown keys are rejected like
+/// everywhere else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebuiSettings {
     pub listen: String,
+    /// `None` = console access is decided by `webui.listen` alone. `Some` =
+    /// credentials required for `/api/*` and `/ws`; an empty `Some` is a
+    /// config error rather than a way to turn auth off.
+    pub auth_token: Option<String>,
 }
 
 impl Default for WebuiSettings {
     fn default() -> Self {
         Self {
             listen: DEFAULT_WEBUI_LISTEN.to_string(),
+            auth_token: None,
         }
     }
 }
@@ -482,17 +494,91 @@ fn default_log_dir() -> PathBuf {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct DaemonSettings {
     pub log_level: String,
     pub log_dir: PathBuf,
     pub monitor_interval: f64,
-    pub host: String,
-    pub port: u16,
-    pub auth_token: String,
+    /// The control-plane IPC endpoint: `/run/appkeeper/<uid>/ak.sock` on
+    /// unix, `\\.\pipe\ak-<username>.sock` on Windows. `host` / `port` /
+    /// `auth_token` used to live here; they are gone because the control
+    /// plane no longer listens on the network and no longer uses an
+    /// application-level credential (unix-socket-control-plane D1/D2/D7).
+    pub socket: PathBuf,
     pub log_buffer_lines: usize,
     pub app_dir: PathBuf,
+}
+
+/// The three `[daemon]` keys the control-plane move removed. They are
+/// accepted by the parser only so the error can name them and the fix,
+/// instead of the generic "unknown field" (D7: a dead key that silently sits
+/// in the file is worse than one that stops the daemon).
+pub const REMOVED_DAEMON_KEYS: [&str; 3] = ["host", "port", "auth_token"];
+
+fn removed_key_error(key: &str) -> String {
+    let replacement = if key == "host" || key == "port" {
+        "the control plane serves a local IPC endpoint now — set `socket` instead of the \
+         removed bind address (`ak config --set socket=<path>`), and delete this key with \
+         `ak config --delete"
+    } else {
+        "the control plane no longer uses an application token — access is decided by the \
+         owner of the local IPC endpoint (`socket`). Delete this key with `ak config --delete"
+    };
+    format!("daemon.{key} has been removed: {replacement} {key}`)")
+}
+
+/// Shape of the `[daemon]` table as it appears on disk: every live key
+/// optional (missing = built-in default) plus the removed ones, which exist
+/// only to produce a targeted rejection.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonSettingsRaw {
+    log_level: Option<String>,
+    log_dir: Option<PathBuf>,
+    monitor_interval: Option<f64>,
+    socket: Option<PathBuf>,
+    log_buffer_lines: Option<usize>,
+    app_dir: Option<PathBuf>,
+    host: Option<toml::Value>,
+    port: Option<toml::Value>,
+    auth_token: Option<toml::Value>,
+}
+
+impl<'de> serde::Deserialize<'de> for DaemonSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let raw = DaemonSettingsRaw::deserialize(d)?;
+        for key in REMOVED_DAEMON_KEYS {
+            let present = match key {
+                "host" => raw.host.is_some(),
+                "port" => raw.port.is_some(),
+                _ => raw.auth_token.is_some(),
+            };
+            if present {
+                return Err(D::Error::custom(removed_key_error(key)));
+            }
+        }
+        let mut out = DaemonSettings::default();
+        if let Some(v) = raw.log_level {
+            out.log_level = v;
+        }
+        if let Some(v) = raw.log_dir {
+            out.log_dir = v;
+        }
+        if let Some(v) = raw.monitor_interval {
+            out.monitor_interval = v;
+        }
+        if let Some(v) = raw.socket {
+            out.socket = v;
+        }
+        if let Some(v) = raw.log_buffer_lines {
+            out.log_buffer_lines = v;
+        }
+        if let Some(v) = raw.app_dir {
+            out.app_dir = v;
+        }
+        Ok(out)
+    }
 }
 
 impl Default for DaemonSettings {
@@ -501,9 +587,7 @@ impl Default for DaemonSettings {
             log_level: "info".into(),
             log_dir: default_log_dir(),
             monitor_interval: 1.0,
-            host: "127.0.0.1".into(),
-            port: 7310,
-            auth_token: String::new(),
+            socket: crate::transport::Endpoint::default_path(),
             log_buffer_lines: 1000,
             // Registry default name (run-daemon-first D9): `app.d` under the
             // daemon config's directory (production default
@@ -545,6 +629,22 @@ impl DaemonConfig {
         self.webui.as_ref().map(|w| w.listen.as_str())
     }
 
+    /// The console's optional access-control token; `None` = unauthenticated
+    /// (see the `webui-api` capability for what that means).
+    pub fn webui_auth_token(&self) -> Option<&str> {
+        self.webui
+            .as_ref()
+            .and_then(|w| w.auth_token.as_deref())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The control-plane IPC endpoint this config resolves to. Built-in
+    /// defaults land on [`crate::transport::Endpoint::default_endpoint`].
+    pub fn control_endpoint(&self) -> Result<crate::transport::Endpoint, String> {
+        crate::transport::Endpoint::parse(&self.daemon.socket.to_string_lossy())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut errors = Vec::new();
         let d = &self.daemon;
@@ -568,8 +668,8 @@ impl DaemonConfig {
                 d.monitor_interval
             ));
         }
-        if d.port == 0 {
-            errors.push("daemon.port: must be > 0".to_string());
+        if let Err(e) = self.control_endpoint() {
+            errors.push(format!("daemon.socket: {e}"));
         }
         if d.log_buffer_lines == 0 {
             errors.push("daemon.log_buffer_lines: must be > 0".to_string());
@@ -580,6 +680,11 @@ impl DaemonConfig {
         if let Some(w) = &self.webui {
             if let Err(e) = validate_listen_addr(&w.listen) {
                 errors.push(format!("webui.listen: {e}"));
+            }
+            // An empty `webui.auth_token` would silently read as "no auth",
+            // which is exactly the failure mode the key exists to prevent.
+            if w.auth_token.as_deref() == Some("") {
+                errors.push("webui.auth_token: must be a non-empty string".to_string());
             }
         }
         if errors.is_empty() {
@@ -1400,14 +1505,21 @@ fn parse_log_level(s: &str) -> std::result::Result<KeyValue, String> {
     }
 }
 
-fn parse_port(s: &str) -> std::result::Result<KeyValue, String> {
-    let v: u16 = s
-        .parse()
-        .map_err(|_| format!("port must be an integer in 1..=65535, got {s:?}"))?;
-    if v == 0 {
-        return Err("port must be an integer in 1..=65535".to_string());
+/// `daemon.socket`: the endpoint value is validated by the transport layer
+/// (same gate the loader applies), so an accepted write can never fail at
+/// bind time with a confusing message.
+fn parse_socket(s: &str) -> std::result::Result<KeyValue, String> {
+    crate::transport::Endpoint::parse(s).map_err(|e| e.to_string())?;
+    Ok(KeyValue::Str(s.to_string()))
+}
+
+/// `webui.auth_token`: non-empty. An empty value would read as "console is
+/// unauthenticated", which is never what a caller writing the key meant.
+fn parse_webui_auth_token(s: &str) -> std::result::Result<KeyValue, String> {
+    if s.is_empty() {
+        return Err("webui.auth_token: must be a non-empty string".to_string());
     }
-    Ok(KeyValue::Int(v as i64))
+    Ok(KeyValue::Str(s.to_string()))
 }
 
 fn parse_monitor_interval(s: &str) -> std::result::Result<KeyValue, String> {
@@ -1465,16 +1577,8 @@ pub const DAEMON_KEYS: &[DaemonKey] = &[
         parse: parse_monitor_interval,
     },
     DaemonKey {
-        name: "host",
-        parse: parse_string,
-    },
-    DaemonKey {
-        name: "port",
-        parse: parse_port,
-    },
-    DaemonKey {
-        name: "auth_token",
-        parse: parse_string,
+        name: "socket",
+        parse: parse_socket,
     },
     DaemonKey {
         name: "log_buffer_lines",
@@ -1491,11 +1595,19 @@ pub fn find_daemon_key(name: &str) -> Option<&'static DaemonKey> {
 }
 
 /// `[webui]` section keys (config-driven-webui): the section's presence
-/// enables the console, so `listen` is the only key — no `enabled` boolean.
-pub const WEBUI_KEYS: &[DaemonKey] = &[DaemonKey {
-    name: "listen",
-    parse: parse_webui_listen,
-}];
+/// enables the console, so `listen` is the only switch — there is no
+/// `enabled` boolean. `auth_token` is the console's own (optional)
+/// credential; it has nothing to do with the control plane, which has none.
+pub const WEBUI_KEYS: &[DaemonKey] = &[
+    DaemonKey {
+        name: "listen",
+        parse: parse_webui_listen,
+    },
+    DaemonKey {
+        name: "auth_token",
+        parse: parse_webui_auth_token,
+    },
+];
 
 fn find_webui_key(name: &str) -> Option<&'static DaemonKey> {
     WEBUI_KEYS.iter().find(|k| k.name == name)
@@ -1530,6 +1642,24 @@ fn known_key_list() -> String {
     names.join(", ")
 }
 
+/// A removed `[daemon]` key named by a `config` invocation, so `--set
+/// port=1` says "use socket" instead of "unknown key" (D7).
+fn removed_key_hint(key: &str) -> Option<String> {
+    let leaf = key.strip_prefix("daemon.").unwrap_or(key);
+    REMOVED_DAEMON_KEYS
+        .contains(&leaf)
+        .then(|| removed_key_error(leaf))
+}
+
+/// The "this key is gone" message a `config` command should print, or the
+/// generic unknown-key message when the key is simply wrong.
+fn unknown_key_message(key: &str) -> String {
+    match removed_key_hint(key) {
+        Some(hint) => hint,
+        None => format!("unknown config key {key:?} (known keys: {})", known_key_list()),
+    }
+}
+
 /// Display one `[daemon]` field for `--get`. Reads the typed field off the
 /// settings struct, so a file value and the built-in default render the same
 /// way (the default flows from `DaemonSettings::default`, never a literal).
@@ -1538,13 +1668,23 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
         "log_level" => settings.log_level.clone(),
         "log_dir" => settings.log_dir.to_string_lossy().into_owned(),
         "monitor_interval" => fmt_float(settings.monitor_interval),
-        "host" => settings.host.clone(),
-        "port" => settings.port.to_string(),
-        "auth_token" => settings.auth_token.clone(),
+        "socket" => settings.socket.to_string_lossy().into_owned(),
         "log_buffer_lines" => settings.log_buffer_lines.to_string(),
         "app_dir" => settings.app_dir.to_string_lossy().into_owned(),
         // Callers resolve names through DAEMON_KEYS first.
         _ => unreachable!("key table and display are in sync: {name:?}"),
+    }
+}
+
+/// `[webui]` field for `--get`; an absent section answers with the built-in
+/// default listen, and an unconfigured token answers with the empty string.
+pub fn webui_key_display(settings: Option<&WebuiSettings>, name: &str) -> String {
+    match name {
+        "listen" => settings
+            .map(|w| w.listen.clone())
+            .unwrap_or_else(|| DEFAULT_WEBUI_LISTEN.to_string()),
+        "auth_token" => settings.and_then(|w| w.auth_token.clone()).unwrap_or_default(),
+        other => unreachable!("webui key table and display are in sync: {other:?}"),
     }
 }
 
@@ -1555,10 +1695,7 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
 /// section is presence-based; the key itself keeps a default).
 pub fn config_effective_value(text: Option<&str>, name: &str) -> Result<String> {
     let Some((table, leaf)) = resolve_key(name) else {
-        bail!(
-            "unknown config key {name:?} (known keys: {})",
-            known_key_list()
-        );
+        bail!("{}", unknown_key_message(name));
     };
     let cfg = match text {
         None => DaemonConfig::empty(),
@@ -1572,11 +1709,7 @@ pub fn config_effective_value(text: Option<&str>, name: &str) -> Result<String> 
     };
     Ok(match table {
         "daemon" => daemon_key_display(&cfg.daemon, leaf),
-        "webui" => cfg
-            .webui
-            .as_ref()
-            .map(|w| w.listen.clone())
-            .unwrap_or_else(|| DEFAULT_WEBUI_LISTEN.to_string()),
+        "webui" => webui_key_display(cfg.webui.as_ref(), leaf),
         other => unreachable!("key tables are daemon|webui: {other:?}"),
     })
 }
@@ -1589,12 +1722,7 @@ pub fn parse_sets(pairs: &[String]) -> Result<Vec<(String, KeyValue)>> {
         let (k, v) = p
             .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("--set expects KEY=VALUE, got {p:?}"))?;
-        let key = resolve_key_table(k).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown config key {k:?} (known keys: {})",
-                known_key_list()
-            )
-        })?;
+        let key = resolve_key_table(k).ok_or_else(|| anyhow::anyhow!("{}", unknown_key_message(k)))?;
         let leaf = key_leaf(k);
         // The leaf parser is the strong-typed gate (resolve_key validated the
         // table membership; this validates the value).
@@ -1740,6 +1868,11 @@ enum DeleteTarget {
 }
 
 fn resolve_delete_target(path: &str) -> std::result::Result<DeleteTarget, String> {
+    // A removed key is reported before the generic unknown-key branches, so
+    // `--delete port` explains itself instead of listing the whitelist.
+    if let Some(hint) = removed_key_hint(path) {
+        return Err(hint);
+    }
     match path.split_once('.') {
         None => {
             if find_daemon_key(path).is_some() {
@@ -1901,7 +2034,7 @@ pub fn render_init_template() -> String {
 # `[webui]` section (optionally with `listen = \"127.0.0.1:9877\"`) to enable
 # it, or run `ak config --set webui.listen=127.0.0.1:9877` + reload.
 # Validate:  ak validate          Edit:  ak config --edit
-# Scripted:  ak config --get port | --set port=8080 | --delete port
+# Scripted:  ak config --get socket | --set socket=/tmp/ak.sock | --delete socket
 
 [daemon]
 # Daemon log level: trace | debug | info | warn | error.
@@ -1912,13 +2045,13 @@ log_level = {log_level}
 log_dir = {log_dir}
 # Supervision loop period in seconds, range (0, 60].
 monitor_interval = {monitor_interval}
-# Control-plane HTTP API bind address; the CLI and webui clients talk to it.
-# Loopback only by default — evaluate auth before exposing it.
-host = {host}
-port = {port}
-# Non-empty = the control plane requires `Authorization: Bearer <token>`
-# (CLI and webui must send the same value); empty = no auth.
-auth_token = {auth_token}
+# Control-plane endpoint: a local IPC socket (a named pipe on Windows).
+# HTTP/1.1 rides on it; the CLI, `ak shell` and appkeeper-bench all talk
+# here. Who may connect is decided by the OPERATING SYSTEM (socket mode
+# 0600 in a 0700 per-uid directory; a DACL on Windows) — there is no token.
+# The default below is per-uid, so root and a normal user can each run
+# their own daemon without colliding.
+socket = {socket}
 # Recent output lines kept in memory per stream (the source for
 # `ak log` and the webui live log).
 log_buffer_lines = {log_buffer_lines}
@@ -1930,9 +2063,7 @@ app_dir = {app_dir}
         log_level = s(&d.log_level),
         log_dir = s(&d.log_dir.to_string_lossy()),
         monitor_interval = fmt_float(d.monitor_interval),
-        host = s(&d.host),
-        port = d.port,
-        auth_token = s(&d.auth_token),
+        socket = s(&d.socket.to_string_lossy()),
         log_buffer_lines = d.log_buffer_lines,
         app_dir = s(&d.app_dir.to_string_lossy()),
     );
@@ -2175,7 +2306,7 @@ mod tests {
         assert!(app_of("[program.api]\ncommand='x'\n\n[program.api.action.i2]\ncommand = 'x ${program.api}'\n").is_err());
         // All documented variables validate.
         let ok = app_of(
-            "[program.api]\ncommand='x'\n\n[program.api.action.v]\ncommand = '''x ${program.api.pid} ${program.api.state} ${program.api.app} ${program.api.work_dir} ${program.api.log_dir} ${app.api.path} ${daemon.pid} ${daemon.host} ${daemon.port} ${daemon.log_dir} ${daemon.app_dir}'''",
+            "[program.api]\ncommand='x'\n\n[program.api.action.v]\ncommand = '''x ${program.api.pid} ${program.api.state} ${program.api.app} ${program.api.work_dir} ${program.api.log_dir} ${app.api.path} ${daemon.pid} ${daemon.socket} ${daemon.log_dir} ${daemon.app_dir}'''",
         );
         assert!(ok.is_ok(), "documented variables must validate: {ok:?}");
         // Shell-domain variables are not appkeeper's business.
@@ -2201,16 +2332,16 @@ mod tests {
                 (VarDomain::Program, "api", "work_dir") => Some("/opt/api".into()),
                 (VarDomain::Program, "down", "pid") => None, // not running
                 (VarDomain::App, "api", "path") => Some("/opt/api/appkeeper.toml".into()),
-                (VarDomain::Daemon, _, "port") => Some("7310".into()),
+                (VarDomain::Daemon, _, "socket") => Some("/run/appkeeper/0/ak.sock".into()),
                 _ => None,
             }
         };
         assert_eq!(
             substitute_vars(
-                "curl http://127.0.0.1:${daemon.port}/?pid=${program.api.pid}",
+                "curl --unix-socket ${daemon.socket} http://localhost/v1/status?pid=${program.api.pid}",
                 resolve
             ),
-            "curl http://127.0.0.1:7310/?pid=4242"
+            "curl --unix-socket /run/appkeeper/0/ak.sock http://localhost/v1/status?pid=4242"
         );
         // pid of a stopped program: empty string, observable in the command.
         assert_eq!(
@@ -2503,7 +2634,7 @@ mod tests {
     #[test]
     fn daemon_rejects_app_entries() {
         let r: Result<DaemonConfig, _> =
-            toml::from_str("[daemon]\nport = 1\n\n[[app]]\nname = \"x\"\n");
+            toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n\n[[app]]\nname = \"x\"\n");
         assert!(r.is_err(), "[[app]] must be rejected in daemon config");
     }
 
@@ -2564,7 +2695,8 @@ mod tests {
 mod config_cmd_tests {
     use super::*;
 
-    /// The key table covers exactly the 8 documented `[daemon]` keys.
+    /// The key table covers exactly the 6 documented `[daemon]` keys —
+    /// `host` / `port` / `auth_token` are gone with the control-plane move.
     #[test]
     fn key_table_lists_all_daemon_keys() {
         let names: Vec<_> = DAEMON_KEYS.iter().map(|k| k.name).collect();
@@ -2574,16 +2706,53 @@ mod config_cmd_tests {
                 "log_level",
                 "log_dir",
                 "monitor_interval",
-                "host",
-                "port",
-                "auth_token",
+                "socket",
                 "log_buffer_lines",
                 "app_dir"
             ]
         );
+        for removed in REMOVED_DAEMON_KEYS {
+            assert!(
+                !DAEMON_KEYS.iter().any(|k| k.name == removed),
+                "{removed} must not be writable"
+            );
+            assert!(config_apply_deletes("[daemon]\n", &[removed.to_string()]).is_err());
+            assert!(parse_sets(&[format!("{removed}=1")]).is_err());
+            assert!(config_effective_value(None, removed).is_err());
+        }
+        // A removed key says what replaced it rather than "unknown key".
+        let err = parse_sets(&["port=7310".to_string()]).unwrap_err().to_string();
+        assert!(err.contains("removed"), "{err}");
+        assert!(err.contains("socket"), "{err}");
     }
 
-    /// Every key accepts legal values and rejects type violations (task 2.1).
+    /// `socket` is a path, gated by the same rule the transport applies, so
+    /// a value `config --set` accepts can never fail at bind time.
+    #[test]
+    fn socket_value_is_gated_by_the_transport() {
+        let parse = |v: &str| (find_daemon_key("socket").unwrap().parse)(v);
+        assert_eq!(
+            parse("/run/appkeeper/1000/ak.sock").unwrap(),
+            KeyValue::Str("/run/appkeeper/1000/ak.sock".into())
+        );
+        assert!(parse("").is_err(), "empty socket is rejected");
+        assert!(
+            parse(&format!("/tmp/{}/ak.sock", "x".repeat(200))).is_err(),
+            "an over-long endpoint is rejected at write time"
+        );
+    }
+
+    /// `webui.auth_token` is the console's own credential; empty is a config
+    /// error rather than a way to turn the check off.
+    #[test]
+    fn webui_auth_token_is_a_non_empty_string() {
+        let parse = |v: &str| (find_webui_key("auth_token").unwrap().parse)(v);
+        assert_eq!(parse("s3cr3t").unwrap(), KeyValue::Str("s3cr3t".into()));
+        assert!(parse("").is_err(), "empty token must be rejected");
+        assert!(WEBUI_KEYS.iter().any(|k| k.name == "auth_token"));
+    }
+
+    /// Every key accepts legal values and rejects type violations (task 4.3).
     #[test]
     fn key_parsers_accept_legal_and_reject_illegal() {
         let parse = |k: &str, v: &str| {
@@ -2596,13 +2765,6 @@ mod config_cmd_tests {
         }
         assert!(parse("log_level", "verbose").is_err());
         assert!(parse("log_level", "INFO").is_err());
-        // port: u16 1..=65535.
-        assert_eq!(parse("port", "8080").unwrap(), KeyValue::Int(8080));
-        assert_eq!(parse("port", "1").unwrap(), KeyValue::Int(1));
-        assert_eq!(parse("port", "65535").unwrap(), KeyValue::Int(65535));
-        for bad in ["abc", "0", "-1", "65536", "8080.5", ""] {
-            assert!(parse("port", bad).is_err(), "port {bad:?} must be rejected");
-        }
         // monitor_interval: positive float.
         assert_eq!(
             parse("monitor_interval", "0.5").unwrap(),
@@ -2631,7 +2793,7 @@ mod config_cmd_tests {
             );
         }
         // Strings accept anything.
-        for k in ["log_dir", "host", "auth_token", "app_dir"] {
+        for k in ["log_dir", "app_dir"] {
             assert_eq!(
                 parse(k, "anything").unwrap(),
                 KeyValue::Str("anything".into())
@@ -2645,10 +2807,13 @@ mod config_cmd_tests {
     #[test]
     fn effective_value_file_priority_and_default_fallback() {
         // Missing file == all defaults (spec: 文件缺失全默认).
-        assert_eq!(config_effective_value(None, "port").unwrap(), "7310");
         assert_eq!(
-            config_effective_value(None, "host").unwrap(),
-            DaemonSettings::default().host
+            config_effective_value(None, "socket").unwrap(),
+            DaemonSettings::default()
+                .socket
+                .to_string_lossy()
+                .into_owned(),
+            "socket falls back to the uid/user-derived default path"
         );
         assert_eq!(
             config_effective_value(None, "log_dir").unwrap(),
@@ -2662,19 +2827,29 @@ mod config_cmd_tests {
             "1.0"
         );
         // File value wins.
-        let text = "[daemon]\nport = 8080\n";
-        assert_eq!(config_effective_value(Some(text), "port").unwrap(), "8080");
+        let text = "[daemon]\nsocket = \"/tmp/ak-test.sock\"\n";
+        assert_eq!(
+            config_effective_value(Some(text), "socket").unwrap(),
+            "/tmp/ak-test.sock"
+        );
         // Unset key in an existing file still falls back to the default
         // (spec: 回退内置默认).
         assert_eq!(
-            config_effective_value(Some(text), "host").unwrap(),
-            "127.0.0.1"
+            config_effective_value(Some(text), "log_buffer_lines").unwrap(),
+            "1000"
         );
+        // The removed keys are rejected with an explanation, not as unknowns.
+        for removed in REMOVED_DAEMON_KEYS {
+            let err = config_effective_value(None, removed).unwrap_err().to_string();
+            assert!(err.contains("removed"), "{removed}: {err}");
+        }
         // Unknown key is rejected; an invalid file is rejected.
         assert!(config_effective_value(None, "foo").is_err());
         assert!(config_effective_value(None, "webui").is_err());
-        assert!(config_effective_value(Some("bogus_field = 1"), "port").is_err());
-        assert!(config_effective_value(Some("[daemon]\nlog_dir = \"rel\"\n"), "port").is_err());
+        assert!(config_effective_value(Some("bogus_field = 1"), "socket").is_err());
+        assert!(
+            config_effective_value(Some("[daemon]\nlog_dir = \"rel\"\n"), "socket").is_err()
+        );
     }
 
     /// --set keeps untouched keys' order, values and comments byte-for-byte;
@@ -2687,15 +2862,22 @@ mod config_cmd_tests {
 # first key
 log_level = \"info\"
 log_buffer_lines = 7          # custom order + trailing note
-# the port comment
-port = 1234 # trailing
+# the socket comment
+socket = \"/tmp/old.sock\" # trailing
 app_dir = \"apps\"
 
 [app-default]
 autostart = true
 ";
         let rendered =
-            config_apply_sets(base, &[("port".to_string(), KeyValue::Int(8080))]).unwrap();
+            config_apply_sets(
+                base,
+                &[(
+                    "socket".to_string(),
+                    KeyValue::Str("/tmp/new.sock".into()),
+                )],
+            )
+            .unwrap();
         // The result must still be a valid config.
         load_daemon_text(&rendered).unwrap();
         // Untouched content is byte-identical.
@@ -2704,7 +2886,7 @@ autostart = true
             "# first key",
             "log_level = \"info\"",
             "log_buffer_lines = 7          # custom order + trailing note",
-            "# the port comment",
+            "# the socket comment",
             "app_dir = \"apps\"",
             "[app-default]",
             "autostart = true",
@@ -2715,12 +2897,15 @@ autostart = true
             );
         }
         // The value changed; the key's own trailing comment survives.
-        assert!(rendered.contains("port = 8080 # trailing"), "{rendered}");
-        assert!(!rendered.contains("1234"), "{rendered}");
+        assert!(
+            rendered.contains("socket = \"/tmp/new.sock\" # trailing"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/tmp/old.sock"), "{rendered}");
         // Re-read: the new value is effective.
         assert_eq!(
-            config_effective_value(Some(&rendered), "port").unwrap(),
-            "8080"
+            config_effective_value(Some(&rendered), "socket").unwrap(),
+            "/tmp/new.sock"
         );
     }
 
@@ -2728,7 +2913,7 @@ autostart = true
     /// the caller never writes (spec: 校验失败回滚不落盘).
     #[test]
     fn set_rejects_configs_that_fail_whole_validation() {
-        let base = "[daemon]\nport = 1234\n";
+        let base = "[daemon]\nsocket = \"/tmp/ak.sock\"\n";
         // log_dir parses as a string but violates the absolute-path rule.
         let r = config_apply_sets(
             base,
@@ -2737,8 +2922,11 @@ autostart = true
         assert!(r.is_err(), "invalid whole config must be rejected");
         // The base itself was invalid → refuse to touch (design D2).
         assert!(
-            config_apply_sets("bogus_field = 1", &[("port".to_string(), KeyValue::Int(1))])
-                .is_err()
+            config_apply_sets(
+                "bogus_field = 1",
+                &[("app_dir".to_string(), KeyValue::Str("x".into()))],
+            )
+            .is_err()
         );
     }
 
@@ -2748,33 +2936,36 @@ autostart = true
     fn set_creates_missing_daemon_table_and_handles_dotted_style() {
         let rendered = config_apply_sets(
             "\n[app-default]\nautostart = true\n",
-            &[("port".to_string(), KeyValue::Int(1))],
+            &[("app_dir".to_string(), KeyValue::Str("apps".into()))],
         )
         .unwrap();
         assert_eq!(
-            config_effective_value(Some(&rendered), "port").unwrap(),
-            "1"
+            config_effective_value(Some(&rendered), "app_dir").unwrap(),
+            "apps"
         );
         // Dotted style.
-        let dotted = "daemon.port = 1234\n";
-        let rendered =
-            config_apply_sets(dotted, &[("port".to_string(), KeyValue::Int(9999))]).unwrap();
+        let dotted = "daemon.app_dir = \"a\"\n";
+        let rendered = config_apply_sets(
+            dotted,
+            &[("app_dir".to_string(), KeyValue::Str("b".into()))],
+        )
+        .unwrap();
         assert_eq!(
-            config_effective_value(Some(&rendered), "port").unwrap(),
-            "9999"
+            config_effective_value(Some(&rendered), "app_dir").unwrap(),
+            "b"
         );
     }
 
     /// parse_sets validates every pair up front (all-or-nothing).
     #[test]
     fn parse_sets_is_all_or_nothing() {
-        let pairs = vec!["port=8080".to_string(), "foo=1".to_string()];
+        let pairs = vec!["log_buffer_lines=80".to_string(), "foo=1".to_string()];
         assert!(parse_sets(&pairs).is_err(), "unknown key rejects the batch");
-        let pairs = vec!["port".to_string()];
+        let pairs = vec!["log_buffer_lines".to_string()];
         assert!(parse_sets(&pairs).is_err(), "missing '=' is rejected");
-        let pairs = vec!["port=1".to_string(), "log_level=debug".to_string()];
+        let pairs = vec!["socket=/tmp/a.sock".to_string(), "log_level=debug".to_string()];
         let out = parse_sets(&pairs).unwrap();
-        assert_eq!(out[0].0, "port");
+        assert_eq!(out[0].0, "socket");
         assert_eq!(out[1].1, KeyValue::Str("debug".into()));
     }
 
@@ -2782,27 +2973,31 @@ autostart = true
     /// keeps everything else, and the deleted key falls back to its default.
     #[test]
     fn delete_removes_key_and_falls_back_to_default() {
+        // The comment sits above `socket`, so it goes with it (a comment
+        // attached to a key is that key's decor); `log_buffer_lines` keeps
+        // its own comment and must survive.
         let base = "\
 [daemon]
-# host note
-host = \"0.0.0.0\"
-port = 8080
-log_buffer_lines = 7
+socket = \"/tmp/old.sock\"
+log_buffer_lines = 7   # kept note
 ";
-        let rendered = match config_apply_deletes(base, &["port".to_string()]).unwrap() {
+        let rendered = match config_apply_deletes(base, &["socket".to_string()]).unwrap() {
             DeleteOutcome::Changed(t) => t,
             other => panic!("expected Changed, got {other:?}"),
         };
-        for snippet in ["# host note", "host = \"0.0.0.0\"", "log_buffer_lines = 7"] {
+        for snippet in ["# kept note"] {
             assert!(
                 rendered.contains(snippet),
                 "lost {snippet:?} in:\n{rendered}"
             );
         }
-        assert!(!rendered.contains("port"), "{rendered}");
+        assert!(!rendered.contains("/tmp/old.sock"), "{rendered}");
         assert_eq!(
-            config_effective_value(Some(&rendered), "port").unwrap(),
-            "7310",
+            config_effective_value(Some(&rendered), "socket").unwrap(),
+            DaemonSettings::default()
+                .socket
+                .to_string_lossy()
+                .into_owned(),
             "deleted key falls back to the built-in default"
         );
         load_daemon_text(&rendered).unwrap();
@@ -2811,14 +3006,23 @@ log_buffer_lines = 7
     /// Deleting an absent key is an idempotent NoChange (file untouched).
     #[test]
     fn delete_absent_key_is_idempotent() {
-        let base = "[daemon]\nport = 8080\n";
+        let base = "[daemon]\nsocket = \"/tmp/ak.sock\"\n";
         assert_eq!(
-            config_apply_deletes(base, &["host".to_string()]).unwrap(),
+            config_apply_deletes(base, &["log_dir".to_string()]).unwrap(),
             DeleteOutcome::NoChange
         );
         // No [daemon] table at all: still a NoChange.
         assert_eq!(
-            config_apply_deletes("[app-default]\nautostart = true\n", &["port".to_string()])
+            config_apply_deletes(
+                "[app-default]\nautostart = true\n",
+                &["socket".to_string()]
+            )
+            .unwrap(),
+            DeleteOutcome::NoChange
+        );
+        // Deleting an absent `socket` is idempotent (spec: 目标不存在幂等成功).
+        assert_eq!(
+            config_apply_deletes("[daemon]\nlog_dir = \"/tmp/l\"\n", &["socket".to_string()])
                 .unwrap(),
             DeleteOutcome::NoChange
         );
@@ -2829,18 +3033,32 @@ log_buffer_lines = 7
     /// section deletes as a whole with its bare table name.
     #[test]
     fn delete_resolves_paths_and_rejects_unknowns() {
-        // Bare key ≡ daemon.port.
-        let rendered =
-            match config_apply_deletes("[daemon]\nport = 1\n", &["port".to_string()]).unwrap() {
-                DeleteOutcome::Changed(t) => t,
-                other => panic!("expected Changed, got {other:?}"),
-            };
-        assert!(!rendered.contains("port"), "{rendered}");
+        // Bare key ≡ daemon.socket.
+        let rendered = match config_apply_deletes(
+            "[daemon]\nsocket = \"/tmp/a.sock\"\n",
+            &["socket".to_string()],
+        )
+        .unwrap()
+        {
+            DeleteOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(!rendered.contains("/tmp/a.sock"), "{rendered}");
         // Explicit dotted form works too.
-        let r = config_apply_deletes("[daemon]\nport = 1\n", &["daemon.port".to_string()]);
+        let r = config_apply_deletes(
+            "[daemon]\nsocket = \"/tmp/a.sock\"\n",
+            &["daemon.socket".to_string()],
+        );
         assert!(matches!(r, Ok(DeleteOutcome::Changed(_))), "{r:?}");
+        // A removed key is rejected with an explanation, not treated as
+        // unknown or silently ignored.
+        for removed in REMOVED_DAEMON_KEYS {
+            let r = config_apply_deletes("[daemon]\n", &[removed.to_string()]);
+            let err = format!("{:#}", r.unwrap_err());
+            assert!(err.contains("removed"), "{removed}: {err}");
+        }
         // `--delete webui` removes the whole [webui] section (console off).
-        let base = "[daemon]\nport = 1\n\n[webui]\n# console note\nlisten = \"127.0.0.1:9877\"\n";
+        let base = "[daemon]\nsocket = \"/tmp/a.sock\"\n\n[webui]\n# console note\nlisten = \"127.0.0.1:9877\"\n";
         let rendered = match config_apply_deletes(base, &["webui".to_string()]).unwrap() {
             DeleteOutcome::Changed(t) => t,
             other => panic!("expected Changed, got {other:?}"),
@@ -2850,7 +3068,7 @@ log_buffer_lines = 7
             "{rendered}"
         );
         assert!(
-            rendered.contains("port = 1"),
+            rendered.contains("socket = \"/tmp/a.sock\""),
             "untouched [daemon] kept: {rendered}"
         );
         assert!(
@@ -2859,7 +3077,7 @@ log_buffer_lines = 7
         );
         // Idempotent when the section is absent.
         assert_eq!(
-            config_apply_deletes("[daemon]\nport = 1\n", &["webui".to_string()]).unwrap(),
+            config_apply_deletes("[daemon]\n", &["webui".to_string()]).unwrap(),
             DeleteOutcome::NoChange
         );
         // Unknown leaf, unknown table, bare table name, deeper path.
@@ -2868,18 +3086,18 @@ log_buffer_lines = 7
             "webui.theme",
             "webui.listen.x",
             "daemon",
-            "daemon.port.x",
+            "daemon.socket.x",
             "daemon.foo",
         ] {
-            let r = config_apply_deletes("[daemon]\nport = 1\n", &[bad.to_string()]);
+            let r = config_apply_deletes("[daemon]\n", &[bad.to_string()]);
             assert!(r.is_err(), "{bad:?} must be rejected");
         }
         // Rejected batches leave nothing half-done (all-or-nothing).
-        let pairs = vec!["port".to_string(), "foo".to_string()];
-        let r = config_apply_deletes("[daemon]\nport = 1\n", &pairs);
+        let pairs = vec!["socket".to_string(), "foo".to_string()];
+        let r = config_apply_deletes("[daemon]\n", &pairs);
         assert!(r.is_err(), "one unknown key rejects the whole batch");
         // An invalid base file is refused before anything is removed.
-        assert!(config_apply_deletes("bogus = 1", &["port".to_string()]).is_err());
+        assert!(config_apply_deletes("bogus = 1", &["socket".to_string()]).is_err());
     }
 
     /// --delete is repeatable: one call removes several targets (bare and
@@ -2890,18 +3108,18 @@ log_buffer_lines = 7
         // Table style, mixed bare + dotted targets.
         let base = "\
 [daemon]
-# port note
-port = 8080
-host = \"0.0.0.0\"
+# socket note
+socket = \"/tmp/old.sock\"
+app_dir = \"apps\"
 log_buffer_lines = 7
 ";
         let rendered =
-            match config_apply_deletes(base, &["port".to_string(), "daemon.host".to_string()]) {
+            match config_apply_deletes(base, &["socket".to_string(), "daemon.app_dir".to_string()]) {
                 Ok(DeleteOutcome::Changed(t)) => t,
                 other => panic!("expected Changed, got {other:?}"),
             };
-        assert!(!rendered.contains("port"), "{rendered}");
-        assert!(!rendered.contains("host"), "{rendered}");
+        assert!(!rendered.contains("/tmp/old.sock"), "{rendered}");
+        assert!(!rendered.contains("app_dir"), "{rendered}");
         assert!(
             rendered.contains("log_buffer_lines = 7"),
             "the untouched key survives: {rendered}"
@@ -2909,14 +3127,14 @@ log_buffer_lines = 7
         load_daemon_text(&rendered).unwrap();
 
         // Dotted-key style (parses as an inline table): both targets go.
-        let dotted = "daemon.port = 8080\ndaemon.host = \"0.0.0.0\"\n";
-        let rendered = match config_apply_deletes(dotted, &["port".to_string(), "host".to_string()])
-        {
-            Ok(DeleteOutcome::Changed(t)) => t,
-            other => panic!("expected Changed, got {other:?}"),
-        };
+        let dotted = "daemon.socket = \"/tmp/old.sock\"\ndaemon.app_dir = \"apps\"\n";
+        let rendered =
+            match config_apply_deletes(dotted, &["socket".to_string(), "app_dir".to_string()]) {
+                Ok(DeleteOutcome::Changed(t)) => t,
+                other => panic!("expected Changed, got {other:?}"),
+            };
         assert!(
-            !rendered.contains("port") && !rendered.contains("host"),
+            !rendered.contains("/tmp/old.sock") && !rendered.contains("app_dir"),
             "{rendered}"
         );
         load_daemon_text(&rendered).unwrap();
@@ -2933,9 +3151,7 @@ log_buffer_lines = 7
         assert_eq!(cfg.daemon.log_level, d.log_level);
         assert_eq!(cfg.daemon.log_dir, d.log_dir);
         assert_eq!(cfg.daemon.monitor_interval, d.monitor_interval);
-        assert_eq!(cfg.daemon.host, d.host);
-        assert_eq!(cfg.daemon.port, d.port);
-        assert_eq!(cfg.daemon.auth_token, d.auth_token);
+        assert_eq!(cfg.daemon.socket, d.socket);
         assert_eq!(cfg.daemon.log_buffer_lines, d.log_buffer_lines);
         assert_eq!(cfg.daemon.app_dir, d.app_dir);
         // The template guides the out-of-the-box experience with an explicit
@@ -2945,7 +3161,13 @@ log_buffer_lines = 7
         // Comments survive the round-trip (init is the first-contact docs).
         assert!(text.contains("[app-default]"));
         assert!(text.contains("restart = \"always\""));
-        assert!(text.contains("auth_token = \"\""));
+        assert!(text.contains("socket = "), "socket is documented in the template");
+        for removed in REMOVED_DAEMON_KEYS {
+            assert!(
+                !text.contains(&format!("{removed} =")),
+                "{removed} must not appear as a live key in the template"
+            );
+        }
         assert!(text.contains("app_dir = \"app.d\""));
         assert!(
             text.contains("resolves against the directory of THIS config file"),
@@ -3030,14 +3252,14 @@ log_buffer_lines = 7
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg_path = tmp.join("daemon.toml");
-        std::fs::write(&cfg_path, "[daemon]\nport = 1\n").unwrap();
+        std::fs::write(&cfg_path, "[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
 
-        let bad = "[daemon]\nport = 1\nbogus_field = 2\n";
+        let bad = "[daemon]\nsocket = \"/tmp/ak.sock\"\nbogus_field = 2\n";
         let r = atomic_write_daemon_config(&cfg_path, bad);
         assert!(r.is_err(), "invalid payload must be rejected");
         assert_eq!(
             std::fs::read_to_string(&cfg_path).unwrap(),
-            "[daemon]\nport = 1\n",
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
             "the target was not modified"
         );
         assert!(
@@ -3046,10 +3268,10 @@ log_buffer_lines = 7
         );
 
         // A valid payload replaces the target and cleans up the temp file.
-        atomic_write_daemon_config(&cfg_path, "[daemon]\nport = 8080\n").unwrap();
+        atomic_write_daemon_config(&cfg_path, "[daemon]\nsocket = \"/tmp/new.sock\"\n").unwrap();
         assert_eq!(
             std::fs::read_to_string(&cfg_path).unwrap(),
-            "[daemon]\nport = 8080\n"
+            "[daemon]\nsocket = \"/tmp/new.sock\"\n"
         );
         assert!(!tmp.join("daemon.toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3063,7 +3285,7 @@ log_buffer_lines = 7
     #[test]
     fn webui_section_parse_and_validate() {
         // No section: disabled.
-        let none: DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        let none: DaemonConfig = toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
         assert!(none.webui.is_none());
         assert_eq!(none.webui_listen(), None);
         assert!(none.validate().is_ok());
@@ -3114,7 +3336,7 @@ log_buffer_lines = 7
         // Existing file without the section → default (console off, but the
         // key still answers with its default).
         assert_eq!(
-            config_effective_value(Some("[daemon]\nport = 1\n"), "webui.listen").unwrap(),
+            config_effective_value(Some("[daemon]\nsocket = \"/tmp/ak.sock\"\n"), "webui.listen").unwrap(),
             "127.0.0.1:9877"
         );
         // Section present → its value.
@@ -3128,8 +3350,9 @@ log_buffer_lines = 7
         assert!(config_effective_value(None, "webui").is_err());
         // daemon.<leaf> dotted form works for --get too.
         assert_eq!(
-            config_effective_value(Some("[daemon]\nport = 1\n"), "daemon.port").unwrap(),
-            "1"
+            config_effective_value(Some("[daemon]\nsocket = \"/tmp/ak.sock\"\n"), "daemon.socket")
+                .unwrap(),
+            "/tmp/ak.sock"
         );
     }
 
@@ -3140,7 +3363,7 @@ log_buffer_lines = 7
     fn set_webui_listen_creates_section_and_validates() {
         // Creates the section on a config without one.
         let rendered = config_apply_sets(
-            "[daemon]\nport = 1234\n",
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
             &[(
                 "webui.listen".to_string(),
                 KeyValue::Str("127.0.0.1:9877".into()),
@@ -3174,9 +3397,12 @@ log_buffer_lines = 7
         );
         // The daemon table is untouched.
         let rendered = config_apply_sets(
-            "[daemon]\nport = 1234\n",
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
             &[
-                ("port".to_string(), KeyValue::Int(4321)),
+                (
+                    "app_dir".to_string(),
+                    KeyValue::Str("apps".into()),
+                ),
                 (
                     "webui.listen".to_string(),
                     KeyValue::Str("127.0.0.1:9877".into()),
@@ -3185,7 +3411,7 @@ log_buffer_lines = 7
         )
         .unwrap();
         assert!(
-            rendered.contains("port = 4321") && rendered.contains("[webui]"),
+            rendered.contains("app_dir = \"apps\"") && rendered.contains("[webui]"),
             "{rendered}"
         );
         // parse_sets routes the webui key through the strong-typed parser.

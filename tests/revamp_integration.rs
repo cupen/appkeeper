@@ -12,41 +12,130 @@
 //! the unit tests: the shutdown-does-not-write-a-record contract, the
 //! `unless-stopped` record across repeated daemon restarts, `always` pull-up
 //! after a manual stop, the offline `run --` cold start, `daemon --detach`
-//! timeout against an occupied port, and `log` dual-stream / multi-program
-//! follow aggregation.
+//! timeout against an occupied endpoint, and `log` dual-stream / multi-program
+//! follow aggregation — plus the unix-socket-control-plane acceptance
+//! scenarios (section 8 of its tasks.md): stale-endpoint recovery, non-endpoint
+//! occupation, `curl --unix-socket` interoperability and the multi-user
+//! isolation contract (the latter conditionally: it needs root + a second
+//! account, which CI and developer machines usually lack).
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Raw HTTP/1.1 over the control endpoint: a unix domain socket on unix, a
+/// named pipe on Windows. The wire contract is exactly what the daemon serves,
+/// so these tests speak HTTP themselves instead of only going through the CLI.
+/// (The Windows branch opens the pipe client end through the filesystem
+/// namespace; it compiles everywhere but is only exercised on Windows hosts.)
+mod sockio {
+    use std::io::{self, Read, Write};
+
+    pub trait Rw: Read + Write {}
+    impl<T: Read + Write> Rw for T {}
+
+    pub fn connect(endpoint: &str) -> io::Result<Box<dyn Rw>> {
+        connect_platform(endpoint)
+    }
+
+    #[cfg(unix)]
+    fn connect_platform(endpoint: &str) -> io::Result<Box<dyn Rw>> {
+        use std::os::unix::net::UnixStream;
+        Ok(Box::new(UnixStream::connect(endpoint)?))
+    }
+
+    #[cfg(windows)]
+    fn connect_platform(endpoint: &str) -> io::Result<Box<dyn Rw>> {
+        Ok(Box::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(endpoint)?,
+        ))
+    }
+
+    /// One request, response read to EOF (the control plane always sends
+    /// `Connection: close`). `None` = the endpoint is unreachable.
+    pub fn request(endpoint: &str, req: &str) -> Option<String> {
+        let mut c = connect(endpoint).ok()?;
+        c.write_all(req.as_bytes()).ok()?;
+        let mut buf = Vec::new();
+        c.read_to_end(&mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    pub fn get(endpoint: &str, path: &str) -> Option<String> {
+        request(
+            endpoint,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    pub fn post_json(endpoint: &str, path: &str, body: &str) -> Option<String> {
+        request(
+            endpoint,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+}
 
 /// The daemon/CLI binary under test (provided by cargo for integration tests).
 fn bin() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_ak"))
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// One isolated daemon workspace: temp root with apps/logs, its own config and
-/// a random control port.
+/// its own control endpoint (a socket inside the workspace).
 struct Ws {
     root: PathBuf,
-    port: u16,
+    /// The control endpoint the config pins: a filesystem path on unix, a pipe
+    /// name on Windows.
+    endpoint: String,
 }
 
 impl Ws {
+    /// The `[daemon] socket` value for this workspace. On unix the path must
+    /// stay under `sun_path` (~107 bytes): `/tmp/xk-revamp-it-<tag>-<pid>` is
+    /// comfortably short for every tag used here.
+    fn endpoint_for(root: &Path, tag: &str) -> String {
+        #[cfg(unix)]
+        {
+            let _ = tag;
+            root.join("ak.sock").to_string_lossy().into_owned()
+        }
+        #[cfg(windows)]
+        {
+            let _ = root;
+            format!(r"\\.\pipe\ak-it-{tag}-{}.sock", std::process::id())
+        }
+    }
+
+    /// The TOML rendering of the endpoint (a basic string path on unix; a
+    /// literal string on Windows, where the backslashes must survive).
+    fn socket_toml(&self) -> String {
+        #[cfg(unix)]
+        {
+            format!("{:?}", self.endpoint)
+        }
+        #[cfg(windows)]
+        {
+            format!("'{}'", self.endpoint)
+        }
+    }
+
     fn new(tag: &str) -> Ws {
         let root = std::env::temp_dir().join(format!("xk-revamp-it-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("logs")).unwrap();
         let ws = Ws {
+            endpoint: Ws::endpoint_for(&root, tag),
             root,
-            port: free_port(),
         };
         ws.write_daemon("");
         ws
@@ -63,9 +152,9 @@ impl Ws {
         std::fs::write(
             self.cfg(),
             format!(
-                "[daemon]\nhost = \"127.0.0.1\"\nport = {}\nlog_dir = \"{log_dir}\"\n\
+                "[daemon]\nsocket = {}\nlog_dir = \"{log_dir}\"\n\
                  app_dir = \"{app_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\n{extra}",
-                self.port
+                self.socket_toml()
             ),
         )
         .unwrap();
@@ -130,18 +219,7 @@ impl Ws {
     }
 
     fn health(&self) -> bool {
-        let Ok(mut s) = TcpStream::connect(("127.0.0.1", self.port)) else {
-            return false;
-        };
-        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-        if s.write_all(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-            .is_err()
-        {
-            return false;
-        }
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).contains("200")
+        matches!(sockio::get(&self.endpoint, "/v1/health"), Some(resp) if resp.starts_with("HTTP/1.1 200"))
     }
 
     fn wait_health(&self, want: bool) {
@@ -169,18 +247,8 @@ impl Ws {
     /// Content-Length or a chunked stream).
     fn post_json(&self, path: &str, body: &serde_json::Value) -> (u16, String) {
         let body = body.to_string();
-        let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let mut s =
-            TcpStream::connect(("127.0.0.1", self.port)).expect("connect the control plane");
-        let _ = s.set_read_timeout(Some(Duration::from_secs(120)));
-        s.write_all(req.as_bytes()).expect("write the request");
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf);
-        let text = String::from_utf8_lossy(&buf).to_string();
+        let text = sockio::post_json(&self.endpoint, path, &body)
+            .expect("connect the control plane");
         let status = text
             .lines()
             .next()
@@ -703,7 +771,7 @@ fn defaults_are_app_d_and_startsecs_three() {
     // A fresh config that does NOT pin `app_dir`: `config --get` answers the
     // built-in default.
     let fresh = ws.root.join("fresh.toml");
-    std::fs::write(&fresh, "[daemon]\nport = 7310\n").unwrap();
+    std::fs::write(&fresh, "[daemon]\n").unwrap();
     let out = Command::new(bin())
         .arg("--config")
         .arg(&fresh)
@@ -772,27 +840,31 @@ fn concurrent_pull_up_yields_one_daemon() {
     assert!(ok_b, "second pull-up succeeds: {out_b}");
     ws.wait_health(true);
 
-    // Exactly one daemon owns the port: a plain bind must fail.
+    // Exactly one daemon owns the endpoint: a second foreground instance
+    // loses the bind race and exits with the already-running explanation.
+    let (ok, _code, out) = ws.cli(&["daemon"]);
     assert!(
-        std::net::TcpListener::bind(("127.0.0.1", ws.port)).is_err(),
-        "exactly one daemon survives and holds the control port"
+        !ok && out.contains("already running"),
+        "the second foreground instance is refused with the live-instance message: {out:?}"
     );
     ws.shutdown();
 }
 
-/// background-daemon: when the control port is occupied by a foreign process
-/// the background daemon cannot bind, so `daemon --detach` exits non-zero and
-/// names the background log — no silent success.
+/// background-daemon: when the control endpoint is occupied by a foreign
+/// process the background daemon cannot bind, so `daemon --detach` exits
+/// non-zero and names the background log — no silent success.
 ///
 /// The holder answers HTTP with 500 (so the health probe fails fast) yet keeps
-/// the port bound; the readiness loop then exhausts its budget. (A holder that
-/// accepts but never answers is the separate, currently-unbounded case pinned
-/// by `detach_readiness_is_bounded`.)
+/// the endpoint bound; the readiness loop then exhausts its budget. (A holder
+/// that accepts but never answers is the separate, currently-unbounded case
+/// pinned by `detach_readiness_is_bounded`.)
+#[cfg(unix)]
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
-fn daemon_detach_times_out_when_port_is_occupied() {
+fn daemon_detach_times_out_when_endpoint_is_occupied() {
+    use std::os::unix::net::UnixListener;
     let ws = Ws::new("detach-occupied");
-    let holder = std::net::TcpListener::bind(("127.0.0.1", ws.port)).unwrap();
+    let holder = UnixListener::bind(&ws.endpoint).unwrap();
     std::thread::spawn(move || {
         for s in holder.incoming().flatten() {
             let mut s = s;
@@ -803,7 +875,7 @@ fn daemon_detach_times_out_when_port_is_occupied() {
         }
     });
     let (ok, code, out) = ws.cli(&["daemon", "--detach"]);
-    assert!(!ok, "daemon --detach must fail on an occupied port: {out}");
+    assert!(!ok, "daemon --detach must fail on an occupied endpoint: {out}");
     assert_ne!(code, 0, "non-zero exit, got {code}");
     assert!(
         out.contains("daemon.out.log"),
@@ -812,15 +884,17 @@ fn daemon_detach_times_out_when_port_is_occupied() {
 }
 
 /// background-daemon / design D6: the readiness probe is bounded (~10s
-/// budget) even when the control port is held by a listener that accepts
+/// budget) even when the control endpoint is held by a listener that accepts
 /// connections but never answers HTTP — the probe uses its own short-timeout
 /// client, so one hung listener cannot eat the whole window.
+#[cfg(unix)]
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
 fn detach_readiness_is_bounded() {
+    use std::os::unix::net::UnixListener;
     let ws = Ws::new("detach-bound");
     // A listener that accepts connections but never answers HTTP.
-    let holder = std::net::TcpListener::bind(("127.0.0.1", ws.port)).unwrap();
+    let holder = UnixListener::bind(&ws.endpoint).unwrap();
     std::thread::spawn(move || {
         let mut kept = Vec::new();
         for s in holder.incoming().flatten() {
@@ -990,6 +1064,477 @@ fn add_restart_over_legacy_app_table_stays_valid() {
     let d = ws.spawn_daemon();
     ws.wait_health(true);
     ws.wait_running("p");
+    ws.shutdown();
+    drop(d);
+}
+
+// -- unix-socket-control-plane tasks 8.1–8.4 --------------------------------
+//
+// Section 8 acceptance: the endpoint lifecycle (stale endpoint recovery,
+// non-endpoint occupation), the HTTP-over-socket operator contract (`curl
+// --unix-socket`) and the multi-user isolation. The multi-user tests are
+// conditional: they need root plus a second account (`nobody` dropped to via
+// setpriv/runuser), which CI and developer machines usually lack — they skip
+// with a printed reason instead of weakening the semantics they assert.
+// 8.5 (Windows named-pipe DACL) is asserted where it is assertable without a
+// Windows host: `transport::control_pipe_sddl` subject set
+// (`transport::tests::control_pipe_dacl_subjects_are_exactly_sy_ba_and_running_account`);
+// the runtime connect behavior is left to `windows-latest` CI.
+
+/// uid of the current process, via `id -u` (no libc dependency here).
+fn current_uid() -> Option<u32> {
+    let out = Command::new("id").arg("-u").output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// (uid, gid) of a system user, from /etc/passwd.
+fn passwd_entry(user: &str) -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() >= 4 && f[0] == user {
+            return Some((f[2].parse().ok()?, f[3].parse().ok()?));
+        }
+    }
+    None
+}
+
+/// A privilege-dropping wrapper: run a command as `nobody`. `setpriv`
+/// (util-linux) is preferred; `runuser` is the fallback. `find` returns
+/// `None` when the host offers neither or has no `nobody` account.
+struct Sudoer {
+    setpriv: Option<&'static str>,
+    runuser: Option<&'static str>,
+    uid: u32,
+    gid: u32,
+}
+
+impl Sudoer {
+    const USER: &'static str = "nobody";
+
+    fn find() -> Option<Sudoer> {
+        let (uid, gid) = passwd_entry(Self::USER)?;
+        let setpriv = ["/usr/bin/setpriv", "/bin/setpriv"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file());
+        let runuser = ["/usr/sbin/runuser", "/sbin/runuser", "/usr/bin/runuser", "/bin/runuser"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file());
+        if setpriv.is_none() && runuser.is_none() {
+            return None;
+        }
+        Some(Sudoer {
+            setpriv,
+            runuser,
+            uid,
+            gid,
+        })
+    }
+
+    /// Build a command that executes `argv` as the test user.
+    fn command(&self, argv: &[&std::ffi::OsStr]) -> Command {
+        if let Some(sp) = self.setpriv {
+            let mut c = Command::new(sp);
+            c.args([
+                "--reuid",
+                &self.uid.to_string(),
+                "--regid",
+                &self.gid.to_string(),
+                "--clear-groups",
+            ]);
+            c.args(argv);
+            c
+        } else {
+            let mut c = Command::new(self.runuser.expect("find() guarantees one tool"));
+            c.args(["-u", Self::USER, "--"]);
+            c.args(argv);
+            c
+        }
+    }
+
+    /// The skip reason when this host cannot run the multi-user scenarios.
+    fn skip_reason() -> Option<String> {
+        if !cfg!(unix) {
+            return Some("multi-user scenarios are unix-only".to_string());
+        }
+        match current_uid() {
+            Some(0) => {}
+            Some(uid) => return Some(format!("this test must run as root (current uid {uid})")),
+            None => return Some("cannot resolve the current uid (`id -u`)".to_string()),
+        }
+        Sudoer::find()
+            .map(|_| ())
+            .ok_or_else(|| "no setpriv/runuser or no `nobody` account".to_string())
+            .err()
+    }
+}
+
+/// 8.2 / control-plane spec「权限不足的专属提示」: a non-owner user querying a
+/// root-owned endpoint exits 3 with the access-denied message that names the
+/// endpoint owner and the caller — and never leaks program state. The
+/// secondary `unreachable` hedge inside the daemon's own message (a reported
+/// implementation finding) is not part of this assertion.
+#[test]
+#[ignore = "needs root + a second account; run with --ignored"]
+fn non_owner_status_gets_the_permission_error() {
+    if let Some(reason) = Sudoer::skip_reason() {
+        println!("skip: {reason}");
+        return;
+    }
+    let sudo = Sudoer::find().expect("skip_reason verified the tools");
+    let ws = Ws::new("perm-denied");
+    ws.write_app(
+        "demo",
+        &format!("[program.secret-worker]\ncommand = \"{SLEEP}\"\nstartsecs = 0.2\nrestart = \"no\"\n"),
+    );
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+
+    let mut out = sudo.command(&[
+        bin().as_os_str(),
+        std::ffi::OsStr::new("--config"),
+        ws.cfg().as_os_str(),
+        std::ffi::OsStr::new("status"),
+    ]);
+    let res = out.output().expect("run ak status as the non-owner");
+    let combined = String::from_utf8_lossy(&res.stdout).to_string()
+        + &String::from_utf8_lossy(&res.stderr);
+    assert_eq!(
+        res.status.code(),
+        Some(3),
+        "the permission failure exits 3: {combined:?}"
+    );
+    assert!(
+        combined.contains("access denied"),
+        "the message is the permission-specific one: {combined:?}"
+    );
+    assert!(
+        combined.contains("owned by uid 0"),
+        "the message names the endpoint owner: {combined:?}"
+    );
+    assert!(
+        !combined.contains("secret-worker"),
+        "no program state leaks to a non-owner: {combined:?}"
+    );
+    // Control: the owner's own CLI answers normally.
+    let (ok, _, own) = ws.cli(&["status"]);
+    assert!(ok, "the owner still queries the endpoint: {own:?}");
+
+    ws.shutdown();
+    drop(d);
+}
+
+/// 8.1 / control-plane spec「同机多用户并存」: root and an unprivileged
+/// account each run a daemon, the endpoints never collide, and the enforceable
+/// direction of the isolation contract holds — the non-owner's client is
+/// refused at connect() while each account serves its own state. (The
+/// root→non-owner direction is NOT asserted: root holds CAP_DAC_OVERRIDE and
+/// the kernel will always let it through — that is a unix fact, not an
+/// appkeeper promise.)
+#[test]
+#[ignore = "needs root + a second account; run with --ignored"]
+fn two_accounts_run_two_daemons_without_conflict() {
+    if let Some(reason) = Sudoer::skip_reason() {
+        println!("skip: {reason}");
+        return;
+    }
+    let sudo = Sudoer::find().expect("skip_reason verified the tools");
+    let ws_root = Ws::new("multiuser-root");
+    let ws_user = Ws::new("multiuser-user");
+
+    // The user daemon owns its whole workspace; the endpoint directory is
+    // private to the account (0700), which is what keeps root's client
+    // contract (and everyone else's) out.
+    ws_user.write_app(
+        "userapp",
+        &format!("[program.user-prog]\ncommand = \"{SLEEP}\"\nstartsecs = 0.2\nrestart = \"no\"\n"),
+    );
+    let st = Command::new("chown")
+        .args(["-R", Sudoer::USER])
+        .arg(&ws_user.root)
+        .status()
+        .expect("chown the user workspace");
+    assert!(st.success(), "chown -R {0} failed", Sudoer::USER);
+    let st = Command::new("chmod")
+        .args(["700"])
+        .arg(&ws_user.root)
+        .status()
+        .expect("chmod the user workspace");
+    assert!(st.success());
+
+    // A root-owned app so the crosstalk check has something to look for.
+    ws_root.write_app(
+        "demo",
+        &format!("[program.root-prog]\ncommand = \"{SLEEP}\"\nstartsecs = 0.2\nrestart = \"no\"\n"),
+    );
+
+    let d_root = ws_root.spawn_daemon();
+    ws_root.wait_health(true);
+
+    // The user daemon runs as `nobody` in its own workspace.
+    let user_out = std::fs::File::create(ws_user.root.join("daemon.out.log")).unwrap();
+    let user_err = user_out.try_clone().unwrap();
+    let mut d_user = sudo
+        .command(&[
+            bin().as_os_str(),
+            std::ffi::OsStr::new("--config"),
+            ws_user.cfg().as_os_str(),
+            std::ffi::OsStr::new("daemon"),
+        ])
+        .stdout(Stdio::from(user_out))
+        .stderr(Stdio::from(user_err))
+        .spawn()
+        .expect("spawn the user daemon");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let user_healthy = loop {
+        if matches!(
+            d_user.try_wait(),
+            Ok(Some(_))
+        ) {
+            break false;
+        }
+        if matches!(
+            sockio::get(&ws_user.endpoint, "/v1/health"),
+            Some(resp) if resp.starts_with("HTTP/1.1 200")
+        ) {
+            break true;
+        }
+        assert!(Instant::now() < deadline, "the user daemon never became healthy");
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    assert!(user_healthy, "the unprivileged daemon serves its own endpoint");
+
+    // Distinct endpoints — the default derivation is what keeps them apart.
+    assert_ne!(ws_root.endpoint, ws_user.endpoint);
+
+    // Each daemon serves its own state, nothing else's.
+    let root_status = sockio::get(&ws_root.endpoint, "/v1/status").expect("root endpoint answers");
+    assert!(root_status.contains("root-prog"), "{root_status}");
+    let user_status = sockio::get(&ws_user.endpoint, "/v1/status").expect("user endpoint answers");
+    assert!(user_status.contains("user-prog"), "{user_status}");
+    assert!(
+        !user_status.contains("root-prog") && !root_status.contains("user-prog"),
+        "no crosstalk between the two daemons"
+    );
+
+    // The enforceable isolation direction: the unprivileged client is refused
+    // by the kernel when reaching for root's endpoint — exit 3, permission
+    // words, no state.
+    let res = sudo
+        .command(&[
+            bin().as_os_str(),
+            std::ffi::OsStr::new("--config"),
+            ws_root.cfg().as_os_str(),
+            std::ffi::OsStr::new("status"),
+        ])
+        .output()
+        .expect("run ak status against the root-owned endpoint");
+    let combined = String::from_utf8_lossy(&res.stdout).to_string()
+        + &String::from_utf8_lossy(&res.stderr);
+    assert_eq!(res.status.code(), Some(3), "{combined:?}");
+    assert!(combined.contains("access denied"), "{combined:?}");
+    assert!(!combined.contains("root-prog"), "{combined:?}");
+
+    // And the account's own CLI against its own daemon succeeds.
+    let res = sudo
+        .command(&[
+            bin().as_os_str(),
+            std::ffi::OsStr::new("--config"),
+            ws_user.cfg().as_os_str(),
+            std::ffi::OsStr::new("status"),
+        ])
+        .output()
+        .expect("run ak status against the user-owned endpoint");
+    assert!(
+        res.status.success()
+            && String::from_utf8_lossy(&res.stdout).contains("user-prog"),
+        "the user serves itself: {:?}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+
+    // Shutdown both.
+    sockio::post_json(&ws_user.endpoint, "/v1/shutdown", "{}");
+    ws_root.shutdown();
+    let _ = d_user.wait();
+    drop(d_root);
+    drop(d_user);
+}
+
+/// 8.1/8.2 partial coverage when the conditional multi-user tests cannot run
+/// (not root / no second account): the endpoint the daemon actually created
+/// is owner-only — mode 0600, owned by the running account — which is the
+/// kernel-level fact the whole multi-user contract rests on, and the default
+/// endpoint derivation names the running uid.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn endpoint_is_owner_only_and_uid_derived() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let ws = Ws::new("owner-only");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    let meta = std::fs::symlink_metadata(&ws.endpoint).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the control endpoint is owner-only"
+    );
+    assert_eq!(
+        meta.uid(),
+        current_uid().expect("unix has a uid"),
+        "the endpoint is owned by the running account"
+    );
+    // The default endpoint derivation names the running uid. A fresh config
+    // without a `socket` key is required — the workspace config pins one, and
+    // a file value always wins over the built-in default.
+    let fresh = ws.root.join("fresh.toml");
+    std::fs::write(&fresh, "[daemon]\n").unwrap();
+    let out = Command::new(bin())
+        .arg("--config")
+        .arg(&fresh)
+        .args(["config", "--get", "socket"])
+        .output()
+        .expect("config --get socket on a fresh config");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("/run/appkeeper/{}/ak.sock", current_uid().unwrap()),
+        "the default endpoint is uid-layered"
+    );
+    ws.shutdown();
+    drop(d);
+}
+
+/// 8.3 (first half): a leftover socket with no listener — the residue of a
+/// crashed daemon — is cleaned up and rebuilt at startup, and the daemon then
+/// serves normally through it.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn stale_endpoint_is_cleared_and_the_daemon_serves() {
+    use std::os::unix::net::UnixListener;
+    let ws = Ws::new("stale-endpoint");
+    // A crash residue: a bound socket whose listener died. std does not
+    // unlink the file on drop — exactly what a SIGKILLed daemon leaves.
+    UnixListener::bind(&ws.endpoint).unwrap();
+    assert!(Path::new(&ws.endpoint).exists(), "the stale endpoint exists");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+    // The rebuilt endpoint is a live control plane, not the dead file.
+    let resp = sockio::get(&ws.endpoint, "/v1/health").expect("the rebuilt endpoint answers");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    ws.shutdown();
+    drop(d);
+}
+
+/// 8.3 (second half): a regular file squatting on the endpoint path blocks
+/// startup with a clear error, and the file is never deleted.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn non_endpoint_file_blocks_startup_and_survives() {
+    let ws = Ws::new("occupied-endpoint");
+    std::fs::write(&ws.endpoint, b"precious data").unwrap();
+    let mut child = Command::new(bin())
+        .arg("--config")
+        .arg(ws.cfg())
+        .arg("daemon")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon against an occupied endpoint");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("poll the daemon") {
+            Some(st) => break st,
+            None => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the daemon must exit quickly on an occupied endpoint"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    let out = child.wait_with_output().unwrap();
+    let combined = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(!status.success(), "startup is refused: {combined:?}");
+    assert!(
+        combined.contains("occupied") || combined.contains("not a socket"),
+        "the refusal explains the occupation: {combined:?}"
+    );
+    assert_eq!(
+        std::fs::read(&ws.endpoint).unwrap(),
+        b"precious data",
+        "the non-endpoint file was never deleted"
+    );
+}
+
+/// 8.4 / control-plane spec「守护进程不监听任何控制面 TCP 端口」(second half):
+/// HTTP semantics ride the socket unchanged — plain `curl --unix-socket`
+/// queries the status projection, the operator troubleshooting contract.
+#[cfg(unix)]
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn curl_unix_socket_queries_the_control_plane() {
+    let has_curl = Command::new("curl")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_curl {
+        println!("skip: curl is not on PATH");
+        return;
+    }
+    let ws = Ws::new("curl-it");
+    let d = ws.spawn_daemon();
+    ws.wait_health(true);
+
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "-",
+            "-w",
+            "\n%{http_code}",
+            "--unix-socket",
+            &ws.endpoint,
+            "http://localhost/v1/status",
+        ])
+        .output()
+        .expect("run curl --unix-socket");
+    assert!(out.status.success(), "curl exits 0");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    assert_eq!(code.trim(), "200", "plain curl gets 200: {text:?}");
+    let v: serde_json::Value = serde_json::from_str(body).expect("the body is the status JSON");
+    assert_eq!(
+        v["daemon"]["socket"].as_str(),
+        Some(ws.endpoint.as_str()),
+        "the projection advertises the very endpoint curl dialed: {v}"
+    );
+    // And the health probe too.
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "-",
+            "-w",
+            "\n%{http_code}",
+            "--unix-socket",
+            &ws.endpoint,
+            "http://localhost/v1/health",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.trim_end().ends_with("200"), "health over curl: {text:?}");
+
     ws.shutdown();
     drop(d);
 }

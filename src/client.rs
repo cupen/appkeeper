@@ -1,44 +1,107 @@
 //! Thin HTTP client behind the CLI control subcommands, with the shared
 //! exit-code contract (0 ok / 1 error / 2 config / 3 daemon unreachable).
+//!
+//! Transport: the control plane lives on a local IPC endpoint (unix socket /
+//! Windows named pipe) and carries HTTP/1.1 over it, so `curl
+//! --unix-socket <path> http://localhost/v1/status` still works for
+//! troubleshooting. This module owns the HTTP semantics; the socket itself is
+//! invisible here (see [`crate::transport`]).
+//!
+//! **About `ureq`:** it stays in `Cargo.toml` and stays used — but only by
+//! [`crate::health`], to probe the user's *own* programs (`health_check =
+//! "http://..."` / `"tcp://..."`). Control-plane traffic must never go back
+//! through it: this endpoint has no token and is reachable only by its
+//! owner, so a general-purpose HTTP client would add nothing but a second
+//! way to reach it.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::transport::{self, Conn};
+
+/// Markers `exit_code_of` maps to 3. Kept as literals (not an error type) so
+/// the contract stays visible in the message the operator actually reads.
+const UNREACHABLE: &str = "daemon unreachable";
+const DENIED: &str = "control endpoint access denied";
+
+/// Default per-operation deadline for control calls. Streaming endpoints
+/// override it (see [`Client::STREAM_TIMEOUT`]).
+const CALL_TIMEOUT: Duration = Duration::from_secs(70);
+/// Readiness-poll budget: a listener that accepts but never answers must not
+/// eat the whole pull-up window (`daemonize::READY_TIMEOUT`).
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+/// `run --app` / custom actions block until the daemon's startup judgement,
+/// which can legitimately take minutes.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How the response body is framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    Length(usize),
+    Chunked,
+    /// No `Content-Length` and no chunking: the body ends when the peer
+    /// closes (the server always sends `Connection: close`).
+    Eof,
+}
+
+/// A parsed response head plus the connection that still carries its body.
+struct Response {
+    status: u16,
+    framing: Framing,
+    conn: BufReader<Box<dyn Conn>>,
+    chunked: ChunkedState,
+}
+
 #[derive(Clone)]
 pub struct Client {
-    agent: ureq::Agent,
-    pub base: String,
-    token: String,
+    endpoint: transport::Endpoint,
+    timeout: Duration,
 }
 
 impl Client {
-    /// Build a client from the daemon config (host/port/token). Works with
+    /// Build a client from the daemon config's control endpoint. Works with
     /// default settings even when no daemon config file exists.
     pub fn from_config(config: &crate::config::DaemonConfig) -> Self {
-        Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(2))
-                .timeout(Duration::from_secs(70))
-                .build(),
-            base: format!("http://{}:{}", config.daemon.host, config.daemon.port),
-            token: config.daemon.auth_token.clone(),
-        }
+        Self::new(config.daemon.socket.to_string_lossy().as_ref(), CALL_TIMEOUT)
     }
 
     /// Same target, but with a short total timeout — for readiness polling
     /// where one hung listener must not eat the whole budget (the default
     /// 70s total would let two probes blow a ~10s readiness window).
     pub fn probe(config: &crate::config::DaemonConfig) -> Self {
+        Self::new(
+            config.daemon.socket.to_string_lossy().as_ref(),
+            PROBE_TIMEOUT,
+        )
+    }
+
+    fn new(endpoint: &str, timeout: Duration) -> Self {
+        // The config is validated on load, so an unusable value can only come
+        // from a hand-built config; fall back to the built-in default rather
+        // than panicking in a CLI path.
+        let endpoint = transport::Endpoint::parse(endpoint)
+            .unwrap_or_else(|_| transport::Endpoint::default_endpoint());
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_millis(500))
-                .timeout(Duration::from_millis(800))
-                .build(),
-            base: format!("http://{}:{}", config.daemon.host, config.daemon.port),
-            token: config.daemon.auth_token.clone(),
+            endpoint,
+            timeout,
         }
+    }
+
+    /// The endpoint this client talks to (for error messages and reports).
+    pub fn endpoint(&self) -> &transport::Endpoint {
+        &self.endpoint
+    }
+
+    fn connect(&self, timeout: Duration) -> Result<Box<dyn Conn>> {
+        let conn = self.endpoint.connect().map_err(|e| connect_error(&self.endpoint, e))?;
+        // Connect is instant on a local endpoint; the deadline that matters is
+        // the per-read one.
+        let _ = conn.set_write_timeout(Some(timeout));
+        let _ = conn.set_read_timeout(Some(timeout));
+        Ok(conn)
     }
 
     fn call(&self, method: &str, path: &str) -> Result<serde_json::Value> {
@@ -51,43 +114,27 @@ impl Client {
         path: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let r = self
-            .agent
-            .request(method, &format!("{}{}", self.base, path));
-        self.send(r, body)
+        self.send(method, path, body, self.timeout, None)
     }
 
-    /// Send a prepared request; `body` rides as JSON when non-empty.
-    fn send(&self, mut r: ureq::Request, body: &serde_json::Value) -> Result<serde_json::Value> {
-        if !self.token.is_empty() {
-            r = r.set("Authorization", &format!("Bearer {}", self.token));
-        }
-        let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
-        // ureq surfaces HTTP error statuses (4xx/5xx) as Error::Status — those
-        // are ANSWERS from the control plane (409 conflict, 404 unknown…),
-        // not transport failures; only Transport means "daemon unreachable".
-        let resp = if has_body {
-            match r
-                .set("Content-Type", "application/json")
-                .send_string(&body.to_string())
-            {
-                Ok(resp) => resp,
-                Err(ureq::Error::Status(_, resp)) => resp,
-                Err(e) => return Err(unreachable(e)),
-            }
-        } else {
-            match r.call() {
-                Ok(resp) => resp,
-                Err(ureq::Error::Status(_, resp)) => resp,
-                Err(e) => return Err(unreachable(e)),
-            }
-        };
-        let status = resp.status();
-        let text = resp.into_string().unwrap_or_default();
+    /// Issue one request and read the whole body. A non-2xx status is an
+    /// ANSWER from the control plane (409 conflict, 404 unknown…), not a
+    /// transport failure; only a failed `connect`/read means "unreachable".
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+        timeout: Duration,
+        accept: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut resp = self.request(method, path, body, timeout, accept)?;
+        let text = resp.read_body()?;
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
-        if (200..300).contains(&status) {
+        if (200..300).contains(&resp.status) {
             Ok(v)
         } else {
+            let status = resp.status;
             let msg = v
                 .get("error")
                 .and_then(|e| e.as_str())
@@ -95,6 +142,82 @@ impl Client {
                 .to_string();
             Err(anyhow::anyhow!("api error {status}: {msg}"))
         }
+    }
+
+    /// Write the request and parse the response head; the caller owns the
+    /// connection from here.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+        timeout: Duration,
+        accept: Option<&str>,
+    ) -> Result<Response> {
+        let mut conn = self.connect(timeout)?;
+        let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
+        let payload = if has_body { body.to_string() } else { String::new() };
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+        if let Some(a) = accept {
+            head.push_str(&format!("Accept: {a}\r\n"));
+        }
+        if has_body {
+            head.push_str("Content-Type: application/json\r\n");
+            head.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+        }
+        head.push_str("Connection: close\r\n\r\n");
+        conn.write_all(head.as_bytes())
+            .and_then(|_| conn.write_all(payload.as_bytes()))
+            .and_then(|_| conn.flush())
+            .map_err(|e| read_error(&self.endpoint, e))?;
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|e| read_error(&self.endpoint, e))?;
+        let status: u16 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .with_context(|| format!("malformed response from the control endpoint: {line:?}"))?;
+        let mut framing = Framing::Eof;
+        let mut total = 0usize;
+        loop {
+            let mut h = String::new();
+            let n = reader
+                .read_line(&mut h)
+                .map_err(|e| read_error(&self.endpoint, e))?;
+            if n == 0 {
+                break;
+            }
+            let t = h.trim_end_matches(['\r', '\n']);
+            if t.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = t.split_once(':') {
+                total += t.len();
+                match (k.trim().to_ascii_lowercase().as_str(), v.trim()) {
+                    ("transfer-encoding", v) if v.eq_ignore_ascii_case("chunked") => {
+                        framing = Framing::Chunked
+                    }
+                    ("content-length", v) => {
+                        if let Ok(len) = v.parse::<usize>() {
+                            framing = Framing::Length(len)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if total > 64 * 1024 {
+                return Err(anyhow::anyhow!("control endpoint sent oversized headers"));
+            }
+        }
+        Ok(Response {
+            status,
+            framing,
+            conn: reader,
+            chunked: ChunkedState::default(),
+        })
     }
 
     /// Cheap reachability probe.
@@ -117,27 +240,25 @@ impl Client {
     /// `run <name>`: start and block until the daemon's startup judgement
     /// (`?wait=1`, run-daemon-first control-plane spec: run 阻塞至守护进程返回).
     pub fn start_and_wait(&self, name: &str) -> Result<serde_json::Value> {
-        let r = self
-            .agent
-            .request(
-                "POST",
-                &format!("{}/v1/programs/{name}/start?wait=1", self.base),
-            )
-            .timeout(Duration::from_secs(15 * 60));
-        self.send(r, &serde_json::json!({}))
+        self.send(
+            "POST",
+            &format!("/v1/programs/{name}/start?wait=1"),
+            &serde_json::json!({}),
+            STREAM_TIMEOUT,
+            None,
+        )
     }
 
     /// Run a program's declared custom action. Long actions must not hit the
-    /// agent's default total timeout, so the request gets its own bound.
+    /// default deadline, so the request gets its own bound.
     pub fn custom_action(&self, program: &str, action: &str) -> Result<serde_json::Value> {
-        let r = self
-            .agent
-            .request(
-                "POST",
-                &format!("{}/v1/programs/{program}/actions/{action}", self.base),
-            )
-            .timeout(Duration::from_secs(15 * 60));
-        self.send(r, &serde_json::json!({}))
+        self.send(
+            "POST",
+            &format!("/v1/programs/{program}/actions/{action}"),
+            &serde_json::json!({}),
+            STREAM_TIMEOUT,
+            None,
+        )
     }
 
     /// Deliver a whitelist signal to a program's child process.
@@ -157,11 +278,13 @@ impl Client {
     /// `run --app`: fan out and block until every program's startup judgement
     /// (`?wait=1`).
     pub fn app_start_and_wait(&self, app: &str) -> Result<serde_json::Value> {
-        let r = self
-            .agent
-            .request("POST", &format!("{}/v1/apps/{app}/start?wait=1", self.base))
-            .timeout(Duration::from_secs(15 * 60));
-        self.send(r, &serde_json::json!({}))
+        self.send(
+            "POST",
+            &format!("/v1/apps/{app}/start?wait=1"),
+            &serde_json::json!({}),
+            STREAM_TIMEOUT,
+            None,
+        )
     }
 
     pub fn reload(&self) -> Result<serde_json::Value> {
@@ -227,57 +350,14 @@ impl Client {
         stream: &str,
         mut on_line: impl FnMut(&str) -> bool,
     ) -> Result<()> {
-        let mut path = format!("/v1/programs/{name}/logs?stream={stream}&tail=20&follow=1");
-        if !self.token.is_empty() {
-            path = format!("{path}&auth=1"); // token goes via header below
+        let path = format!("/v1/programs/{name}/logs?stream={stream}&tail=20&follow=1");
+        let mut resp = self.request("GET", &path, &serde_json::json!({}), STREAM_TIMEOUT, Some("text/plain"))?;
+        if resp.status != 200 {
+            let status = resp.status;
+            let text = resp.read_body().unwrap_or_default();
+            anyhow::bail!("api error {status}: {text}");
         }
-        let mut r = self
-            .agent
-            .get(&format!("{}{}", self.base, path))
-            .set("Accept", "text/plain");
-        if !self.token.is_empty() {
-            r = r.set("Authorization", &format!("Bearer {}", self.token));
-        }
-        let resp = match r.call() {
-            Ok(resp) => resp,
-            // 4xx/5xx are control-plane answers (e.g. unknown program 404).
-            Err(ureq::Error::Status(_, resp)) => resp,
-            Err(e) => return Err(unreachable(e)),
-        };
-        if resp.status() != 200 {
-            let code = resp.status();
-            let msg = resp.into_string().unwrap_or_default();
-            anyhow::bail!("api error {code}: {msg}");
-        }
-        let mut reader = resp.into_reader();
-        let mut pending = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    // Flush a trailing line without a newline.
-                    if !pending.is_empty() {
-                        let line = String::from_utf8_lossy(&pending).into_owned();
-                        if !on_line(&line) {
-                            return Ok(());
-                        }
-                    }
-                    return Ok(());
-                }
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&line_bytes);
-                        let line = line.trim_end_matches(['\n', '\r']);
-                        if !on_line(line) {
-                            return Ok(());
-                        }
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        resp.for_each_line(&mut on_line)
     }
 
     // -- ad-hoc run (run-daemon-first section 6) ----------------------------
@@ -291,63 +371,34 @@ impl Client {
         body: &serde_json::Value,
         mut on_frame: impl FnMut(&serde_json::Value),
     ) -> Result<serde_json::Value> {
-        let mut r = self
-            .agent
-            .post(&format!("{}/v1/run", self.base))
-            .timeout(Duration::from_secs(15 * 60))
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/x-ndjson");
-        if !self.token.is_empty() {
-            r = r.set("Authorization", &format!("Bearer {}", self.token));
-        }
-        let resp = match r.send_string(&body.to_string()) {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(_, resp)) => resp,
-            Err(e) => return Err(unreachable(e)),
-        };
-        if resp.status() != 200 {
-            let code = resp.status();
-            let text = resp.into_string().unwrap_or_default();
+        let mut resp = self.request(
+            "POST",
+            "/v1/run",
+            body,
+            STREAM_TIMEOUT,
+            Some("application/x-ndjson"),
+        )?;
+        if resp.status != 200 {
+            let status = resp.status;
+            let text = resp.read_body().unwrap_or_default();
             let msg = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .unwrap_or(text);
-            anyhow::bail!("api error {code}: {msg}");
+            anyhow::bail!("api error {status}: {msg}");
         }
-        let mut reader = resp.into_reader();
-        let mut pending: Vec<u8> = Vec::new();
         let mut last = serde_json::Value::Null;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                        let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&line_bytes);
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                            on_frame(&v);
-                            last = v;
-                        }
-                    }
-                }
-                Err(e) => return Err(e.into()),
+        resp.for_each_line(&mut |line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return true;
             }
-        }
-        // Flush a trailing frame without a newline.
-        let tail = String::from_utf8_lossy(&pending);
-        let tail = tail.trim();
-        if !tail.is_empty()
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(tail)
-        {
-            on_frame(&v);
-            last = v;
-        }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                on_frame(&v);
+                last = v;
+            }
+            true
+        })?;
         Ok(last)
     }
 
@@ -374,19 +425,168 @@ impl Client {
     }
 }
 
-fn unreachable(e: ureq::Error) -> anyhow::Error {
-    let hint = "daemon unreachable (is `ak daemon` active?)";
-    match e {
-        ureq::Error::Transport(t) => anyhow::anyhow!("{hint}: {t}"),
-        other => anyhow::anyhow!("{hint}: {other}"),
+impl Response {
+    /// The whole body as text, whatever the framing.
+    fn read_body(&mut self) -> Result<String> {
+        let mut out = Vec::new();
+        while self.pump(&mut out)? {}
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Feed the decoded body to `on_line`, whole lines only; a trailing line
+    /// without a newline is flushed at EOF. Returning false from `on_line`
+    /// stops the stream.
+    fn for_each_line(&mut self, on_line: &mut dyn FnMut(&str) -> bool) -> Result<()> {
+        let mut pending: Vec<u8> = Vec::new();
+        while self.pump(&mut pending)? {
+            while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                let bytes: Vec<u8> = pending.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&bytes);
+                if !on_line(line.trim_end_matches(['\n', '\r'])) {
+                    return Ok(());
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let line = String::from_utf8_lossy(&pending);
+            on_line(line.trim_end_matches(['\n', '\r']));
+        }
+        Ok(())
+    }
+
+    /// Decode one step of the body into `out`. Returns false at end of body.
+    fn pump(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        let mut buf = [0u8; 8192];
+        match self.framing {
+            Framing::Length(0) => Ok(false),
+            Framing::Length(remaining) => {
+                let want = remaining.min(buf.len());
+                let n = self.conn.read(&mut buf[..want])?;
+                if n == 0 {
+                    return Ok(false);
+                }
+                out.extend_from_slice(&buf[..n]);
+                self.framing = Framing::Length(remaining - n);
+                Ok(true)
+            }
+            Framing::Chunked => self.chunked.next_chunk(&mut self.conn, out),
+            Framing::Eof => {
+                let n = self.conn.read(&mut buf)?;
+                if n == 0 {
+                    Ok(false)
+                } else {
+                    out.extend_from_slice(&buf[..n]);
+                    Ok(true)
+                }
+            }
+        }
     }
 }
 
+/// The chunked-transfer decoder state, kept beside the response so the
+/// streaming and buffered paths decode identically.
+#[derive(Default)]
+struct ChunkedState {
+    /// Bytes still to come from the current chunk.
+    remaining: usize,
+    /// A chunk body has been consumed at least once (its trailing CRLF has
+    /// not been swallowed yet).
+    mid_stream: bool,
+    /// The terminating zero-length chunk was seen.
+    finished: bool,
+}
+
+impl ChunkedState {
+    /// Decode the next chunk into `out`. `Ok(false)` = stream complete.
+    fn next_chunk(&mut self, r: &mut dyn Read, out: &mut Vec<u8>) -> Result<bool> {
+        if self.finished {
+            return Ok(false);
+        }
+        if self.remaining == 0 {
+            if self.mid_stream {
+                // The CRLF that terminated the previous chunk body.
+                let mut crlf = [0u8; 2];
+                r.read_exact(&mut crlf)?;
+                self.mid_stream = false;
+            }
+            let size = read_chunk_size(r)?;
+            if size == 0 {
+                self.finished = true;
+                return Ok(false);
+            }
+            self.remaining = size;
+        }
+        let want = self.remaining.min(8192);
+        let mut buf = vec![0u8; want];
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("truncated chunked stream");
+        }
+        out.extend_from_slice(&buf[..n]);
+        self.remaining -= n;
+        if self.remaining == 0 {
+            self.mid_stream = true;
+        }
+        Ok(true)
+    }
+}
+
+/// Read one `<hex>[;ext]\r\n` chunk-size line.
+fn read_chunk_size(r: &mut dyn Read) -> Result<usize> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\r\n") {
+        if r.read(&mut byte)? == 0 {
+            anyhow::bail!("truncated chunked stream (no chunk size)");
+        }
+        line.push(byte[0]);
+        if line.len() > 64 {
+            anyhow::bail!("malformed chunked stream (chunk size line too long)");
+        }
+    }
+    let text = String::from_utf8_lossy(&line);
+    let hex = text.split(';').next().unwrap_or("").trim();
+    usize::from_str_radix(hex, 16).with_context(|| format!("malformed chunk size {text:?}"))
+}
+
+
+/// A failed `connect()`: the two causes the spec separates — "no daemon
+/// there" and "not your endpoint" — get different words.
+fn connect_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::PermissionDenied => {
+            let owner = match ep.owner_uid() {
+                Some(uid) => format!("endpoint {} is owned by uid {uid}", ep.display()),
+                None => format!("endpoint {} is not accessible to this account", ep.display()),
+            };
+            let me = match transport::current_uid() {
+                Some(uid) => format!("uid {uid}"),
+                None => format!("account {:?}", transport::current_user()),
+            };
+            anyhow::anyhow!(
+                "{DENIED}: {owner}, the current user is {me} — run this command as the account \
+                 the daemon runs under, or with higher privileges"
+            )
+        }
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
+            anyhow::anyhow!("{UNREACHABLE} (is `ak daemon` active? endpoint {}): {e}", ep.display())
+        }
+        _ => anyhow::anyhow!("{UNREACHABLE} (endpoint {}): {e}", ep.display()),
+    }
+}
+
+/// A failed write/read on an established connection: the peer went away.
+fn read_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!("{UNREACHABLE} (connection to {} failed): {e}", ep.display())
+}
+
 /// Exit code class for a client error, per the CLI contract:
-/// 3 = daemon unreachable, 1 = everything else (2 handled at parse time).
+/// 3 = daemon unreachable (or the endpoint is not yours), 1 = everything else
+/// (2 handled at parse time).
 pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     let s = format!("{err:#}");
-    if s.contains("daemon unreachable") {
+    if s.contains(UNREACHABLE) || s.contains(DENIED) {
         3
     } else {
         1
@@ -403,128 +603,265 @@ pub fn load_config(config_path: &Path) -> Result<crate::config::DaemonConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn config_with_port(port: u16) -> crate::config::DaemonConfig {
-        toml::from_str(&format!("[daemon]\nhost = \"127.0.0.1\"\nport = {port}\n")).unwrap()
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xk-client-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
-    /// `follow_lines` frames the chunked stream into whole lines (a line split
-    /// across chunks is reassembled; a trailing line without a newline is
-    /// flushed at EOF) and stops when the callback returns false.
+    fn config_with_socket(socket: &std::path::Path) -> crate::config::DaemonConfig {
+        toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            socket.to_string_lossy()
+        ))
+        .unwrap()
+    }
+
+    /// Bind a private endpoint and return it with its listener. Binding in
+    /// the test body (not in the server thread) removes the startup race:
+    /// the endpoint exists before the client is allowed to try.
+    fn bound(path: &std::path::Path) -> (transport::Endpoint, transport::Listener) {
+        let ep = transport::Endpoint::parse(&path.display().to_string()).unwrap();
+        let listener = ep.bind().unwrap();
+        (ep, listener)
+    }
+
+    /// A one-shot fake control plane on a private socket: read one request,
+    /// answer with the bytes the test supplies.
+    fn fake_server(
+        listener: transport::Listener,
+        response: String,
+    ) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut listener = listener;
+            let mut conn = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = std::io::Read::read(&mut conn, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if let Some((head, body)) = String::from_utf8_lossy(&req).split_once("\r\n\r\n") {
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("Content-Length: ")
+                                .or_else(|| l.strip_prefix("content-length: "))
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break;
+                    }
+                }
+            }
+            let _ = std::io::Write::write_all(&mut conn, response.as_bytes());
+            let _ = std::io::Write::flush(&mut conn);
+            String::from_utf8_lossy(&req).into_owned()
+        })
+    }
+
+    /// A Content-Length-framed response; the length is derived so a test can
+    /// never lie about its own body (a mismatch shows up as a truncated read).
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn ok_response(body: &str) -> String {
+        http_response("HTTP/1.1 200 OK", body)
+    }
+
+    /// Task 3.1: the request is a well-formed HTTP/1.1 message over the
+    /// socket (request line, Host, JSON body) and a 200 is decoded.
+    #[test]
+    fn call_writes_http_and_decodes_json() {
+        let dir = tmp_dir("ok");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(listener, ok_response("{\"result\":\"ok\"}"));
+        let c = Client::from_config(&config_with_socket(&sock));
+        let v = c.status().unwrap();
+        assert_eq!(v["result"], "ok");
+        let req = server.join().unwrap();
+        assert!(req.starts_with("GET /v1/status HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("Host: localhost\r\n"), "{req}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body rides as JSON with a Content-Length the server can trust.
+    #[test]
+    fn post_body_is_json_with_content_length() {
+        let dir = tmp_dir("body");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(listener, ok_response("{\"ok\":true}"));
+        let c = Client::from_config(&config_with_socket(&sock));
+        let v = c.signal("web", "USR1").unwrap();
+        assert_eq!(v["ok"], true);
+        let req = server.join().unwrap();
+        assert!(req.contains("Content-Type: application/json\r\n"), "{req}");
+        assert!(req.contains("Content-Length: 17\r\n"), "{req}");
+        assert!(req.ends_with("{\"signal\":\"USR1\"}"), "{req}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.1: a 4xx is an ANSWER (api error), not a transport failure —
+    /// the daemon is demonstrably reachable.
+    #[test]
+    fn error_status_is_an_api_error_not_unreachable() {
+        let dir = tmp_dir("404");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            http_response("HTTP/1.1 404 Not Found", r#"{"error":"unknown program"}"#),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.program("ghost").expect_err("404 must error");
+        let text = format!("{err:#}");
+        assert!(text.contains("404"), "{text}");
+        assert!(text.contains("unknown program"), "{text}");
+        assert_eq!(exit_code_of(&err), 1, "a control-plane answer is not unreachable");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.3: nothing listening at the endpoint → "daemon unreachable",
+    /// exit code 3.
+    #[test]
+    fn no_listener_reports_unreachable_with_exit_3() {
+        let dir = tmp_dir("dead");
+        let sock = dir.join("ak.sock");
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.status().expect_err("nothing is listening");
+        let text = format!("{err:#}");
+        assert!(text.contains(UNREACHABLE), "{text}");
+        assert!(text.contains(&sock.display().to_string()), "{text}");
+        assert_eq!(exit_code_of(&err), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.3: a permission failure gets its own words — it must NOT read
+    /// as "the daemon is not running".
+    #[test]
+    fn permission_error_is_distinguished_from_unreachable() {
+        let denied = connect_error(
+            &transport::Endpoint::default_endpoint(),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let text = format!("{denied:#}");
+        assert!(text.contains(DENIED), "{text}");
+        assert!(text.contains("uid"), "names the ids: {text}");
+        assert!(!text.starts_with(UNREACHABLE), "{text}");
+        // Still exit class 3: the operator cannot act on it here.
+        assert_eq!(exit_code_of(&denied), 3);
+    }
+
+    /// Task 3.2: chunked frames are reassembled into whole lines (a line
+    /// split across chunks is rejoined; a trailing line without a newline is
+    /// flushed at EOF) and the callback can stop the stream.
     #[test]
     fn follow_lines_reassembles_and_stops() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
-                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
-            // Two lines, the first split across two chunks; then a final line
-            // with no trailing newline.
-            for chunk in ["one\npar", "tial\ntail-no-nl"] {
-                let body = chunk.as_bytes();
-                let framed = format!("{:x}\r\n{}\r\n", body.len(), chunk);
-                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+        for stop_early in [false, true] {
+            let dir = tmp_dir("follow");
+            let sock = dir.join("ak.sock");
+            let (_ep, listener) = bound(&sock);
+            let chunks: Vec<&str> = if stop_early {
+                vec!["a\nb\nc\n"]
+            } else {
+                vec!["one\npar", "tial\ntail-no-nl"]
+            };
+            let server = std::thread::spawn(move || {
+                let mut listener = listener;
+                let mut conn = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut conn, &mut buf);
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                            Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                std::io::Write::write_all(&mut conn, head.as_bytes()).unwrap();
+                for chunk in chunks {
+                    let body = chunk.as_bytes();
+                    let framed = format!("{:x}\r\n{}\r\n", body.len(), chunk);
+                    std::io::Write::write_all(&mut conn, framed.as_bytes()).unwrap();
+                }
+                std::io::Write::write_all(&mut conn, b"0\r\n\r\n").unwrap();
+                let _ = std::io::Write::flush(&mut conn);
+            });
+            let c = Client::from_config(&config_with_socket(&sock));
+            let mut got = Vec::new();
+            let mut count = 0;
+            c.follow_lines("web", "out", |line| {
+                count += 1;
+                if stop_early {
+                    got.push(line.to_string());
+                    false
+                } else {
+                    got.push(line.to_string());
+                    true
+                }
+            })
+            .unwrap();
+            if stop_early {
+                assert_eq!(got, vec!["a"], "the callback stops the stream");
+            } else {
+                assert_eq!(got, vec!["one", "partial", "tail-no-nl"]);
             }
-            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
-            let _ = std::io::Write::flush(&mut sock);
-        });
-
-        let c = Client::from_config(&config_with_port(port));
-        let mut got = Vec::new();
-        c.follow_lines("web", "out", |line| {
-            got.push(line.to_string());
-            true
-        })
-        .unwrap();
-        assert_eq!(got, vec!["one", "partial", "tail-no-nl"]);
-        server.join().unwrap();
-
-        // A callback returning false stops early.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
-                        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
-            for chunk in ["a\nb\nc\n"] {
-                let framed = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
-                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
-            }
-            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
-            let _ = std::io::Write::flush(&mut sock);
-        });
-        let c = Client::from_config(&config_with_port(port));
-        let mut count = 0;
-        c.follow_lines("web", "out", |_| {
-            count += 1;
-            false // stop after the first line
-        })
-        .unwrap();
-        assert_eq!(count, 1, "the callback stops the stream");
-        server.join().unwrap();
+            server.join().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
-    /// A 404 answer is surfaced as an api error (the control plane answered,
-    /// the daemon is reachable).
+    /// A 404 on a streaming endpoint is an api error, not a broken pipe.
     #[test]
     fn follow_lines_surfaces_api_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
-            let body = "{\"error\":\"unknown program\"}";
-            let resp = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
-        });
-        let c = Client::from_config(&config_with_port(port));
-        let err = c
-            .follow_lines("ghost", "out", |_| true)
-            .err()
-            .expect("404 must error");
+        let dir = tmp_dir("follow404");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            http_response("HTTP/1.1 404 Not Found", r#"{"error":"unknown program"}"#),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.follow_lines("ghost", "out", |_| true).expect_err("404 must error");
         assert!(err.to_string().contains("404"), "{err:#}");
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- ad-hoc run streaming (run-daemon-first task 6.1) -------------------
-
-    /// A fake server emitting NDJSON frames (one split across chunks) is
-    /// framed into whole JSON values, and the terminal frame is returned.
+    /// Task 3.2: NDJSON frames (one split across chunks) come out whole, in
+    /// order, and the terminal frame is returned.
     #[test]
     fn adhoc_run_parses_frames_and_returns_terminal() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let dir = tmp_dir("adhoc");
+        let sock = dir.join("ak.sock");
+        let (_ep, listener) = bound(&sock);
         let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut listener = listener;
+            let mut conn = listener.accept().unwrap();
             let mut buf = [0u8; 8192];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let _ = std::io::Read::read(&mut conn, &mut buf);
             let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
                         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-            std::io::Write::write_all(&mut sock, head.as_bytes()).unwrap();
-            // Frame 1 split across two chunks; frame 2 whole.
+            std::io::Write::write_all(&mut conn, head.as_bytes()).unwrap();
             for chunk in [
                 "{\"phase\":\"sta",
                 "ged\",\"estimate_secs\":3}\n{\"ok\":true,\"program\":\"web\",\"pid\":42}\n",
             ] {
                 let framed = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
-                std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+                std::io::Write::write_all(&mut conn, framed.as_bytes()).unwrap();
             }
-            std::io::Write::write_all(&mut sock, b"0\r\n\r\n").unwrap();
-            let _ = std::io::Write::flush(&mut sock);
+            std::io::Write::write_all(&mut conn, b"0\r\n\r\n").unwrap();
+            let _ = std::io::Write::flush(&mut conn);
         });
-        let c = Client::from_config(&config_with_port(port));
+        let c = Client::from_config(&config_with_socket(&sock));
         let mut seen = Vec::new();
         let last = c
             .adhoc_run(&serde_json::json!({"command": "/bin/true"}), |f| {
@@ -536,89 +873,99 @@ mod tests {
         assert_eq!(last["ok"], true);
         assert_eq!(last["pid"], 42);
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A 4xx answer is surfaced as an api error (the control plane answered).
+    /// A 4xx answer to the ad-hoc call is an api error carrying the daemon's
+    /// own explanation.
     #[test]
     fn adhoc_run_surfaces_api_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut sock, &mut buf);
-            let body = "{\"error\":\"app name \\\"all\\\" is reserved\"}";
-            let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
-        });
-        let c = Client::from_config(&config_with_port(port));
+        let dir = tmp_dir("adhoc400");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            http_response(
+                "HTTP/1.1 400 Bad Request",
+                r#"{"error":"app name \"all\" is reserved"}"#,
+            ),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
         let err = c
             .adhoc_run(&serde_json::json!({"command": "/bin/true"}), |_| {})
             .expect_err("400 must error");
         assert!(err.to_string().contains("400"), "{err:#}");
         assert!(err.to_string().contains("reserved"), "{err:#}");
         server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The residual confirm/decline surface posts to /v1/run/commit and
     /// /v1/run/abort with the program name.
     #[test]
     fn adhoc_commit_and_abort_post_name() {
-        for (path, call) in [
-            ("/v1/run/commit", 0),
-            ("/v1/run/abort", 1),
-        ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let server = std::thread::spawn(move || {
-                let (mut sock, _) = listener.accept().unwrap();
-                // Read until the body has arrived (headers + Content-Length).
-                let mut req = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = std::io::Read::read(&mut sock, &mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    req.extend_from_slice(&buf[..n]);
-                    let text = String::from_utf8_lossy(&req);
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let len = head
-                            .lines()
-                            .find_map(|l| {
-                                l.strip_prefix("Content-Length: ")
-                                    .or_else(|| l.strip_prefix("content-length: "))
-                            })
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if body.len() >= len {
-                            break;
-                        }
-                    }
-                }
-                let req = String::from_utf8_lossy(&req).to_string();
-                assert!(req.contains(path), "path in request: {req}");
-                assert!(req.contains("\"name\":\"web\""), "name in body: {req}");
-                let body = "{\"result\":\"ok\"}";
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
-            });
-            let c = Client::from_config(&config_with_port(port));
-            let v = if call == 0 {
+        for (path, commit) in [("/v1/run/commit", true), ("/v1/run/abort", false)] {
+            let dir = tmp_dir("commit");
+            let sock = dir.join("ak.sock");
+            let (_, listener) = bound(&sock);
+        let server = fake_server(listener, ok_response("{\"result\":\"ok\"}"));
+            let c = Client::from_config(&config_with_socket(&sock));
+            let v = if commit {
                 c.adhoc_commit("web").unwrap()
             } else {
                 c.adhoc_abort("web").unwrap()
             };
             assert_eq!(v["result"], "ok");
-            server.join().unwrap();
+            let req = server.join().unwrap();
+            assert!(req.contains(path), "path in request: {req}");
+            assert!(req.contains("\"name\":\"web\""), "name in body: {req}");
+            let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Task 3.4: a listener that accepts but never answers must not eat the
+    /// readiness budget — the probe gives up within its own short timeout.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_exhaust_the_budget_on_a_silent_listener() {
+        let dir = tmp_dir("probe");
+        let sock = dir.join("ak.sock");
+        let (_ep, mut listener) = bound(&sock);
+        // Accept and then say nothing, ever; the test only needs the
+        // accepted connection to exist while the probe gives up.
+        let silent = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let _ = std::io::Read::read(&mut conn, &mut buf);
+            drop(conn);
+        });
+        let cfg = config_with_socket(&sock);
+        let probe = Client::probe(&cfg);
+        let t0 = std::time::Instant::now();
+        assert!(probe.health().is_err(), "no answer is not healthy");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the probe gives up on its own budget (took {elapsed:?})"
+        );
+        drop(silent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.5 (module contract): the client resolves its endpoint from the
+    /// config and never invents one.
+    #[test]
+    fn endpoint_comes_from_the_config() {
+        let dir = tmp_dir("ep");
+        let sock = dir.join("custom.sock");
+        let c = Client::from_config(&config_with_socket(&sock));
+        assert_eq!(c.endpoint().display(), sock.display().to_string());
+        // The built-in default when the config has no explicit socket.
+        let d: crate::config::DaemonConfig = toml::from_str("[daemon]\n").unwrap();
+        assert_eq!(
+            Client::from_config(&d).endpoint().display(),
+            transport::Endpoint::default_endpoint().display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

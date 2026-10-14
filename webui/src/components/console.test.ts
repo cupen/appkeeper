@@ -197,7 +197,7 @@ describe('console components', () => {
     confirmButton!.click()
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
-    expect(fetchMock).toHaveBeenCalledWith('/api/programs/web/stop', { method: 'POST' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/programs/web/stop', { method: 'POST', credentials: 'same-origin' })
     expect(el.shadowRoot!.textContent).toContain('program web is stopped')
     el.remove()
   })
@@ -226,7 +226,7 @@ describe('console components', () => {
     startButton!.click()
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
-    expect(fetchMock).toHaveBeenCalledWith('/api/programs/worker/start', { method: 'POST' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/programs/worker/start', { method: 'POST', credentials: 'same-origin' })
     expect(el.shadowRoot!.textContent).toContain('cannot start: retries exhausted')
     el.remove()
   })

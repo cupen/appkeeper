@@ -7,6 +7,7 @@
 
 import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property, state } from 'lit/decorators.js'
+import { apiFetch } from '../lib/api.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import { formatBytes, formatPercent, formatUptime, stateGlyph } from '../lib/format.js'
 
@@ -175,9 +176,10 @@ export class AkProgramDetail extends LitElement {
     this.confirm = null
     this.notice = null
     try {
-      const res = await fetch(`/api/programs/${encodeURIComponent(this.program)}/${action}`, {
-        method: 'POST',
-      })
+      const res = await apiFetch(
+        `/api/programs/${encodeURIComponent(this.program)}/${action}`,
+        { method: 'POST' },
+      )
       const body = (await res.json().catch(() => ({}))) as { result?: string; error?: string }
       if (res.ok) {
         this.notice = { ok: true, text: body.result ?? `${action} 已提交` }

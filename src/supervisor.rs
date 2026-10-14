@@ -325,8 +325,7 @@ pub fn signal_program(
 pub fn run_context(st: &SupervisorState) -> crate::action::RunContext {
     let mut ctx = crate::action::RunContext {
         daemon_pid: std::process::id(),
-        daemon_host: st.config.daemon.host.clone(),
-        daemon_port: st.config.daemon.port,
+        daemon_socket: st.config.daemon.socket.to_string_lossy().into_owned(),
         daemon_log_dir: config::resolve_path(&st.config.daemon.log_dir, &st.config_dir),
         daemon_app_dir: config::resolve_path(&st.config.daemon.app_dir, &st.config_dir),
         ..Default::default()
@@ -612,6 +611,10 @@ pub struct Supervisor {
     /// Web-console intent handle (config-driven-webui): reload publishes a
     /// new intent here, the resident manager thread converges the runtime.
     pub webui: Arc<WebuiControl>,
+    /// The console's access-control state (`webui.auth_token`), published by
+    /// whichever console instance is currently bound so the credential
+    /// endpoints answer consistently with the guard middleware.
+    pub console_auth: Mutex<std::sync::Arc<crate::web::ConsoleAuth>>,
     config_path: Mutex<PathBuf>,
     started: std::time::Instant,
     interval: Duration,
@@ -645,6 +648,9 @@ impl Supervisor {
             metrics: Arc::new(crate::metrics::MetricsTable::new()),
             actions: crate::action::ActionRuns::new(),
             webui: WebuiControl::new(),
+            console_auth: Mutex::new(std::sync::Arc::new(
+                crate::web::ConsoleAuth::disabled(),
+            )),
             config_path: Mutex::new(config_dir.join("appkeeper.toml")),
             started: std::time::Instant::now(),
             interval,
@@ -1232,17 +1238,12 @@ impl Supervisor {
                     }
                 }
             }
-            // Daemon fields that cannot hot-apply.
-            let old_daemon = &st.config.daemon;
-            if old_daemon.port != new_config.daemon.port
-                || old_daemon.host != new_config.daemon.host
-            {
+            // Daemon fields that cannot hot-apply: the control endpoint is
+            // bound once at startup and the listening socket is not rebindable
+            // mid-flight.
+            if st.config.daemon.socket != new_config.daemon.socket {
                 doc.daemon_hints
-                    .push("daemon host/port changed: restart appkeeper to apply".into());
-            }
-            if old_daemon.auth_token != new_config.daemon.auth_token {
-                doc.daemon_hints
-                    .push("daemon auth_token changed: restart appkeeper to apply".into());
+                    .push("daemon socket changed: restart appkeeper to apply".into());
             }
         }
         // Refresh file stamps (all files we parsed).
@@ -2004,19 +2005,13 @@ impl Supervisor {
                 }
             }
 
-            // Daemon fields that cannot hot-apply.
-            let old_daemon = st.config.daemon.clone();
-            if old_daemon.port != new_config.daemon.port
-                || old_daemon.host != new_config.daemon.host
-            {
+            // Daemon fields that cannot hot-apply: the control endpoint is
+            // bound once at startup and the listening socket is not rebindable
+            // mid-flight.
+            if st.config.daemon.socket != new_config.daemon.socket {
                 result
                     .daemon_hints
-                    .push("daemon host/port changed: restart appkeeper to apply".into());
-            }
-            if old_daemon.auth_token != new_config.daemon.auth_token {
-                result
-                    .daemon_hints
-                    .push("daemon auth_token changed: restart appkeeper to apply".into());
+                    .push("daemon socket changed: restart appkeeper to apply".into());
             }
             st.config = new_config.clone();
             // Persisted app records exclude staged (started-but-unpersisted)
@@ -2185,18 +2180,19 @@ const WEBUI_BIND_WAIT: Duration = Duration::from_secs(5);
 /// The desired web-console state, derived from the `[webui]` config section:
 /// present = enabled at `listen`, absent = disabled (design D1: presence IS
 /// the switch, there is no boolean).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WebuiIntent {
     pub enabled: bool,
     pub listen: String,
+    /// The console's own access-control token; empty = the console applies no
+    /// application-layer credential and its isolation is whatever
+    /// `webui.listen` grants (webui-api capability).
+    pub auth_token: String,
 }
 
 impl WebuiIntent {
     pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            listen: String::new(),
-        }
+        Self::default()
     }
 
     pub fn from_config(config: &DaemonConfig) -> Self {
@@ -2204,14 +2200,16 @@ impl WebuiIntent {
             Some(listen) => Self {
                 enabled: true,
                 listen: listen.to_string(),
+                auth_token: config.webui_auth_token().unwrap_or("").to_string(),
             },
             None => Self::disabled(),
         }
     }
 
-    /// Does an instance bound to `listen` already satisfy this intent?
-    fn serves(&self, listen: &str) -> bool {
-        self.enabled && self.listen == listen
+    /// Does an instance bound to `listen` with this token already satisfy the
+    /// intent? Rotating the token forces a rebind — the router holds it.
+    fn serves(&self, listen: &str, auth_token: &str) -> bool {
+        self.enabled && self.listen == listen && self.auth_token == auth_token
     }
 }
 
@@ -2311,6 +2309,9 @@ impl WebuiControl {
 /// One live console instance owned by the manager thread.
 struct RunningWebui {
     listen: String,
+    /// The token the running router enforces; part of the identity, so a
+    /// rotated token rebinds instead of leaving the old one in place.
+    auth_token: String,
     stop: Arc<crate::web::WebuiLifecycle>,
     handle: Option<std::thread::JoinHandle<Result<()>>>,
 }
@@ -2368,20 +2369,26 @@ impl RunningWebui {
 /// Spawn one console instance and report `(instance, ok, note)`. Bind
 /// failures are non-fatal (design D5): the daemon keeps running without the
 /// console and the note explains how to retry.
-fn start_webui(sup: &Arc<Supervisor>, listen: &str) -> (Option<RunningWebui>, bool, String) {
+fn start_webui(
+    sup: &Arc<Supervisor>,
+    listen: &str,
+    auth_token: &str,
+) -> (Option<RunningWebui>, bool, String) {
     let stop = crate::web::WebuiLifecycle::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let sup2 = Arc::clone(sup);
     let stop2 = Arc::clone(&stop);
     let addr = listen.to_string();
+    let token = auth_token.to_string();
     let handle = std::thread::Builder::new()
         .name("webui".into())
-        .spawn(move || crate::web::serve(sup2, &addr, stop2, Some(tx)))
+        .spawn(move || crate::web::serve(sup2, &addr, &token, stop2, Some(tx)))
         .expect("spawn webui thread");
     match rx.recv_timeout(WEBUI_BIND_WAIT) {
         Ok(Ok(bound)) => (
             Some(RunningWebui {
                 listen: bound.clone(),
+                auth_token: auth_token.to_string(),
                 stop,
                 handle: Some(handle),
             }),
@@ -2409,6 +2416,7 @@ fn start_webui(sup: &Arc<Supervisor>, listen: &str) -> (Option<RunningWebui>, bo
             (
                 Some(RunningWebui {
                     listen: listen.to_string(),
+                    auth_token: auth_token.to_string(),
                     stop,
                     handle: Some(handle),
                 }),
@@ -2449,7 +2457,7 @@ pub fn webui_manager_loop(sup: Arc<Supervisor>) {
         if generation > converged_gen {
             let matches = running
                 .as_ref()
-                .map(|r| desired.serves(&r.listen))
+                .map(|r| desired.serves(&r.listen, &r.auth_token))
                 .unwrap_or(false);
             if matches {
                 sup.webui.mark_applied(
@@ -2464,7 +2472,8 @@ pub fn webui_manager_loop(sup: Arc<Supervisor>) {
                 running = None;
                 if desired.enabled {
                     info!("webui console starting on {}", desired.listen);
-                    let (inst, ok, note) = start_webui(&sup, &desired.listen);
+                    let (inst, ok, note) =
+                        start_webui(&sup, &desired.listen, &desired.auth_token);
                     running = inst;
                     // Log degraded starts (bind failure, early exit) right
                     // here so both `run` startup and `reload` record it —
@@ -3545,6 +3554,7 @@ mod tests {
         let generation = sup.webui.set_desired(WebuiIntent {
             enabled: true,
             listen: listen.clone(),
+            ..Default::default()
         });
         let note = wait_applied_ok(&sup, generation);
         assert!(
@@ -3583,6 +3593,7 @@ mod tests {
         let generation = sup.webui.set_desired(WebuiIntent {
             enabled: true,
             listen: old.clone(),
+            ..Default::default()
         });
         wait_applied_ok(&sup, generation);
         assert!(std::net::TcpStream::connect(&old).is_ok());
@@ -3590,6 +3601,7 @@ mod tests {
         let generation = sup.webui.set_desired(WebuiIntent {
             enabled: true,
             listen: new.clone(),
+            ..Default::default()
         });
         wait_applied_ok(&sup, generation);
         std::thread::sleep(Duration::from_millis(150));
@@ -3619,8 +3631,9 @@ mod tests {
         let mgr = spawn_manager(&sup);
 
         let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: taken.clone(),
+              enabled: true,
+              listen: taken.clone(),
+              ..Default::default()
         });
         let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
         assert!(!ok, "occupied port must not report success: {note}");
@@ -3635,8 +3648,9 @@ mod tests {
         drop(blocker);
         std::thread::sleep(Duration::from_millis(100));
         let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: taken.clone(),
+              enabled: true,
+              listen: taken.clone(),
+              ..Default::default()
         });
         wait_applied_ok(&sup, generation);
         assert!(
@@ -3653,15 +3667,16 @@ mod tests {
     /// (webui-api: 启动时按配置伺服; configuration: `listen` 缺省 127.0.0.1:9877).
     #[test]
     fn webui_intent_from_config_maps_presence_and_default() {
-        let off: DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        let off: DaemonConfig = toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
         assert_eq!(WebuiIntent::from_config(&off), WebuiIntent::disabled());
         // A bare `[webui]` table enables the console at the default address.
         let bare: DaemonConfig = toml::from_str("[webui]\n").unwrap();
         assert_eq!(
             WebuiIntent::from_config(&bare),
             WebuiIntent {
-                enabled: true,
-                listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
+                  enabled: true,
+                  listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
+                  ..Default::default()
             }
         );
         // An explicit listen passes through verbatim.
@@ -3669,8 +3684,9 @@ mod tests {
         assert_eq!(
             WebuiIntent::from_config(&explicit),
             WebuiIntent {
-                enabled: true,
-                listen: "0.0.0.0:8080".to_string(),
+                  enabled: true,
+                  listen: "0.0.0.0:8080".to_string(),
+                  ..Default::default()
             }
         );
     }
@@ -3825,14 +3841,18 @@ mod tests {
         // Regression: [daemon] changes still produce restart hints, and webui
         // diffs never appear in pending.
         let port_c = free_port();
+        let sock_c = cfg_path.with_extension("sock");
         std::fs::write(
             &cfg_path,
-            format!("[daemon]\nport = 17310\n[webui]\nlisten = '127.0.0.1:{port_c}'\n"),
+            format!(
+                "[daemon]\nsocket = {:?}\n[webui]\nlisten = '127.0.0.1:{port_c}'\n",
+                sock_c.to_string_lossy()
+            ),
         )
         .unwrap();
         let out = sup.cmd_reload().unwrap();
         assert!(
-            out.contains("daemon host/port changed: restart appkeeper to apply"),
+            out.contains("daemon socket changed: restart appkeeper to apply"),
             "daemon hint still renders: {out}"
         );
         assert!(out.contains("webui:"), "webui note appended: {out}");
@@ -3842,7 +3862,7 @@ mod tests {
                 st.pending
                     .daemon_hints
                     .iter()
-                    .any(|h| h.contains("host/port")),
+                    .any(|h| h.contains("daemon socket changed")),
                 "hint recorded in pending"
             );
             assert!(

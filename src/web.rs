@@ -15,8 +15,8 @@
 //! flag, `serve` honors an external stop flag (reload off / rebind), and WS
 //! sessions close gracefully (queued frames flush, then a Close frame).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -245,9 +245,17 @@ async fn program_action(
 
 /// Build the console router (exposed for integration tests). `stop` is the
 /// external lifecycle state shared with the WS sessions (see [`serve`]).
-pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) -> Router {
-    Router::new()
-        .route("/api/health", get(health))
+/// `auth_token` empty = no application-layer credential at all (the console's
+/// isolation is whatever `webui.listen` grants — see the `webui-api`
+/// capability); non-empty = `/api/*` (except `/api/health`) and `/ws` require
+/// a session established by exchanging the token at `/api/auth`.
+pub fn build_router(
+    sup: Arc<Supervisor>,
+    stop: Arc<WebuiLifecycle>,
+    auth_token: &str,
+) -> Router {
+    let auth = console_auth_for(&sup, auth_token);
+    let guarded = Router::new()
         .route("/api/overview", get(overview))
         .route("/api/programs", get(programs))
         .route("/api/programs/{name}", get(program_detail))
@@ -255,13 +263,251 @@ pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) -> Router {
         .route("/api/programs/{name}/{action}", post(program_action))
         .route("/api/pending", get(pending))
         .route("/api/apply", post(apply))
-        .route("/assets/{*path}", get(assets::asset))
         .route("/ws", get(ws_upgrade))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&auth),
+            console_auth,
+        ));
+    Router::new()
+        // Credential plumbing: exchange the token for a session cookie, and
+        // drop a session again. Both stay reachable without a session — they
+        // are how one is obtained.
+        .route("/api/auth", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .merge(guarded)
+        .route("/api/health", get(health))
+        .route("/assets/{*path}", get(assets::asset))
         .layer(Extension(stop))
         .layer(CompressionLayer::new())
         .with_state(sup)
         .fallback(assets::spa_fallback)
 }
+
+/// Resolve the console's auth state for this instance: the token from the
+/// config, or the disabled (pass-through) state when there is none.
+fn console_auth_for(sup: &Arc<Supervisor>, auth_token: &str) -> Arc<ConsoleAuth> {
+    if auth_token.is_empty() {
+        return Arc::new(ConsoleAuth::disabled());
+    }
+    let auth = Arc::new(ConsoleAuth::new(auth_token));
+    *sup.console_auth.lock().unwrap() = Arc::clone(&auth);
+    auth
+}
+
+/// The console's access-control state. Sessions are random opaque ids kept
+/// in memory; the token itself is only ever compared at the exchange and is
+/// never stored in a cookie, a URL or a log line.
+#[derive(Debug, Clone)]
+pub struct ConsoleAuth {
+    token: Arc<String>,
+    sessions: Arc<Mutex<HashSet<String>>>,
+    /// Upper bound so a stuck browser cannot grow the set without limit.
+    capacity: usize,
+}
+
+impl ConsoleAuth {
+    /// Unauthenticated console: every guard is a no-op.
+    pub fn disabled() -> Self {
+        ConsoleAuth {
+            token: Arc::new(String::new()),
+            sessions: Arc::new(Mutex::new(HashSet::new())),
+            capacity: 0,
+        }
+    }
+
+    pub fn new(token: &str) -> Self {
+        ConsoleAuth {
+            token: Arc::new(token.to_string()),
+            sessions: Arc::new(Mutex::new(HashSet::new())),
+            capacity: 64,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.token.is_empty()
+    }
+
+    fn check(&self, presented: &str) -> bool {
+        self.enabled() && self.sessions.lock().unwrap().contains(presented)
+    }
+
+    fn exchange(&self, token: &str) -> Option<String> {
+        if !self.enabled() || !constant_time_eq(token, &self.token) {
+            return None;
+        }
+        let mut set = self.sessions.lock().unwrap();
+        if set.len() >= self.capacity {
+            // Drop the oldest by insertion order would need an ordered set;
+            // clearing wholesale is simpler and only costs a re-login.
+            set.clear();
+        }
+        let id = random_session_id();
+        set.insert(id.clone());
+        Some(id)
+    }
+
+    fn revoke(&self, id: &str) {
+        if self.enabled() {
+            self.sessions.lock().unwrap().remove(id);
+        }
+    }
+}
+
+/// Session cookie carrying the opaque session id (never the token).
+const SESSION_COOKIE: &str = "ak_console";
+/// How long a browser keeps the session cookie.
+const SESSION_MAX_AGE: u64 = 12 * 3600;
+
+/// Compare without an early exit on the first differing byte.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// A random hex id. Good enough for an in-memory session that only exists
+/// behind a loopback-ish listener, and it has no dependency on the OS RNG API.
+fn random_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let addr = &nanos as *const u128 as usize as u128;
+    let mut v = nanos ^ (pid << 64) ^ (addr << 32);
+    let mut out = String::with_capacity(32);
+    for _ in 0..4 {
+        v ^= v << 13;
+        v ^= v >> 7;
+        v ^= v << 17;
+        out.push_str(&format!("{v:032x}"));
+    }
+    out.truncate(32);
+    out
+}
+
+/// Read one cookie by name from a header value.
+fn cookie_value(header: Option<&str>, name: &str) -> Option<String> {
+    let raw = header?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=')
+            && k.trim() == name
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Exchange the token for a session cookie. The token rides in a JSON body
+/// or an `X-Auth-Token` header — never in the URL, which would end up in
+/// browser history and access logs (webui-api requirement).
+async fn auth_login(
+    State(sup): State<Arc<Supervisor>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let auth = console_auth_of(&sup);
+    if !auth.enabled() {
+        // No token configured: there is nothing to exchange and nothing to
+        // protect — say so instead of handing out a meaningless cookie.
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "webui.auth_token is not configured; this console requires no credential",
+        );
+    }
+    let presented = headers
+        .get("x-auth-token")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or_else(|| {
+            body.as_ref()
+                .and_then(|Json(v)| v.get("token").and_then(|t| t.as_str()))
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    match auth.exchange(&presented) {
+        Some(id) => {
+            let cookie = format!(
+                "{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE}"
+            );
+            (
+                StatusCode::OK,
+                [(axum::http::header::SET_COOKIE, cookie)],
+                Json(json!({ "ok": true })),
+            )
+                .into_response()
+        }
+        None => api_error(StatusCode::UNAUTHORIZED, "invalid or missing token"),
+    }
+}
+
+/// Drop this browser's session cookie.
+async fn auth_logout(headers: axum::http::HeaderMap, State(sup): State<Arc<Supervisor>>) -> Response {
+    let auth = console_auth_of(&sup);
+    if let Some(id) = cookie_value(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+        SESSION_COOKIE,
+    ) {
+        auth.revoke(&id);
+    }
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::SET_COOKIE,
+            format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+        )],
+        Json(json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+/// The auth state the credential endpoints judge against.
+fn console_auth_of(sup: &Arc<Supervisor>) -> Arc<ConsoleAuth> {
+    Arc::clone(&sup.console_auth.lock().unwrap())
+}
+
+/// The guard: an unauthenticated console passes every request through
+/// untouched (behaviour is then exactly what it was before this feature).
+/// A configured console requires a valid session cookie for everything but
+/// `/api/health`; a token in the query string is deliberately NOT accepted,
+/// because URLs land in browser history and access logs.
+async fn console_auth(
+    State(auth): State<Arc<ConsoleAuth>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !auth.enabled() {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| cookie_value(Some(raw), SESSION_COOKIE));
+    match presented {
+        Some(id) if auth.check(&id) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "console authentication required",
+                "hint": "POST the token to /api/auth to obtain a session cookie",
+            })),
+        )
+            .into_response(),
+    }
+}
+
 
 /// Serve the console on `listen`. Blocks the calling thread; run it on a
 /// dedicated worker thread. Exits when the daemon shuts down (flag is set by
@@ -272,6 +518,7 @@ pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) -> Router {
 pub fn serve(
     sup: Arc<Supervisor>,
     listen: &str,
+    auth_token: &str,
     stop: Arc<WebuiLifecycle>,
     bound: Option<std::sync::mpsc::Sender<Result<String>>>,
 ) -> Result<()> {
@@ -279,8 +526,9 @@ pub fn serve(
         .worker_threads(2)
         .enable_all()
         .build()?;
+    let auth_token = auth_token.to_string();
     rt.block_on(async move {
-        let app = build_router(sup.clone(), Arc::clone(&stop));
+        let app = build_router(sup.clone(), Arc::clone(&stop), &auth_token);
         let listener = match tokio::net::TcpListener::bind(listen).await {
             Ok(l) => l,
             Err(e) => {
@@ -293,7 +541,14 @@ pub fn serve(
                 return Err(anyhow::anyhow!(msg));
             }
         };
-        log::info!("webui listening on http://{listen}");
+        log::info!(
+            "webui listening on http://{listen} (auth: {})",
+            if auth_token.is_empty() {
+                "disabled — anyone who can reach this address has full control"
+            } else {
+                "token required"
+            }
+        );
         if let Some(tx) = &bound {
             let _ = tx.send(Ok(listen.to_string()));
         }
@@ -695,9 +950,187 @@ mod tests {
         (status, body)
     }
 
+    /// Issue a request with optional headers/cookies; returns status, body
+    /// and the `Set-Cookie` the router emitted (empty when it did not).
+    async fn call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, axum::body::Bytes, String) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body, set_cookie)
+    }
+
+    fn authed_app(token: &str) -> Router {
+        build_router(test_sup(), test_stop(), token)
+    }
+
+    /// 6.1: with no `webui.auth_token`, nothing about the console changes —
+    /// anonymous `/api/overview` still answers 200 and no credential
+    /// endpoint invents a session.
+    #[tokio::test]
+    async fn no_token_means_no_authentication_at_all() {
+        let app = authed_app("");
+        for uri in [
+            "/api/overview",
+            "/api/programs",
+            "/api/pending",
+            "/api/health",
+        ] {
+            let (status, _, _) = call(app.clone(), "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must stay open");
+        }
+        // Exchanging a token is a no-go: there is none to exchange.
+        let (status, body, _) = call(
+            app.clone(),
+            "POST",
+            "/api/auth",
+            None,
+            Some(r#"{"token":"anything"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("not configured"));
+    }
+
+    /// 6.2: with a token configured, `/api/*` (except `/api/health`) and
+    /// `/ws` refuse anonymous callers; `/api/health` stays open so a
+    /// liveness probe does not need a credential.
+    #[tokio::test]
+    async fn configured_token_gates_api_and_ws_but_not_health() {
+        let app = authed_app("s3cr3t");
+        for uri in [
+            "/api/overview",
+            "/api/programs",
+            "/api/pending",
+            "/ws",
+            "/api/programs/web",
+        ] {
+            let (status, body, _) = call(app.clone(), "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} must be gated");
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get("error").is_some(), "{uri}: {v}");
+            assert!(
+                !String::from_utf8_lossy(&body).contains("programs"),
+                "{uri} leaked state before authentication"
+            );
+        }
+        let (status, _, _) = call(app.clone(), "GET", "/api/health", None, None).await;
+        assert_eq!(status, StatusCode::OK, "health stays reachable");
+        // A write action is gated too — not just reads.
+        let (status, _, _) = call(app.clone(), "POST", "/api/apply", None, Some("{}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 6.3: exchange the token for a session cookie, then use the cookie. A
+    /// wrong token gets nothing, and a token in the URL is never a
+    /// credential.
+    #[tokio::test]
+    async fn token_exchanges_for_a_session_cookie() {
+        let app = authed_app("s3cr3t");
+
+        // Wrong token → 401, no cookie.
+        let (status, _, set_cookie) = call(
+            app.clone(),
+            "POST",
+            "/api/auth",
+            None,
+            Some(r#"{"token":"nope"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(set_cookie.is_empty(), "no session for a wrong token");
+
+        // Right token → an HttpOnly, SameSite session cookie.
+        let (status, _, set_cookie) = call(
+            app.clone(),
+            "POST",
+            "/api/auth",
+            None,
+            Some(r#"{"token":"s3cr3t"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(set_cookie.starts_with("ak_console="), "{set_cookie}");
+        assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+        assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
+        assert!(!set_cookie.contains("s3cr3t"), "the token is never in the cookie");
+        let cookie = set_cookie.split(';').next().unwrap().to_string();
+
+        // The cookie opens the gated surface.
+        let (status, _, _) = call(app.clone(), "GET", "/api/overview", Some(&cookie), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ...and logging out closes it again.
+        let (status, _, _) = call(
+            app.clone(),
+            "POST",
+            "/api/auth/logout",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A token in the query string is not a credential — it would end up in
+    /// browser history and access logs (webui-api requirement).
+    #[tokio::test]
+    async fn token_in_query_string_is_not_accepted() {
+        let app = authed_app("s3cr3t");
+        let (status, body, _) = call(
+            app.clone(),
+            "GET",
+            "/api/overview?token=s3cr3t",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!String::from_utf8_lossy(&body).contains("programs"));
+    }
+
+    /// The token is never written to the response body — only the cookie.
+    #[tokio::test]
+    async fn a_forged_cookie_is_rejected() {
+        let app = authed_app("s3cr3t");
+        let (status, _, _) = call(
+            app.clone(),
+            "GET",
+            "/api/overview",
+            Some("ak_console=not-a-real-session"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn rest_endpoints_serve_projection_and_404_objects() {
-        let app = build_router(test_sup(), test_stop());
+        let app = build_router(test_sup(), test_stop(), "");
 
         let (status, body) = get(app.clone(), "/api/health").await;
         assert_eq!(status, StatusCode::OK);
@@ -822,7 +1255,7 @@ mod tests {
     #[tokio::test]
     async fn overview_json_carries_metric_fields() {
         let (sup, name) = sup_with_metrics();
-        let app = build_router(sup, test_stop());
+        let app = build_router(sup, test_stop(), "");
         let (status, body) = get(app, "/api/overview").await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -846,7 +1279,7 @@ mod tests {
         let sup2 = sup.clone();
         let stop = test_stop();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, build_router(sup2, stop)).await;
+            let _ = axum::serve(listener, build_router(sup2, stop, "")).await;
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -861,22 +1294,34 @@ mod tests {
         assert_eq!(doc.daemon.system.cpu_percent, Some(3.4));
     }
 
-    #[tokio::test]
-    async fn control_plane_status_carries_metrics() {
+    /// The control plane's projection is served over the local IPC endpoint —
+    /// same JSON, no TCP port involved. It is queried with the in-tree client,
+    /// which speaks HTTP/1.1 over that endpoint.
+    #[test]
+    fn control_plane_status_carries_metrics() {
         let (sup, name) = sup_with_metrics();
-        // Port 0 → OS-assigned ephemeral port; no clashes with other tests.
+        let dir = std::env::temp_dir().join(format!("xk-web-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("ak.sock");
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("[daemon]\nsocket = {:?}\n", socket.to_string_lossy()),
+        )
+        .unwrap();
         {
             let mut st = sup.state.lock().unwrap();
-            st.config.daemon.port = 0;
+            st.config.daemon.socket = socket.clone();
         }
-        let listener = crate::server::bind(&sup).expect("ephemeral bind");
-        let addr = listener.local_addr().unwrap();
+        let listener = crate::server::bind(&sup).expect("control endpoint bind");
+        let config = {
+            let st = sup.state.lock().unwrap();
+            st.config.clone()
+        };
         std::thread::spawn(move || crate::server::serve(sup, listener));
 
-        let resp = ureq::get(&format!("http://{addr}/v1/status"))
-            .call()
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&resp.into_string().unwrap()).unwrap();
+        let client = crate::client::Client::from_config(&config);
+        let v = client.status().expect("/v1/status over the control endpoint");
         let p = v["programs"]
             .as_array()
             .unwrap()
@@ -886,6 +1331,7 @@ mod tests {
         assert_eq!(p["cpu_percent"], 12.5);
         assert_eq!(p["mem_bytes"], 4096);
         assert_eq!(v["daemon"]["system"]["cpu_percent"], 3.4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- lifecycle: external stop + graceful WS close (config-driven-webui) ---
@@ -901,7 +1347,7 @@ mod tests {
         let (bound_tx, bound_rx) = std::sync::mpsc::channel();
         let stop2 = Arc::clone(&stop);
         let addr = listen.clone();
-        let handle = std::thread::spawn(move || serve(sup, &addr, stop2, Some(bound_tx)));
+        let handle = std::thread::spawn(move || serve(sup, &addr, "", stop2, Some(bound_tx)));
 
         let bound = bound_rx
             .recv_timeout(Duration::from_secs(10))
@@ -937,7 +1383,7 @@ mod tests {
         let listen = format!("{}", blocker.local_addr().unwrap());
         let stop = test_stop();
         let (bound_tx, bound_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || serve(sup, &listen, stop, Some(bound_tx)));
+        let handle = std::thread::spawn(move || serve(sup, &listen, "", stop, Some(bound_tx)));
         let err = bound_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("bind report in time")
@@ -961,7 +1407,7 @@ mod tests {
         let stop2 = Arc::clone(&stop);
         let addr = listen.clone();
         let sup2 = Arc::clone(&sup);
-        let handle = std::thread::spawn(move || serve(sup2, &addr, stop2, Some(bound_tx)));
+        let handle = std::thread::spawn(move || serve(sup2, &addr, "", stop2, Some(bound_tx)));
         let bound = bound_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("bind report in time")
@@ -998,7 +1444,7 @@ mod tests {
         let stop = test_stop();
         let (bound_tx, bound_rx) = std::sync::mpsc::channel();
         let stop2 = Arc::clone(&stop);
-        std::thread::spawn(move || serve(sup, &listen, stop2, Some(bound_tx)));
+        std::thread::spawn(move || serve(sup, &listen, "", stop2, Some(bound_tx)));
         let bound = bound_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("bind report in time")
@@ -1079,7 +1525,7 @@ mod high_speed_tests {
         let addr = listener.local_addr().unwrap();
         let sup2 = sup.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, build_router(sup2, test_stop())).await;
+            let _ = axum::serve(listener, build_router(sup2, test_stop(), "")).await;
         });
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -1279,7 +1725,7 @@ mod pending_ws_tests {
     #[tokio::test]
     async fn ws_status_delta_carries_pending_changes() {
         let sup = sup_with_pending();
-        let app = build_router(sup.clone(), test_stop());
+        let app = build_router(sup.clone(), test_stop(), "");
         let resp = app
             .oneshot(Request::get("/api/overview").body(Body::empty()).unwrap())
             .await
@@ -1292,7 +1738,7 @@ mod pending_ws_tests {
         assert_eq!(v["pending"]["programs"][0]["program"], "web");
         assert_eq!(v["pending"]["programs"][0]["running"], true);
         // And /api/pending serves the same doc.
-        let app2 = build_router(sup.clone(), test_stop());
+        let app2 = build_router(sup.clone(), test_stop(), "");
         let resp = app2
             .oneshot(Request::get("/api/pending").body(Body::empty()).unwrap())
             .await

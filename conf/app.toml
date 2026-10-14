@@ -77,7 +77,7 @@ command = "/opt/myapp/myserver --port 8080"
 #
 # 多行命令整段交给 shell（管道/重定向/&& 可用）；${...} 已知域变量在执行前
 # 替换：program.<名>.pid|state|app|work_dir|log_dir、app.<名>.path、
-# daemon.pid|host|port|log_dir|app_dir；程序未运行时 pid 为空串；
+# daemon.pid|socket|log_dir|app_dir；程序未运行时 pid 为空串；
 # ${HOME} 等 shell 变量原样保留。动作里可链式调用 appkeeper 子命令。
 #
 # [program.main.action.upgrade]

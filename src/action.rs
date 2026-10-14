@@ -289,8 +289,7 @@ pub struct ProgramVars {
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
     pub daemon_pid: u32,
-    pub daemon_host: String,
-    pub daemon_port: u16,
+    pub daemon_socket: String,
     pub daemon_log_dir: PathBuf,
     pub daemon_app_dir: PathBuf,
     /// App name -> app config path.
@@ -307,8 +306,7 @@ impl RunContext {
         match r.domain {
             config::VarDomain::Daemon => match r.field.as_str() {
                 "pid" => Some(self.daemon_pid.to_string()),
-                "host" => Some(self.daemon_host.clone()),
-                "port" => Some(self.daemon_port.to_string()),
+                "socket" => Some(self.daemon_socket.clone()),
                 "log_dir" => Some(self.daemon_log_dir.display().to_string()),
                 "app_dir" => Some(self.daemon_app_dir.display().to_string()),
                 _ => None,
@@ -520,8 +518,7 @@ mod tests {
     fn run_context_substitution() {
         let mut ctx = RunContext {
             daemon_pid: 7,
-            daemon_host: "127.0.0.1".into(),
-            daemon_port: 7310,
+            daemon_socket: "/run/appkeeper/1000/ak.sock".into(),
             ..Default::default()
         };
         ctx.programs.insert(
@@ -555,8 +552,8 @@ mod tests {
         );
         // Daemon domain.
         assert_eq!(
-            ctx.substitute("d=${daemon.pid} ${daemon.host}:${daemon.port}"),
-            "d=7 127.0.0.1:7310"
+            ctx.substitute("d=${daemon.pid} s=${daemon.socket}"),
+            "d=7 s=/run/appkeeper/1000/ak.sock"
         );
         // Unknown domain passes through for the shell.
         assert_eq!(ctx.substitute("echo ${HOME}"), "echo ${HOME}");

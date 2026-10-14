@@ -18,13 +18,14 @@ log_dir = "/tmp/appkeeper/logs"
 # 守护循环巡检周期（秒），取值范围 (0, 60]
 monitor_interval = 1.0
 
-# 控制面 HTTP API 监听地址与端口；status/start/stop/log 等 CLI 与 webui 都走它。
-# 默认只绑回环地址；对外提供请自行评估鉴权。
-host = "127.0.0.1"
-port = 7310
-
-# 非空 = 控制面要求 Bearer 鉴权（CLI 与 webui 需携带同值）；空 = 不鉴权（仅回环使用）。
-auth_token = ""
+# 控制面本地 IPC 端点（socket 上跑 HTTP/1.1）；status/start/stop/log 等 CLI
+# 与 appkeeper-bench 都走它。默认按 uid 分层，root 与普通用户可各跑一个
+# 守护进程互不冲突；Windows 下是 \\.\pipe\ak-<用户名>.sock。
+#
+# 谁能连上由操作系统决定：unix 上 socket 权限 0600、所在 uid 目录 0700，
+# 内核在 connect() 阶段就拒绝非属主；Windows 上是命名管道的 DACL。
+# 控制面没有 token，也不监听任何网络端口。
+socket = "/run/appkeeper/1000/ak.sock"
 
 # 每个输出流在内存中保留的最近行数，`ak log` 与 webui 实时日志的数据源。
 log_buffer_lines = 1000

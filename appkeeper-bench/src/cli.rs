@@ -66,16 +66,13 @@ pub struct BenchArgs {
     #[arg(long = "programs", default_value_t = 4)]
     pub programs: u32,
 
-    /// Connect to an already-running daemon at HOST:PORT instead of spawning
-    /// an isolated one. The daemon must be on the same host (bench reads its
-    /// app registry and log files from disk). NOTE: the load writes real disk
-    /// logs through the target daemon.
-    #[arg(long = "connect")]
-    pub connect: Option<String>,
-
-    /// Bearer token for the daemon control plane (use with --connect).
-    #[arg(long = "token")]
-    pub token: Option<String>,
+    /// Connect to an already-running daemon over its control endpoint
+    /// (a unix socket path, or `\\.\pipe\…` on Windows) instead of
+    /// spawning an isolated one. The daemon must be on the same host (bench
+    /// reads its app registry and log files from disk). NOTE: the load writes
+    /// real disk logs through the target daemon.
+    #[arg(long = "socket", value_name = "PATH")]
+    pub socket: Option<String>,
 
     /// Path of the appkeeper daemon binary (default: discovered next to this
     /// binary, then target/{debug,release} of this workspace).
@@ -316,6 +313,34 @@ mod tests {
         assert_eq!(e.total_per_program(), 1, "tiny budgets stay positive");
         let e = parse(&["--case", "firehose"]).unwrap();
         assert_eq!(e.total_per_program(), 0, "0 means unlimited");
+    }
+
+    /// `--socket` is the new topology selector; the removed `--connect` /
+    /// `--token` are refused by `main` with an explanation (they are not
+    /// accepted as unknown args silently either).
+    #[test]
+    fn socket_option_replaces_connect() {
+        let cli = Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--socket", "/run/appkeeper/0/ak.sock"])
+            .unwrap();
+        assert_eq!(
+            cli.bench.socket.as_deref(),
+            Some("/run/appkeeper/0/ak.sock")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "appkeeper-bench",
+                "--case",
+                "firehose",
+                "--connect",
+                "127.0.0.1:7310",
+            ])
+            .is_err(),
+            "--connect must not parse"
+        );
+        assert!(
+            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--token", "x"]).is_err(),
+            "--token must not parse"
+        );
     }
 
     #[test]

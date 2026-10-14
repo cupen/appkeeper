@@ -960,7 +960,8 @@ mod tests {
         let cfg: crate::config::DaemonConfig =
             toml::from_str("[webui]\nlisten = '0.0.0.0:9999'\n").unwrap();
         assert_eq!(webui_url_of(&cfg), "http://0.0.0.0:9999");
-        let off: crate::config::DaemonConfig = toml::from_str("[daemon]\nport = 1\n").unwrap();
+        let off: crate::config::DaemonConfig =
+            toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
         assert_eq!(webui_url_of(&off), "http://127.0.0.1:9877");
         assert_eq!(
             webui_url_of(&off),

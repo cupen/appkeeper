@@ -2,7 +2,10 @@
 
 轻量级进程守护工具（Rust），通过 TOML 配置守护任意多个子进程：退出后指数退避重启、
 stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理进程树。
-内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`ak reload` 热生效）。
+控制面走**本地 socket**（unix `/run/appkeeper/<uid>/ak.sock`、Windows 命名管道），
+无任何控制面 TCP 端口，身份由 OS 属主强制（`[daemon] socket` 可覆盖端点路径）。
+内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`ak reload` 热生效；
+`webui.auth_token` 可选配置后以 cookie 会话保护 `/api/*`）。
 
 ## Architecture
 
@@ -11,10 +14,11 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `<名>`/`--app` 启动、`--`/`--cmd` ad-hoc 注册全部经控制面 API 由守护进程执行，
   统一返回 `{程序名, 配置路径, PID}` 并支持 `--json`；ad-hoc 注册「先启动成功、
   后落盘」，守护离线一律退出码 3 且不隐式拉起；守护形态的 `run` 在参数解析前
-  拦截并给迁移提示）| `validate` | `config`（daemon 配置本地管理：init/set/get/
-  delete/edit 五动作，白名单键表与读改写/原子落盘引擎在 `src/config.rs`）；控制子命令
-  `status/stop/restart/log/pid/reload/shutdown`
-  走本地 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
+  拦截并给迁移提示）| `validate`（含 webui 无 token 的暴露警告）| `config`
+  （daemon 配置本地管理：init/set/get/delete/edit 五动作，白名单键表与读改写/
+  原子落盘引擎在 `src/config.rs`；`[daemon]` 死键 host/port/auth_token 报错）；
+  控制子命令 `status/stop/restart/log/pid/reload/shutdown`
+  走本地 socket 上的 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
   `apply all` 中 `all` 为全量保留字，不可作应用名；`add --apply` 保留离线隐式拉起）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
@@ -23,22 +27,30 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   连接线程而非命令处理器；`src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件
   + 占位 `*.toml.pending` 与原子 rename 落盘引擎）；`src/config.rs` — 分层配置
   （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
-  `src/health.rs` — 健康探测；`src/client.rs` — CLI HTTP 客户端（含 ad-hoc NDJSON 流式读取）。
-- `src/server.rs` — 控制平面：std 手写 HTTP（`/v1/*`，可选 Bearer 鉴权），
-  状态投影（`StatusDoc`/`ProgramInfo`，含 `config_path`/`health_confirmed`）由此导出；
+  `src/health.rs` — 健康探测（`ureq` 仅供它探测用户程序 URL，不得接回控制面）；
+  `src/client.rs` — CLI HTTP/1.1 客户端（自建传输层，含 ad-hoc NDJSON 流式读取）。
+- `src/transport.rs` — **唯一**知晓本地 IPC 细节的传输层模块：`Conn`/`Listener`/
+  `Endpoint`（connect/bind/chmod 0600/uid 0700 目录/陈旧端点清理/Windows 命名管道
+  DACL 全部封死在此），模块内不出现 HTTP 语义，上层代码不出现 socket 路径。
+- `src/server.rs` — 控制平面：std 手写 HTTP/1.1 over 传输层（`/v1/*`，
+  鉴权即 socket 属主，无应用层 token），状态投影（`StatusDoc`/`ProgramInfo`，
+  含 `config_path`/`health_confirmed`）由此导出；
   `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册。
 - `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
   bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
   外部采集（daemon 侧零改动）；轮转对账/清理契约见 README「性能基准」。
 - `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
   supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
-  SPA + `/api/*`（复用控制面投影）+ `/ws` 推送（快照/增量/日志/心跳，
-  MessagePack 二进制帧）；与控制面共享 `Supervisor` 与环形缓冲。
+  SPA + `/api/*`（复用控制面投影；可选 `webui.auth_token` → `/api/auth` 换票
+  cookie 会话）+ `/ws` 推送（快照/增量/日志/心跳，MessagePack 二进制帧）；
+  与控制面共享 `Supervisor` 与环形缓冲。
 - `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
 - `webui/` — Web 控制台前端（pnpm + Vite + TypeScript + Lit），release 构建
   后 `dist/` 经 rust-embed 嵌入二进制；dist 不提交。build.rs 在 release（或
   `AK_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
-  运行时读盘，无 Node 时回退占位页）。
+  运行时读盘，无 Node 时回退占位页）。`lib/api.ts`（统一 fetch 封装 +
+  401 换票重放）与 `lib/credentials.ts`（凭据状态机）+ `components/credential-gate.ts`
+  构成可选 token 的前端配合。
 
 ## Build & Run
 
@@ -56,12 +68,12 @@ cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--r
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- daemon                    # 守护（daemon 配置含 [webui] 段时伺服内嵌控制台；
                                        #   config --set webui.listen=... + reload 可热开启）
-cargo run -- status                    # 控制面 CLI（默认端口 7310）
+cargo run -- status                    # 控制面 CLI（经控制 socket；无任何 TCP 端口）
 
 cargo run -p appkeeper-bench -- --case firehose --duration 10
                                        # 性能基准：firehose/rotation/fanout/drip 四 case；
-                                       #   缺省自带隔离环境（临时 workspace + 随机端口），
-                                       #   --connect <addr> 连同机已运行 daemon（--token Bearer），
+                                       #   缺省自带隔离环境（临时 workspace + 随机 socket 路径），
+                                       #   --socket <path> 连同机已运行 daemon，
                                        #   --json <path> 导出机器可读报告；无阈值门禁
 
 ## OpenSpec 规范驱动开发（`.agents`）

@@ -7,11 +7,13 @@
 //! Protocol (design D6): spawn `current_exe() daemon -c <config>` in a
 //! detached process group (unix `process_group(0)`, windows
 //! `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`), redirect stdout/stderr
-//! (append) to `{log_dir}/daemon.out.log`, then poll `/v1/health` every
-//! ~200ms for up to ~10s. There is no lock file: a second instance loses the
-//! port race and exits on its own (the existing "bind conflict" behavior),
-//! and any caller that observes a healthy daemon is satisfied — it never
-//! fails because its own child exited.
+//! (append) to `{log_dir}/daemon.out.log`, then poll `/v1/health` over the
+//! control socket every ~200ms for up to ~10s. No credential is involved:
+//! the probe can only succeed if this account owns the endpoint. There is no
+//! lock file either — a second instance loses the endpoint race and exits on
+//! its own (the "bind conflict" behavior), and any caller that observes a
+//! healthy daemon is satisfied — it never fails because its own child
+//! exited.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -50,8 +52,8 @@ pub fn daemon_log_path(config: &DaemonConfig, config_dir: &Path) -> PathBuf {
 /// out. Never binds a lock: a concurrent pull-up just races on the port and
 /// the loser self-terminates.
 pub fn ensure_daemon(config: &DaemonConfig, config_path: &Path, config_dir: &Path) -> SpawnOutcome {
-    // Short-timeout probes: a listener that accepts TCP but never answers
-    // HTTP must not eat the readiness budget (see `Client::probe`).
+    // Short-timeout probes: a listener that accepts but never answers HTTP
+    // must not eat the readiness budget (see `Client::probe`).
     let probe = Client::probe(config);
     if probe.health().is_ok() {
         return SpawnOutcome::Ready {
@@ -140,8 +142,11 @@ pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
 mod tests {
     use super::*;
 
-    fn cfg_with(port: u16, log_dir: &Path) -> DaemonConfig {
-        let mut c: DaemonConfig = toml::from_str(&format!("[daemon]\nport = {port}\n")).unwrap();
+    /// A config pointing at a private control socket and a private log dir.
+    fn cfg_with_socket(socket: &Path, log_dir: &Path) -> DaemonConfig {
+        let mut c: DaemonConfig =
+            toml::from_str(&format!("[daemon]\nsocket = {:?}\n", socket.to_string_lossy()))
+                .unwrap();
         c.daemon.log_dir = log_dir.to_path_buf();
         c
     }
@@ -158,11 +163,14 @@ mod tests {
     #[test]
     fn daemon_log_path_resolves_against_config_dir() {
         let dir = tmp_dir("logpath");
-        let cfg = cfg_with(7310, Path::new("logs"));
+        let cfg = cfg_with_socket(
+            Path::new("/tmp/never-used.sock"),
+            Path::new("logs"),
+        );
         let p = daemon_log_path(&cfg, &dir);
         assert_eq!(p, dir.join("logs").join("daemon.out.log"));
         // An absolute log_dir ignores the config dir.
-        let abs = cfg_with(7310, &dir.join("abs"));
+        let abs = cfg_with_socket(Path::new("/tmp/never-used.sock"), &dir.join("abs"));
         assert_eq!(
             daemon_log_path(&abs, Path::new("/elsewhere")),
             dir.join("abs").join("daemon.out.log")
@@ -175,11 +183,13 @@ mod tests {
     #[test]
     fn ensure_daemon_short_circuits_when_online() {
         let dir = tmp_dir("online");
-        // A fake health answerer on a free port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // A fake health answerer on a private control socket — the probe
+        // goes there, and nowhere else (there is no control port to probe).
+        let socket = dir.join("ak.sock");
+        let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
+        let mut listener = ep.bind().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
             let _ = std::io::Read::read(&mut sock, &mut buf);
             let body = "{}";
@@ -190,7 +200,7 @@ mod tests {
             );
             let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
         });
-        let cfg = cfg_with(port, &dir);
+        let cfg = cfg_with_socket(&socket, &dir);
         let config_path = dir.join("daemon.toml");
         std::fs::write(&config_path, "").unwrap();
         match ensure_daemon(&cfg, &config_path, &dir) {
@@ -213,8 +223,8 @@ mod tests {
     #[test]
     fn wait_ready_times_out_and_names_log() {
         let dir = tmp_dir("timeout");
-        // loopback:1 is never open.
-        let cfg = cfg_with(1, &dir);
+        // Nothing is bound at this path, so nothing ever answers.
+        let cfg = cfg_with_socket(&dir.join("absent.sock"), &dir);
         let client = Client::from_config(&cfg);
         let t0 = Instant::now();
         assert!(
@@ -264,7 +274,11 @@ mod tests {
         let dir = tmp_dir("spawn");
         let log = dir.join("logs").join("daemon.out.log");
         let config_path = dir.join("daemon.toml");
-        std::fs::write(&config_path, "[daemon]\nport = 1\n").unwrap();
+        std::fs::write(
+            &config_path,
+            "[daemon]\nsocket = \"/tmp/xk-daemonize-spawn.sock\"\n",
+        )
+        .unwrap();
         let pid = spawn_detached(&config_path, &log).expect("spawn");
         assert!(pid > 0);
         assert!(log.exists(), "log file created");

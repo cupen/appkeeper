@@ -144,6 +144,14 @@ pub fn render_unit(
     s.push_str("RestartSec=3\n");
     s.push_str("KillSignal=SIGTERM\n");
     s.push_str(&format!("TimeoutStopSec={timeout_stop_sec}\n"));
+    // The control socket lives under /run/appkeeper/<uid>/ak.sock. Declaring
+    // RuntimeDirectory has systemd create /run/appkeeper (0755) at start and
+    // remove it at stop. Deliberately NO ProtectSystem=strict / ReadWritePaths
+    // sandboxing here: those would make that directory unwritable and the
+    // daemon could not bind. The daemon also creates the directory itself
+    // when it is missing, so an older unit without this key still works.
+    s.push_str("RuntimeDirectory=appkeeper\n");
+    s.push_str("RuntimeDirectoryMode=0755\n");
     if let Some(u) = user {
         s.push_str(&format!("User={u}\n"));
     }
@@ -482,10 +490,46 @@ mod tests {
              RestartSec=3\n\
              KillSignal=SIGTERM\n\
              TimeoutStopSec=90\n\
+             RuntimeDirectory=appkeeper\n\
+             RuntimeDirectoryMode=0755\n\
              \n\
              [Install]\n\
              WantedBy=multi-user.target\n"
         );
+    }
+
+    /// 7.1: the unit creates the control socket's parent directory, and adds
+    /// nothing that would make it unwritable (a sandbox directive here would
+    /// silently break socket creation for every systemd install).
+    #[test]
+    fn unit_declares_runtime_directory_and_no_socket_blocking_sandbox() {
+        let unit = render_unit(
+            Path::new("/usr/local/bin/ak"),
+            Path::new("/etc/appkeeper/daemon.toml"),
+            Some("akuser"),
+            RestartPolicy::Always,
+            90,
+        );
+        assert!(
+            unit.contains("RuntimeDirectory=appkeeper\n"),
+            "systemd must create /run/appkeeper: {unit}"
+        );
+        assert!(unit.contains("RuntimeDirectoryMode=0755\n"), "{unit}");
+        for blocking in [
+            "ProtectSystem=strict",
+            "ProtectSystem=true",
+            "ReadOnlyPaths=",
+            "PrivateTmp=yes",
+            "ProtectHome=yes",
+        ] {
+            assert!(
+                !unit.contains(blocking),
+                "{blocking} would block /run/appkeeper and the socket bind: {unit}"
+            );
+        }
+        // A non-root unit still gets the directory; the daemon creates the
+        // per-uid subdirectory under it.
+        assert!(unit.contains("User=akuser\n"), "{unit}");
     }
 
     #[test]

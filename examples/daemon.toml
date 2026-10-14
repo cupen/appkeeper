@@ -7,9 +7,7 @@
 log_level = "info"          # trace|debug|info|warn|error
 log_dir = "/tmp/appkeeper/logs" # absolute path required; /tmp is volatile — use e.g. /var/log/appkeeper for logs that survive reboots
 monitor_interval = 1.0      # supervision tick (seconds)
-host = "127.0.0.1"          # control API bind address (loopback by default)
-port = 7310                 # control API port
-auth_token = ""             # empty = no auth (loopback only); set a secret to require Bearer auth
+socket = "/run/appkeeper/1000/ak.sock"  # control endpoint (HTTP/1.1 over a local socket); default is per-uid, Windows uses \\.\pipe\ak-<user>.sock. Admission is enforced by the OS (0600 socket in a 0700 uid dir; a DACL on Windows) — there is no token and no TCP port
 log_buffer_lines = 1000     # in-memory ring per stream, used by `ak log --tail/-f`
 app_dir = "app.d"           # registration directory: one <name>.toml link per registered app (default app.d; old default was apps)
 

@@ -11,6 +11,7 @@
  * - WS back   → stop polling; the fresh snapshot clears staleness.
  */
 
+import { apiFetch, apiJson } from './api.js'
 import { loadRefreshMs, saveRefreshMs, type RefreshMs } from './prefs.js'
 import type { PendingDoc, ProgramInfo, StatusDoc, StreamId } from './types.js'
 import { WsClient, type WsState } from './ws-client.js'
@@ -79,6 +80,19 @@ export class ConsoleStore {
       error: () => {
         /* frame-level errors surface as logs; nothing actionable */
       },
+      handshakeRefused: () => {
+        // Distinguish "needs a credential" from "backend down" with one
+        // REST probe: only a 401 here raises the gate (apiFetch owns the
+        // prompt + replay). Any other failure is the offline path the
+        // transport banner already covers.
+        void apiFetch('/api/overview')
+          .then((res) => {
+            if (res.status === 401 && this.client) this.client.connect()
+          })
+          .catch(() => {
+            /* offline: stateChange already flipped the transport banner */
+          })
+      },
       stateChange: (state: WsState) => {
         if (state === 'open') return // snapshot handler flips to live
         if (state === 'closed') {
@@ -139,13 +153,11 @@ export class ConsoleStore {
     const body: Record<string, unknown> = { restart: opts.restart ?? false }
     if (opts.app) body['app'] = opts.app
     if (opts.program) body['program'] = opts.program
-    const res = await fetch('/api/apply', {
+    const v = await apiJson<{ result?: string; error?: string }>('/api/apply', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    const v = (await res.json().catch(() => null)) as { result?: string; error?: string } | null
-    if (!res.ok) throw new Error(v?.error ?? `HTTP ${res.status}`)
     // The WS delta / next poll refreshes state; nudge immediately for UI
     // snappiness by re-polling the overview once.
     void this.pollOnceIfNotLive()
@@ -209,7 +221,7 @@ export class ConsoleStore {
 
   private async pollOnce(): Promise<void> {
     try {
-      const res = await fetch('/api/overview')
+      const res = await apiFetch('/api/overview')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const doc = (await res.json()) as StatusDoc
       this.doc = {

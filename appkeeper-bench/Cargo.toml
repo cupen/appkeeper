@@ -7,8 +7,6 @@ description = "Load benchmark harness for a real appkeeper daemon: case-driven l
 
 [dependencies]
 anyhow = "1.0"
-# 控制面为本地 http，无需 TLS（与根包同款配置）
-ureq = { version = "2.10", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -79,7 +79,10 @@ pub(crate) struct Args {
 
 struct Workspace {
     root: PathBuf,
-    control_port: u16,
+    /// The control endpoint the daemon config pins: a filesystem path on unix,
+    /// a pipe name on Windows (unix-socket-control-plane: the control plane
+    /// serves a local IPC endpoint, not a TCP port).
+    control_socket: PathBuf,
     webui_port: u16,
 }
 
@@ -101,7 +104,6 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     for d in ["apps", "logs", "app-alpha", "app-beta"] {
         std::fs::create_dir_all(root.join(d)).context("create workspace dirs")?;
     }
-    let control_port = free_port()?;
     let webui_port = free_port()?;
     // Forward slashes in the TOML basic string: a raw Windows path would
     // put invalid `\U`-style escapes into the config.
@@ -112,10 +114,16 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     // workspace get the supervised experience (the built-in cascade default is
     // `no`). `app_dir = "apps"` keeps this workspace on the explicit name the
     // scenarios below use (run-daemon-first changed the built-in default).
+    // The control plane rides a local IPC endpoint inside the workspace
+    // (unix-socket-control-plane): a socket path on unix, a pipe name on
+    // Windows. The temp-dir prefix is short so `sun_path` (~107 bytes) is
+    // never an issue.
+    let control_socket = control_socket_in(&root);
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            socket = socket_toml_value(&control_socket),
         ),
     )?;
     std::fs::write(
@@ -136,9 +144,63 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     )?;
     Ok(Workspace {
         root,
-        control_port,
+        control_socket,
         webui_port,
     })
+}
+
+/// The control endpoint for a workspace: `<root>/ak.sock` on unix (a short
+/// temp-dir prefix keeps it inside the ~107-byte `sun_path` budget),
+/// `\\.\pipe\ak-e2e-<name>.sock` on Windows.
+fn control_socket_in(root: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let _ = root; // used above
+        root.join("ak.sock")
+    }
+    #[cfg(windows)]
+    {
+        let name = format!(
+            r"\\.\pipe\ak-e2e-{}-{}.sock",
+            root.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "ws".into()),
+            std::process::id()
+        );
+        PathBuf::from(name)
+    }
+}
+
+/// The TOML value for a `[daemon] socket` entry: a basic string on unix, a
+/// literal string on Windows (backslashes must survive unescaped).
+fn socket_toml_value(ep: &Path) -> String {
+    #[cfg(unix)]
+    {
+        format!("{:?}", ep.to_string_lossy())
+    }
+    #[cfg(windows)]
+    {
+        format!("'{}'", ep.to_string_lossy())
+    }
+}
+
+/// The current uid (via `id -u`), for asserting the uid-layered default
+/// endpoint in the config scenarios. Windows has none (the pipe name carries
+/// the user instead), where this returns 0 and the uid assertions are skipped.
+fn current_uid_e2e() -> u32 {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(windows)]
+    {
+        0
+    }
 }
 
 /// Register a config as `app_dir/<name>.toml` — symlink where available,
@@ -163,6 +225,33 @@ struct Daemon {
     child: Child,
 }
 
+/// `curl --unix-socket <ep> http://localhost<path>`: the control plane speaks
+/// HTTP/1.1 over the local IPC endpoint, so plain curl is the harness client
+/// (and doubles as the operator troubleshooting contract, spec 8.4).
+fn curl_socket(endpoint: &Path, args: &[&str], path: &str) -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s");
+    cmd.arg(format!("--unix-socket={}", endpoint.display()));
+    cmd.args(args);
+    cmd.arg(format!("http://localhost{path}"));
+    cmd
+}
+
+/// GET a control-plane path over the socket; returns (status, body).
+fn socket_get(endpoint: &Path, path: &str) -> Result<(u16, String)> {
+    let out = curl_socket(endpoint, &["-o", "-", "-w", "\n%{http_code}"], path)
+        .output()
+        .context("curl the control socket")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+}
+
+/// Is the daemon healthy on this control endpoint?
+fn socket_health_ok(endpoint: &Path) -> bool {
+    matches!(socket_get(endpoint, "/v1/health"), Ok((c, _)) if c == 200)
+}
+
 fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
     // The daemon must not inherit our stdio (see stress.rs for the reasons),
     // but its output lands in workspace files so a crash leaves evidence.
@@ -185,15 +274,9 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
         if let Ok(Some(_)) = child.try_wait() {
             bail!("daemon exited during startup");
         }
-        let ok = Command::new("curl")
-            .args([
-                "-sf",
-                &format!("http://127.0.0.1:{}/api/health", ws.webui_port),
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        // Readiness rides the control socket — there is no control port to
+        // poll (and the console may not even be enabled in a given workspace).
+        if socket_health_ok(&ws.control_socket) {
             break;
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -202,16 +285,7 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
 }
 
 fn shutdown_daemon(ws: &Workspace, daemon: &mut Daemon) {
-    let _ = Command::new("curl")
-        .args([
-            "-sf",
-            "-m",
-            "10",
-            "-X",
-            "POST",
-            &format!("http://127.0.0.1:{}/v1/shutdown", ws.control_port),
-        ])
-        .output();
+    let _ = curl_socket(&ws.control_socket, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
     for _ in 0..60 {
         if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             return;
@@ -312,12 +386,11 @@ fn cli_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<String> {
 /// HTTP status code + body of a control-plane request (curl, like `api`,
 /// but the status code is kept so error mappings can be asserted).
 fn api_checked(ws: &Workspace, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-s", "-o", "-", "-w", "\n%{http_code}", "-X", method]);
+    let mut cmd = curl_socket(&ws.control_socket, &["-o", "-", "-w", "\n%{http_code}"], path);
+    cmd.arg("-X").arg(method);
     if !body.is_empty() {
         cmd.args(["-d", body]);
     }
-    cmd.arg(format!("http://127.0.0.1:{}{path}", ws.control_port));
     let out = cmd.output().context("curl control plane")?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
@@ -347,11 +420,7 @@ fn find_sleep() -> Result<PathBuf> {
 }
 
 fn api(ws: &Workspace, path: &str) -> Result<String> {
-    let out = Command::new("curl")
-        .args([
-            "-sf",
-            &format!("http://127.0.0.1:{}{path}", ws.control_port),
-        ])
+    let out = curl_socket(&ws.control_socket, &["-sf"], path)
         .output()
         .context("curl control plane")?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -359,26 +428,17 @@ fn api(ws: &Workspace, path: &str) -> Result<String> {
 
 /// pid of a program via the control plane (None = not running or unknown).
 fn pid_of(ws: &Workspace, program: &str) -> Result<Option<u32>> {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "-",
-            "-w",
-            "\n%{http_code}",
-            &format!("http://127.0.0.1:{}/v1/programs/{program}", ws.control_port),
-        ])
-        .output()
-        .context("curl program")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "000"));
-    if code.trim() == "404" {
+    let (code, body) = socket_get(
+        &ws.control_socket,
+        &format!("/v1/programs/{program}"),
+    )?;
+    if code == 404 {
         return Ok(None);
     }
-    if !code.trim().starts_with('2') {
+    if !(200..300).contains(&code) {
         bail!("GET {program} -> {code}: {body}");
     }
-    let v: serde_json::Value = serde_json::from_str(body)?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
     Ok(v.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
 }
 
@@ -477,16 +537,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     cli(bin, ws, &["shutdown"])?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let up = Command::new("curl")
-            .args([
-                "-sf",
-                "-m",
-                "2",
-                &format!("http://127.0.0.1:{}/v1/health", ws.control_port),
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let up = socket_health_ok(&ws.control_socket);
         if !up {
             break;
         }
@@ -641,9 +692,15 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // default config (/etc/appkeeper/daemon.toml), where a real daemon may be
     // listening and answering 404 instead.
     let dead_cfg = ws.root.join("daemon-dead.toml");
+    // A config pointing at an endpoint nothing serves keeps this hermetic —
+    // the bare form would read the machine's default config otherwise, where
+    // a real daemon of this uid may be listening.
     std::fs::write(
         &dead_cfg,
-        format!("[daemon]\nhost = \"127.0.0.1\"\nport = {}\n", free_port()?),
+        format!(
+            "[daemon]\nsocket = {}\n",
+            socket_toml_value(&ws.root.join("daemon-dead.sock"))
+        ),
     )?;
     let (ok, code, combined) = cli_try_cfg(bin, &dead_cfg, &["run", "web"])?;
     expect(
@@ -740,9 +797,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "log_level",
         "log_dir",
         "monitor_interval",
-        "host",
-        "port",
-        "auth_token",
+        "socket",
         "log_buffer_lines",
         "app_dir",
     ] {
@@ -751,13 +806,17 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("the template renders the known key {key}"),
         )?;
     }
+    // unix-socket-control-plane: the removed bind/token keys are gone from
+    // the template, and the socket default is the uid-layered endpoint.
+    for removed in ["host", "port = ", "auth_token"] {
+        expect(
+            !text.contains(&format!("{removed} =")),
+            &format!("the removed key {removed} is not rendered as a live key"),
+        )?;
+    }
     expect(
-        text.contains("port = 7310") && text.contains("host = \"127.0.0.1\""),
-        "defaults are rendered with values",
-    )?;
-    expect(
-        text.contains("auth_token = \"\""),
-        "auth_token renders empty",
+        text.contains("socket = \"/run/appkeeper/") && text.contains("/ak.sock"),
+        "the socket default is rendered (uid-layered endpoint)",
     )?;
     expect(
         text.contains("[app-default]") && text.contains("restart = \"always\""),
@@ -772,14 +831,14 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(out.contains("next:"), "init prints the next-step hint")?;
 
     step("K2. config --get: defaults for unset keys, bare value / key=value");
-    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
     expect(
-        out.trim() == "7310",
-        &format!("a single key prints the bare value: {out:?}"),
+        out.trim() == format!("/run/appkeeper/{}/ak.sock", current_uid_e2e()),
+        &format!("a single key prints the bare (uid-derived) default: {out:?}"),
     )?;
-    let out = cli_cfg(bin, &cfg, &["config", "--get", "port", "--get", "host"])?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "socket", "--get", "log_level"])?;
     expect(
-        out.contains("port=7310") && out.contains("host=127.0.0.1"),
+        out.contains("socket=/run/appkeeper/") && out.contains("log_level=info"),
         &format!("multiple keys print key=value lines: {out:?}"),
     )?;
 
@@ -800,36 +859,48 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("K4. config --set writes strong-typed keys (offline note printed)");
-    // Point the config at a dead control port first: the reload-hint probe
-    // reads the pre-modification port, and the built-in default 7310 may be
-    // served by a real daemon on this host (which would flip the note online).
-    let dead = free_port()?;
-    cli_cfg(bin, &cfg, &["config", "--set", &format!("port={dead}")])?;
+    // Point the config at an endpoint nothing serves first: the reload-hint
+    // probe reads the pre-modification config, and the built-in default
+    // (/run/appkeeper/<uid>/ak.sock) may be served by a real daemon of this
+    // uid on this host (which would flip the note online).
+    let dead_socket = ws.root.join("cfgcmd-dead.sock");
+    cli_cfg(
+        bin,
+        &cfg,
+        &[
+            "config",
+            "--set",
+            &format!("socket={}", dead_socket.display()),
+        ],
+    )?;
     let out = cli_cfg(
         bin,
         &cfg,
-        &["config", "--set", "port=8080", "--set", "log_level=debug"],
+        &["config", "--set", "monitor_interval=2.5", "--set", "log_level=debug"],
     )?;
-    expect(out.contains("port"), "set reports the written keys: {out}")?;
+    expect(out.contains("monitor_interval"), "set reports the written keys: {out}")?;
     expect(
         out.contains("offline"),
         "the offline note says the change takes effect at next start",
     )?;
     expect(
-        out.contains("set port = 8080") && out.contains("set log_level = debug"),
+        out.contains("set monitor_interval = 2.5") && out.contains("set log_level = debug"),
         "set prints the written keys with their new values",
     )?;
-    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
-    expect(out.trim() == "8080", "the file value wins over the default")?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
+    expect(
+        out.trim() == dead_socket.display().to_string(),
+        "the file value wins over the default",
+    )?;
     let out = cli_cfg(bin, &cfg, &["config", "--get", "log_level"])?;
     expect(out.trim() == "debug", "log_level was written")?;
 
     step("K5. --set keeps comments, key order and untouched values");
     std::fs::write(
         &cfg,
-        "# my header\n[daemon]\n# keep me\nlog_level = \"info\"\nlog_buffer_lines = 7 # count\nport = 1234 # trailing\n",
+        "# my header\n[daemon]\n# keep me\nlog_level = \"info\"\nlog_buffer_lines = 7 # count\nsocket = \"/tmp/old.sock\" # trailing\n",
     )?;
-    cli_cfg(bin, &cfg, &["config", "--set", "port=8081"])?;
+    cli_cfg(bin, &cfg, &["config", "--set", "socket=/tmp/new.sock"])?;
     let text = std::fs::read_to_string(&cfg)?;
     for snippet in [
         "# my header",
@@ -843,16 +914,15 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
     expect(
-        text.contains("port = 8081 # trailing"),
+        text.contains("socket = \"/tmp/new.sock\" # trailing"),
         "the touched key's trailing comment survives",
     )?;
 
     step("K6. illegal sets are rejected with the file unchanged");
     let before = std::fs::read_to_string(&cfg)?;
     for bad in [
-        "port=abc",
-        "port=0",
-        "port=65536",
+        "socket=", // empty: the transport gate rejects it
+        &format!("socket=/tmp/{}/ak.sock", "x".repeat(200)), // over sun_path
         "foo=1",
         "log_level=verbose",
         "monitor_interval=0",
@@ -869,9 +939,35 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "rejected sets leave the file byte-identical",
     )?;
 
+    step("K6b. removed keys are refused with the replacement named (D7)");
+    for removed in ["port=8080", "host=127.0.0.1", "auth_token=legacy"] {
+        let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--set", removed])?;
+        expect(
+            !ok && code == 2,
+            &format!("--set {removed} exits 2 (the key is removed)"),
+        )?;
+        expect(
+            combined.contains("removed") && combined.contains("socket"),
+            "the error names the removal and the socket replacement: {combined:?}",
+        )?;
+    }
+    // A config file that still carries the dead keys fails validate outright.
+    let legacy = ws.root.join("cfgcmd-legacy.toml");
+    std::fs::write(&legacy, "[daemon]\nhost = \"127.0.0.1\"\nport = 7310\nauth_token = \"x\"\n")?;
+    let (ok, _code, combined) = cli_try_cfg(bin, &legacy, &["validate"])?;
+    expect(
+        !ok && combined.contains("removed"),
+        "a legacy config with host/port/auth_token fails validate: {combined:?}",
+    )?;
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "the live config was untouched by the legacy checks",
+    )?;
+
     step("K7. --set on a missing file is refused with the --init hint");
     let fresh = ws.root.join("cfgcmd-fresh.toml");
-    let (ok, code, combined) = cli_try_cfg(bin, &fresh, &["config", "--set", "port=1"])?;
+    let (ok, code, combined) =
+        cli_try_cfg(bin, &fresh, &["config", "--set", "socket=/tmp/ak.sock"])?;
     expect(
         !ok && code == 2,
         &format!("set without a config exits 2, got {code}"),
@@ -883,14 +979,14 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(!fresh.exists(), "nothing was created by the refused set")?;
 
     step("K8. --delete removes the key, the default applies again");
-    cli_cfg(bin, &cfg, &["config", "--delete", "port"])?;
-    let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+    cli_cfg(bin, &cfg, &["config", "--delete", "socket"])?;
+    let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
     expect(
-        out.trim() == "7310",
-        "the deleted key answers with the default",
+        out.trim() == format!("/run/appkeeper/{}/ak.sock", current_uid_e2e()),
+        "the deleted key answers with the uid-derived default",
     )?;
     let text = std::fs::read_to_string(&cfg)?;
-    expect(!text.contains("port ="), "the port line is gone")?;
+    expect(!text.contains("socket ="), "the socket line is gone")?;
     expect(
         text.contains("log_buffer_lines = 7 # count"),
         "untouched keys survive the delete",
@@ -898,7 +994,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("K9. --delete of an absent key is an idempotent success");
     let before = std::fs::read_to_string(&cfg)?;
-    let out = cli_cfg(bin, &cfg, &["config", "--delete", "host"])?;
+    let out = cli_cfg(bin, &cfg, &["config", "--delete", "socket"])?;
     expect(
         out.contains("no change"),
         "the output explains nothing changed",
@@ -947,7 +1043,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli_cfg(bin, &cfg, &["config", "--get", "webui.listen"])?;
     expect(out.trim() == "127.0.0.1:19877", "get reads the section")?;
     let other = dir.join("daemon-empty.toml");
-    std::fs::write(&other, "[daemon]\nport = 7310\n")?;
+    std::fs::write(&other, "[daemon]\nlog_buffer_lines = 500\n")?;
     let out = cli_cfg(bin, &other, &["config", "--get", "webui.listen"])?;
     expect(
         out.trim() == "127.0.0.1:9877",
@@ -972,7 +1068,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         // Valid edit: the config passes validation afterwards.
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '[daemon]\\nport = 9999\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-edit.sock\"\\n' > \"$1\"\n",
         )?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
@@ -984,8 +1080,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             .output()
             .context("run config --edit (valid)")?;
         expect(out.status.success(), "a valid edit exits 0")?;
-        let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
-        expect(out.trim() == "9999", "the edited value is effective")?;
+        let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
+        expect(
+            out.trim() == "/tmp/xk-e2e-edit.sock",
+            "the edited value is effective",
+        )?;
         // Invalid edit: exit 2 and the file keeps the editor's content.
         std::fs::write(&script, "#!/bin/sh\nprintf 'bogus_field = 1\\n' > \"$1\"\n")?;
         let out = Command::new(bin)
@@ -1008,7 +1107,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "the file keeps the editor's content (no rollback)",
         )?;
         // Restore a legal config for the following scenario.
-        std::fs::write(&cfg, "[daemon]\nport = 9999\n")?;
+        std::fs::write(&cfg, "[daemon]\nsocket = \"/tmp/xk-e2e-edit.sock\"\n")?;
     } else {
         println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
     }
@@ -1037,7 +1136,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the error names the key as unknown",
     )?;
     let missing = ws.root.join("cfgcmd-missing.toml");
-    let (ok, code, combined) = cli_try_cfg(bin, &missing, &["config", "--delete", "port"])?;
+    let (ok, code, combined) = cli_try_cfg(bin, &missing, &["config", "--delete", "socket"])?;
     expect(
         !ok && code == 2,
         &format!("delete without a config exits 2, got {code}"),
@@ -1057,11 +1156,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         let editor = dir.join("env-editor.sh");
         std::fs::write(
             &visual,
-            "#!/bin/sh\nprintf '[daemon]\\nport = 9111\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-visual.sock\"\\n' > \"$1\"\n",
         )?;
         std::fs::write(
             &editor,
-            "#!/bin/sh\nprintf '[daemon]\\nport = 9222\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-editor.sock\"\\n' > \"$1\"\n",
         )?;
         use std::os::unix::fs::PermissionsExt;
         for s in [&visual, &editor] {
@@ -1076,10 +1175,12 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             .output()
             .context("run config --edit with both $VISUAL and $EDITOR")?;
         expect(out.status.success(), "the edit through $VISUAL exits 0")?;
-        let out = cli_cfg(bin, &cfg, &["config", "--get", "port"])?;
+        let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
         expect(
-            out.trim() == "9111",
-            &format!("$VISUAL won over $EDITOR (9111, not 9222): {out:?}"),
+            out.trim() == "/tmp/xk-e2e-visual.sock",
+            &format!(
+                "$VISUAL won over $EDITOR (visual.sock, not editor.sock): {out:?}"
+            ),
         )?;
     } else {
         println!("    (windows: the $VISUAL-precedence scenario requires unix; skipping)");
@@ -1819,18 +1920,19 @@ fn setup_runfirst_workspace() -> Result<Workspace> {
     for d in ["apps", "logs", "fan-app", "slow-app", "mixed-app"] {
         std::fs::create_dir_all(root.join(d)).context("create runfirst dirs")?;
     }
-    let control_port = free_port()?;
+    let control_socket = control_socket_in(&root);
     let webui_port = free_port()?;
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            socket = socket_toml_value(&control_socket),
         ),
     )?;
     Ok(Workspace {
         root,
-        control_port,
+        control_socket,
         webui_port,
     })
 }
@@ -1875,14 +1977,18 @@ fn expect_no_residue(ws: &Workspace, name: &str) -> Result<()> {
 /// POST a JSON body to a control-plane path and return `(status, raw body)`.
 /// `-N` disables curl buffering so a chunked NDJSON stream arrives as-is.
 fn post_ndjson(ws: &Workspace, path: &str, body: &serde_json::Value) -> Result<(u16, String)> {
-    post_ndjson_at(ws.control_port, path, body)
+    post_ndjson_at(&ws.control_socket, path, body)
 }
 
-/// [`post_ndjson`] against an explicit control port (secondary workspaces).
-fn post_ndjson_at(port: u16, path: &str, body: &serde_json::Value) -> Result<(u16, String)> {
-    let out = Command::new("curl")
-        .args([
-            "-s",
+/// [`post_ndjson`] against an explicit endpoint (secondary workspaces).
+fn post_ndjson_at(
+    endpoint: &Path,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(u16, String)> {
+    let out = curl_socket(
+        endpoint,
+        &[
             "-N",
             "-o",
             "-",
@@ -1894,18 +2000,19 @@ fn post_ndjson_at(port: u16, path: &str, body: &serde_json::Value) -> Result<(u1
             "Content-Type: application/json",
             "-d",
             &body.to_string(),
-        ])
-        .arg(format!("http://127.0.0.1:{port}{path}"))
-        .output()
-        .context("curl the ndjson endpoint")?;
+        ],
+        path,
+    )
+    .output()
+    .context("curl the ndjson endpoint")?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
     Ok((code.trim().parse().unwrap_or(0), body.to_string()))
 }
 
-/// Spawn the daemon against an explicit config on an explicit control port,
-/// waiting for `/v1/health`.
-fn spawn_daemon_at(bin: &Path, cfg: &Path, port: u16) -> Result<Daemon> {
+/// Spawn the daemon against an explicit config, waiting for control-socket
+/// health. The endpoint the config pins is passed separately for polling.
+fn spawn_daemon_at(bin: &Path, cfg: &Path, endpoint: &Path) -> Result<Daemon> {
     let out = std::fs::File::create(cfg.with_extension("out.log"))?;
     let err = out.try_clone()?;
     let mut child = Command::new(bin)
@@ -1925,7 +2032,7 @@ fn spawn_daemon_at(bin: &Path, cfg: &Path, port: u16) -> Result<Daemon> {
         if let Ok(Some(_)) = child.try_wait() {
             bail!("secondary daemon exited during startup");
         }
-        if http_ok(&format!("http://127.0.0.1:{port}/v1/health")) {
+        if socket_health_ok(endpoint) {
             break;
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -1933,43 +2040,22 @@ fn spawn_daemon_at(bin: &Path, cfg: &Path, port: u16) -> Result<Daemon> {
     Ok(Daemon { child })
 }
 
-/// pid of a program on an explicit control port.
-fn pid_of_at(port: u16, program: &str) -> Result<Option<u32>> {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "-",
-            "-w",
-            "\n%{http_code}",
-            &format!("http://127.0.0.1:{port}/v1/programs/{program}"),
-        ])
-        .output()
-        .context("curl program")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "000"));
-    if code.trim() == "404" {
+/// pid of a program on an explicit control endpoint.
+fn pid_of_at(endpoint: &Path, program: &str) -> Result<Option<u32>> {
+    let (code, body) = socket_get(endpoint, &format!("/v1/programs/{program}"))?;
+    if code == 404 {
         return Ok(None);
     }
-    if !code.trim().starts_with('2') {
+    if !(200..300).contains(&code) {
         bail!("GET {program} -> {code}: {body}");
     }
-    let v: serde_json::Value = serde_json::from_str(body)?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
     Ok(v.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32))
 }
 
-/// Shut down a daemon on an explicit control port and reap it.
-fn shutdown_daemon_at(port: u16, daemon: &mut Daemon) {
-    let _ = Command::new("curl")
-        .args([
-            "-sf",
-            "-m",
-            "10",
-            "-X",
-            "POST",
-            &format!("http://127.0.0.1:{port}/v1/shutdown"),
-        ])
-        .output();
+/// Shut down a daemon on an explicit control endpoint and reap it.
+fn shutdown_daemon_at(endpoint: &Path, daemon: &mut Daemon) {
+    let _ = curl_socket(endpoint, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
     for _ in 0..60 {
         if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             return;
@@ -2007,7 +2093,7 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("RDF0. offline `run` forms exit 3 and derive no daemon (background-daemon)");
     expect(
-        !http_ok(&format!("http://127.0.0.1:{}/v1/health", ws.control_port)),
+        !socket_health_ok(&ws.control_socket),
         "the runfirst workspace starts with no daemon",
     )?;
     let cmd_form = format!("{sleep_s} 1");
@@ -2029,7 +2115,7 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
     expect(
-        !http_ok(&format!("http://127.0.0.1:{}/v1/health", ws.control_port)),
+        !socket_health_ok(&ws.control_socket),
         "no daemon was derived in the background",
     )?;
     expect(
@@ -2483,18 +2569,19 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     std::fs::write(&blocker, "not a directory")?;
     let ro_apps = blocker.join("apps");
     let ro_cfg = ws.root.join("daemon-ro.toml");
-    let ro_port = free_port()?;
+    let ro_endpoint = ws.root.join("daemon-ro.sock");
     let ro_logs = ws.root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
         &ro_cfg,
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {ro_port}\nlog_dir = \"{ro_logs}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{ro_logs}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n",
             ro_apps.display().to_string().replace('\\', "/"),
+            socket = socket_toml_value(&ro_endpoint),
         ),
     )?;
-    let mut ro_daemon = spawn_daemon_at(bin, &ro_cfg, ro_port)?;
+    let mut ro_daemon = spawn_daemon_at(bin, &ro_cfg, &ro_endpoint)?;
     let (code, body) = post_ndjson_at(
-        ro_port,
+        &ro_endpoint,
         "/v1/run",
         &serde_json::json!({ "name": "ro", "command": sleep_s, "args": ["300"] }),
     )?;
@@ -2511,10 +2598,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         "no app_dir was created under the blocker",
     )?;
     expect(
-        pid_of_at(ro_port, "ro")?.is_none(),
+        pid_of_at(&ro_endpoint, "ro")?.is_none(),
         "no process was started when the placeholder could not be written",
     )?;
-    shutdown_daemon_at(ro_port, &mut ro_daemon);
+    shutdown_daemon_at(&ro_endpoint, &mut ro_daemon);
 
     // -- 8.6: partial failure + residual state ------------------------------
 
@@ -2621,7 +2708,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let defaults = ws.root.join("defaults");
     std::fs::create_dir_all(&defaults)?;
     let dcfg = defaults.join("daemon.toml");
-    std::fs::write(&dcfg, "[daemon]\nhost = \"127.0.0.1\"\nport = 1\n")?;
+    std::fs::write(&dcfg, "[daemon]\n")?;
     let out = cli_cfg(bin, &dcfg, &["config", "--get", "app_dir"])?;
     expect(
         out.trim() == "app.d",
@@ -2632,22 +2719,12 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     Ok(())
 }
 
-/// Ask the daemon to shut down and wait for the control port to close.
+/// Ask the daemon to shut down and wait for the endpoint to go quiet.
 fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
     cli(bin, ws, &["shutdown"])?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let up = Command::new("curl")
-            .args([
-                "-sf",
-                "-m",
-                "2",
-                &format!("http://127.0.0.1:{}/v1/health", ws.control_port),
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !up {
+        if !socket_health_ok(&ws.control_socket) {
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -2665,12 +2742,13 @@ fn detach_pass(bin: &Path) -> Result<()> {
     let root = std::env::temp_dir().join(format!("xk-xtask-detach-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("logs"))?;
-    let port = free_port()?;
+    let endpoint = control_socket_in(&root);
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\n"
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\n",
+            socket = socket_toml_value(&endpoint),
         ),
     )?;
     let cfg = root.join("daemon.toml");
@@ -2680,8 +2758,8 @@ fn detach_pass(bin: &Path) -> Result<()> {
         &format!("daemon --detach exits 0, got {code}: {combined}"),
     )?;
     expect(
-        combined.contains(&format!("127.0.0.1:{port}")),
-        &format!("the ready message prints the listen address: {combined:?}"),
+        combined.contains(endpoint.display().to_string().as_str()),
+        &format!("the ready message prints the control endpoint: {combined:?}"),
     )?;
     expect(
         combined.contains("daemon.out.log"),
@@ -2923,14 +3001,11 @@ fn pids_with_arg(arg: &str) -> Vec<u32> {
 }
 
 fn state_of(ws: &Workspace, program: &str) -> Result<String> {
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            &format!("http://127.0.0.1:{}/v1/programs/{program}", ws.control_port),
-        ])
-        .output()
-        .context("curl program state")?;
-    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))?;
+    let (_code, body) = socket_get(
+        &ws.control_socket,
+        &format!("/v1/programs/{program}"),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
     Ok(v.get("state")
         .and_then(|s| s.as_str())
         .unwrap_or("unknown")
@@ -3528,20 +3603,22 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         Err(_) => println!("    skip: 127.0.0.1:9877 is occupied on this host"),
         Ok(reserve) => {
             drop(reserve);
-            let control2 = free_port()?;
+            let endpoint2 = control_socket_in(&ws.root.join("ws2"));
             let log2 = ws.root.join("logs2");
             let apps2 = ws.root.join("apps2");
             std::fs::create_dir_all(&log2)?;
             std::fs::create_dir_all(&apps2)?;
-            // A second daemon with its own control port, log dir and an empty
-            // app registry — the bare `[webui]` section is the only switch.
+            // A second daemon with its own control endpoint, log dir and an
+            // empty app registry — the bare `[webui]` section is the only
+            // switch.
             let cfg2 = ws.root.join("daemon2.toml");
             std::fs::write(
                 &cfg2,
                 format!(
-                    "[daemon]\nhost = \"127.0.0.1\"\nport = {control2}\nlog_dir = \"{}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n\n[webui]\n",
+                    "[daemon]\nsocket = {socket}\nlog_dir = \"{}\"\nlog_level = \"warn\"\napp_dir = \"{}\"\n\n[webui]\n",
                     log2.display().to_string().replace('\\', "/"),
                     apps2.display().to_string().replace('\\', "/"),
+                    socket = socket_toml_value(&endpoint2),
                 ),
             )?;
             let out = std::fs::File::create(ws.root.join("daemon2.out.log"))?;
@@ -3569,16 +3646,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
                 "the console serves on the default listen without an explicit listen",
             )?;
             // The console exits with the daemon (POST /v1/shutdown).
-            let _ = Command::new("curl")
-                .args([
-                    "-sf",
-                    "-m",
-                    "10",
-                    "-X",
-                    "POST",
-                    &format!("http://127.0.0.1:{control2}/v1/shutdown"),
-                ])
-                .output();
+            let _ = curl_socket(&endpoint2, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
             for _ in 0..80 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     break;
@@ -3921,10 +3989,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
     setup_actions_app(&ws, &bin)?;
 
     println!(
-        "workspace: {}\ndaemon: run (webui 127.0.0.1:{} via [webui]), control 127.0.0.1:{}",
+        "workspace: {}\ndaemon: run (webui 127.0.0.1:{} via [webui]), control endpoint {}",
         ws.root.display(),
         ws.webui_port,
-        ws.control_port
+        ws.control_socket.display()
     );
     // Offline scenarios first: the daemon must NOT be running yet.
     offline_pass(&bin, &ws)?;

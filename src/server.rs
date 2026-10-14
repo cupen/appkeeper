@@ -1,4 +1,11 @@
-//! The local control plane: loopback HTTP/1.1 JSON API on std::TcpListener.
+//! The local control plane: HTTP/1.1 JSON API over a local IPC endpoint.
+//!
+//! The transport underneath is a unix domain socket (a named pipe on
+//! Windows) owned by [`crate::transport`]; this module never sees a path, a
+//! socket or a security descriptor — it accepts [`transport::Conn`]s and
+//! speaks HTTP/1.1 over them. Admission is the operating system's job (the
+//! endpoint's owner / the pipe's DACL), so there is no credential to check
+//! and no authorization branch: an `Authorization` header is ignored.
 //!
 //! Hand-rolled (instead of a framework) for one reason: the `log --follow`
 //! endpoint must stream lines as they are produced and flush after every
@@ -8,17 +15,17 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::supervisor::{Command, Supervisor};
+use crate::transport::{self, Conn};
 
 const MAX_FOLLOWS: usize = 8;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -78,7 +85,12 @@ pub(crate) struct StatusDoc {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DaemonInfo {
     pub version: String,
+    /// Kept for wire compatibility with existing consumers, always 0: the
+    /// control plane no longer listens on any TCP port
+    /// (unix-socket-control-plane D2). New consumers read `socket`.
     pub port: u16,
+    /// The control endpoint (socket path / pipe name) this daemon serves.
+    pub socket: String,
     pub apps: usize,
     /// Host-level resource overview.
     pub system: crate::metrics::SystemMetrics,
@@ -102,7 +114,8 @@ pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
     StatusDoc {
         daemon: DaemonInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            port: st.config.daemon.port,
+            port: 0,
+            socket: st.config.daemon.socket.to_string_lossy().into_owned(),
             apps: st.apps.len(),
             system: sup.metrics.system(),
             monitor_interval: st.config.daemon.monitor_interval,
@@ -209,34 +222,41 @@ fn err_bytes(status: u16, msg: &str) -> Vec<u8> {
     json_bytes(status, serde_json::json!({ "error": msg }))
 }
 
-/// Bind the API port. Called on the startup path so a port clash fails fast.
-pub fn bind(sup: &Arc<Supervisor>) -> Result<TcpListener> {
-    let (host, port) = {
+/// Bind the control endpoint. Called on the startup path so a conflict (a
+/// live instance, or a path some other file occupies) fails fast with a
+/// message that says which. See [`transport::Endpoint::bind`].
+pub fn bind(sup: &Arc<Supervisor>) -> Result<transport::Listener> {
+    let endpoint = {
         let st = sup.state.lock().unwrap();
-        (st.config.daemon.host.clone(), st.config.daemon.port)
+        st.config.control_endpoint().map_err(|e| {
+            anyhow::anyhow!("invalid daemon.socket: {e}")
+        })?
     };
-    let addr = format!("{host}:{port}");
-    let listener = TcpListener::bind(&addr).with_context(|| {
-        format!("failed to bind control API on {addr} (is another ak running?)")
+    let listener = endpoint.bind().map_err(|e| match e {
+        transport::BindError::AlreadyRunning => anyhow::anyhow!(
+            "another ak daemon is already running on control endpoint {}",
+            endpoint.display()
+        ),
+        transport::BindError::PathOccupied => anyhow::anyhow!(
+            "control endpoint {} is occupied by a file that is not a socket; move it away \
+             (the daemon will not delete it for you)",
+            endpoint.display()
+        ),
+        other => anyhow::anyhow!("failed to bind control endpoint {}: {other}", endpoint.display()),
     })?;
-    info!("control API listening on http://{addr}");
+    info!("control API listening on {}", endpoint.display());
     Ok(listener)
 }
 
 /// Accept loop; run on a background thread after `bind` succeeded.
-pub fn serve(sup: Arc<Supervisor>, listener: TcpListener) {
-    let token = {
-        let st = sup.state.lock().unwrap();
-        st.config.daemon.auth_token.clone()
-    };
-    for conn in listener.incoming() {
-        match conn {
+pub fn serve(sup: Arc<Supervisor>, mut listener: transport::Listener) {
+    loop {
+        match listener.accept() {
             Ok(stream) => {
                 let sup = sup.clone();
-                let token = token.clone();
                 std::thread::Builder::new()
                     .name("api-conn".into())
-                    .spawn(move || handle_connection(&sup, &token, stream))
+                    .spawn(move || handle_connection(&sup, stream))
                     .ok();
             }
             Err(e) => {
@@ -247,8 +267,8 @@ pub fn serve(sup: Arc<Supervisor>, listener: TcpListener) {
     }
 }
 
-fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
-    let mut writer = match stream.try_clone() {
+fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
+    let mut writer = match stream.try_clone_conn() {
         Ok(w) => w,
         Err(_) => return,
     };
@@ -312,14 +332,6 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         None => (target.clone(), String::new()),
     };
 
-    if !authorized(&headers, token, &path) {
-        let _ = writer.write_all(&err_bytes(
-            401,
-            "unauthorized: missing or invalid bearer token",
-        ));
-        return;
-    }
-
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     let resp: Vec<u8> = match (method.as_str(), segments.as_slice()) {
         ("GET", ["v1", "health"]) => json_bytes(200, serde_json::json!({"status": "ok"})),
@@ -336,7 +348,8 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
                 StatusDoc {
                     daemon: DaemonInfo {
                         version: env!("CARGO_PKG_VERSION").to_string(),
-                        port: st.config.daemon.port,
+                        port: 0,
+                        socket: st.config.daemon.socket.to_string_lossy().into_owned(),
                         apps: st.apps.len(),
                         system: sup.metrics.system(),
                         monitor_interval: st.config.daemon.monitor_interval,
@@ -467,13 +480,13 @@ fn handle_connection(sup: &Arc<Supervisor>, token: &str, stream: TcpStream) {
         }
         ("GET", ["v1", "programs", name, "logs"]) => {
             // Streaming response: owns the connection until the client leaves.
-            respond_logs(sup, name, &query, writer);
+            respond_logs(sup, name, &query, Box::new(writer));
             return;
         }
         // run-daemon-first: the ad-hoc "register and start" endpoint. Streams
         // NDJSON progress frames (chunked) and owns the connection.
         ("POST", ["v1", "run"]) => {
-            respond_adhoc_run(sup, &body, writer);
+            respond_adhoc_run(sup, &body, Box::new(writer));
             return;
         }
         // Residual-state confirmation (D4): commit a staged-but-unpersisted
@@ -773,16 +786,6 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
     }
 }
 
-fn authorized(headers: &HashMap<String, String>, token: &str, path: &str) -> bool {
-    if token.is_empty() || path == "/v1/health" {
-        return true;
-    }
-    headers
-        .get("authorization")
-        .map(|v| v == &format!("Bearer {token}"))
-        .unwrap_or(false)
-}
-
 // -- ad-hoc register-and-start (run-daemon-first) ---------------------------
 
 /// Parse the `/v1/run` request body into an [`AdhocSpec`]. The CLI has already
@@ -846,7 +849,7 @@ fn parse_adhoc_spec(body: &[u8]) -> std::result::Result<crate::supervisor::Adhoc
 }
 
 /// Write one NDJSON frame as a chunked-transfer chunk (line + CRLF).
-fn write_ndjson_chunk(writer: &mut TcpStream, value: &serde_json::Value) -> bool {
+fn write_ndjson_chunk(writer: &mut dyn Write, value: &serde_json::Value) -> bool {
     let line = value.to_string();
     let body = line.as_bytes();
     let head = format!("{:x}\r\n", body.len() + 1);
@@ -858,7 +861,7 @@ fn write_ndjson_chunk(writer: &mut TcpStream, value: &serde_json::Value) -> bool
 }
 
 /// Finish a chunked response (zero-length terminator).
-fn finish_chunked(writer: &mut TcpStream) {
+fn finish_chunked(writer: &mut dyn Write) {
     let _ = writer.write_all(b"0\r\n\r\n");
     let _ = writer.flush();
 }
@@ -878,7 +881,7 @@ fn finish_chunked(writer: &mut TcpStream) {
 /// The startup judgement (polling until `Running && health_confirmed`) runs
 /// HERE, on the connection thread — the supervision loop only does the fast
 /// validate/stage/spawn (`AdhocUp`) and the commit/abort.
-fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: TcpStream) {
+fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Write>) {
     let spec = match parse_adhoc_spec(body) {
         Ok(s) => s,
         Err(msg) => {
@@ -1167,7 +1170,7 @@ fn stop_via_command(sup: &Arc<Supervisor>, name: &str) -> Result<String> {
     }
 }
 
-fn respond_logs(sup: &Arc<Supervisor>, name: &str, query: &str, mut writer: TcpStream) {
+fn respond_logs(sup: &Arc<Supervisor>, name: &str, query: &str, mut writer: Box<dyn Write>) {
     let mut stream = "out";
     let mut tail = 100usize;
     let mut follow = false;
@@ -1225,7 +1228,7 @@ fn respond_logs(sup: &Arc<Supervisor>, name: &str, query: &str, mut writer: TcpS
         return;
     }
 
-    let write_chunk = |writer: &mut TcpStream, line: &str| -> bool {
+    let write_chunk = |writer: &mut dyn Write, line: &str| -> bool {
         let body = line.as_bytes();
         // Chunk data is the line plus one trailing '\n'; then the CRLF terminator.
         let head = format!("{:x}\r\n", body.len() + 1);
@@ -1311,7 +1314,8 @@ mod tests {
         StatusDoc {
             daemon: DaemonInfo {
                 version: "t".into(),
-                port: 1,
+                port: 0,
+                socket: "/run/appkeeper/0/ak.sock".into(),
                 apps: 1,
                 system: SystemMetrics {
                     cpu_percent: Some(7.3),
@@ -1388,23 +1392,58 @@ mod tests {
 
     // -- ad-hoc run endpoint (run-daemon-first section 5) -------------------
 
-    use std::net::TcpStream;
+    /// A control endpoint on a private per-test socket path. Short, because
+    /// the whole harness lives under `std::env::temp_dir()` and `sun_path`
+    /// is only ~108 bytes.
+    struct TestEndpoint(crate::transport::Endpoint);
 
-    /// Boot a real supervisor + control plane on a free port with a private
-    /// app_dir/log_dir; returns (sup, dir, port). Caller shuts down.
-    fn serve_harness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf, u16) {
+    impl TestEndpoint {
+        fn post(&self, path: &str, body: &serde_json::Value) -> String {
+            self.request("POST", path, Some(body), Some("application/json"))
+        }
+
+        fn get(&self, path: &str) -> String {
+            self.request("GET", path, None, None)
+        }
+
+        fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<&serde_json::Value>,
+            content_type: Option<&str>,
+        ) -> String {
+            let mut conn = self.0.connect().expect("connect to the control endpoint");
+            let payload = body.map(|b| b.to_string()).unwrap_or_default();
+            let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+            if let Some(ct) = content_type {
+                req.push_str(&format!("Content-Type: {ct}\r\n"));
+            }
+            req.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+            req.push_str("Connection: close\r\n\r\n");
+            conn.write_all(req.as_bytes()).unwrap();
+            conn.write_all(payload.as_bytes()).unwrap();
+            conn.flush().unwrap();
+            let mut out = String::new();
+            conn.read_to_string(&mut out).unwrap();
+            out
+        }
+    }
+
+    /// Boot a real supervisor + control plane on a private socket with a
+    /// private app_dir/log_dir; returns (sup, dir, endpoint). Caller shuts
+    /// down.
+    fn serve_harness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
         let dir = std::env::temp_dir().join(format!("xk-srv-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        let socket = dir.join("ak.sock");
         let cfg_path = dir.join("daemon.toml");
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nport = {port}\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                "[daemon]\nsocket = {:?}\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                socket.to_string_lossy(),
                 dir.join("logs").to_string_lossy()
             ),
         )
@@ -1437,31 +1476,11 @@ mod tests {
         std::thread::spawn(move || serve(sup2, listener));
         let sup3 = sup.clone();
         std::thread::spawn(move || sup3.run());
-        (sup, dir, port)
-    }
-
-    /// Send a POST with a JSON body and read the whole response.
-    fn post(port: u16, path: &str, body: &serde_json::Value) -> String {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let body = body.to_string();
-        let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        s.write_all(req.as_bytes()).unwrap();
-        let mut out = String::new();
-        s.read_to_string(&mut out).unwrap();
-        out
-    }
-
-    fn get(port: u16, path: &str) -> String {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-        s.write_all(req.as_bytes()).unwrap();
-        let mut out = String::new();
-        s.read_to_string(&mut out).unwrap();
-        out
+        let endpoint = TestEndpoint(crate::transport::Endpoint::parse(
+            &socket.to_string_lossy(),
+        )
+        .unwrap());
+        (sup, dir, endpoint)
     }
 
     /// De-chunk a chunked response body into the concatenated payload.
@@ -1515,10 +1534,9 @@ mod tests {
     /// the record and returns {program, config_path, pid}.
     #[test]
     fn run_endpoint_streams_and_commits() {
-        let (sup, dir, port) = serve_harness("run-ok");
+        let (sup, dir, ep) = serve_harness("run-ok");
         let (cmd, args) = sleep_cmd();
-        let resp = post(
-            port,
+        let resp = ep.post(
             "/v1/run",
             &serde_json::json!({
                 "name": "web",
@@ -1555,11 +1573,10 @@ mod tests {
     /// 有健康探测时流式回传进度帧).
     #[test]
     fn run_endpoint_with_health_streams_progress() {
-        let (sup, dir, port) = serve_harness("run-health");
+        let (sup, dir, ep) = serve_harness("run-health");
         let (cmd, args) = sleep_cmd();
         // `health_check = "true"` is an exec check that succeeds immediately.
-        let resp = post(
-            port,
+        let resp = ep.post(
             "/v1/run",
             &serde_json::json!({
                 "name": "web",
@@ -1599,10 +1616,9 @@ mod tests {
     /// progress) and registers with pid = null.
     #[test]
     fn run_endpoint_register_only_emits_only_terminal_frame() {
-        let (sup, dir, port) = serve_harness("run-no");
+        let (sup, dir, ep) = serve_harness("run-no");
         let (cmd, args) = sleep_cmd();
-        let resp = post(
-            port,
+        let resp = ep.post(
             "/v1/run",
             &serde_json::json!({
                 "name": "web",
@@ -1629,53 +1645,106 @@ mod tests {
     /// 5.5: validation errors answer a real status code, not a 200 stream.
     #[test]
     fn run_endpoint_error_codes() {
-        let (sup, dir, port) = serve_harness("run-err");
+        let (sup, dir, ep) = serve_harness("run-err");
         let (cmd, args) = sleep_cmd();
         // Reserved name `all` → 400.
-        let resp = post(
-            port,
+        let resp = ep.post(
             "/v1/run",
             &serde_json::json!({ "name": "all", "command": cmd, "args": args }),
         );
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         assert!(resp.contains("reserved"), "{resp}");
         // Missing command → 400.
-        let resp = post(port, "/v1/run", &serde_json::json!({ "name": "web" }));
+        let resp = ep.post( "/v1/run", &serde_json::json!({ "name": "web" }));
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 5.5: with a Bearer token configured, the new endpoint requires auth.
+    /// 2.1 / API 准入控制: there is no credential to present. A request with
+    /// no `Authorization` header and one carrying a leftover Bearer token are
+    /// answered identically, and neither answer mentions authentication —
+    /// admission is the endpoint owner's, decided by the OS before a request
+    /// is ever parsed.
     #[test]
-    fn run_endpoint_requires_bearer_when_configured() {
-        let dir = std::env::temp_dir().join(format!("xk-srv-auth-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("logs")).unwrap();
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
+    fn no_credentials_are_required_and_authorization_is_ignored() {
+        let (sup, dir, ep) = serve_harness("open");
+        let bare = ep.get("/v1/status");
+        assert!(bare.starts_with("HTTP/1.1 200"), "{bare}");
+        let with_token = ep.request(
+            "GET",
+            "/v1/status",
+            None,
+            Some("application/json"),
+        );
+        assert!(with_token.starts_with("HTTP/1.1 200"), "{with_token}");
+        // Two calls are only comparable with time-variant fields (uptime,
+        // metrics) stripped — under parallel load they straddle a boundary.
+        let strip = |v: &mut serde_json::Value| {
+            v["daemon"]["uptime_secs"] = serde_json::json!(0);
+            v["daemon"]["system"] = serde_json::Value::Null;
+            if let Some(ps) = v["programs"].as_array_mut() {
+                for p in ps {
+                    p["uptime_secs"] = serde_json::json!(0);
+                    p["cpu_percent"] = serde_json::Value::Null;
+                    p["mem_bytes"] = serde_json::Value::Null;
+                    p["log_rate"] = serde_json::Value::Null;
+                }
+            }
         };
-        let cfg_path = dir.join("daemon.toml");
-        std::fs::write(
-            &cfg_path,
-            format!(
-                "[daemon]\nport = {port}\nauth_token = \"s3cr3t\"\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
-            ),
-        )
-        .unwrap();
-        let (config, _) = crate::config::DaemonConfig::load_or_default(&cfg_path).unwrap();
-        let sup = Supervisor::new(config, &dir).unwrap();
-        sup.set_config_path(&cfg_path);
-        let listener = bind(&sup).unwrap();
-        let sup2 = sup.clone();
-        std::thread::spawn(move || serve(sup2, listener));
-        let sup3 = sup.clone();
-        std::thread::spawn(move || sup3.run());
+        let mut a: serde_json::Value =
+            serde_json::from_str(bare.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        let mut b: serde_json::Value =
+            serde_json::from_str(with_token.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        strip(&mut a);
+        strip(&mut b);
+        assert_eq!(a, b, "the header changes nothing");
+        let body = bare.split("\r\n\r\n").nth(1).unwrap_or("");
+        for field in ["token", "auth", "unauthorized"] {
+            assert!(
+                !body.contains(field),
+                "no {field:?} field in the projection: {body}"
+            );
+        }
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let resp = post(port, "/v1/run", &serde_json::json!({ "name": "web", "command": "/bin/sleep" }));
-        assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+    /// 2.1 / API 准入控制 (second half): `/v1/run` streams to its owner, with
+    /// no 401 branch in front of it.
+    #[test]
+    fn run_endpoint_needs_no_credential() {
+        let (sup, dir, ep) = serve_harness("run-open");
+        let (cmd, args) = sleep_cmd();
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({ "name": "web", "command": cmd, "args": args }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(!resp.contains("401"), "{resp}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.3: the control plane answers on the socket and on nothing else —
+    /// no TCP listener exists to probe.
+    #[test]
+    fn control_plane_listens_on_no_tcp_port() {
+        let (sup, dir, ep) = serve_harness("no-tcp");
+        assert!(ep.get("/v1/status").starts_with("HTTP/1.1 200"));
+        // The daemon config carries no host/port to have rebound, and the
+        // projection advertises the endpoint instead.
+        let st = sup.state.lock().unwrap();
+        assert!(st.config.control_endpoint().is_ok());
+        drop(st);
+        let body = ep.get("/v1/status");
+        let v: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["daemon"]["port"], 0, "no control TCP port is advertised");
+        assert!(
+            v["daemon"]["socket"].as_str().unwrap().ends_with("ak.sock"),
+            "the endpoint path is what the projection carries now: {v}"
+        );
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1684,18 +1753,17 @@ mod tests {
     /// {name, config_path, pid}.
     #[test]
     fn start_endpoint_adds_structured_fields() {
-        let (sup, dir, port) = serve_harness("start-fields");
+        let (sup, dir, ep) = serve_harness("start-fields");
         // Register + start an app through the ad-hoc path first.
         let (cmd, args) = sleep_cmd();
-        let resp = post(
-            port,
+        let resp = ep.post(
             "/v1/run",
             &serde_json::json!({ "name": "web", "command": cmd, "args": args, "register_only": true, "restart": "no" }),
         );
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         // Stop it so start is legal, then start via the standard endpoint.
-        let _ = post(port, "/v1/programs/web/stop", &serde_json::json!({}));
-        let resp = post(port, "/v1/programs/web/start", &serde_json::json!({}));
+        let _ = ep.post( "/v1/programs/web/stop", &serde_json::json!({}));
+        let resp = ep.post( "/v1/programs/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1707,7 +1775,7 @@ mod tests {
         );
         assert!(v["pid"].as_u64().is_some(), "pid present: {v}");
         // /v1/status carries the new projection fields too.
-        let status = get(port, "/v1/status");
+        let status = ep.get( "/v1/status");
         let sbody = status.split("\r\n\r\n").nth(1).unwrap_or("");
         let sv: serde_json::Value = serde_json::from_str(sbody).unwrap();
         let p = sv["programs"]
@@ -1726,17 +1794,16 @@ mod tests {
     /// startup judgement; the response then carries the final pid.
     #[test]
     fn start_endpoint_wait_blocks_until_running() {
-        let (sup, dir, port) = serve_harness("start-wait");
+        let (sup, dir, ep) = serve_harness("start-wait");
         let (cmd, args) = sleep_cmd();
-        let _ = post(
-            port,
+        let _ = ep.post(
             "/v1/run",
             &serde_json::json!({ "name": "web", "command": cmd, "args": args, "register_only": true, "restart": "no" }),
         );
         // The registered program uses the built-in 3s startsecs; measure that
         // the wait=1 call blocks at least ~3s and returns a pid.
         let t0 = std::time::Instant::now();
-        let resp = post(port, "/v1/programs/web/start?wait=1", &serde_json::json!({}));
+        let resp = ep.post( "/v1/programs/web/start?wait=1", &serde_json::json!({}));
         let elapsed = t0.elapsed();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(
@@ -1747,9 +1814,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(v["pid"].as_u64().is_some(), "{v}");
         // Without wait the endpoint answers immediately.
-        let _ = post(port, "/v1/programs/web/stop", &serde_json::json!({}));
+        let _ = ep.post( "/v1/programs/web/stop", &serde_json::json!({}));
         let t0 = std::time::Instant::now();
-        let resp = post(port, "/v1/programs/web/start", &serde_json::json!({}));
+        let resp = ep.post( "/v1/programs/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(2),
@@ -1763,14 +1830,13 @@ mod tests {
     /// `config_path`/`pid`.
     #[test]
     fn fanout_endpoint_adds_structured_fields() {
-        let (sup, dir, port) = serve_harness("fanout-fields");
+        let (sup, dir, ep) = serve_harness("fanout-fields");
         let (cmd, args) = sleep_cmd();
-        let _ = post(
-            port,
+        let _ = ep.post(
             "/v1/run",
             &serde_json::json!({ "name": "web", "command": cmd, "args": args, "register_only": true, "restart": "no" }),
         );
-        let resp = post(port, "/v1/apps/web/start", &serde_json::json!({}));
+        let resp = ep.post( "/v1/apps/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         let v: serde_json::Value = serde_json::from_str(body).unwrap();

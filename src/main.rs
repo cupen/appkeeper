@@ -2,8 +2,9 @@
 //! layered config (global daemon config + per-app deployment files).
 //!
 //! `ak daemon` is the daemon entry (the only one); everything else is a
-//! client: `run` is a client verb (control-plane actions over the loopback
-//! HTTP API), and add/remove/list manage the app registry (app_dir links).
+//! client: `run` is a client verb (control-plane actions over the HTTP/1.1
+//! API carried on a local IPC endpoint), and add/remove/list manage the app
+//! registry (app_dir links).
 
 mod action;
 mod api;
@@ -21,6 +22,7 @@ mod server;
 mod service;
 mod shell;
 mod supervisor;
+mod transport;
 mod web;
 
 use std::path::{Path, PathBuf};
@@ -149,7 +151,7 @@ enum Cmd {
         get: Vec<String>,
         /// Remove a daemon config key or whole section (repeatable): bare
         /// keys are shorthand for [daemon] leaves, dotted paths like
-        /// daemon.port or webui.listen name them directly, and a bare
+        /// daemon.socket or webui.listen name them directly, and a bare
         /// section name (`webui`) removes the whole table — deleting
         /// `[webui]` turns the console off. Idempotent — absent targets
         /// change nothing
@@ -955,11 +957,14 @@ fn run_detach(config_path: &Path) -> Result<()> {
     let config_dir = config_dir_of(config_path);
     match daemonize::ensure_daemon(&config, config_path, &config_dir) {
         daemonize::SpawnOutcome::Ready { already_online } => {
-            let addr = format!("{}:{}", config.daemon.host, config.daemon.port);
+            let endpoint = config
+                .control_endpoint()
+                .map(|e| e.display())
+                .unwrap_or_else(|_| config.daemon.socket.to_string_lossy().into_owned());
             if already_online {
-                println!("daemon already running on http://{addr}");
+                println!("daemon already running on control endpoint {endpoint}");
             } else {
-                println!("daemon running in the background on http://{addr}");
+                println!("daemon running in the background on control endpoint {endpoint}");
             }
             println!(
                 "logs: {}",
@@ -970,7 +975,7 @@ fn run_detach(config_path: &Path) -> Result<()> {
         daemonize::SpawnOutcome::TimedOut { log_path } => {
             eprintln!(
                 "ak: error: the daemon did not become ready; see {} \
-                 (a port conflict is likely — check `ak status`)",
+                 (a control-endpoint conflict is likely — check `ak status`)",
                 log_path.display()
             );
             std::process::exit(EXIT_ERROR);
@@ -1124,10 +1129,11 @@ fn run_adhoc(
     let config = client::load_config(config_path)?;
     let c = client::Client::from_config(&config);
     // daemon-first: offline is exit 3 and MUST NOT pull a daemon up.
-    if c.health().is_err() {
+    if let Err(e) = c.health() {
         eprintln!(
-            "ak: error: daemon unreachable (is `ak daemon` active?) — `ak run` is \
-             daemon-first and does not start the daemon for you"
+            "ak: error: {e:#} — `ak run` is daemon-first and does not start the daemon \
+             for you (control endpoint: {})",
+            c.endpoint().display()
         );
         std::process::exit(EXIT_UNREACHABLE);
     }
@@ -1696,6 +1702,27 @@ fn apply_after_add(config: &DaemonConfig, config_path: &Path, app: &str) -> AddA
 
 // -- validate ---------------------------------------------------------------
 
+/// The warning `validate` prints when the console is on but unauthenticated.
+///
+/// The console keeps TCP (browsers cannot reach a unix socket) and owns
+/// stop / apply authority in-process, so with no `[webui] auth_token` the
+/// isolation the control socket provides does not extend to the console: any
+/// local user who can reach `webui.listen` can stop or replace programs.
+/// That is a deliberate default (existing deployments must keep working, see
+/// the `webui-api` capability) — but it must not stay silent.
+pub fn webui_open_console_warning(config: &DaemonConfig) -> Option<String> {
+    let listen = config.webui_listen()?;
+    if config.webui_auth_token().is_some() {
+        return None;
+    }
+    Some(format!(
+        "warning: [webui] is enabled without auth_token — any local user able to reach \
+         {listen} can stop or replace your programs via the console API; set one with \
+         `ak config --set webui.auth_token=<secret>` (clients then exchange it for a \
+         session cookie once)"
+    ))
+}
+
 fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
     if let Some(p) = single {
         let config = client::load_config(config_path)?;
@@ -1743,6 +1770,9 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
         for p in &a.programs {
             println!("    - {} <{}>", p.name, p.command);
         }
+    }
+    if let Some(warning) = webui_open_console_warning(&config) {
+        println!("{warning}");
     }
     Ok(())
 }
@@ -2065,7 +2095,8 @@ fn run_daemon(config_path: &Path) -> Result<()> {
             .context("failed to spawn health checker")?;
     }
 
-    // Bind the API first so a port clash fails fast and clearly, then serve
+    // Bind the control endpoint first so a conflict (a live instance, or a
+    // non-socket file at the path) fails fast and clearly, then serve
     // connections on a background thread while the main thread supervises.
     let listener = server::bind(&sup)?;
     {
@@ -2169,7 +2200,7 @@ mod edit_tests {
         let dir = temp_root("abnormal");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("daemon.toml");
-        std::fs::write(&path, "[daemon]\nport = 8080\n").unwrap();
+        std::fs::write(&path, "[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
         let script = dir.join("fake-editor.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -2181,7 +2212,7 @@ mod edit_tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "[daemon]\nport = 8080\n",
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
             "the file keeps its pre-edit content"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2192,22 +2223,36 @@ mod edit_tests {
 mod sync_tests {
     use super::*;
 
-    fn config_with_port(port: u16) -> Result<DaemonConfig> {
-        Ok(toml::from_str(&format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {port}\n"
-        ))?)
-    }
+
+/// A private control endpoint for tests: the mock control plane binds it
+/// before the client is allowed to connect, so there is no startup race.
+fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
+    let dir = std::env::temp_dir().join(format!("xk-mock-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("ak.sock");
+    let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
+    let listener = ep.bind().unwrap();
+    (socket, listener)
+}
+
+fn config_with_socket(socket: &Path) -> DaemonConfig {
+    toml::from_str(&format!(
+        "[daemon]\nsocket = {:?}\n",
+        socket.to_string_lossy()
+    ))
+    .unwrap()
+}
 
     /// A reachable daemon whose reload fails must surface as an error (main
     /// maps it to a non-zero exit), never a swallowed warning — the registry
     /// changed but the daemon did not pick it up.
     #[test]
     fn reload_failure_while_online_is_an_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (socket, mut listener) = mock_socket("reload-fail");
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
-                let (mut sock, _) = listener.accept().unwrap();
+                let mut sock = listener.accept().unwrap();
                 let mut buf = [0u8; 4096];
                 let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -2225,7 +2270,7 @@ mod sync_tests {
             }
         });
 
-        let config = config_with_port(port).unwrap();
+        let config = config_with_socket(&socket);
         let r = sync_if_online(&config);
         let err = r.err().expect("reload failure while online must error");
         assert!(
@@ -2239,7 +2284,8 @@ mod sync_tests {
     /// nothing to sync — silent success.
     #[test]
     fn offline_sync_is_a_silent_success() {
-        let config = config_with_port(1).unwrap(); // loopback:1 is never open
+        // Nothing is bound at this path, so the probe cannot succeed.
+        let config = config_with_socket(Path::new("/tmp/xk-mock-absent/ak.sock"));
         sync_if_online(&config).expect("offline sync must be a silent success");
     }
 
@@ -2248,11 +2294,10 @@ mod sync_tests {
     /// control-plane result comes back (fake daemon, sync_tests style).
     #[test]
     fn add_apply_online_runs_app_scoped_apply() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let (socket, mut listener) = mock_socket("apply-online");
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
-                let (mut sock, _) = listener.accept().unwrap();
+                let mut sock = listener.accept().unwrap();
                 // Read the full request: headers to the blank line, then the
                 // Content-Length body (it may arrive in a separate segment).
                 let mut raw = Vec::new();
@@ -2306,7 +2351,7 @@ mod sync_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("daemon.toml");
         std::fs::write(&config_path, "").unwrap();
-        let config = config_with_port(port).unwrap();
+        let config = config_with_socket(&socket);
         match apply_after_add(&config, &config_path, "abc") {
             AddApplyOutcome::Applied(text) => {
                 assert!(text.contains("abc.abc -> start"), "result text: {text}");
@@ -2411,7 +2456,15 @@ mod config_cmd_tests {
     fn set_missing_file_is_rejected_with_init_hint() {
         let dir = temp_root("set-missing");
         let path = dir.join("daemon.toml");
-        let code = config_cmd(&path, &["port=8080".to_string()], &[], &[], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &["socket=/tmp/ak.sock".to_string()],
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_CONFIG, "missing file set must exit 2");
         assert!(!path.exists(), "a rejected set must not create the file");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2421,7 +2474,7 @@ mod config_cmd_tests {
     fn delete_missing_file_is_rejected() {
         let dir = temp_root("del-missing");
         let path = dir.join("daemon.toml");
-        let code = config_cmd(&path, &[], &[], &["port".to_string()], false, false).unwrap();
+        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
         assert_eq!(code, EXIT_CONFIG);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2430,7 +2483,7 @@ mod config_cmd_tests {
     fn get_missing_file_answers_defaults_and_exits_zero() {
         let dir = temp_root("get-missing");
         let path = dir.join("nested").join("daemon.toml");
-        let code = config_cmd(&path, &[], &["port".to_string()], &[], false, false).unwrap();
+        let code = config_cmd(&path, &[], &["socket".to_string()], &[], false, false).unwrap();
         assert_eq!(code, EXIT_OK, "--get on a missing file is all defaults");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2439,12 +2492,12 @@ mod config_cmd_tests {
     fn set_get_delete_roundtrip_over_a_real_file() {
         let dir = temp_root("roundtrip");
         let path = dir.join("daemon.toml");
-        std::fs::write(&path, "[daemon]\nport = 1234\n").unwrap();
+        std::fs::write(&path, "[daemon]\nsocket = \"/tmp/old.sock\"\n").unwrap();
 
         // set: exit 0, value lands on disk.
         let code = config_cmd(
             &path,
-            &["port=8080".to_string(), "log_level=debug".to_string()],
+            &["socket=/tmp/new.sock".to_string(), "log_level=debug".to_string()],
             &[],
             &[],
             false,
@@ -2454,26 +2507,30 @@ mod config_cmd_tests {
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("port = 8080") && text.contains("log_level = \"debug\""),
+            text.contains("socket = \"/tmp/new.sock\"") && text.contains("log_level = \"debug\""),
             "{text}"
         );
         // A rejected set leaves the file byte-identical.
         let before = text.clone();
-        let code = config_cmd(&path, &["port=abc".to_string()], &[], &[], false, false).unwrap();
-        assert_eq!(code, EXIT_CONFIG, "type violation exits 2");
+        let code = config_cmd(&path, &["socket=".to_string()], &[], &[], false, false).unwrap();
+        assert_eq!(code, EXIT_CONFIG, "an empty socket exits 2");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // A removed key is refused with an explanation and writes nothing.
+        let code = config_cmd(&path, &["port=8080".to_string()], &[], &[], false, false).unwrap();
+        assert_eq!(code, EXIT_CONFIG, "a removed key exits 2");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         // delete: exit 0, key gone; second delete of an absent key is still 0.
-        let code = config_cmd(&path, &[], &[], &["port".to_string()], false, false).unwrap();
+        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("port"), "{text}");
+        assert!(!text.contains("/tmp/new.sock"), "{text}");
         assert!(
             text.contains("log_level = \"debug\""),
             "untouched key kept: {text}"
         );
         let before = text.clone();
-        let code = config_cmd(&path, &[], &[], &["port".to_string()], false, false).unwrap();
+        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
         assert_eq!(code, EXIT_OK, "absent-key delete is idempotent success");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2483,7 +2540,7 @@ mod config_cmd_tests {
     fn get_unknown_key_is_rejected_with_config_exit_code() {
         let dir = temp_root("get-unknown");
         let path = dir.join("daemon.toml");
-        std::fs::write(&path, "[daemon]\nport = 8080\n").unwrap();
+        std::fs::write(&path, "[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
         let code = config_cmd(&path, &[], &["foo".to_string()], &[], false, false).unwrap();
         assert_eq!(code, EXIT_CONFIG, "an unknown --get key must exit 2");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2496,21 +2553,21 @@ mod config_cmd_tests {
         let path = dir.join("daemon.toml");
         std::fs::write(
             &path,
-            "[daemon]\n# port note\nport = 8080\nhost = \"0.0.0.0\"\nlog_level = \"debug\"\n",
+            "[daemon]\n# socket note\nsocket = \"/tmp/old.sock\"\nlog_level = \"debug\"\n",
         )
         .unwrap();
         let code = config_cmd(
             &path,
             &[],
             &[],
-            &["port".to_string(), "host".to_string()],
+            &["socket".to_string(), "log_buffer_lines".to_string()],
             false,
             false,
         )
         .unwrap();
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("port") && !text.contains("host"), "{text}");
+        assert!(!text.contains("/tmp/old.sock") && !text.contains("log_buffer_lines"), "{text}");
         assert!(
             text.contains("log_level = \"debug\""),
             "the untouched key survives: {text}"
@@ -2572,24 +2629,33 @@ mod config_cmd_tests {
 
     // -- online probe (task 4.1): mock daemon, both branches ------------------
 
-    fn config_with_port(port: u16) -> Result<DaemonConfig> {
-        Ok(toml::from_str(&format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {port}\n"
-        ))?)
-    }
+    /// A /v1/health answerer on a private control socket, sync_tests style.
 
-    /// A /v1/health answerer on a free port, sync_tests style.
-    fn spawn_health_mock() -> (std::net::TcpListener, u16) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
-    }
+/// A private control endpoint for tests: the mock control plane binds it
+/// before the client is allowed to connect, so there is no startup race.
+fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
+    let dir = std::env::temp_dir().join(format!("xk-mock-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("ak.sock");
+    let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
+    let listener = ep.bind().unwrap();
+    (socket, listener)
+}
+
+fn config_with_socket(socket: &Path) -> DaemonConfig {
+    toml::from_str(&format!(
+        "[daemon]\nsocket = {:?}\n",
+        socket.to_string_lossy()
+    ))
+    .unwrap()
+}
 
     #[test]
     fn sync_hint_online_suggests_reload() {
-        let (listener, port) = spawn_health_mock();
+        let (socket, mut listener) = mock_socket("sync-online");
         let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
             let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -2601,7 +2667,7 @@ mod config_cmd_tests {
                         Content-Length: 2\r\nConnection: close\r\n\r\n{}";
             std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
         });
-        let config = config_with_port(port).unwrap();
+        let config = config_with_socket(&socket);
         let msg = config_sync_hint(&config);
         assert!(msg.contains("online") && msg.contains("reload"), "{msg}");
         server.join().unwrap();
@@ -2609,12 +2675,54 @@ mod config_cmd_tests {
 
     #[test]
     fn sync_hint_offline_names_next_start() {
-        let config = config_with_port(1).unwrap(); // loopback:1 is never open
+        let config = config_with_socket(Path::new("/tmp/xk-mock-absent/ak.sock"));
         let msg = config_sync_hint(&config);
         assert!(
             msg.contains("offline") && msg.contains("next start"),
             "{msg}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests: the `validate` console-auth warning (unix-socket-control-plane 6.4)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod validate_warning_tests {
+    use super::*;
+
+    fn daemon_config(toml_text: &str) -> DaemonConfig {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    #[test]
+    fn console_without_token_warns_with_listen_address() {
+        let config = daemon_config("[webui]\nlisten = \"127.0.0.1:8527\"\n");
+        let warning = webui_open_console_warning(&config).expect("an open console must warn");
+        assert!(warning.contains("127.0.0.1:8527"), "{warning}");
+        assert!(warning.contains("without auth_token"), "{warning}");
+        // The warning must name what is actually at risk, not just "insecure".
+        assert!(warning.contains("stop or replace"), "{warning}");
+        // And it must name the fix.
+        assert!(
+            warning.contains("ak config --set webui.auth_token="),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn console_with_token_stays_silent() {
+        let config = daemon_config(
+            "[webui]\nlisten = \"127.0.0.1:8527\"\nauth_token = \"s3cret\"\n",
+        );
+        assert!(webui_open_console_warning(&config).is_none());
+    }
+
+    #[test]
+    fn console_absent_stays_silent() {
+        let config = daemon_config("[daemon]\nlog_level = \"warn\"\n");
+        assert!(webui_open_console_warning(&config).is_none());
     }
 }
 

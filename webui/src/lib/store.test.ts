@@ -137,9 +137,10 @@ describe('store', () => {
     await vi.advanceTimersByTimeAsync(1)
     expect(store.getSnapshot().transport).toBe('poll')
 
-    // Poll succeeds → doc refreshed from /api/overview.
+    // Poll succeeds → doc refreshed from /api/overview (apiFetch sends the
+    // request same-origin so the session cookie rides along).
     await vi.advanceTimersByTimeAsync(3000)
-    expect(fetchMock).toHaveBeenCalledWith('/api/overview')
+    expect(fetchMock).toHaveBeenCalledWith('/api/overview', { credentials: 'same-origin' })
     expect(store.getSnapshot().doc!.programs.map((p) => p.name)).toEqual(['a', 'new'])
 
     // Poll fails → offline banner state; doc retained (stale but present).

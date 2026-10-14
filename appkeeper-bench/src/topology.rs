@@ -1,7 +1,7 @@
 //! Run topologies (design D4/D7): spawn an isolated daemon in a temp
-//! workspace, or connect to an already-running one. Both go through the same
-//! /v1 client code path; cleanup runs on every exit path (success, failure,
-//! ctrl-C) and removes everything bench created.
+//! workspace, or connect to an already-running one over its control socket.
+//! Both go through the same /v1 client code path; cleanup runs on every exit
+//! path (success, failure, ctrl-C) and removes everything bench created.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -82,9 +82,47 @@ pub fn release_cleanup() {
     CLEANUP_RUNNING.store(false, Ordering::SeqCst);
 }
 
-fn free_port() -> Result<u16> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+/// A socket path for the isolated daemon, short enough for `sun_path`
+/// (~108 bytes). The workspace already lives under a short temp prefix, so
+/// this stays well inside the limit — and the length is checked rather than
+/// truncated, because a truncated path would point bench and the daemon at
+/// two different endpoints.
+fn isolated_socket(root: &Path) -> Result<PathBuf> {
+    let path = root.join("ak.sock");
+    let len = path.display().to_string().len();
+    const MAX: usize = 100;
+    if len > MAX {
+        bail!(
+            "the isolated control endpoint path is {len} bytes, over the {MAX}-byte limit a \
+             local socket can carry: {} — set TMPDIR to a shorter path",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// 5.4: the isolated daemon's endpoint must be owner-only, in a private
+/// directory. A daemon that got this wrong would be reachable by every local
+/// account, so bench refuses to measure it.
+fn assert_endpoint_isolated(endpoint: &crate::api::Endpoint) -> Result<()> {
+    const SOCKET_MODE: u32 = 0o600;
+    const DIR_MODE: u32 = 0o700;
+    match (endpoint.file_mode(), endpoint.dir_mode()) {
+        (Some(m), Some(d)) => {
+            if m != SOCKET_MODE || d != DIR_MODE {
+                bail!(
+                    "the isolated daemon's control endpoint {} is not owner-only: socket is \
+                     {:04o}, its directory is {:04o} (expected 0600 / 0700) — the daemon's \
+                     per-user isolation is not in effect",
+                    endpoint.display(),
+                    m,
+                    d
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn unique_suffix() -> u128 {
@@ -242,16 +280,31 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
         std::fs::create_dir_all(root.join(d))
             .with_context(|| format!("create workspace dir {}", root.join(d).display()))?;
     }
-    let control_port = free_port()?;
+    // The control endpoint lives INSIDE the workspace, so cleanup removes it
+    // with everything else and two benches never collide. The workspace root
+    // is created owner-only (0700) up front: the daemon deliberately never
+    // re-permissions a directory an operator (here: bench) chose — it only
+    // guarantees the 0700 contract for the built-in per-uid default path.
+    // Creating it here is what makes the 5.4 isolation assertion below true.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", root.display()))?;
+    }
+    let control_socket = isolated_socket(root)?;
     // Forward slashes so the TOML basic string stays valid on Windows.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    let socket = control_socket
+        .to_string_lossy()
+        .replace('\\', "/");
     // No [webui] section: the bench environment never serves the console.
     // `app_dir` is explicit so the bench workspace is independent of the
     // built-in default name (run-daemon-first changed it to `app.d`).
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nhost = \"127.0.0.1\"\nport = {control_port}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"app.d\"\n",
+            "[daemon]\nsocket = \"{socket}\"\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"app.d\"\n",
         ),
     )
     .with_context(|| format!("write daemon.toml in {}", root.display()))?;
@@ -270,8 +323,9 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
         .with_context(|| format!("spawn daemon {}", bin.display()))?;
     *DAEMON_CHILD.lock().unwrap() = Some(child);
 
-    let client = Client::new(&format!("127.0.0.1:{control_port}"), None)?;
+    let client = Client::new(&control_socket.to_string_lossy())?;
     wait_health(&client, 20)?;
+    assert_endpoint_isolated(&client.endpoint())?;
     let daemon_version = client.daemon_version()?;
     let daemon_pid = {
         let guard = DAEMON_CHILD.lock().unwrap();
@@ -292,11 +346,11 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
 
 /// Connect to a running daemon and resolve where its apps/logs live. Refuses
 /// to run when any bench-prefixed app already exists there (design D7).
-pub fn connect_site(addr: &str, token: Option<&str>) -> Result<Site> {
-    let client = Client::new(addr, token)?;
+pub fn connect_site(socket: &str) -> Result<Site> {
+    let client = Client::new(socket)?;
     client
         .health()
-        .with_context(|| format!("cannot reach the target daemon at {addr}"))?;
+        .with_context(|| format!("cannot reach the target daemon at {socket}"))?;
     let daemon_version = client.daemon_version()?;
     let config_source = client.config_source()?;
     let paths = dcfg::discover(Path::new(&config_source))?;
@@ -463,7 +517,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xk-bench-cln-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = CleanupCtx {
-            client: Client::new("127.0.0.1:9", None).unwrap(),
+            client: Client::new("/tmp/xk-bench-no-daemon/ak.sock").unwrap(),
             app_files: vec![dir.join("nope.toml")],
             app_names: vec!["appkeeper-bench-nope".into()],
             log_dir: dir.clone(),

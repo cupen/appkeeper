@@ -24,6 +24,21 @@ mod topology;
 use clap::Parser;
 
 fn main() {
+    // The control plane moved from TCP to a local IPC endpoint; `--connect`
+    // and `--token` are gone rather than silently accepted (benchmark spec:
+    // 旧的 --connect 与 --token 不再生效 → 非零码退出并说明替代).
+    for (flag, replacement) in [
+        ("--connect", "--socket <path>"),
+        ("--token", "nothing (the control plane has no token)"),
+    ] {
+        if std::env::args().any(|a| a == flag || a.starts_with(&format!("{flag}="))) {
+            eprintln!(
+                "appkeeper-bench: error: {flag} has been removed: the daemon serves a local IPC \
+                 endpoint now — use {replacement}"
+            );
+            std::process::exit(2);
+        }
+    }
     let cli = cli::Cli::parse();
     let result = match &cli.cmd {
         Some(cli::Cmd::Generate(g)) => generate::run_generate(g),

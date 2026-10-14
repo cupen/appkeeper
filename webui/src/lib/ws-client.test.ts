@@ -84,6 +84,7 @@ describe('ws-client', () => {
       gap: (p, s, n) => events.push(`gap:${p}:${s}:${n}`),
       error: (m) => events.push(`error:${m}`),
       stateChange: (s) => events.push(`state:${s}`),
+      handshakeRefused: () => {},
     })
     client.connect()
     const ws = FakeWebSocket.instances[0]!
@@ -128,6 +129,7 @@ describe('ws-client', () => {
       gap: () => {},
       error: () => {},
       stateChange: () => {},
+      handshakeRefused: () => {},
     })
     client.connect()
     const ws = FakeWebSocket.instances[0]!
@@ -156,6 +158,7 @@ describe('ws-client', () => {
       gap: () => {},
       error: () => {},
       stateChange: (s) => states.push(s),
+      handshakeRefused: () => {},
     })
     client.connect()
     const first = FakeWebSocket.instances[0]!
@@ -185,6 +188,7 @@ describe('ws-client', () => {
       gap: () => {},
       error: (m) => errors.push(m),
       stateChange: () => {},
+      handshakeRefused: () => {},
     })
     client.connect()
     const ws = FakeWebSocket.instances[0]!

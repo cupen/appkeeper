@@ -22,6 +22,7 @@ import './views/app-overview.js'
 import './views/program-detail.js'
 import './components/console-tree.js'
 import './components/overview-bar.js'
+import './components/credential-gate.js'
 
 // Exported for tests: the route resolution audit iterates these. Deep links
 // to unknown paths fall through to the dashboard like any unmatched path.
@@ -253,6 +254,7 @@ export class AkApp extends LitElement {
               : html`<ak-dashboard></ak-dashboard>`}
         </div>
       </main>
+      <ak-credential-gate></ak-credential-gate>
     `
   }
 }

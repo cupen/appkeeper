@@ -182,12 +182,11 @@ pub fn run_bench(a: &BenchArgs) -> Result<()> {
     let started_epoch = report::now_epoch_secs();
 
     // 1. Topology.
-    let site: Site = match &a.connect {
-        Some(addr) => {
-            let s = topology::connect_site(addr, a.token.as_deref())
-                .map_err(|e| e.context("connect topology"))?;
+    let site: Site = match &a.socket {
+        Some(socket) => {
+            let s = topology::connect_site(socket).map_err(|e| e.context("connect topology"))?;
             eprintln!(
-                "[bench] connected to daemon at {addr} (pid unknown: RSS sampling off in \
+                "[bench] connected to daemon at {socket} (pid unknown: RSS sampling off in \
                  connect mode)"
             );
             s
@@ -331,7 +330,7 @@ fn measure(
             "rate": eff.rate,
             "duration": eff.duration,
             "programs": eff.programs,
-            "connect": a.connect,
+            "socket": a.socket,
         }),
         aggregate: Aggregate {
             rows: aggregate_rows,
