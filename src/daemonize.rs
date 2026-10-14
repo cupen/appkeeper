@@ -8,12 +8,13 @@
 //! detached process group (unix `process_group(0)`, windows
 //! `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`), redirect stdout/stderr
 //! (append) to `{log_dir}/daemon.out.log`, then poll `/v1/health` over the
-//! control socket every ~200ms for up to ~10s. No credential is involved:
-//! the probe can only succeed if this account owns the endpoint. There is no
-//! lock file either — a second instance loses the endpoint race and exits on
-//! its own (the "bind conflict" behavior), and any caller that observes a
-//! healthy daemon is satisfied — it never fails because its own child
-//! exited.
+//! configured control endpoint every ~200ms for up to ~10s — the endpoint
+//! shape is whatever `[daemon] socket` says (local IPC path or `tcp://`,
+//! tcp-control-endpoint: 形态驱动、零行为分叉), and `/v1/health` is
+//! credential-free in both shapes. There is no lock file either — a second
+//! instance loses the endpoint race and exits on its own (the "bind
+//! conflict" behavior), and any caller that observes a healthy daemon is
+//! satisfied — it never fails because its own child exited.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -262,6 +263,79 @@ mod tests {
             cmd.get_program().to_string_lossy(),
             "/usr/local/bin/ak",
             "the program is the current executable path"
+        );
+    }
+
+    // -- TCP form (tcp-control-endpoint task 4.2) ----------------------------
+    // shell.rs needs no change: it dials via `Client::from_config`, which is
+    // shape-agnostic by contract. The readiness probe is exercised here in
+    // both outcomes on a `tcp://` endpoint to prove the protocol is
+    // endpoint-shape driven, not a fork.
+
+    /// A `tcp://` endpoint with a live (fake) health answerer short-circuits
+    /// `ensure_daemon` — same protocol over TCP, `/v1/health` exempt from
+    /// credentials in every shape.
+    #[test]
+    fn ensure_daemon_short_circuits_over_tcp() {
+        let dir = tmp_dir("tcp-online");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            port
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // One-shot fake health answer: accepts, reads the request, answers
+        // 200 with a fixed body — /v1/health is credential-free.
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut conn, &mut buf);
+            let body = "{}";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
+        });
+        let cfg = cfg_with_socket(
+            Path::new(&format!("tcp://127.0.0.1:{port}")),
+            &dir,
+        );
+        let config_path = dir.join("daemon.toml");
+        std::fs::write(&config_path, "").unwrap();
+        match ensure_daemon(&cfg, &config_path, &dir) {
+            SpawnOutcome::Ready {
+                already_online: true,
+            } => {}
+            other => panic!("the tcp:// daemon must short-circuit, got {other:?}"),
+        }
+        assert!(
+            !daemon_log_path(&cfg, &dir).exists(),
+            "no spawn happened, so no daemon log was created"
+        );
+        server.join().unwrap();
+    }
+
+    /// The readiness budget still bounds the wait on a `tcp://` endpoint
+    /// that never answers (probe budget, not a hang).
+    #[test]
+    fn wait_ready_over_tcp_times_out() {
+        let dir = tmp_dir("tcp-timeout");
+        // Bind-then-drop leaves the port closed: nothing will ever answer.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg = cfg_with_socket(
+            Path::new(&format!("tcp://127.0.0.1:{port}")),
+            &dir,
+        );
+        let client = Client::from_config(&cfg);
+        assert!(
+            !wait_ready(&client, Duration::from_millis(300)),
+            "no daemon on the tcp:// endpoint"
         );
     }
 

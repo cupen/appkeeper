@@ -345,9 +345,12 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
 // -- connect topology ----------------------------------------------------------
 
 /// Connect to a running daemon and resolve where its apps/logs live. Refuses
-/// to run when any bench-prefixed app already exists there (design D7).
-pub fn connect_site(socket: &str) -> Result<Site> {
-    let client = Client::new(socket)?;
+/// to run when any bench-prefixed app already exists there (design D7). The
+/// endpoint is a `[daemon] socket` shape (IPC path or `tcp://host:port`);
+/// `token` is the Bearer credential for the tcp:// form (`--token`, already
+/// validated against the endpoint shape by the CLI layer).
+pub fn connect_site(socket: &str, token: Option<&str>) -> Result<Site> {
+    let client = Client::with_token(socket, token.map(String::from))?;
     client
         .health()
         .with_context(|| format!("cannot reach the target daemon at {socket}"))?;

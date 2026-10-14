@@ -806,14 +806,23 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("the template renders the known key {key}"),
         )?;
     }
-    // unix-socket-control-plane: the removed bind/token keys are gone from
-    // the template, and the socket default is the uid-layered endpoint.
-    for removed in ["host", "port = ", "auth_token"] {
+    // unix-socket-control-plane removed the bind keys; tcp-control-endpoint
+    // brought `auth_token` back as a COMMENTED template line (only the tcp://
+    // form takes it) — so it must exist as a comment but never as a live key.
+    for removed in ["host", "port = "] {
         expect(
             !text.contains(&format!("{removed} =")),
             &format!("the removed key {removed} is not rendered as a live key"),
         )?;
     }
+    expect(
+        text.contains("# auth_token = \"change-me\"") && text.contains("ONLY for the tcp:// form"),
+        "auth_token is a commented template line with the tcp:// shape note",
+    )?;
+    expect(
+        !text.contains("\nauth_token = "),
+        "auth_token is not rendered as a live (uncommented) key",
+    )?;
     expect(
         text.contains("socket = \"/run/appkeeper/") && text.contains("/ak.sock"),
         "the socket default is rendered (uid-layered endpoint)",
@@ -940,7 +949,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("K6b. removed keys are refused with the replacement named (D7)");
-    for removed in ["port=8080", "host=127.0.0.1", "auth_token=legacy"] {
+    for removed in ["port=8080", "host=127.0.0.1"] {
         let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--set", removed])?;
         expect(
             !ok && code == 2,
@@ -951,13 +960,35 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "the error names the removal and the socket replacement: {combined:?}",
         )?;
     }
+    expect(
+        std::fs::read_to_string(&cfg)? == before,
+        "the removed-key sets left the file byte-identical",
+    )?;
+    // tcp-control-endpoint: `auth_token` is a conditional key again. On a
+    // path-form socket the write parses, but whole-config validation refuses
+    // the combination — exit 2, the fix named, file unchanged.
+    {
+        let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--set", "auth_token=legacy"])?;
+        expect(
+            !ok && code == 2,
+            &format!("--set auth_token on a path-form socket exits 2, got {code}"),
+        )?;
+        expect(
+            combined.contains("auth_token") && combined.contains("tcp://"),
+            &format!("the combination error names auth_token and the tcp:// form: {combined:?}"),
+        )?;
+        expect(
+            std::fs::read_to_string(&cfg)? == before,
+            "the refused auth_token set left the file byte-identical",
+        )?;
+    }
     // A config file that still carries the dead keys fails validate outright.
     let legacy = ws.root.join("cfgcmd-legacy.toml");
     std::fs::write(&legacy, "[daemon]\nhost = \"127.0.0.1\"\nport = 7310\nauth_token = \"x\"\n")?;
     let (ok, _code, combined) = cli_try_cfg(bin, &legacy, &["validate"])?;
     expect(
         !ok && combined.contains("removed"),
-        "a legacy config with host/port/auth_token fails validate: {combined:?}",
+        "a legacy config with host/port fails validate: {combined:?}",
     )?;
     expect(
         std::fs::read_to_string(&cfg)? == before,
@@ -3800,6 +3831,350 @@ fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+// -- tcp control endpoint pass (tcp-control-endpoint) -----------------------------
+
+/// The `[daemon] socket` TCP form: `tcp://127.0.0.1:<port>` with the Bearer
+/// token in `auth_token`. The whole pass runs against this one config; the
+/// 401 scenarios re-read the SAME endpoint through a config with a wrong
+/// token (the daemon-side counterpart of "the fix is in the caller's config").
+struct TcpWs {
+    /// The bare `host:port` for plain `http://` curls (the config carries the
+    /// full `tcp://` URL itself).
+    addr: String,
+    token: &'static str,
+    cfg: PathBuf,
+}
+
+/// Plain HTTP over the TCP control endpoint, with an optional Bearer header:
+/// the same wire contract `curl_socket` exercises on the IPC form. Returns
+/// (status, body).
+fn tcp_get(addr: &str, path: &str, token: Option<&str>) -> Result<(u16, String)> {
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s")
+        .arg("-o")
+        .arg("-")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg(format!("http://{addr}{path}"));
+    if let Some(t) = token {
+        cmd.arg("-H").arg(format!("Authorization: Bearer {t}"));
+    }
+    let out = cmd.output().context("curl the tcp control endpoint")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+}
+
+/// The CLI against the TCP workspace's config.
+fn tcp_cli(bin: &Path, ws: &TcpWs, args: &[&str]) -> Result<String> {
+    let (ok, _code, combined) = tcp_cli_try(bin, ws, args);
+    if !ok {
+        bail!("appkeeper {args:?} failed: {combined}");
+    }
+    Ok(combined)
+}
+
+/// The CLI against the TCP workspace's config, expecting possible FAILURE;
+/// returns (success, exit code, stdout+stderr).
+fn tcp_cli_try(bin: &Path, ws: &TcpWs, args: &[&str]) -> (bool, i32, String) {
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(&ws.cfg)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("run appkeeper {args:?}: {e}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        out.status.success(),
+        out.status.code().unwrap_or(-1),
+        combined,
+    )
+}
+
+fn tcp_health_ok(ws: &TcpWs) -> bool {
+    matches!(tcp_get(&ws.addr, "/v1/health", None), Ok((200, _)))
+}
+
+/// Wait until the program's state is `running` (the built-in startsecs window
+/// keeps it in `starting` first) and return its live pid. `status --json` is
+/// the machine-readable projection, so the judgment is per-program exact.
+fn tcp_wait_running(bin: &Path, ws: &TcpWs, program: &str) -> Result<u32> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = tcp_cli(bin, ws, &["status", "--json"])?;
+        let v: serde_json::Value = serde_json::from_str(out.trim())
+            .with_context(|| format!("status --json parses: {out:?}"))?;
+        let prog = v["programs"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == program))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if prog["state"] == "running" {
+            if let Some(pid) = prog["pid"].as_u64() {
+                return Ok(pid as u32);
+            }
+        }
+        if Instant::now() > deadline {
+            bail!("{program} never reached running (tcp form): {prog}");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn tcp_wait_dead(ws: &TcpWs) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if !tcp_health_ok(ws) {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("the tcp daemon did not shut down");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// TCP form end-to-end (tcp-control-endpoint D5, tasks 4.4): the daemon and
+/// every CLI subcommand speak the SAME protocol over `tcp://` as over the
+/// local IPC path, admission rides `auth_token`, and both rejection paths
+/// (401 with a wrong token, no-token startup) refuse loudly. The implicit
+/// pull-up (`add --apply`, background-daemon spec) is included: the probe
+/// must dial the TCP endpoint from a cold start.
+fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
+    step("T. tcp:// control endpoint: same protocol, Bearer admission, full CLI");
+
+    let root = std::env::temp_dir().join(format!("xk-xtask-tcp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("apps"))?;
+    std::fs::create_dir_all(root.join("logs"))?;
+    let port = free_port()?;
+    let endpoint = format!("tcp://127.0.0.1:{port}");
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    let app_dir = root.join("apps").to_string_lossy().replace('\\', "/");
+    let cfg = root.join("daemon.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[daemon]\nsocket = \"{endpoint}\"\nauth_token = \"tcp-e2e-token\"\n\
+             log_dir = \"{log_dir}\"\napp_dir = \"{app_dir}\"\nlog_level = \"warn\"\n\
+             monitor_interval = 0.5\n\n[app-default]\nrestart = \"always\"\n"
+        ),
+    )?;
+    let ws = TcpWs {
+        addr: format!("127.0.0.1:{port}"),
+        token: "tcp-e2e-token",
+        cfg: cfg.clone(),
+    };
+
+    // T0. The combination gate: `tcp://` without a token fails validate AND
+    // the daemon refuses to boot (control-plane spec: TCP 无 token 不可启动).
+    let no_token_cfg = root.join("daemon-no-token.toml");
+    std::fs::write(
+        &no_token_cfg,
+        format!(
+            "[daemon]\nsocket = \"{endpoint}\"\nlog_dir = \"{log_dir}\"\napp_dir = \"{app_dir}\"\n"
+        ),
+    )?;
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(&no_token_cfg)
+        .args(["validate"])
+        .output()
+        .context("validate a tcp:// config without auth_token")?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    expect(
+        !out.status.success(),
+        &format!("validate rejects tcp:// without auth_token: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("auth_token") && combined.contains("tcp://"),
+        "the refusal names auth_token and the tcp:// form",
+    )?;
+    let no_token_log = root.join("no-token-daemon.out.log");
+    let out_f = std::fs::File::create(&no_token_log)?;
+    let err_f = out_f.try_clone()?;
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&no_token_cfg)
+        .arg("daemon")
+        .stdout(Stdio::from(out_f))
+        .stderr(Stdio::from(err_f))
+        .spawn()
+        .context("spawn daemon without auth_token")?;
+    let mut refused = false;
+    for _ in 0..50 {
+        match child.try_wait()? {
+            Some(st) => {
+                refused = !st.success();
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    if !refused {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    expect(refused, "the daemon exits non-zero on a tokenless tcp:// config")?;
+    expect(
+        std::fs::read_to_string(&no_token_log)?.contains("auth_token"),
+        "the startup refusal names auth_token",
+    )?;
+
+    // T1. Offline, the endpoint answers nothing: exit 3 unreachable, and the
+    // implicit pull-up bring the daemon up THROUGH the tcp:// endpoint
+    // (background-daemon spec: the readiness probe dials the configured
+    // endpoint whatever shape it is).
+    let sleep = find_sleep()?;
+    let (ok, code, combined) = tcp_cli_try(bin, &ws, &["status"]);
+    expect(
+        !ok && code == 3 && combined.contains("unreachable"),
+        &format!("offline tcp:// status is exit-3 unreachable, got {code}: {combined:?}"),
+    )?;
+    let out = tcp_cli(
+        bin,
+        &ws,
+        &[
+            "add",
+            sleep.to_str().unwrap(),
+            "--name",
+            "tcpdemo",
+            "--args",
+            "100000",
+            "--apply",
+        ],
+    )?;
+    expect(
+        out.contains("tcpdemo"),
+        &format!("offline add --apply succeeds over tcp://: {out:?}"),
+    )?;
+    expect(
+        root.join("apps/tcpdemo.toml").is_file(),
+        "the scaffolded registration landed in app_dir",
+    )?;
+    expect(
+        !root.join("ak.sock").exists() && !root.join("tcp.sock").exists(),
+        "a tcp:// daemon creates no socket file",
+    )?;
+
+    // T2. Control subcommands over TCP with the correct token: the same
+    // verbs, same outputs as the IPC form (control-plane spec: TCP 形态提供
+    // 同一套端点).
+    let pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
+    let out = tcp_cli(bin, &ws, &["status"])?;
+    expect(
+        out.contains("tcpdemo") && out.contains("running") && !out.contains("starting"),
+        &format!("status lists the program over tcp://: {out:?}"),
+    )?;
+    expect(
+        tcp_cli(bin, &ws, &["pid", "tcpdemo"])?.trim() == pid.to_string(),
+        "pid prints the live pid over tcp://",
+    )?;
+    // `log` rides the token'd endpoint too; the sleeper is silent, so the
+    // assertion is the exit-0 round trip itself.
+    tcp_cli(bin, &ws, &["log", "tcpdemo", "--tail", "5"])?;
+    let out = tcp_cli(bin, &ws, &["run", "--", sleep.to_str().unwrap(), "100000", "--name", "tcpadhoc"])?;
+    expect(
+        out.contains("tcpadhoc") && out.contains("pid"),
+        &format!("ad-hoc run registers over tcp://: {out:?}"),
+    )?;
+    tcp_wait_running(bin, &ws, "tcpadhoc")?;
+    // reload + apply ride the token'd endpoint too (a disk edit enters
+    // pending, reload previews it, apply lands it).
+    std::fs::write(
+        root.join("apps/tcpdemo.toml"),
+        format!("[app]\nrestart = \"always\"\n\n[program.tcpdemo]\ncommand = {:?}\nargs = [\"200000\"]\nstartsecs = 0.2\n", sleep.display().to_string()),
+    )?;
+    let out = tcp_cli(bin, &ws, &["reload"])?;
+    expect(
+        out.contains("tcpdemo") && out.contains("apply"),
+        &format!("reload previews the pending change over tcp://: {out:?}"),
+    )?;
+    let out = tcp_cli(bin, &ws, &["apply"])?;
+    expect(
+        out.contains("update-and-restart") && out.contains("tcpdemo"),
+        &format!("apply lands the change over tcp://: {out:?}"),
+    )?;
+    let new_pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
+    expect(new_pid != pid, "the changed program was restarted (pid changed)")?;
+    // stop + start round the gate as well.
+    tcp_cli(bin, &ws, &["stop", "tcpadhoc"])?;
+    let (ok, _code, combined) = {
+        // start-or-hint on a registered program goes through `run <name>`.
+        tcp_cli_try(bin, &ws, &["run", "tcpadhoc"])
+    };
+    expect(ok, &format!("run <name> restarts the stopped program: {combined:?}"))?;
+    tcp_wait_running(bin, &ws, "tcpadhoc")?;
+    expect(
+        tcp_cli(bin, &ws, &["list"])?.contains("tcpdemo"),
+        "list works over tcp://",
+    )?;
+
+    // T3. Wire contract: /v1/health is credential-free, /v1/status is not
+    // (control-plane spec: TCP 形态拒绝匿名请求 / 健康探测免凭据).
+    let (code, _) = tcp_get(&ws.addr, "/v1/health", None)?;
+    expect(code == 200, "health over tcp:// needs no credential")?;
+    let (code, body) = tcp_get(&ws.addr, "/v1/status", None)?;
+    expect(code == 401, &format!("anonymous /v1/status is 401, got {code}"))?;
+    expect(
+        !body.contains("programs") && !body.contains("tcpdemo"),
+        "the 401 leaks no program state",
+    )?;
+    let (code, _) = tcp_get(&ws.addr, "/v1/status", Some("wrong-token"))?;
+    expect(code == 401, "a wrong token is 401 too")?;
+    let (code, body) = tcp_get(&ws.addr, "/v1/status", Some(ws.token))?;
+    expect(code == 200 && body.contains("tcpdemo"), "the right token passes")?;
+
+    // T4. A caller config with the WRONG token: 401 is a business answer —
+    // exit 3, the message names auth_token, and it is NOT "unreachable"
+    // (control-plane spec: TCP 凭据错误的专属提示).
+    let wrong_cfg = root.join("daemon-wrong-token.toml");
+    std::fs::write(
+        &wrong_cfg,
+        format!(
+            "[daemon]\nsocket = \"{endpoint}\"\nauth_token = \"not-the-daemons-token\"\n\
+             log_dir = \"{log_dir}\"\napp_dir = \"{app_dir}\"\n"
+        ),
+    )?;
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(&wrong_cfg)
+        .args(["status"])
+        .output()
+        .context("status with a wrong token")?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    expect(
+        out.status.code() == Some(3),
+        &format!("a rejected credential exits 3, got {:?}", out.status.code()),
+    )?;
+    expect(
+        combined.contains("401") && combined.contains("auth_token"),
+        &format!("the error names 401 and the auth_token fix: {combined:?}"),
+    )?;
+    expect(
+        !combined.contains("unreachable"),
+        "a 401 is never phrased as daemon unreachable",
+    )?;
+
+    // T5. Shutdown through the token'd endpoint; the daemon goes away.
+    tcp_cli(bin, &ws, &["shutdown"])?;
+    tcp_wait_dead(&ws)?;
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
 // -- browser pass -----------------------------------------------------------------
 
 /// Drive the embedded console with playwright (node script via npx-resolved
@@ -4012,6 +4387,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
             browser_pass(&ws)?;
         }
         bench_pass(&bin, &ws)?;
+        tcp_control_endpoint_pass(&bin)?;
         Ok(())
     })();
 

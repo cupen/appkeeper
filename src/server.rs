@@ -1,11 +1,16 @@
-//! The local control plane: HTTP/1.1 JSON API over a local IPC endpoint.
+//! The local control plane: HTTP/1.1 JSON API over the configured control
+//! endpoint (local IPC, or `tcp://` — tcp-control-endpoint D1).
 //!
-//! The transport underneath is a unix domain socket (a named pipe on
-//! Windows) owned by [`crate::transport`]; this module never sees a path, a
-//! socket or a security descriptor — it accepts [`transport::Conn`]s and
-//! speaks HTTP/1.1 over them. Admission is the operating system's job (the
-//! endpoint's owner / the pipe's DACL), so there is no credential to check
-//! and no authorization branch: an `Authorization` header is ignored.
+//! The transport underneath is owned by [`crate::transport`]; this module
+//! never sees a path, a port or a platform IPC type — it accepts
+//! [`transport::Conn`]s and speaks HTTP/1.1 over them. Admission follows the
+//! endpoint shape (design D2/D3 — the shapes never mix): the local IPC form
+//! was decided by the operating system before the request was ever parsed,
+//! so an `Authorization` header is ignored there; the `tcp://` form leans on
+//! the Bearer credential from `[daemon] auth_token`, required for every
+//! request except `/v1/health`. The shape is a daemon-startup fact, so the
+//! gate is derived from the config per connection — there is no per-request
+//! dual-track.
 //!
 //! Hand-rolled (instead of a framework) for one reason: the `log --follow`
 //! endpoint must stream lines as they are produced and flush after every
@@ -224,7 +229,10 @@ fn err_bytes(status: u16, msg: &str) -> Vec<u8> {
 
 /// Bind the control endpoint. Called on the startup path so a conflict (a
 /// live instance, or a path some other file occupies) fails fast with a
-/// message that says which. See [`transport::Endpoint::bind`].
+/// message that says which. The shape — local IPC or `tcp://` — comes from
+/// `[daemon] socket` and is picked inside [`crate::transport`]; the startup
+/// log names the endpoint URL, which is self-describing (task 2.4). See
+/// [`transport::Endpoint::bind`].
 pub fn bind(sup: &Arc<Supervisor>) -> Result<transport::Listener> {
     let endpoint = {
         let st = sup.state.lock().unwrap();
@@ -265,6 +273,53 @@ pub fn serve(sup: Arc<Supervisor>, mut listener: transport::Listener) {
             }
         }
     }
+}
+
+/// One connection's admission policy, derived from the daemon config
+/// (tcp-control-endpoint D2/D3): the endpoint shape is fixed at daemon
+/// startup, so every connection of a daemon shares one policy — there is no
+/// mixed state.
+enum Admission {
+    /// Local IPC: admission was the kernel's (endpoint owner, decided at
+    /// `connect()`); any `Authorization` header is noise and is ignored.
+    OwnerOnly,
+    /// TCP: a Bearer credential gate on everything except `/v1/health`.
+    /// The token is non-empty in every runnable config (the combination
+    /// check rejects `tcp://` without one at startup), but an empty token
+    /// still fails closed below.
+    Bearer(String),
+}
+
+/// Derive the admission policy for one connection from the live config.
+fn admission_for(sup: &Supervisor) -> Admission {
+    let st = sup.state.lock().unwrap();
+    match st.config.control_endpoint() {
+        Ok(ep) if ep.is_tcp() => Admission::Bearer(
+            st.config
+                .daemon
+                .auth_token
+                .clone()
+                .unwrap_or_default(),
+        ),
+        _ => Admission::OwnerOnly,
+    }
+}
+
+/// The Bearer check for the TCP form (tcp-control-endpoint D3): a
+/// scheme-insensitive `Bearer` prefix, then a plain — non-constant-time —
+/// token comparison, the same sensitivity class as the webui console token.
+/// An empty expected token never matches (fail closed).
+fn bearer_ok(headers: &HashMap<String, String>, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(value) = headers.get("authorization") else {
+        return false;
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer") && token.trim() == expected
 }
 
 fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
@@ -333,6 +388,23 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
     };
 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    // Admission gate (tcp-control-endpoint D3, tasks 2.2/2.3): on the TCP
+    // form every request except the health probe needs the Bearer token;
+    // the 401 carries the fix in its body. On the IPC form the header is
+    // ignored — the OS already decided who this is.
+    if let Admission::Bearer(token) = admission_for(sup) {
+        let exempt = method == "GET" && segments.as_slice() == ["v1", "health"];
+        if !exempt && !bearer_ok(&headers, &token) {
+            let _ = writer.write_all(&err_bytes(
+                401,
+                "unauthorized: a tcp:// control endpoint requires `Authorization: Bearer <token>` \
+                 (the daemon's [daemon] auth_token) for every request except /v1/health",
+            ));
+            return;
+        }
+    }
+
     let resp: Vec<u8> = match (method.as_str(), segments.as_slice()) {
         ("GET", ["v1", "health"]) => json_bytes(200, serde_json::json!({"status": "ok"})),
         ("GET", ["v1", "status"]) => {
@@ -1846,6 +1918,163 @@ mod tests {
         assert!(p.get("result").is_some());
         assert!(p.get("config_path").is_some(), "{v}");
         assert!(p.get("pid").is_some(), "{v}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- TCP form + Bearer admission (tcp-control-endpoint tasks 2.1–2.4) ----
+
+    /// An ephemeral free localhost TCP port (bind :0, read, drop — the
+    /// standard small race between drop and re-bind is accepted).
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// TCP-form harness: the same supervisor + control plane as
+    /// [`serve_harness`], but the control endpoint is
+    /// `tcp://127.0.0.1:<port>` with a Bearer token — the `tcp://` shape of
+    /// `[daemon] socket` (task 2.1).
+    fn serve_harness_tcp(tag: &str, token: &str) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
+        let dir = std::env::temp_dir().join(format!("xk-srv-tcp-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let port = free_tcp_port();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nsocket = \"tcp://127.0.0.1:{port}\"\nauth_token = {token:?}\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let (config, _) = crate::config::DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        let listener = bind(&sup).unwrap();
+        let sup2 = sup.clone();
+        std::thread::spawn(move || serve(sup2, listener));
+        let sup3 = sup.clone();
+        std::thread::spawn(move || sup3.run());
+        let endpoint = TestEndpoint(crate::transport::Endpoint::parse(&format!(
+            "tcp://127.0.0.1:{port}"
+        ))
+        .unwrap());
+        (sup, dir, endpoint)
+    }
+
+    impl TestEndpoint {
+        /// GET with an optional `Authorization: Bearer <token>` header.
+        fn get_auth(&self, path: &str, token: Option<&str>) -> String {
+            let mut conn = self.0.connect().expect("connect to the control endpoint");
+            let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+            if let Some(t) = token {
+                req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+            }
+            req.push_str("Connection: close\r\n\r\n");
+            conn.write_all(req.as_bytes()).unwrap();
+            conn.flush().unwrap();
+            let mut out = String::new();
+            conn.read_to_string(&mut out).unwrap();
+            out
+        }
+    }
+
+    /// Task 2.1: the TCP form serves the same endpoint set with byte-equal
+    /// semantics — `/v1/status` answers with the same projection (and the
+    /// projection advertises the `tcp://` URL as the endpoint).
+    #[test]
+    fn tcp_form_serves_the_same_status_projection() {
+        let (sup, dir, ep) = serve_harness_tcp("status", "secret-1");
+        let resp = ep.get_auth("/v1/status", Some("secret-1"));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            v["daemon"]["socket"], ep.0.display(),
+            "the endpoint URL is what the projection carries"
+        );
+        // And /v1/health on the same form.
+        let health = ep.get_auth("/v1/health", Some("secret-1"));
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tasks 2.2/2.3: the Bearer gate on the TCP form — missing and wrong
+    /// tokens are 401 (program state never leaks), the correct token passes,
+    /// and `/v1/health` is exempt with or without credentials.
+    #[test]
+    fn tcp_bearer_gate_three_ways() {
+        let (sup, dir, ep) = serve_harness_tcp("gate", "secret-2");
+        // No credential → 401, and the body names the fix.
+        let bare = ep.get_auth("/v1/status", None);
+        assert!(bare.starts_with("HTTP/1.1 401"), "{bare}");
+        let body = bare.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body.contains("auth_token"), "{body}");
+        assert!(
+            !body.contains("programs"),
+            "no program state leaks through the gate: {body}"
+        );
+        // Wrong credential → 401.
+        let wrong = ep.get_auth("/v1/status", Some("wrong"));
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        // Correct credential → 200 (the plain == comparison, non-constant-time).
+        let right = ep.get_auth("/v1/status", Some("secret-2"));
+        assert!(right.starts_with("HTTP/1.1 200"), "{right}");
+        // Health probe: exempt with no token and with a wrong token.
+        assert!(ep.get_auth("/v1/health", None).starts_with("HTTP/1.1 200"));
+        assert!(
+            ep.get_auth("/v1/health", Some("wrong")).starts_with("HTTP/1.1 200")
+        );
+        // Bearer scheme is case-insensitive; a non-Bearer scheme never is.
+        let mut conn = ep.0.connect().unwrap();
+        let req = "GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\
+                   Authorization: bearer secret-2\r\nConnection: close\r\n\r\n";
+        std::io::Write::write_all(&mut conn, req.as_bytes()).unwrap();
+        let mut out = String::new();
+        conn.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "lowercase bearer passes: {out}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 2.3 (direct): the comparison function itself — right token
+    /// passes, wrong token, wrong scheme, missing header and the fail-closed
+    /// empty expected token are all rejected.
+    #[test]
+    fn bearer_comparison_right_and_wrong() {
+        let mut h = HashMap::new();
+        assert!(!bearer_ok(&h, "tok"), "no header at all");
+        h.insert("authorization".into(), "Bearer tok".into());
+        assert!(bearer_ok(&h, "tok"), "exact match passes");
+        assert!(!bearer_ok(&h, "other"), "wrong token rejected");
+        h.insert("authorization".into(), "Basic tok".into());
+        assert!(!bearer_ok(&h, "tok"), "wrong scheme rejected");
+        h.insert("authorization".into(), "Bearer".into());
+        assert!(!bearer_ok(&h, "tok"), "scheme without token rejected");
+        h.insert("authorization".into(), "Bearer  ".into());
+        assert!(!bearer_ok(&h, "tok"), "empty presented token rejected");
+        // Fail closed: an empty expected token (a tcp:// config without one
+        // can never legally run, but the gate must not open either).
+        h.insert("authorization".into(), "Bearer ".into());
+        assert!(!bearer_ok(&h, ""), "empty expected token never matches");
+    }
+
+    /// Task 2.2 (IPC half): the path form ignores the Authorization header —
+    /// a leftover Bearer header changes nothing (the OS decided admission).
+    #[test]
+    fn ipc_form_ignores_the_authorization_header() {
+        let (sup, dir, ep) = serve_harness("ipc-ignore");
+        // The existing harness endpoint is a local IPC path; any header must
+        // be ignored, including a token that matches nothing.
+        let resp = ep.get_auth("/v1/status", Some("leftover-token"));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(!resp.contains("401"), "{resp}");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

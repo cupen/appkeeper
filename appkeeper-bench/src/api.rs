@@ -1,12 +1,15 @@
 //! /v1 control-plane client (design: bench is a pure external consumer of the
 //! existing control plane — no daemon changes, same endpoints the CLI uses).
 //!
-//! Transport: the control plane moved to a local IPC endpoint — a unix
-//! domain socket, a named pipe on Windows — carrying HTTP/1.1. Bench speaks
-//! that protocol itself; there is no `HOST:PORT` and no token any more
-//! (admission is the endpoint's owner, decided by the operating system).
+//! Transport: the control plane lives on the endpoint the daemon config
+//! names — a local IPC endpoint (unix domain socket, named pipe on Windows)
+//! or a `tcp://host:port` URL (tcp-control-endpoint) — carrying HTTP/1.1
+//! over either. Bench speaks that protocol itself. The IPC form has no
+//! application credential (admission is the endpoint's owner); the tcp://
+//! form takes the Bearer credential passed as `--token`.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -16,20 +19,32 @@ use serde_json::Value;
 #[derive(Clone, Debug)]
 pub struct Client {
     endpoint: Endpoint,
+    /// Bearer credential sent with every request when set (`--token`, only
+    /// meaningful for a tcp:// endpoint; the CLI layer refuses it elsewhere).
+    token: Option<String>,
 }
 
 impl Client {
-    /// `path` is the daemon's control socket (or `\\.\pipe\…` on Windows).
-    pub fn new(path: &str) -> Result<Self> {
-        let path = path.trim();
-        if path.is_empty() {
+    /// `endpoint` is the daemon's control endpoint: a local IPC path (or
+    /// `\\.\pipe\…` on Windows) or a `tcp://host:port` URL — the same shapes
+    /// `[daemon] socket` accepts (tcp-control-endpoint D5).
+    pub fn new(endpoint: &str) -> Result<Self> {
+        Self::with_token(endpoint, None)
+    }
+
+    /// Same, with the Bearer credential for a tcp:// endpoint.
+    pub fn with_token(endpoint: &str, token: Option<String>) -> Result<Self> {
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() {
             return Err(anyhow!(
-                "--socket needs the daemon's control endpoint path, e.g. \
-                 /run/appkeeper/$(id -u)/ak.sock"
+                "--socket needs the daemon's control endpoint: a local IPC path \
+                 (e.g. /run/appkeeper/$(id -u)/ak.sock) or a tcp://host:port URL"
             ));
         }
         Ok(Client {
-            endpoint: Endpoint::new(PathBuf::from(path)),
+            endpoint: Endpoint::parse(endpoint)
+                .map_err(|e| anyhow!("--socket {e}"))?,
+            token,
         })
     }
 
@@ -62,11 +77,21 @@ impl Client {
     }
 
     /// Issue one request; a non-2xx status is a control-plane ANSWER (409
-    /// conflict, 404 unknown…), not a transport failure.
+    /// conflict, 404 unknown…), not a transport failure. A 401 is its own
+    /// class (benchmark spec: TCP 形态凭据被拒 → 明确报告 token 不被接受,
+    /// MUST NOT 表述为「连接不上」).
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         let mut conn = self.connect()?;
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+        if let Some(token) = &self.token {
+            // Trim: a credential with stray whitespace is a user typo, and
+            // the header must stay well-formed.
+            req.push_str(&format!(
+                "Authorization: Bearer {}\r\n",
+                token.trim()
+            ));
+        }
         req.push_str("Content-Type: application/json\r\n");
         req.push_str(&format!("Content-Length: {}\r\n", payload.len()));
         req.push_str("Connection: close\r\n\r\n");
@@ -149,14 +174,30 @@ impl Client {
                 .and_then(|e| e.as_str())
                 .unwrap_or(&text)
                 .to_string();
-            Err(anyhow!("control plane answered {status}: {msg}"))
+            if status == 401 {
+                Err(anyhow!(
+                    "the daemon rejected the bench credential (401): {msg} — pass --token \
+                     matching the daemon's [daemon] auth_token (only a tcp:// endpoint takes one)"
+                ))
+            } else {
+                Err(anyhow!("control plane answered {status}: {msg}"))
+            }
         }
     }
 
     pub fn health(&self) -> Result<()> {
         self.request("GET", "/v1/health", None)
             .map(|_| ())
-            .with_context(|| format!("cannot reach the daemon at {}", self.addr()))
+            .map_err(|e| {
+                // /v1/health is credential-free, so a 401 here would mean a
+                // non-conforming daemon; report it as itself, never as
+                // "cannot reach".
+                if e.to_string().contains("401") {
+                    e
+                } else {
+                    e.context(format!("cannot reach the daemon at {}", self.addr()))
+                }
+            })
     }
 
     pub fn status(&self) -> Result<Value> {
@@ -239,32 +280,76 @@ impl Client {
 
 // -- endpoint transport ------------------------------------------------------
 
-/// A local IPC endpoint. All platform detail lives here; the client above
-/// only ever sees `Read + Write` bytes.
+/// A control endpoint in one of the two `[daemon] socket` shapes (design D5):
+/// a local IPC path / pipe name, or a `tcp://host:port` URL. All platform
+/// detail lives here; the client above only ever sees `Read + Write` bytes.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    path: PathBuf,
+    /// Local IPC form: filesystem path / pipe name.
+    path: Option<PathBuf>,
+    /// TCP form: `host:port` with IPv6 brackets preserved as written.
+    tcp: Option<String>,
 }
 
 impl Endpoint {
-    pub fn new(path: PathBuf) -> Self {
-        Endpoint { path }
+    /// Parse a `--socket` value with the same grammar as
+    /// `[daemon] socket`: the `tcp://` prefix selects TCP (`host:port` must
+    /// resolve: non-empty host, port 1–65535), every other non-empty value
+    /// is a local IPC path.
+    pub fn parse(value: &str) -> Result<Endpoint, String> {
+        let value = value.trim();
+        if let Some(rest) = value.strip_prefix("tcp://") {
+            let rest = rest.trim_end_matches('/');
+            let Some((host, port_raw)) = rest.rsplit_once(':') else {
+                return Err(format!(
+                    "tcp:// endpoint must be host:port, got {rest:?} (missing ':port')"
+                ));
+            };
+            if host.is_empty() {
+                return Err(format!("tcp:// endpoint host must not be empty, got {rest:?}"));
+            }
+            let port_err = || {
+                format!("tcp:// endpoint port must be an integer in 1..=65535, got {port_raw:?}")
+            };
+            let port: u16 = port_raw.trim().parse().map_err(|_| port_err())?;
+            if port == 0 {
+                return Err(port_err());
+            }
+            return Ok(Endpoint {
+                path: None,
+                tcp: Some(format!("{host}:{port}")),
+            });
+        }
+        Ok(Endpoint {
+            path: Some(PathBuf::from(value)),
+            tcp: None,
+        })
     }
 
     pub fn display(&self) -> String {
-        self.path.display().to_string()
+        match (&self.tcp, &self.path) {
+            (Some(addr), _) => format!("tcp://{addr}"),
+            (_, Some(p)) => p.display().to_string(),
+            _ => unreachable!("an endpoint is exactly one of IPC|TCP"),
+        }
     }
 
     pub fn connect(&self) -> std::io::Result<Conn> {
-        Conn::open(&self.path)
+        if let Some(addr) = &self.tcp {
+            return TcpStream::connect(addr).map(Conn::tcp);
+        }
+        Conn::open(self.path.as_deref().expect("IPC form carries a path"))
     }
 
-    /// Owner uid of the endpoint file, when the platform has one.
+    /// Owner uid of the endpoint file, when the platform has one. A TCP
+    /// endpoint has no owner (admission is the Bearer credential).
     pub fn owner_uid(&self) -> Option<u32> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            std::fs::symlink_metadata(&self.path).ok().map(|m| m.uid())
+            self.path
+                .as_ref()
+                .and_then(|p| std::fs::symlink_metadata(p).ok().map(|m| m.uid()))
         }
         #[cfg(not(unix))]
         {
@@ -272,13 +357,15 @@ impl Endpoint {
         }
     }
 
-    /// Permission bits of the endpoint file, for the isolation assertions.
+    /// Permission bits of the endpoint file, for the isolation assertions
+    /// (IPC form only).
     pub fn file_mode(&self) -> Option<u32> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(&self.path)
-                .ok()
+            self.path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
                 .map(|m| m.permissions().mode() & 0o7777)
         }
         #[cfg(not(unix))]
@@ -293,7 +380,8 @@ impl Endpoint {
         {
             use std::os::unix::fs::PermissionsExt;
             self.path
-                .parent()
+                .as_ref()
+                .and_then(|p| p.parent())
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map(|m| m.permissions().mode() & 0o7777)
         }
@@ -324,6 +412,13 @@ pub struct Conn(Box<dyn Stream>);
 /// The one capability the client needs from a connection.
 trait Stream: Read + Write + Send {}
 impl<T: Read + Write + Send> Stream for T {}
+
+impl Conn {
+    /// TCP form (cross-platform std; no platform branches).
+    fn tcp(s: TcpStream) -> Conn {
+        Conn(Box::new(s))
+    }
+}
 
 impl Read for Conn {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -380,6 +475,88 @@ mod tests {
     fn socket_path_is_kept_verbatim() {
         let c = Client::new("/run/appkeeper/1000/ak.sock").unwrap();
         assert_eq!(c.addr(), "/run/appkeeper/1000/ak.sock");
+    }
+
+    /// tcp-control-endpoint 4.3: `--socket` accepts both endpoint shapes —
+    /// the same URL grammar as `[daemon] socket`. Malformed tcp:// values
+    /// are refused before any connection is attempted.
+    #[test]
+    fn socket_accepts_both_shapes_and_rejects_bad_tcp() {
+        let c = Client::new("tcp://127.0.0.1:7310").unwrap();
+        assert_eq!(c.addr(), "tcp://127.0.0.1:7310");
+        // IPC stays verbatim.
+        let c = Client::new("/tmp/ak.sock").unwrap();
+        assert_eq!(c.addr(), "/tmp/ak.sock");
+        for bad in ["tcp://127.0.0.1", "tcp://127.0.0.1:99999", "tcp://:1", "tcp://127.0.0.1:0"] {
+            let err = Client::new(bad).unwrap_err().to_string();
+            assert!(err.contains("--socket"), "{bad}: {err}");
+        }
+    }
+
+    /// The token rides as a Bearer header on every request (only a tcp://
+    /// endpoint legally has one; the CLI layer refuses the IPC+token combo).
+    #[test]
+    fn token_rides_as_bearer_header() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut conn, &mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = r#"{"daemon":{"version":"t"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
+            req
+        });
+        let c = Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("bt".into()))
+            .unwrap();
+        assert_eq!(c.daemon_version().unwrap(), "t");
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("Authorization: Bearer bt\r\n"),
+            "the bench token rides along: {req}"
+        );
+    }
+
+    /// A 401 from the daemon is reported as a rejected credential — never
+    /// as a connection failure (benchmark spec: TCP 凭据被拒 MUST NOT
+    /// 表述为「连接不上」).
+    #[test]
+    fn tcp_401_is_a_rejected_credential_not_unreachable() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut conn, &mut buf);
+            let body = r#"{"error":"unauthorized"}"#;
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
+        });
+        let c = Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("wrong".into()))
+            .unwrap();
+        let err = c.status().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("--token"), "names the fix: {text}");
+        assert!(!text.contains("cannot reach"), "{text}");
+        assert!(!text.contains("connection refused"), "{text}");
+        server.join().unwrap();
     }
 
     /// An unreachable endpoint names the endpoint it tried (benchmark spec:

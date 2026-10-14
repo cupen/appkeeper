@@ -427,10 +427,10 @@ pub const DEFAULT_WEBUI_LISTEN: &str = "127.0.0.1:9877";
 
 /// The optional `[webui]` section of the daemon config. `listen` selects the
 /// console's TCP address; `auth_token` (optional, empty by default) turns on
-/// the console's own credential check. The control plane has no token at all
-/// — its access is decided by the local IPC endpoint's owner
-/// (unix-socket-control-plane D1/D8). Unknown keys are rejected like
-/// everywhere else.
+/// the console's own credential check. The control plane's credential is a
+/// different key: `[daemon] auth_token`, conditional on a `tcp://` socket
+/// (tcp-control-endpoint D2). Unknown keys are rejected like everywhere
+/// else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebuiSettings {
@@ -499,32 +499,65 @@ pub struct DaemonSettings {
     pub log_level: String,
     pub log_dir: PathBuf,
     pub monitor_interval: f64,
-    /// The control-plane IPC endpoint: `/run/appkeeper/<uid>/ak.sock` on
-    /// unix, `\\.\pipe\ak-<username>.sock` on Windows. `host` / `port` /
-    /// `auth_token` used to live here; they are gone because the control
-    /// plane no longer listens on the network and no longer uses an
-    /// application-level credential (unix-socket-control-plane D1/D2/D7).
+    /// The control-plane endpoint: a local IPC path (`/run/appkeeper/<uid>/
+    /// ak.sock` on unix, `\\.\pipe\ak-<username>.sock` on Windows) or a
+    /// `tcp://host:port` URL (tcp-control-endpoint D1 — the `tcp://` prefix
+    /// picks the shape). `host` / `port` used to live here as separate keys;
+    /// they are gone because the endpoint is one URL now.
     pub socket: PathBuf,
+    /// The control-plane Bearer credential — a CONDITIONAL key
+    /// (tcp-control-endpoint D2): required (non-empty) when `socket` is
+    /// `tcp://`, and MUST NOT be set on a path-form socket (a local IPC
+    /// endpoint has no application credential; the OS decides by owner).
+    /// `None` = unconfigured.
+    pub auth_token: Option<String>,
     pub log_buffer_lines: usize,
     pub app_dir: PathBuf,
 }
 
-/// The three `[daemon]` keys the control-plane move removed. They are
+/// The `[daemon]` keys earlier control-plane designs removed. They are
 /// accepted by the parser only so the error can name them and the fix,
 /// instead of the generic "unknown field" (D7: a dead key that silently sits
-/// in the file is worse than one that stops the daemon).
-pub const REMOVED_DAEMON_KEYS: [&str; 3] = ["host", "port", "auth_token"];
+/// in the file is worse than one that stops the daemon). The list was
+/// `[host, port, auth_token]` before tcp-control-endpoint: `auth_token`
+/// returned as a conditional key and left this list.
+pub const REMOVED_DAEMON_KEYS: [&str; 2] = ["host", "port"];
 
 fn removed_key_error(key: &str) -> String {
-    let replacement = if key == "host" || key == "port" {
-        "the control plane serves a local IPC endpoint now — set `socket` instead of the \
-         removed bind address (`ak config --set socket=<path>`), and delete this key with \
-         `ak config --delete"
-    } else {
-        "the control plane no longer uses an application token — access is decided by the \
-         owner of the local IPC endpoint (`socket`). Delete this key with `ak config --delete"
-    };
-    format!("daemon.{key} has been removed: {replacement} {key}`)")
+    format!(
+        "daemon.{key} has been removed: the control endpoint is one URL now — set `socket` \
+         instead (a local IPC path or `tcp://host:port`; `ak config --set socket=<endpoint>`), \
+         and delete this key with `ak config --delete {key}`"
+    )
+}
+
+/// The endpoint-shape ↔ credential combination rule (tcp-control-endpoint
+/// D2) — the one gate shared by every path that validates a whole config:
+/// load-time (`load_or_default` → `validate`), `ak validate`, and the
+/// `config` engine (`config_apply_sets` / `config_apply_deletes` /
+/// `config_effective_value` all validate before answering). A `tcp://`
+/// socket MUST carry a non-empty `auth_token` (the network can reach it and
+/// the token is its only defense); a path-form socket MUST NOT (the OS
+/// decides by owner; an application credential there is dead weight that
+/// only pretends to add security). `Some(msg)` = invalid, with a message
+/// that says how to fix it.
+pub fn auth_pair_error(is_tcp: bool, auth_token: Option<&str>) -> Option<String> {
+    let empty = auth_token.map(str::trim).unwrap_or("").is_empty();
+    match (is_tcp, empty) {
+        (true, true) => Some(
+            "daemon.auth_token: a `tcp://` control endpoint is reachable from the network and \
+             the token is its only defense — set a non-empty auth_token, or drop the tcp:// \
+             form from `socket`"
+                .to_string(),
+        ),
+        (false, false) => Some(
+            "daemon.auth_token: only a `tcp://` socket takes a credential — a local IPC \
+             endpoint has none (the OS decides by the endpoint owner); remove auth_token or \
+             declare `socket = \"tcp://host:port\"`"
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Shape of the `[daemon]` table as it appears on disk: every live key
@@ -537,11 +570,11 @@ struct DaemonSettingsRaw {
     log_dir: Option<PathBuf>,
     monitor_interval: Option<f64>,
     socket: Option<PathBuf>,
+    auth_token: Option<String>,
     log_buffer_lines: Option<usize>,
     app_dir: Option<PathBuf>,
     host: Option<toml::Value>,
     port: Option<toml::Value>,
-    auth_token: Option<toml::Value>,
 }
 
 impl<'de> serde::Deserialize<'de> for DaemonSettings {
@@ -549,10 +582,10 @@ impl<'de> serde::Deserialize<'de> for DaemonSettings {
         use serde::de::Error as _;
         let raw = DaemonSettingsRaw::deserialize(d)?;
         for key in REMOVED_DAEMON_KEYS {
-            let present = match key {
-                "host" => raw.host.is_some(),
-                "port" => raw.port.is_some(),
-                _ => raw.auth_token.is_some(),
+            let present = if key == "host" {
+                raw.host.is_some()
+            } else {
+                raw.port.is_some()
             };
             if present {
                 return Err(D::Error::custom(removed_key_error(key)));
@@ -571,6 +604,7 @@ impl<'de> serde::Deserialize<'de> for DaemonSettings {
         if let Some(v) = raw.socket {
             out.socket = v;
         }
+        out.auth_token = raw.auth_token.filter(|t| !t.is_empty());
         if let Some(v) = raw.log_buffer_lines {
             out.log_buffer_lines = v;
         }
@@ -588,6 +622,7 @@ impl Default for DaemonSettings {
             log_dir: default_log_dir(),
             monitor_interval: 1.0,
             socket: crate::transport::Endpoint::default_path(),
+            auth_token: None,
             log_buffer_lines: 1000,
             // Registry default name (run-daemon-first D9): `app.d` under the
             // daemon config's directory (production default
@@ -668,8 +703,13 @@ impl DaemonConfig {
                 d.monitor_interval
             ));
         }
-        if let Err(e) = self.control_endpoint() {
-            errors.push(format!("daemon.socket: {e}"));
+        match self.control_endpoint() {
+            Err(e) => errors.push(format!("daemon.socket: {e}")),
+            Ok(ep) => {
+                if let Some(msg) = auth_pair_error(ep.is_tcp(), d.auth_token.as_deref()) {
+                    errors.push(msg);
+                }
+            }
         }
         if d.log_buffer_lines == 0 {
             errors.push("daemon.log_buffer_lines: must be > 0".to_string());
@@ -1522,6 +1562,18 @@ fn parse_webui_auth_token(s: &str) -> std::result::Result<KeyValue, String> {
     Ok(KeyValue::Str(s.to_string()))
 }
 
+/// `[daemon] auth_token`: non-empty. The credential is the tcp:// control
+/// endpoint's only defense, so an empty value is always a mistake — a tcp://
+/// socket with one is rejected by the whole-config combination check, and a
+/// path-form socket rejects the key entirely (removal is `--delete`'s job,
+/// not `--set auth_token=`).
+fn parse_daemon_auth_token(s: &str) -> std::result::Result<KeyValue, String> {
+    if s.trim().is_empty() {
+        return Err("daemon.auth_token: must be a non-empty string".to_string());
+    }
+    Ok(KeyValue::Str(s.to_string()))
+}
+
 fn parse_monitor_interval(s: &str) -> std::result::Result<KeyValue, String> {
     let v: f64 = s
         .parse()
@@ -1579,6 +1631,10 @@ pub const DAEMON_KEYS: &[DaemonKey] = &[
     DaemonKey {
         name: "socket",
         parse: parse_socket,
+    },
+    DaemonKey {
+        name: "auth_token",
+        parse: parse_daemon_auth_token,
     },
     DaemonKey {
         name: "log_buffer_lines",
@@ -1669,6 +1725,9 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
         "log_dir" => settings.log_dir.to_string_lossy().into_owned(),
         "monitor_interval" => fmt_float(settings.monitor_interval),
         "socket" => settings.socket.to_string_lossy().into_owned(),
+        // Unconfigured prints the empty string (spec: --get auth_token 未配置
+        // 打印空串) — the key has no default to fall back to.
+        "auth_token" => settings.auth_token.clone().unwrap_or_default(),
         "log_buffer_lines" => settings.log_buffer_lines.to_string(),
         "app_dir" => settings.app_dir.to_string_lossy().into_owned(),
         // Callers resolve names through DAEMON_KEYS first.
@@ -2045,13 +2104,21 @@ log_level = {log_level}
 log_dir = {log_dir}
 # Supervision loop period in seconds, range (0, 60].
 monitor_interval = {monitor_interval}
-# Control-plane endpoint: a local IPC socket (a named pipe on Windows).
-# HTTP/1.1 rides on it; the CLI, `ak shell` and appkeeper-bench all talk
-# here. Who may connect is decided by the OPERATING SYSTEM (socket mode
-# 0600 in a 0700 per-uid directory; a DACL on Windows) — there is no token.
-# The default below is per-uid, so root and a normal user can each run
-# their own daemon without colliding.
+# Control endpoint (URL, shape by scheme): the default below is a local IPC
+# socket (a named pipe on Windows); a `tcp://host:port` value turns it into
+# a TCP control endpoint instead. HTTP/1.1 rides on either form; the CLI,
+# `ak shell` and appkeeper-bench all talk here. On the IPC form WHO may
+# connect is decided by the OPERATING SYSTEM (socket mode 0600 in a 0700
+# per-uid directory; a DACL on Windows). The default is per-uid, so root and
+# a normal user can each run their own daemon without colliding.
 socket = {socket}
+# Bearer credential for the control endpoint — ONLY for the tcp:// form:
+# uncomment it together with `socket = \"tcp://host:port\"`. On a tcp://
+# endpoint the token is required (the network can reach it; the token is its
+# only defense — plaintext HTTP, so keep it inside a trusted network or an
+# SSH tunnel). On the default path form this key must stay commented out:
+# setting auth_token on a local IPC endpoint is a validation error.
+# auth_token = \"change-me\"
 # Recent output lines kept in memory per stream (the source for
 # `ak log` and the webui live log).
 log_buffer_lines = {log_buffer_lines}
@@ -2695,8 +2762,11 @@ mod tests {
 mod config_cmd_tests {
     use super::*;
 
-    /// The key table covers exactly the 6 documented `[daemon]` keys —
-    /// `host` / `port` / `auth_token` are gone with the control-plane move.
+    /// The key table covers exactly the 7 documented `[daemon]` keys —
+    /// `host` / `port` are gone with the control-plane move, while
+    /// `auth_token` returned as a CONDITIONAL key (tcp-control-endpoint 3.1):
+    /// writable, readable and deletable, with its combination rule enforced
+    /// by whole-config validation.
     #[test]
     fn key_table_lists_all_daemon_keys() {
         let names: Vec<_> = DAEMON_KEYS.iter().map(|k| k.name).collect();
@@ -2707,6 +2777,7 @@ mod config_cmd_tests {
                 "log_dir",
                 "monitor_interval",
                 "socket",
+                "auth_token",
                 "log_buffer_lines",
                 "app_dir"
             ]
@@ -2740,6 +2811,224 @@ mod config_cmd_tests {
             parse(&format!("/tmp/{}/ak.sock", "x".repeat(200))).is_err(),
             "an over-long endpoint is rejected at write time"
         );
+        // The tcp:// form parses through the same gate (tcp-control-endpoint
+        // 3.3): well-formed URLs are writable, malformed ones are not.
+        assert_eq!(
+            parse("tcp://127.0.0.1:7310").unwrap(),
+            KeyValue::Str("tcp://127.0.0.1:7310".into())
+        );
+        assert!(parse("tcp://127.0.0.1").is_err(), "missing port rejected");
+        assert!(parse("tcp://127.0.0.1:99999").is_err(), "port range rejected");
+        assert!(parse("tcp://:7310").is_err(), "empty host rejected");
+    }
+
+    /// `daemon.auth_token` is a non-empty string at write time; the shape
+    /// combination (tcp:// vs path) is whole-config validation's business.
+    #[test]
+    fn daemon_auth_token_is_a_non_empty_string() {
+        let parse = |v: &str| (find_daemon_key("auth_token").unwrap().parse)(v);
+        assert_eq!(parse("s3cr3t").unwrap(), KeyValue::Str("s3cr3t".into()));
+        assert!(parse("").is_err(), "empty token must be rejected");
+        assert!(parse("  ").is_err(), "whitespace-only token rejected");
+    }
+
+    /// tcp-control-endpoint 3.1: `auth_token` loads again — the loader
+    /// accepts the key (into the typed field) instead of the dead-key
+    /// rejection, on both socket shapes.
+    #[test]
+    fn loader_accepts_auth_token_again() {
+        let tcp: DaemonConfig = toml::from_str(
+            "[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"t1\"\n",
+        )
+        .unwrap();
+        assert_eq!(tcp.daemon.auth_token.as_deref(), Some("t1"));
+        let path: DaemonConfig =
+            toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
+        assert_eq!(path.daemon.auth_token, None, "unset stays None");
+        // An empty value reads as unconfigured (the combination check would
+        // reject it on tcp:// anyway).
+        let empty: DaemonConfig =
+            toml::from_str("[daemon]\nauth_token = \"\"\n").unwrap();
+        assert_eq!(empty.daemon.auth_token, None);
+        // host/port remain dead keys with the targeted message.
+        let r: Result<DaemonConfig, _> = toml::from_str("[daemon]\nport = 7310\n");
+        let msg = r.err().unwrap().to_string();
+        assert!(msg.contains("removed") && msg.contains("socket"), "{msg}");
+    }
+
+    /// tcp-control-endpoint 3.2: the combination rule, branch by branch —
+    /// `tcp://` without a token and a path-form socket with one are both
+    /// rejected by `validate` (which load / `ak validate` / config set / get
+    /// / delete all share), with messages that name the fix.
+    #[test]
+    fn socket_token_combination_is_validated() {
+        // tcp:// + token: the one legal credential shape.
+        let ok: DaemonConfig = toml::from_str(
+            "[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"t\"\n",
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        // tcp:// + no token → rejected, names auth_token.
+        let missing: DaemonConfig =
+            toml::from_str("[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\n").unwrap();
+        let msg = missing.validate().unwrap_err().to_string();
+        assert!(msg.contains("daemon.auth_token"), "{msg}");
+        assert!(msg.contains("tcp://"), "{msg}");
+        // tcp:// + empty token → same rejection.
+        let empty: DaemonConfig = toml::from_str(
+            "[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"\"\n",
+        )
+        .unwrap();
+        assert!(empty.validate().is_err());
+        // Path form (explicit) + token → rejected.
+        let ipc: DaemonConfig = toml::from_str(
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\nauth_token = \"t\"\n",
+        )
+        .unwrap();
+        let msg = ipc.validate().unwrap_err().to_string();
+        assert!(msg.contains("auth_token"), "{msg}");
+        assert!(msg.contains("tcp://"), "{msg}");
+        // Default (unset) socket is path-form: a token there is rejected too.
+        let def: DaemonConfig = toml::from_str("[daemon]\nauth_token = \"t\"\n").unwrap();
+        assert!(def.validate().is_err());
+        // Path form without a token (the default world) stays legal.
+        let plain: DaemonConfig =
+            toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
+        plain.validate().unwrap();
+        // The standalone gate mirrors validate (shared function, task 3.2).
+        assert!(auth_pair_error(true, None).is_some());
+        assert!(auth_pair_error(true, Some("")).is_some());
+        assert!(auth_pair_error(true, Some("  ")).is_some());
+        assert!(auth_pair_error(false, Some("t")).is_some());
+        assert!(auth_pair_error(true, Some("t")).is_none());
+        assert!(auth_pair_error(false, None).is_none());
+    }
+
+    /// tcp-control-endpoint 3.2/3.3: the config engine rides the same
+    /// combination gate. The legal repair flow is the repeatable `--set`
+    /// batch (socket + token in one call, spec: 随后补写 auth_token 通过整体
+    /// 校验); a token alone on a path-form config is refused, and a base that
+    /// is already invalid is never touched (design D2).
+    #[test]
+    fn set_auth_token_follows_the_combination_rule() {
+        // The legal flow: flip socket and add the token in one batch.
+        let rendered = config_apply_sets(
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
+            &[
+                ("socket".to_string(), KeyValue::Str("tcp://127.0.0.1:7310".into())),
+                ("auth_token".to_string(), KeyValue::Str("t".into())),
+            ],
+        )
+        .unwrap();
+        assert!(rendered.contains("tcp://127.0.0.1:7310"), "{rendered}");
+        assert!(rendered.contains("auth_token = \"t\""), "{rendered}");
+        // A valid tcp:// base accepts updating the token.
+        let rendered = config_apply_sets(
+            "[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"old\"\n",
+            &[("auth_token".to_string(), KeyValue::Str("new".into()))],
+        )
+        .unwrap();
+        assert!(rendered.contains("auth_token = \"new\""), "{rendered}");
+        // A token alone on a path-form config: whole-config validation
+        // refuses; nothing is rendered (the caller never writes).
+        let r = config_apply_sets(
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
+            &[("auth_token".to_string(), KeyValue::Str("t".into()))],
+        );
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("auth_token"), "{msg}");
+        // And the reverse: flipping to tcp:// WITHOUT the token is refused
+        // too — there is no intermediate half-migrated state on disk.
+        let r = config_apply_sets(
+            "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
+            &[("socket".to_string(), KeyValue::Str("tcp://127.0.0.1:7310".into()))],
+        );
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("auth_token"), "{msg}");
+    }
+
+    /// tcp-control-endpoint 3.3: `--delete auth_token` under a tcp:// socket
+    /// makes the whole config illegal → the engine refuses (the caller would
+    /// leave the file untouched, non-zero exit); on a path-form config the
+    /// delete of an absent auth_token stays idempotent.
+    #[test]
+    fn delete_auth_token_rolls_back_on_tcp() {
+        let tcp = "[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"t\"\n";
+        let r = config_apply_deletes(tcp, &["auth_token".to_string()]);
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("auth_token"), "{msg}");
+        // Idempotent NoChange when the key was never set (path form).
+        assert_eq!(
+            config_apply_deletes(
+                "[daemon]\nsocket = \"/tmp/ak.sock\"\n",
+                &["auth_token".to_string()]
+            )
+            .unwrap(),
+            DeleteOutcome::NoChange
+        );
+    }
+
+    /// tcp-control-endpoint 3.3: `--get auth_token` — file value on a tcp://
+    /// config, empty string when unconfigured (spec: 未配置打印空串).
+    #[test]
+    fn get_auth_token_value_and_empty_default() {
+        assert_eq!(
+            config_effective_value(None, "auth_token").unwrap(),
+            "",
+            "missing file → empty string, not an error"
+        );
+        assert_eq!(
+            config_effective_value(
+                Some("[daemon]\nsocket = \"/tmp/ak.sock\"\n"),
+                "auth_token"
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(
+            config_effective_value(
+                Some("[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"t1\"\n"),
+                "auth_token"
+            )
+            .unwrap(),
+            "t1"
+        );
+        // An invalid config (token on a path form) is refused, not answered.
+        assert!(config_effective_value(
+            Some("[daemon]\nauth_token = \"t\"\n"),
+            "auth_token"
+        )
+        .is_err());
+        // Dotted form resolves too.
+        assert_eq!(
+            config_effective_value(
+                Some("[daemon]\nsocket = \"tcp://127.0.0.1:7310\"\nauth_token = \"t1\"\n"),
+                "daemon.auth_token"
+            )
+            .unwrap(),
+            "t1"
+        );
+    }
+
+    /// tcp-control-endpoint 3.3: `socket` validation covers the tcp:// parse
+    /// — empty, missing port and out-of-range port are all load-time
+    /// rejections that name the field.
+    #[test]
+    fn socket_tcp_parse_errors_are_validation_errors() {
+        for (bad, frag) in [
+            ("", "must not be empty"),
+            ("tcp://127.0.0.1", "host:port"),
+            ("tcp://127.0.0.1:99999", "1..=65535"),
+            ("tcp://:7310", "host must not be empty"),
+        ] {
+            let cfg: DaemonConfig =
+                toml::from_str(&format!("[daemon]\nsocket = {bad:?}\n")).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("daemon.socket") && err.contains(frag),
+                "socket {bad:?} must be rejected with {frag:?}: {err}"
+            );
+        }
     }
 
     /// `webui.auth_token` is the console's own credential; empty is a config
@@ -3166,6 +3455,28 @@ log_buffer_lines = 7
             assert!(
                 !text.contains(&format!("{removed} =")),
                 "{removed} must not appear as a live key in the template"
+            );
+        }
+        // tcp-control-endpoint 3.4: auth_token is back as a COMMENTED line
+        // with the shape note (only tcp:// applies; path form rejects it),
+        // and the removed host/port appear nowhere at all.
+        assert!(
+            text.contains("# auth_token = \"change-me\""),
+            "auth_token must be present as a commented line:\n{text}"
+        );
+        assert!(
+            text.contains("ONLY for the tcp:// form"),
+            "the template must say the token belongs to the tcp:// form"
+        );
+        assert!(
+            text.contains("validation error"),
+            "the template must warn that a path form rejects the key"
+        );
+        for removed in ["host", "port"] {
+            assert!(
+                !text.contains(&format!("{removed} =")),
+                "{removed} must not appear as a config key in the template (comment or not): \
+                 occurrences of the word inside a tcp:// URL example are fine"
             );
         }
         assert!(text.contains("app_dir = \"app.d\""));

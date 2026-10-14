@@ -184,7 +184,8 @@ pub fn run_bench(a: &BenchArgs) -> Result<()> {
     // 1. Topology.
     let site: Site = match &a.socket {
         Some(socket) => {
-            let s = topology::connect_site(socket).map_err(|e| e.context("connect topology"))?;
+            let s = topology::connect_site(socket, a.token.as_deref())
+                .map_err(|e| e.context("connect topology"))?;
             eprintln!(
                 "[bench] connected to daemon at {socket} (pid unknown: RSS sampling off in \
                  connect mode)"

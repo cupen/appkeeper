@@ -1,18 +1,21 @@
-//! Local IPC transport for the control plane (unix-socket-control-plane D9).
+//! Control-plane transport (unix-socket-control-plane D9 + tcp-control-endpoint D1).
 //!
 //! This module is the ONLY place in the tree that knows about unix domain
-//! sockets, named pipes, socket permission bits or Windows security
-//! descriptors. Everything above it — [`crate::server`] (HTTP parsing and
-//! routing), [`crate::client`] (HTTP/1.1 requests), [`crate::main`] — sees
-//! an opaque [`Endpoint`] plus [`Conn`]/[`Listener`] and never sees a path
-//! or a platform IPC type. Conversely nothing here knows what HTTP is: the
+//! sockets, named pipes, socket permission bits, Windows security
+//! descriptors — or that the `tcp://` form of `[daemon] socket` is TCP at
+//! all. Everything above it — [`crate::server`] (HTTP parsing and routing),
+//! [`crate::client`] (HTTP/1.1 requests), [`crate::main`] — sees an opaque
+//! [`Endpoint`] plus [`Conn`]/[`Listener`] and never sees a path, a port or
+//! a platform IPC type. Conversely nothing here knows what HTTP is: the
 //! bytes in and out are opaque.
 //!
-//! Identity is enforced by the operating system, not by the application
-//! (design D1): unix binds the socket `0600` inside a `0700` per-uid
-//! directory, Windows builds an explicit DACL naming only the running
-//! account, SYSTEM and Administrators. There is no application-level
-//! credential anywhere on this layer.
+//! Identity is enforced by whichever model the endpoint shape picks (design
+//! D2 — the shapes never mix): a local IPC path delegates to the operating
+//! system (unix binds the socket `0600` inside a `0700` per-uid directory,
+//! Windows builds an explicit DACL naming only the running account, SYSTEM
+//! and Administrators), while a `tcp://` endpoint is reachable from the
+//! network and leans on the application-level Bearer credential checked by
+//! [`crate::server`] — this layer carries the bytes, not the policy.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +45,10 @@ pub enum EndpointError {
     /// `MAX_PATH` on Windows). Truncating silently would point the daemon at
     /// an endpoint nobody else connects to.
     TooLong { len: usize, max: usize },
+    /// A `tcp://` value that does not parse as `host:port` (missing port,
+    /// empty host, port outside 1–65535). The message names the defect and
+    /// the fix.
+    Tcp(String),
 }
 
 impl std::fmt::Display for EndpointError {
@@ -53,6 +60,7 @@ impl std::fmt::Display for EndpointError {
                 "is {len} bytes, longer than the {max}-byte limit for a local IPC endpoint \
                  (unix sun_path / Windows pipe name)"
             ),
+            EndpointError::Tcp(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -96,14 +104,34 @@ impl From<io::Error> for BindError {
     }
 }
 
-/// A local IPC endpoint: a filesystem path on unix, a pipe name on Windows.
+/// A control-plane endpoint, one of exactly two shapes (tcp-control-endpoint
+/// D1): a local IPC path (filesystem path on unix, pipe name on Windows) or a
+/// `tcp://host:port` TCP address. The `socket` value's URL prefix picks the
+/// shape; the same URL is what [`Endpoint::parse`] accepts, what
+/// [`Endpoint::display`] renders and what the config layer validates.
 ///
-/// Opaque on purpose — callers format it with [`Endpoint::display`] and pass
-/// it back to [`Endpoint::connect`] / [`Endpoint::bind`]; nothing else is
+/// Opaque on purpose — callers format it with [`Endpoint::display`], ask it
+/// which admission model it implies with [`Endpoint::is_tcp`], and pass it
+/// back to [`Endpoint::connect`] / [`Endpoint::bind`]; nothing else is
 /// reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
-    inner: platform::Endpoint,
+    inner: Inner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Inner {
+    Ipc(platform::Endpoint),
+    Tcp(TcpAddr),
+}
+
+/// A parsed `tcp://host:port`. `host` keeps IPv6 brackets exactly as written
+/// (`[::1]`), so `format!("{host}:{port}")` is always a valid std resolver
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpAddr {
+    host: String,
+    port: u16,
 }
 
 /// The per-user root every default endpoint lives under: `/run/appkeeper`
@@ -123,21 +151,31 @@ pub const ROOT_DIR_MODE: u32 = 0o755;
 pub const SOCKET_MODE: u32 = 0o600;
 
 impl Endpoint {
-    /// Parse a configured endpoint value. Rejects empty and over-long values
-    /// up front so validation and bind agree on what is acceptable.
+    /// Parse a configured endpoint value. Rejects empty and unusable values
+    /// up front so validation and bind agree on what is acceptable. The
+    /// `tcp://` prefix selects the TCP shape (`host:port` must resolve:
+    /// non-empty host, port 1–65535 — design D1); every other non-empty
+    /// value is a local IPC path.
     pub fn parse(value: &str) -> Result<Endpoint, EndpointError> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return Err(EndpointError::Empty);
         }
-        platform::Endpoint::parse(trimmed)
-            .map(|inner| Endpoint { inner })
+        if let Some(rest) = trimmed.strip_prefix("tcp://") {
+            return parse_tcp(rest).map(|tcp| Endpoint {
+                inner: Inner::Tcp(tcp),
+            });
+        }
+        platform::Endpoint::parse(trimmed).map(|inner| Endpoint {
+            inner: Inner::Ipc(inner),
+        })
     }
 
     /// The platform default: `/run/appkeeper/<uid>/ak.sock` on unix,
     /// `\\.\pipe\ak-<username>.sock` on Windows. Both carry the current
     /// uid / user name so two accounts on one machine never collide
-    /// (design D5).
+    /// (design D5). Defaults are always the IPC shape; TCP is an explicit
+    /// `tcp://` choice.
     pub fn default_path() -> PathBuf {
         platform::Endpoint::default_path()
     }
@@ -146,47 +184,186 @@ impl Endpoint {
     /// construction; the `expect` documents that invariant).
     pub fn default_endpoint() -> Endpoint {
         Endpoint {
-            inner: platform::Endpoint::default_endpoint(),
+            inner: Inner::Ipc(platform::Endpoint::default_endpoint()),
         }
     }
 
     /// Human-readable form for logs, error messages and `ak validate` hints.
+    /// A TCP endpoint renders as its URL (`tcp://host:port`) — the shape is
+    /// self-evident in the startup log (task 2.4).
     pub fn display(&self) -> String {
-        self.inner.display()
+        match &self.inner {
+            Inner::Ipc(e) => e.display(),
+            Inner::Tcp(t) => format!("tcp://{}:{}", t.host, t.port),
+        }
+    }
+
+    /// Which admission model this endpoint implies (tcp-control-endpoint D2,
+    /// read-only): `true` = TCP, Bearer credential on the application layer;
+    /// `false` = local IPC, the OS decides by endpoint owner. This is the
+    /// only shape introspection above this layer — the client uses it to
+    /// decide whether to attach an `Authorization` header without ever
+    /// seeing the raw value.
+    pub fn is_tcp(&self) -> bool {
+        matches!(self.inner, Inner::Tcp(_))
     }
 
     /// Open a connection. Errors keep their `io::ErrorKind` so callers can
     /// tell "not there" from "not allowed" — the two get different operator
     /// messages (spec: 控制面连接失败的错误区分).
     pub fn connect(&self) -> io::Result<Box<dyn Conn>> {
-        self.inner.connect().map(|c| Box::new(c) as Box<dyn Conn>)
+        match &self.inner {
+            Inner::Ipc(e) => e.connect().map(|c| Box::new(c) as Box<dyn Conn>),
+            Inner::Tcp(t) => {
+                let addr = format!("{}:{}", t.host, t.port);
+                std::net::TcpStream::connect(addr)
+                    .map(|s| Box::new(TcpConn(s)) as Box<dyn Conn>)
+            }
+        }
     }
 
     /// Owner uid of the endpoint, when the platform can tell us. Used to
     /// explain a permission failure ("endpoint belongs to uid 0, you are
     /// uid 1000") — the operating system already made the decision, we only
-    /// report it.
+    /// report it. A TCP endpoint has no owner (task 1.4): admission is the
+    /// Bearer credential, not a filesystem identity.
     pub fn owner_uid(&self) -> Option<u32> {
-        self.inner.owner_uid()
+        match &self.inner {
+            Inner::Ipc(e) => e.owner_uid(),
+            Inner::Tcp(_) => None,
+        }
     }
 
-    /// Create the directories, clear a stale endpoint, and start listening.
+    /// Create the directories, clear a stale endpoint, and start listening —
+    /// IPC shape. The TCP shape binds the address; there is no filesystem
+    /// and nothing stale to clean (task 1.3).
     pub fn bind(&self) -> Result<Listener, BindError> {
-        Ok(Listener {
-            inner: self.inner.bind()?,
-        })
+        match &self.inner {
+            Inner::Ipc(e) => e.bind().map(|l| Listener {
+                inner: ListenerInner::Ipc(l),
+            }),
+            Inner::Tcp(t) => tcp_bind(t).map(|l| Listener {
+                inner: ListenerInner::Tcp(l),
+            }),
+        }
+    }
+}
+
+/// Parse the `host:port` after the `tcp://` prefix (task 1.1): host non-empty,
+/// port an integer in 1–65535. Errors name the defect so a rejected startup
+/// says what to fix.
+fn parse_tcp(rest: &str) -> Result<TcpAddr, EndpointError> {
+    // A trailing "/" is URL furniture, not part of host:port (the control
+    // plane has no URL path); anything longer than that is a typo and will
+    // fail the port parse with a precise message.
+    let rest = rest.trim_end_matches('/');
+    let Some((host, port_raw)) = rest.rsplit_once(':') else {
+        return Err(EndpointError::Tcp(format!(
+            "tcp:// endpoint must be host:port, got {rest:?} (missing ':port')"
+        )));
+    };
+    if host.is_empty() {
+        return Err(EndpointError::Tcp(format!(
+            "tcp:// endpoint host must not be empty, got {rest:?}"
+        )));
+    }
+    // A colon-bearing host without brackets is a bare IPv6 literal; std's
+    // resolver cannot dial it, so reject at parse time with the bracket form.
+    if !host.starts_with('[') && host.contains(':') {
+        return Err(EndpointError::Tcp(format!(
+            "tcp:// endpoint IPv6 host must be bracketed, got {rest:?} \
+             (write \"[{host}]:{port_raw}\")"
+        )));
+    }
+    let port_err = || {
+        EndpointError::Tcp(format!(
+            "tcp:// endpoint port must be an integer in 1..=65535, got {port_raw:?}"
+        ))
+    };
+    let port: u16 = port_raw.trim().parse().map_err(|_| port_err())?;
+    if port == 0 {
+        return Err(port_err());
+    }
+    Ok(TcpAddr {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Bind a TCP control endpoint (task 1.3): there is no filesystem and no
+/// stale-endpoint cleanup — an `AddrInUse` conflict is decided by probing
+/// whether the occupant answers (`AlreadyRunning` when it does); every other
+/// failure is the real bind error, reported as-is.
+fn tcp_bind(t: &TcpAddr) -> Result<std::net::TcpListener, BindError> {
+    let addr = format!("{}:{}", t.host, t.port);
+    match std::net::TcpListener::bind(&addr) {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            match std::net::TcpStream::connect(&addr) {
+                // Something answers on the address another listener holds:
+                // a live daemon, not ours to disturb.
+                Ok(_) => Err(BindError::AlreadyRunning),
+                // Occupied but not answering: there is no stale file to
+                // clear on TCP, so the bind error stands.
+                Err(_) => Err(BindError::Io(e)),
+            }
+        }
+        Err(e) => Err(BindError::Io(e)),
     }
 }
 
 /// A bound endpoint ready to hand out connections.
 pub struct Listener {
-    inner: platform::Listener,
+    inner: ListenerInner,
+}
+
+enum ListenerInner {
+    Ipc(platform::Listener),
+    Tcp(std::net::TcpListener),
 }
 
 impl Listener {
     /// Block until one client connects.
     pub fn accept(&mut self) -> io::Result<Box<dyn Conn>> {
-        self.inner.accept().map(|c| Box::new(c) as Box<dyn Conn>)
+        match &mut self.inner {
+            ListenerInner::Ipc(l) => l.accept().map(|c| Box::new(c) as Box<dyn Conn>),
+            ListenerInner::Tcp(l) => l
+                .accept()
+                .map(|(s, _)| Box::new(TcpConn(s)) as Box<dyn Conn>),
+        }
+    }
+}
+
+/// A TCP connection of the control plane (cross-platform std — no platform
+/// branches; the DACL/permission work is IPC-only, design: TCP details live
+/// in this module alone). Read/write timeout semantics match the UDS
+/// connection (task 1.2).
+pub struct TcpConn(std::net::TcpStream);
+
+impl Read for TcpConn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for TcpConn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Conn for TcpConn {
+    fn try_clone_conn(&self) -> io::Result<Box<dyn Conn>> {
+        Ok(Box::new(TcpConn(self.0.try_clone()?)))
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.0.set_read_timeout(timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.0.set_write_timeout(timeout)
     }
 }
 
@@ -1246,5 +1423,172 @@ mod tests {
                 "{absent} must not appear as a DACL subject: {sddl}"
             );
         }
+    }
+
+    // -- TCP form (tcp-control-endpoint tasks 1.1–1.4) -----------------------
+
+    /// An ephemeral free TCP port on localhost: bind :0, read the assigned
+    /// port, drop the listener. (A tiny race window remains between the drop
+    /// and the re-bind; standard test practice.)
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Task 1.1: `tcp://host:port` parses into the TCP shape and displays
+    /// back as the same URL; the default derivation is untouched (still the
+    /// per-uid IPC path, not TCP).
+    #[test]
+    fn tcp_parse_accepts_well_formed_urls() {
+        let ep = Endpoint::parse("tcp://127.0.0.1:7310").unwrap();
+        assert!(ep.is_tcp());
+        assert_eq!(ep.display(), "tcp://127.0.0.1:7310");
+        // Whitespace around the value is trimmed like every other form.
+        assert_eq!(
+            Endpoint::parse("  tcp://localhost:1  ").unwrap().display(),
+            "tcp://localhost:1"
+        );
+        // A trailing slash is URL furniture, kept out of the port.
+        assert_eq!(
+            Endpoint::parse("tcp://127.0.0.1:9/").unwrap().display(),
+            "tcp://127.0.0.1:9"
+        );
+        // The defaults remain the IPC shape (缺省推导不变).
+        let def = Endpoint::default_endpoint();
+        assert!(!def.is_tcp());
+        assert_eq!(def.display(), Endpoint::default_path().display().to_string());
+    }
+
+    /// Task 1.1: malformed `tcp://` values are rejected with a readable
+    /// error naming the defect — missing port, empty host, port out of range
+    /// (including 0), non-numeric port.
+    #[test]
+    fn tcp_parse_rejects_malformed_urls() {
+        for (bad, frag) in [
+            ("tcp://", "missing"),
+            ("tcp://127.0.0.1", "missing"),
+            ("tcp://:7310", "host must not be empty"),
+            ("tcp://127.0.0.1:99999", "1..=65535"),
+            ("tcp://127.0.0.1:0", "1..=65535"),
+            ("tcp://127.0.0.1:x", "1..=65535"),
+            ("tcp://127.0.0.1:-1", "1..=65535"),
+            ("tcp://::1:7310", "must be bracketed"),
+        ] {
+            match Endpoint::parse(bad) {
+                Err(EndpointError::Tcp(msg)) => {
+                    assert!(
+                        msg.contains(frag),
+                        "{bad:?} must name the defect ({frag:?}): {msg}"
+                    );
+                }
+                other => panic!("{bad:?} must be a Tcp parse error, got {other:?}"),
+            }
+        }
+        // The TCP shape never trips the IPC path-length rule (no sun_path).
+        let long = format!("tcp://host.example:1/{}", "x".repeat(300));
+        assert!(
+            matches!(Endpoint::parse(&long), Err(EndpointError::Tcp(_))),
+            "an over-long tcp:// value is a parse error, not TooLong"
+        );
+    }
+
+    /// Task 1.2: a TCP listener hands out connections that read and write in
+    /// both directions, with the same clone and timeout affordances as the
+    /// IPC connection.
+    #[test]
+    fn tcp_bind_connect_round_trips() {
+        let port = free_tcp_port();
+        let ep = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
+        let mut listener = ep.bind().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+            let mut buf = [0u8; 5];
+            conn.read_exact(&mut buf).unwrap();
+            conn.write_all(b"pong").unwrap();
+            conn.flush().unwrap();
+            let mut writer = conn.try_clone_conn().unwrap();
+            writer.write_all(b"!").unwrap();
+            writer.flush().unwrap();
+            buf
+        });
+        let mut conn = ep.connect().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.write_all(b"hello").unwrap();
+        conn.flush().unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "pong!");
+        assert_eq!(server.join().unwrap(), *b"hello");
+    }
+
+    /// Task 1.3 (branch 1): binding a TCP address a live listener already
+    /// serves reports `AlreadyRunning` — the probe connect answered.
+    #[test]
+    fn tcp_bind_reports_already_running() {
+        let port = free_tcp_port();
+        let ep = Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
+        let _first = ep.bind().unwrap();
+        match ep.bind() {
+            Err(BindError::AlreadyRunning) => {}
+            Err(other) => panic!("expected AlreadyRunning, got {other}"),
+            Ok(_) => panic!("a live TCP endpoint must not be re-bindable"),
+        }
+    }
+
+    /// Task 1.3 (branch 2): a bind failure that is not an occupancy is the
+    /// real error — never phrased as "another daemon" and never mapped into
+    /// a false positive. The address probe first establishes, with the same
+    /// std primitive the transport uses, that this environment does refuse
+    /// non-local unassigned binds; on a host with `ip_nonlocal_bind` (or an
+    /// equivalent quirk) the premise does not exist and there is nothing to
+    /// assert.
+    #[test]
+    fn tcp_bind_unassignable_address_is_a_real_error() {
+        let addr = "240.0.0.1:7310"; // reserved class E, never a local address
+        match std::net::TcpListener::bind(addr) {
+            Err(e) if e.kind() != io::ErrorKind::AddrInUse => {
+                let ep = Endpoint::parse(&format!("tcp://{addr}")).unwrap();
+                match ep.bind() {
+                    Err(BindError::Io(bound_err)) => {
+                        assert_eq!(
+                            bound_err.kind(),
+                            e.kind(),
+                            "the real bind error passes through unchanged"
+                        );
+                    }
+                    Err(BindError::AlreadyRunning) => {
+                        panic!("a refused bind must not read as another daemon")
+                    }
+                    Err(other) => panic!("expected Io, got {other}"),
+                    Ok(_) => panic!("a refused address must not bind"),
+                }
+            }
+            // This host accepts the address (non-local bind enabled): the
+            // branch's premise does not hold here.
+            _ => {}
+        }
+    }
+
+    /// Task 1.3 (branch 3) / task 2.4: TCP has no filesystem presence — a
+    /// bound endpoint creates no files anywhere and never deletes anything
+    /// (the stale-endpoint cleanup is IPC-only).
+    #[test]
+    fn tcp_endpoint_never_touches_the_filesystem_and_has_no_owner() {
+        let d = tmp_dir("tcp-fs");
+        std::fs::write(d.join("keep.txt"), b"precious").unwrap();
+        let before: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
+        let ep = Endpoint::parse(&format!("tcp://127.0.0.1:{}", free_tcp_port())).unwrap();
+        assert_eq!(ep.owner_uid(), None, "TCP has no owner (task 1.4)");
+        let listener = ep.bind().unwrap();
+        drop(listener);
+        let after: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
+        assert_eq!(before.len(), after.len(), "no files created: {after:?}");
+        assert!(d.join("keep.txt").exists(), "existing files untouched");
+        assert_eq!(std::fs::read(d.join("keep.txt")).unwrap(), b"precious");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

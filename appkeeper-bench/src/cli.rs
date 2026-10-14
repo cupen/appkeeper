@@ -67,12 +67,21 @@ pub struct BenchArgs {
     pub programs: u32,
 
     /// Connect to an already-running daemon over its control endpoint
-    /// (a unix socket path, or `\\.\pipe\…` on Windows) instead of
-    /// spawning an isolated one. The daemon must be on the same host (bench
-    /// reads its app registry and log files from disk). NOTE: the load writes
-    /// real disk logs through the target daemon.
-    #[arg(long = "socket", value_name = "PATH")]
+    /// (`[daemon] socket` shapes: a local IPC path / `\\.\pipe\…` on
+    /// Windows, or a `tcp://host:port` URL) instead of spawning an isolated
+    /// one. The daemon must be on the same host for the IPC form (bench
+    /// reads its app registry and log files from disk); a `tcp://` endpoint
+    /// works remotely. NOTE: the load writes real disk logs through the
+    /// target daemon.
+    #[arg(long = "socket", value_name = "ENDPOINT")]
     pub socket: Option<String>,
+
+    /// Bearer credential for a `tcp://` control endpoint — the daemon's
+    /// `[daemon] auth_token`. Only the tcp:// form takes a credential; the
+    /// local IPC form has none (admission is the endpoint owner), so
+    /// combining `--token` with a path-form `--socket` is a user error.
+    #[arg(long = "token", value_name = "TOKEN")]
+    pub token: Option<String>,
 
     /// Path of the appkeeper daemon binary (default: discovered next to this
     /// binary, then target/{debug,release} of this workspace).
@@ -174,6 +183,26 @@ pub fn resolve(a: &BenchArgs) -> Result<Effective> {
     let case = a
         .case
         .ok_or_else(|| anyhow::anyhow!("--case is required (firehose | rotation | fanout | drip)"))?;
+    // --token only applies to a tcp:// control endpoint (tcp-control-endpoint
+    // D5): the local IPC form has no application credential, and offering one
+    // there is a user error — refused before any connection is attempted.
+    if let Some(token) = a.token.as_deref() {
+        let tcp = a
+            .socket
+            .as_deref()
+            .map(|s| s.trim().starts_with("tcp://"))
+            .unwrap_or(false);
+        if !tcp {
+            bail!(
+                "--token only applies to a tcp:// control endpoint \
+                 (--socket tcp://host:port); the local IPC form has no credential (admission \
+                 is the endpoint owner) — drop --token or point --socket at a tcp:// endpoint"
+            );
+        }
+        if token.trim().is_empty() {
+            bail!("--token must be a non-empty string");
+        }
+    }
     if a.log_row_size < MIN_ROW_SIZE {
         bail!(
             "--log-row-size must be >= {MIN_ROW_SIZE} (the [stream] seq timestamp prefix must fit), got {}",
@@ -315,9 +344,11 @@ mod tests {
         assert_eq!(e.total_per_program(), 0, "0 means unlimited");
     }
 
-    /// `--socket` is the new topology selector; the removed `--connect` /
-    /// `--token` are refused by `main` with an explanation (they are not
-    /// accepted as unknown args silently either).
+    /// `--socket` is the topology selector, in both endpoint shapes; the
+    /// removed `--connect` is refused by `main` with an explanation (it is
+    /// not accepted as an unknown arg silently either). `--token` is back
+    /// (tcp-control-endpoint 4.3): it parses everywhere but `resolve` only
+    /// accepts it for a tcp:// `--socket`.
     #[test]
     fn socket_option_replaces_connect() {
         let cli = Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--socket", "/run/appkeeper/0/ak.sock"])
@@ -326,6 +357,18 @@ mod tests {
             cli.bench.socket.as_deref(),
             Some("/run/appkeeper/0/ak.sock")
         );
+        let cli = Cli::try_parse_from([
+            "appkeeper-bench",
+            "--case",
+            "firehose",
+            "--socket",
+            "tcp://127.0.0.1:7310",
+            "--token",
+            "s3cr3t",
+        ])
+        .unwrap();
+        assert_eq!(cli.bench.socket.as_deref(), Some("tcp://127.0.0.1:7310"));
+        assert_eq!(cli.bench.token.as_deref(), Some("s3cr3t"));
         assert!(
             Cli::try_parse_from([
                 "appkeeper-bench",
@@ -337,10 +380,53 @@ mod tests {
             .is_err(),
             "--connect must not parse"
         );
-        assert!(
-            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--token", "x"]).is_err(),
-            "--token must not parse"
-        );
+    }
+
+    /// tcp-control-endpoint 4.3: three command-line branches of the
+    /// `--token` rule — tcp:// + token parses and resolves; token on an IPC
+    /// path and token without a tcp:// socket are user errors, phrased as
+    /// "the IPC form has no credential", and never reach a connection.
+    #[test]
+    fn token_only_applies_to_a_tcp_socket() {
+        // Branch 1: tcp:// + token → legal.
+        let e = parse(&[
+            "--case",
+            "firehose",
+            "--socket",
+            "tcp://127.0.0.1:7310",
+            "--token",
+            "t",
+        ])
+        .unwrap();
+        assert_eq!(e.case, Case::Firehose);
+        // Branch 2: IPC path + token → user error before any connect.
+        let err = parse(&[
+            "--case",
+            "firehose",
+            "--socket",
+            "/run/appkeeper/0/ak.sock",
+            "--token",
+            "t",
+        ])
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--token"), "{text}");
+        assert!(text.contains("tcp://"), "{text}");
+        assert!(text.contains("no credential"), "{text}");
+        // Branch 3: token without any socket (spawn mode) → same rule.
+        let err = parse(&["--case", "firehose", "--token", "t"]).unwrap_err();
+        assert!(format!("{err:#}").contains("--token"), "{err:#}");
+        // An empty token is a typo, not a credential.
+        let err = parse(&[
+            "--case",
+            "firehose",
+            "--socket",
+            "tcp://127.0.0.1:7310",
+            "--token",
+            " ",
+        ])
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("non-empty"), "{err:#}");
     }
 
     #[test]

@@ -214,6 +214,9 @@ log_dir = "/var/log/appkeeper" # 可选；缺省 /tmp/appkeeper/logs，必须为
 monitor_interval = 1.0
 # socket = "/run/appkeeper/1000/ak.sock"  # 可选；缺省 /run/appkeeper/<uid>/ak.sock
                                            # （Windows 缺省 \\.\pipe\ak-<用户名>.sock）
+                                           # 也可写 tcp://host:port 声明 TCP 形态控制端点
+                                           # （见下文「控制平面」与「远程管理」）
+# auth_token = "<随机串>"    # 仅 socket 为 tcp:// 形态时必配；路径形态下设置会被校验拒绝
 log_buffer_lines = 1000
 app_dir = "app.d"           # 注册目录，缺省 daemon 配置同级 app.d/（旧默认 apps/）
 
@@ -222,11 +225,12 @@ restart = "always"          # 启动/重启策略：no | on-failure | always | u
 restart_backoff = 1.0
 ```
 
-> 旧键 `host` / `port` / `auth_token` 已随控制面改走本地 socket 而**移除**：
-> 配置文件里出现这三个键会被 `validate`/启动校验拒绝（见「升级注意」）。
-> 控制面不再监听任何 TCP 端口——「谁能控制守护进程」由操作系统的 socket
-> 属主直接回答（unix：socket `0600` + uid 目录 `0700`；Windows：命名管道
-> DACL），没有需要用户记得配置的默认关闭开关。
+> 旧键 `host` / `port` 已**移除**：端点统一由 `socket` 的 URL 表达，配置文件里
+> 出现这两个键会被 `validate`/启动校验拒绝（见「升级注意」）。
+> 缺省（本地 IPC 路径形态）下「谁能控制守护进程」由操作系统的 socket 属主直接
+> 回答（unix：socket `0600` + uid 目录 `0700`；Windows：命名管道 DACL）。
+> `auth_token` 是**条件键**：仅 `socket = "tcp://..."` 形态必配，路径形态下
+> 出现会被校验拒绝（见下文「控制平面」）。
 
 > **`restart` 取代了旧的 `autostart` + `autorestart`**（docker 字面量语义）：
 > - `no`：退出不重启，守护启动/apply 不拉起；
@@ -342,13 +346,17 @@ ak config --edit                        # $VISUAL/$EDITOR 全文编辑 + 保存�
 ```
 
 - **白名单强类型**：`--set`/`--get`/`--delete` 接受 `[daemon]` 表的 6 个已知键
-  （`log_level`、`log_dir`、`monitor_interval`、`socket`、`log_buffer_lines`、
-  `app_dir`）与 `[webui]` 段的 `webui.listen` / `webui.auth_token`；
-  `socket` 为非空端点值（unix 限 107 字节内、空值拒绝），`monitor_interval`
+  （`log_level`、`log_dir`、`monitor_interval`、`socket`、`auth_token`、
+  `log_buffer_lines`、`app_dir`）与 `[webui]` 段的 `webui.listen` /
+  `webui.auth_token`；`socket` 为非空端点值（路径形态 unix 限 107 字节内、
+  空值拒绝；`tcp://` 形态须可解析——host 非空、端口 1–65535）、
+  `auth_token` 为非空字符串（形态组合规则：`tcp://` 必配、路径形态必须不配，
+  违反即整体校验失败回滚），`monitor_interval`
   为正浮点、`log_buffer_lines` 为非负整数、`log_level` ∈
   trace|debug|info|warn|error、`webui.listen` 须为 host:port、
-  `webui.auth_token` 须为非空字符串。旧键 `host` / `port` / `auth_token`
-  已移除：set/get/delete 均以退出码 2 拒绝并指明改用 `socket`；配置文件里
+  `webui.auth_token` 须为非空字符串。旧键 `host` / `port` 已移除：
+  set/get/delete 均以退出码 2 拒绝并指明改用 `socket`（`auth_token` 回归白名单，
+  但受形态组合校验约束）；配置文件里
   出现这三个死键同样被校验拒绝。未知键或类型不符以退出码 2 拒绝，不落盘。
 - **读-改-写保留格式**：写入只改动目标键的值节点，未触碰键的顺序、值与注释原样保持。
 - **写后整体校验 + 原子落盘**：先写临时文件、整体校验通过后 rename 覆盖；校验失败
@@ -475,8 +483,16 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
 
 ## 控制平面
 
-守护进程在**本地 socket**（unix 缺省 `/run/appkeeper/<uid>/ak.sock`，Windows
-`\\.\pipe\ak-<用户名>.sock`；`[daemon] socket` 可覆盖）上提供 HTTP/1.1 JSON API：
+守护进程在 `[daemon] socket` 声明的**控制端点**上提供 HTTP/1.1 JSON API，恰为
+两种形态之一（同一时刻只监听一种）：
+
+- **本地 IPC 形态（缺省）**：unix 缺省 `/run/appkeeper/<uid>/ak.sock`，Windows
+  `\\.\pipe\ak-<用户名>.sock`；其它非空 `socket` 值即路径；
+- **TCP 形态**：`socket = "tcp://host:port"`（与 `auth_token` 必配）。
+
+两种形态承载的端点集合与请求/响应结构一字不改：
+
+
 
 `GET /v1/health|status|programs|programs/{name}|programs/{name}/logs`，
 `POST /v1/programs/{name}/start|stop|restart`（`?wait=1` 阻塞至启动判定，
@@ -489,18 +505,46 @@ ak restart api          # 动作中链式控制命令：CLI 自动读取 daemon 
 `GET /v1/pending`、`POST /v1/apply`、`/v1/shutdown`。
 `GET /v1/programs/{name}/logs?stream=out|err&tail=N&follow=1` 支持流式跟随。
 
-### 鉴权：身份由操作系统给出
+### 鉴权：准入由端点形态唯一决定
 
-控制面**没有应用层鉴权，也没有任何 TCP 端口**：socket 文件权限 `0600`、
+**本地 IPC 形态（缺省）——身份由操作系统给出**：socket 文件权限 `0600`、
 所在 uid 目录 `0700`（Windows 命名管道以 DACL 显式收紧到运行账户 + SYSTEM +
-Administrators），内核在 connect 阶段直接拒绝非属主。同一台机器上 root 与
-普通用户可以各跑一个 daemon，端点互不可达、天然隔离。
+Administrators），内核在 connect 阶段直接拒绝非属主。此形态没有应用层凭据：
+`[daemon] auth_token` 必须不配置（配置即校验失败），请求携带的任何
+`Authorization` 头都被忽略。同一台机器上 root 与普通用户可以各跑一个 daemon，
+端点互不可达、天然隔离。
+
+**TCP 形态——准入由 Bearer 凭据承担**：除 `/v1/health`（免凭据，仅回存活，
+不含任何程序状态）外，全部 `/v1/*` 请求要求 `Authorization: Bearer <token>`
+（token 即 `[daemon] auth_token`），缺失或不匹配返回 401。CLI / shell / bench
+在 tcp:// 形态下自动附带该头。`tcp://` 是**明文 HTTP**：token 是唯一防线，
+只应部署在受信网络或 SSH 隧道之内，跨公网必须自带 TLS 隧道（本项目刻意不做
+TLS）。`tcp://` 而 `auth_token` 为空的配置在启动期即被拒绝——不存在
+「TCP 无 token」的可运行状态。
 
 控制面连接失败有**专属区分**（退出码均为 3，但文案不同）：
 
 - 端点不存在 → 「守护进程不可达」（真没跑）；
-- 权限不足（端点在但属主是别的账户）→ 提示端点属主与当前用户不一致、
-  需更高权限——**不会**被表述成「守护进程未运行」，也无任何状态泄露。
+- IPC 形态权限不足（端点在但属主是别的账户）→ 提示端点属主与当前用户不一致、
+  需更高权限——**不会**被表述成「守护进程未运行」，也无任何状态泄露；
+- TCP 形态凭据被拒（HTTP 401）→ 报 401 与「tcp:// 形态需要 auth_token」提示，
+  作为业务答案透传——同样**不会**被表述成「守护进程未运行」。
+
+### 远程管理即配置
+
+另一台机器想操作这个 daemon，不需要任何新机制：一份指向 `tcp://` 的配置就是
+全部所需——
+
+```toml
+[daemon]
+socket = "tcp://<host>:7310"
+auth_token = "<与守护进程一致的随机串>"
+```
+
+```bash
+ak -c <该配置> status          # CLI 经 TCP 端点操作远端守护进程
+appkeeper-bench --case firehose --socket tcp://<host>:7310 --token <token>
+```
 
 ### 运维排障（HTTP 语义保留）
 
@@ -528,7 +572,7 @@ $reader.ReadToEnd()
 ```
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置错误、`3` 守护进程不可达
-（含权限不足——见上文「专属区分」）。
+（含权限不足与 TCP 凭据被拒——见上文「专属区分」）。
 例外：`appkeeper action` 成功时**透传动作自身的退出码**（超时/调用失败为 1，
 守护不可达为 3）。
 
@@ -726,12 +770,13 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 
 - **守护进程不再监听任何控制面 TCP 端口**（默认 7310 消失）。防火墙/容器端口
   映射里的相关条目失效；远程控制能力被移除（`run` 本就是纯客户端动词）。
-- **`[daemon]` 的 `host` / `port` / `auth_token` 三个键被删除**。既有配置文件
+- **`[daemon]` 的 `host` / `port` 两个键被删除**（后续 tcp-control-endpoint
+  把 `auth_token` 恢复为条件键——见下一条升级注意）。既有配置文件
   含其中任一键时 `validate`/启动校验**直接报错**（拒绝启动，不会静默忽略）。
   迁移一行命令：
 
   ```bash
-  ak config --delete host --delete port --delete auth_token   # 或手改 daemon.toml
+  ak config --delete host --delete port   # 或手改 daemon.toml
   ak validate   # 确认通过后再启动
   ```
 
@@ -744,9 +789,38 @@ serde 结构体派生，字段语义完全一致；体积敏感的 WS 通道用 
 配套变化：`daemon --detach` 就绪探测改走 socket（无 TCP 可探测）；systemd
 unit 新增 `RuntimeDirectory=appkeeper`（**已装机 unit 建议重新生成**
 `sudo ak service install --force --now`，旧 unit 也能用——守护进程会自建
-`/run/appkeeper` 目录链）；`appkeeper-bench` 的 `--connect/--token` 改为
-`--socket <path>`；排障方式见上文「运维排障」（`curl --unix-socket` /
+`/run/appkeeper` 目录链）；`appkeeper-bench` 的 `--connect` 改为
+`--socket <endpoint>`；排障方式见上文「运维排障」（`curl --unix-socket` /
 PowerShell `NamedPipeClientStream`）。
+
+**回滚提示**：换回旧版本二进制即可（旧版本里这几个键仍是合法键），无需清理
+配置；新版本在 `/run/appkeeper` 下留下的目录与 socket 文件不影响旧版启动。
+
+## 升级注意（tcp-control-endpoint：socket 单键双形态，TCP 显式选择）
+
+本版把 `[daemon] socket` 升级为**单键双形态**：`tcp://host:port` 声明 TCP 形态
+控制端点，其它非空值为本地 IPC 路径（缺省不变）。默认行为与本上一版逐字相同，
+选择 TCP 的部署显式承担「凭据即唯一防线」的责任。两处 BREAKING：
+
+- **死键清单收窄**：`host` / `port` 保持死键报错不变；`auth_token` 从
+  「无条件死键」变为**条件键**——`socket` 为 `tcp://` 形态时必配（非空），
+  路径形态下出现即校验拒绝（「auth_token 仅属于 tcp:// 形态」）。缺省路径
+  形态下残留的 `auth_token` 需删除：
+
+  ```bash
+  ak config --delete auth_token   # 或手改 daemon.toml（仅路径形态需要）
+  ak validate
+  ```
+- **`tcp://` 无法解析（缺 host、端口越界）或 `tcp://` 缺 token** → 拒绝启动，
+  错误信息给出修复方式；不存在半态。
+
+配套变化：TCP 形态下除 `/v1/health`（免凭据）外全部 `/v1/*` 要求
+`Authorization: Bearer <token>`，客户端（CLI 全部子命令、shell、`daemonize`
+就绪探测、bench）按配置形态自动附带；CLI 的 401 报错含修复提示、退出码 3。
+`appkeeper-bench` 的 `--token` 恢复且仅对 `tcp://` 形态有意义（对 IPC 形态
+提供 `--token` 属用户错误，不发起连接）。`config --init` 模板中 `auth_token`
+以注释行回填并注明形态边界。**不做 TLS**：`tcp://` 定位为受信网络或 SSH
+隧道内的明文 HTTP。
 
 **回滚提示**：换回旧版本二进制即可（旧版本里这三个键仍是合法键），无需清理
 配置；新版本在 `/run/appkeeper` 下留下的目录与 socket 文件不影响旧版启动。
@@ -924,8 +998,12 @@ bytes/s、峰值/均值 RSS、轮转次数、wall time、逐行完整性校验�
 # 自带隔离环境（缺省）：临时 workspace 拉起自己的 daemon 与负载程序，结束自动清理
 appkeeper-bench --case firehose --duration 10
 
-# 连接已运行的 daemon（同机；指向其控制 socket）
+# 连接已运行的 daemon（IPC 形态；同机，指向其控制 socket，凭属主准入、无凭据）
 appkeeper-bench --case firehose --socket /run/appkeeper/$(id -u)/ak.sock
+
+# 连接 TCP 形态控制端点（可远程；--token 须与守护进程 [daemon] auth_token 一致，
+# 仅 tcp:// 形态有意义——对 IPC 形态提供 --token 是用户错误，不发起连接）
+appkeeper-bench --case firehose --socket tcp://127.0.0.1:7310 --token <token>
 
 # 导出机器可读报告
 appkeeper-bench --case rotation --log-rows 200000 --json report.json

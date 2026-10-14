@@ -7,7 +7,8 @@
 log_level = "info"          # trace|debug|info|warn|error
 log_dir = "/tmp/appkeeper/logs" # absolute path required; /tmp is volatile — use e.g. /var/log/appkeeper for logs that survive reboots
 monitor_interval = 1.0      # supervision tick (seconds)
-socket = "/run/appkeeper/1000/ak.sock"  # control endpoint (HTTP/1.1 over a local socket); default is per-uid, Windows uses \\.\pipe\ak-<user>.sock. Admission is enforced by the OS (0600 socket in a 0700 uid dir; a DACL on Windows) — there is no token and no TCP port
+socket = "/run/appkeeper/1000/ak.sock"  # control endpoint, shape by scheme (HTTP/1.1): a local IPC path (default, per-uid; Windows uses \\.\pipe\ak-<user>.sock, admission enforced by the OS: 0600 socket in a 0700 uid dir / a DACL on Windows — no application credential there) or "tcp://host:port" for a TCP control endpoint
+# auth_token = "change-me"   # ONLY for the tcp:// form: required there (Bearer on every /v1/* except /v1/health; plaintext HTTP — trusted network or SSH tunnel only); setting it on a path-form socket is a validation error
 log_buffer_lines = 1000     # in-memory ring per stream, used by `ak log --tail/-f`
 app_dir = "app.d"           # registration directory: one <name>.toml link per registered app (default app.d; old default was apps)
 

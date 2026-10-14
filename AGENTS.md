@@ -2,10 +2,12 @@
 
 轻量级进程守护工具（Rust），通过 TOML 配置守护任意多个子进程：退出后指数退避重启、
 stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理进程树。
-控制面走**本地 socket**（unix `/run/appkeeper/<uid>/ak.sock`、Windows 命名管道），
-无任何控制面 TCP 端口，身份由 OS 属主强制（`[daemon] socket` 可覆盖端点路径）。
-内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动（缺省关闭，`ak reload` 热生效；
-`webui.auth_token` 可选配置后以 cookie 会话保护 `/api/*`）。
+控制面端点由 `[daemon] socket` 单键双形态决定（tcp-control-endpoint）：缺省
+**本地 IPC**（unix `/run/appkeeper/<uid>/ak.sock`、Windows 命名管道，身份由 OS
+属主强制），或显式 `tcp://host:port`（Bearer 凭据准入，`auth_token` 必配）；
+同一时刻只监听一种形态。内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动
+（缺省关闭，`ak reload` 热生效；`webui.auth_token` 可选配置后以 cookie 会话
+保护 `/api/*`）。
 
 ## Architecture
 
@@ -16,9 +18,11 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   后落盘」，守护离线一律退出码 3 且不隐式拉起；守护形态的 `run` 在参数解析前
   拦截并给迁移提示）| `validate`（含 webui 无 token 的暴露警告）| `config`
   （daemon 配置本地管理：init/set/get/delete/edit 五动作，白名单键表与读改写/
-  原子落盘引擎在 `src/config.rs`；`[daemon]` 死键 host/port/auth_token 报错）；
+  原子落盘引擎在 `src/config.rs`；`[daemon]` 死键 host/port 报错，
+  `auth_token` 为条件键：`tcp://` 形态必配、路径形态拒绝，
+  组合校验 `auth_pair_error` 被 load/validate/set/get 共用）；
   控制子命令 `status/stop/restart/log/pid/reload/shutdown`
-  走本地 socket 上的 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
+  走配置端点上的 HTTP API；`add/remove/list` 管理 app 注册表（add 按路径形态分派：
   目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成 `app_dir/<name>.toml`，
   `apply all` 中 `all` 为全量保留字，不可作应用名；`add --apply` 保留离线隐式拉起）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
@@ -29,11 +33,13 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
   `src/health.rs` — 健康探测（`ureq` 仅供它探测用户程序 URL，不得接回控制面）；
   `src/client.rs` — CLI HTTP/1.1 客户端（自建传输层，含 ad-hoc NDJSON 流式读取）。
-- `src/transport.rs` — **唯一**知晓本地 IPC 细节的传输层模块：`Conn`/`Listener`/
-  `Endpoint`（connect/bind/chmod 0600/uid 0700 目录/陈旧端点清理/Windows 命名管道
-  DACL 全部封死在此），模块内不出现 HTTP 语义，上层代码不出现 socket 路径。
-- `src/server.rs` — 控制平面：std 手写 HTTP/1.1 over 传输层（`/v1/*`，
-  鉴权即 socket 属主，无应用层 token），状态投影（`StatusDoc`/`ProgramInfo`，
+- `src/transport.rs` — **唯一**知晓传输形态细节的模块：`Conn`/`Listener`/
+  `Endpoint`（`tcp://` 解析与 TCP 监听/拨号在此；IPC 侧 chmod 0600/uid 0700
+  目录/陈旧端点清理/Windows 命名管道 DACL 同样封死在此；`is_tcp()` 是唯一
+  形态外泄面），模块内不出现 HTTP 语义，上层代码不出现端点原始串。
+- `src/server.rs` — 控制平面：std 手写 HTTP/1.1 over 传输层（`/v1/*`；
+  准入按端点形态：IPC 形态即 socket 属主、忽略 Authorization 头，TCP 形态
+  Bearer 门——除 `/v1/health` 免凭据外 401），状态投影（`StatusDoc`/`ProgramInfo`，
   含 `config_path`/`health_confirmed`）由此导出；
   `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册。
 - `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =

@@ -1,18 +1,24 @@
 //! Thin HTTP client behind the CLI control subcommands, with the shared
 //! exit-code contract (0 ok / 1 error / 2 config / 3 daemon unreachable).
 //!
-//! Transport: the control plane lives on a local IPC endpoint (unix socket /
-//! Windows named pipe) and carries HTTP/1.1 over it, so `curl
-//! --unix-socket <path> http://localhost/v1/status` still works for
-//! troubleshooting. This module owns the HTTP semantics; the socket itself is
-//! invisible here (see [`crate::transport`]).
+//! Transport: the control plane lives on the endpoint `[daemon] socket`
+//! names — a local IPC path (unix socket / Windows named pipe) or a
+//! `tcp://host:port` URL — and carries HTTP/1.1 over either, so
+//! `curl --unix-socket <path> http://localhost/v1/status` still works for
+//! troubleshooting. This module owns the HTTP semantics; the endpoint itself
+//! is invisible here (see [`crate::transport`]). The one shape-awareness the
+//! client keeps is credential attachment (tcp-control-endpoint D4): on a
+//! `tcp://` endpoint every request carries `Authorization: Bearer
+//! <auth_token>` (the config's), on a path endpoint nothing is attached —
+//! decided via [`transport::Endpoint::is_tcp`], never by peeking at the raw
+//! value.
 //!
 //! **About `ureq`:** it stays in `Cargo.toml` and stays used — but only by
 //! [`crate::health`], to probe the user's *own* programs (`health_check =
 //! "http://..."` / `"tcp://..."`). Control-plane traffic must never go back
-//! through it: this endpoint has no token and is reachable only by its
-//! owner, so a general-purpose HTTP client would add nothing but a second
-//! way to reach it.
+//! through it: the endpoint is either owner-only IPC or token-gated TCP, so
+//! a general-purpose HTTP client would add nothing but a second way to
+//! reach it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -26,6 +32,12 @@ use crate::transport::{self, Conn};
 /// the contract stays visible in the message the operator actually reads.
 const UNREACHABLE: &str = "daemon unreachable";
 const DENIED: &str = "control endpoint access denied";
+/// A tcp:// control endpoint answered 401: the daemon is demonstrably up and
+/// reachable — it just refused our credential. Its own exit class is 3
+/// (control-plane spec: TCP 凭据被拒 → 退出码 3), because the fix is on the
+/// operator's side of the connection (match the daemon's `auth_token`), not
+/// in the command's arguments.
+const TOKEN_REJECTED: &str = "control endpoint rejected the credential";
 
 /// Default per-operation deadline for control calls. Streaming endpoints
 /// override it (see [`Client::STREAM_TIMEOUT`]).
@@ -58,6 +70,10 @@ struct Response {
 #[derive(Clone)]
 pub struct Client {
     endpoint: transport::Endpoint,
+    /// The Bearer credential attached to every request when the endpoint is
+    /// TCP (tcp-control-endpoint D4). `None` is the path-form world — the
+    /// header is not even sent there.
+    token: Option<String>,
     timeout: Duration,
 }
 
@@ -65,7 +81,11 @@ impl Client {
     /// Build a client from the daemon config's control endpoint. Works with
     /// default settings even when no daemon config file exists.
     pub fn from_config(config: &crate::config::DaemonConfig) -> Self {
-        Self::new(config.daemon.socket.to_string_lossy().as_ref(), CALL_TIMEOUT)
+        Self::new(
+            config.daemon.socket.to_string_lossy().as_ref(),
+            config.daemon.auth_token.clone(),
+            CALL_TIMEOUT,
+        )
     }
 
     /// Same target, but with a short total timeout — for readiness polling
@@ -74,11 +94,12 @@ impl Client {
     pub fn probe(config: &crate::config::DaemonConfig) -> Self {
         Self::new(
             config.daemon.socket.to_string_lossy().as_ref(),
+            config.daemon.auth_token.clone(),
             PROBE_TIMEOUT,
         )
     }
 
-    fn new(endpoint: &str, timeout: Duration) -> Self {
+    fn new(endpoint: &str, token: Option<String>, timeout: Duration) -> Self {
         // The config is validated on load, so an unusable value can only come
         // from a hand-built config; fall back to the built-in default rather
         // than panicking in a CLI path.
@@ -86,8 +107,23 @@ impl Client {
             .unwrap_or_else(|_| transport::Endpoint::default_endpoint());
         Self {
             endpoint,
+            token,
             timeout,
         }
+    }
+
+    /// The `Authorization` header value to attach: only on a TCP endpoint
+    /// (the path form has no application credential and its server ignores
+    /// the header). `Some` even when the token is unconfigured — the empty
+    /// bearer is simply refused with the explanatory 401.
+    fn auth_header(&self) -> Option<String> {
+        if !self.endpoint.is_tcp() {
+            return None;
+        }
+        Some(format!(
+            "Bearer {}",
+            self.token.as_deref().unwrap_or("")
+        ))
     }
 
     /// The endpoint this client talks to (for error messages and reports).
@@ -140,7 +176,7 @@ impl Client {
                 .and_then(|e| e.as_str())
                 .unwrap_or("request failed")
                 .to_string();
-            Err(anyhow::anyhow!("api error {status}: {msg}"))
+            Err(api_error(status, &msg))
         }
     }
 
@@ -158,6 +194,9 @@ impl Client {
         let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
         let payload = if has_body { body.to_string() } else { String::new() };
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+        if let Some(auth) = self.auth_header() {
+            head.push_str(&format!("Authorization: {auth}\r\n"));
+        }
         if let Some(a) = accept {
             head.push_str(&format!("Accept: {a}\r\n"));
         }
@@ -355,7 +394,11 @@ impl Client {
         if resp.status != 200 {
             let status = resp.status;
             let text = resp.read_body().unwrap_or_default();
-            anyhow::bail!("api error {status}: {text}");
+            let msg = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or(text);
+            anyhow::bail!("{:#}", api_error(status, &msg));
         }
         resp.for_each_line(&mut on_line)
     }
@@ -385,7 +428,7 @@ impl Client {
                 .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .unwrap_or(text);
-            anyhow::bail!("api error {status}: {msg}");
+            anyhow::bail!("{:#}", api_error(status, &msg));
         }
         let mut last = serde_json::Value::Null;
         resp.for_each_line(&mut |line| {
@@ -581,12 +624,29 @@ fn read_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
     anyhow::anyhow!("{UNREACHABLE} (connection to {} failed): {e}", ep.display())
 }
 
+/// A non-2xx control-plane ANSWER (the daemon is demonstrably reachable).
+/// 401 is its own class on a `tcp://` endpoint: the message carries the fix
+/// (`auth_token`), and [`exit_code_of`] maps it to 3 like the other
+/// "the daemon did not do what you asked because of the endpoint" answers
+/// (control-plane spec: TCP 凭据被拒 → 专属提示 + 退出码 3).
+fn api_error(status: u16, msg: &str) -> anyhow::Error {
+    if status == 401 {
+        anyhow::anyhow!(
+            "{TOKEN_REJECTED} (api error 401): {msg} — a tcp:// control endpoint requires the \
+             daemon's `[daemon] auth_token`, which the client sends as `Authorization: Bearer \
+             <token>`; check the auth_token in your config"
+        )
+    } else {
+        anyhow::anyhow!("api error {status}: {msg}")
+    }
+}
+
 /// Exit code class for a client error, per the CLI contract:
-/// 3 = daemon unreachable (or the endpoint is not yours), 1 = everything else
-/// (2 handled at parse time).
+/// 3 = daemon unreachable (or the endpoint is not yours, or its TCP form
+/// rejected the credential), 1 = everything else (2 handled at parse time).
 pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     let s = format!("{err:#}");
-    if s.contains(UNREACHABLE) || s.contains(DENIED) {
+    if s.contains(UNREACHABLE) || s.contains(DENIED) || s.contains(TOKEN_REJECTED) {
         3
     } else {
         1
@@ -693,6 +753,10 @@ mod tests {
         let req = server.join().unwrap();
         assert!(req.starts_with("GET /v1/status HTTP/1.1\r\n"), "{req}");
         assert!(req.contains("Host: localhost\r\n"), "{req}");
+        assert!(
+            !req.contains("Authorization"),
+            "a path-form endpoint carries no credential: {req}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -967,5 +1031,101 @@ mod tests {
             transport::Endpoint::default_endpoint().display()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- TCP form (tcp-control-endpoint task 4.1) ----------------------------
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn config_with_tcp(port: u16, token: Option<&str>) -> crate::config::DaemonConfig {
+        let token_line = match token {
+            Some(t) => format!("auth_token = \"{t}\"\n"),
+            None => String::new(),
+        };
+        toml::from_str(&format!(
+            "[daemon]\nsocket = \"tcp://127.0.0.1:{port}\"\n{token_line}"
+        ))
+        .unwrap()
+    }
+
+    /// A bound private TCP endpoint for the fake-server pattern.
+    fn bound_tcp(port: u16) -> (transport::Endpoint, transport::Listener) {
+        let ep = transport::Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap();
+        let listener = ep.bind().unwrap();
+        (ep, listener)
+    }
+
+    /// 4.1: on a `tcp://` endpoint the client automatically attaches
+    /// `Authorization: Bearer <auth_token>` from the same config; the
+    /// endpoint shape (via `is_tcp`) is the only decision input.
+    #[test]
+    fn tcp_client_sends_the_bearer_header() {
+        let port = free_tcp_port();
+        let (_, listener) = bound_tcp(port);
+        let server = fake_server(listener, ok_response("{\"result\":\"ok\"}"));
+        let c = Client::from_config(&config_with_tcp(port, Some("tok-1")));
+        assert!(c.endpoint().is_tcp());
+        let v = c.status().unwrap();
+        assert_eq!(v["result"], "ok");
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("Authorization: Bearer tok-1\r\n"),
+            "the config's token rides along: {req}"
+        );
+    }
+
+    /// 4.1: a tcp:// config without a token sends an empty bearer (the
+    /// server would 401 it) — the shape still decides attachment, uniformly.
+    #[test]
+    fn tcp_client_without_token_sends_empty_bearer() {
+        let port = free_tcp_port();
+        let (_, listener) = bound_tcp(port);
+        let server = fake_server(listener, ok_response("{}"));
+        let c = Client::from_config(&config_with_tcp(port, None));
+        let _ = c.status();
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("Authorization: Bearer \r\n"),
+            "the header is attached (shape decides), empty when unconfigured: {req}"
+        );
+    }
+
+    /// 4.1: a 401 from the control plane is a business answer (the daemon is
+    /// reachable): the message keeps the daemon's own words plus the fix,
+    /// and the exit class is 3 — never "unreachable" wording for a refusal.
+    #[test]
+    fn tcp_401_is_a_business_answer_with_exit_3() {
+        let port = free_tcp_port();
+        let (_, listener) = bound_tcp(port);
+        let server = fake_server(
+            listener,
+            http_response("HTTP/1.1 401 Unauthorized", r#"{"error":"unauthorized"}"#),
+        );
+        let c = Client::from_config(&config_with_tcp(port, Some("wrong")));
+        let err = c.status().expect_err("401 must error");
+        let text = format!("{err:#}");
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("auth_token"), "names the fix: {text}");
+        assert!(text.contains("unauthorized"), "keeps the daemon's words: {text}");
+        assert_eq!(exit_code_of(&err), 3);
+        server.join().unwrap();
+    }
+
+    /// 4.1: a closed TCP endpoint is the plain unreachable case (exit 3,
+    /// "daemon unreachable" wording — connection refused, nothing answered).
+    #[test]
+    fn tcp_connect_refused_is_unreachable() {
+        let port = free_tcp_port(); // bound briefly, then dropped: closed
+        let c = Client::from_config(&config_with_tcp(port, Some("t")));
+        let err = c.status().expect_err("nothing is listening");
+        let text = format!("{err:#}");
+        assert!(text.contains(UNREACHABLE), "{text}");
+        assert_eq!(exit_code_of(&err), 3);
     }
 }
