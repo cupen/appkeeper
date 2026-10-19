@@ -1,0 +1,30 @@
+# Keep the build context to the dependency manifests only (KB-sized).
+#
+# The test image deliberately never receives project sources: it is reused
+# across commits and only refreshed when a lock file changes. Everything is
+# excluded first, then the manifests the Dockerfile COPYs are re-included.
+#
+# Explicit exclusions. Redundant under `**` for now, but they document the
+# contract and keep holding if the whitelist below is ever relaxed:
+.git
+target
+webui/node_modules
+webui/dist
+docker-out
+.ansible
+openspec/changes/archive
+# Whitelist: only the manifests the Dockerfile COPYs. Everything else stays
+# out of the build context.
+**
+!Cargo.toml
+!Cargo.lock
+!docker/
+!docker/Dockerfile.test
+!docker/entrypoint.sh
+!xtask/
+!xtask/Cargo.toml
+!appkeeper-bench/
+!appkeeper-bench/Cargo.toml
+!webui/
+!webui/package.json
+!webui/pnpm-lock.yaml

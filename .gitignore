@@ -2,4 +2,5 @@
 /logs
 /webui/node_modules
 /webui/dist
+/docker-out
 .ansible/.tmp/

@@ -1066,3 +1066,41 @@ appkeeper-bench 自身的完整周期集成测试（真实 daemon，每条数秒
 ```bash
 cargo test -p appkeeper-bench --test integration -- --ignored --test-threads=1
 ```
+
+### Docker 测试环境（一次性全量验收）
+
+本机不必装 Rust/Node/pnpm/playwright：`debian:bookworm-slim` 基座的测试镜像
+预装了全量验收所需的整条工具链，一条命令跑完上面全部内容（`cargo test
+--workspace` + webui 三连 + `xtask e2e` 含 playwright 浏览器段 + bench
+firehose 报告），退出码即成败。
+
+```bash
+# 构建镜像并跑全量验收（缺省国际线路）
+scripts/docker-test.sh
+
+# 大陆线路（rustup/crates→rsproxy、npm→npmmirror、apt→aliyun）
+scripts/docker-test.sh --region cn
+
+# 复用已构建的镜像；只跑指定阶段（test,webui,e2e,bench 任选）
+scripts/docker-test.sh --no-build
+scripts/docker-test.sh --stages e2e
+```
+
+镜像**不含项目源码**：构建上下文只取锁文件与 manifest（`Cargo.lock`、
+各 `Cargo.toml`、`webui/pnpm-lock.yaml`），依赖（crates、pnpm 包、chromium）
+在构建期预烘进镜像，因此同一镜像跨 commit 复用，只有锁文件变了才需重建。
+
+- **产物**：各阶段日志与 `bench-firehose.json` 落在 `docker-out/<时间戳>/`
+  （容器内 `/out`）；任一段失败即停，退出码非零。
+- **离线复跑**：锁文件未变时依赖全部命中镜像缓存，可加 `--network none` 验证。
+- **属主归还**：包装脚本注入 `HOST_UID`/`HOST_GID`，容器退出前把
+  `target/`、`webui/node_modules/`、`webui/dist/` 与产物目录的属主交回宿主用户。
+- **构建缓存隔离**：容器用按仓库哈希命名的命名卷盖住 `/work/target`——
+  e2e 固定读 `target/debug/`，直接复用宿主（可能是别的发行版/glibc）的产物会跑不起来；
+  卷内缓存跨次运行复用，宿主 `target/` 不受影响。
+- **交互排障**：`docker run -it --rm -v "$PWD:/work" appkeeper-test:latest bash`
+  直接进容器（工具链齐备），不带参数则默认跑全量验收。
+- **工具链版本**：`RUST_VERSION`、`NODE_VERSION`、`PNPM_VERSION`、
+  `PLAYWRIGHT_VERSION` 均为构建参数，缺省为当前可用版本，可
+  `--build-arg` 钉死复现。受限网络可用
+  `--build-arg PW_DOWNLOAD_HOST=<mirror>` 单独覆盖浏览器下载源。

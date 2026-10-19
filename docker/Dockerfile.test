@@ -1,0 +1,177 @@
+# syntax=docker/dockerfile:1
+#
+# appkeeper one-shot acceptance test image.
+#
+#   docker build -f docker/Dockerfile.test -t appkeeper-test:latest .
+#
+# The image intentionally contains NO project sources: only lock files and
+# manifests are copied for dependency pre-baking, so one image serves every
+# commit whose lock files have not changed.
+#
+# Layer order (see openspec/changes/docker-test-env/design.md):
+#   apt base -> toolchain -> manifests -> dependency pre-bake
+#
+# REGION switches every download line at once:
+#   global (default): rustup/crates.io, nodejs.org, registry.npmjs.org, playwright CDN
+#   cn:               rsproxy, npmmirror node binaries, registry.npmmirror.com,
+#                     npmmirror playwright binaries
+# Unknown values fail the build instead of silently falling back.
+
+FROM debian:bookworm-slim
+
+# Toolchain versions are build-args; the defaults are real, currently published
+# versions (checked against upstream when added).
+ARG REGION=global
+ARG RUST_VERSION=stable
+ARG NODE_VERSION=22.23.3
+ARG PNPM_VERSION=11.24.0
+# 1.57.0 -> chromium revision 1200: the newest revision whose x64 assets are
+# mirrored on npmmirror, so both REGION lines can pre-bake the browser.
+ARG PLAYWRIGHT_VERSION=1.57.0
+# Explicit browser-download override for restricted networks (e.g. a corporate
+# mirror). Empty keeps the REGION default; it does not redefine REGION.
+ARG PW_DOWNLOAD_HOST=
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/ak \
+    CARGO_HOME=/ak/cargo \
+    RUSTUP_HOME=/ak/rustup \
+    PLAYWRIGHT_BROWSERS_PATH=/ak/ms-playwright \
+    NPM_CONFIG_CACHE=/ak/.npm \
+    npm_config_store_dir=/ak/pnpm-store \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    PATH=/ak/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---------------------------------------------------------------- region switch
+# Validated first so an unknown region fails before spending time on downloads.
+# The resulting file is sourced by every later build-time layer.
+RUN set -eux; \
+    mkdir -p /etc/appkeeper-test; \
+    case "$REGION" in \
+      global) \
+        printf '%s\n' \
+          'export AK_REGION=global' \
+          'export RUSTUP_DIST_SERVER=https://static.rust-lang.org' \
+          'export RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup' \
+          'export NODE_BASE=https://nodejs.org/dist' \
+          'export NPM_CONFIG_REGISTRY=https://registry.npmjs.org' \
+          'export CRATES_INDEX=' \
+          'export PLAYWRIGHT_DOWNLOAD_HOST=' \
+          > /etc/appkeeper-test/region.env; \
+        ;; \
+      cn) \
+        printf '%s\n' \
+          'export AK_REGION=cn' \
+          'export RUSTUP_DIST_SERVER=https://rsproxy.cn' \
+          'export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup' \
+          'export NODE_BASE=https://cdn.npmmirror.com/binaries/node' \
+          'export NPM_CONFIG_REGISTRY=https://registry.npmmirror.com' \
+          'export CRATES_INDEX=sparse+https://rsproxy.cn/index/' \
+          'export PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright' \
+          > /etc/appkeeper-test/region.env; \
+        ;; \
+      *) \
+        echo "ERROR: unsupported REGION '${REGION}'; valid values are: global, cn" >&2; \
+        exit 1; \
+        ;; \
+    esac; \
+    if [ -n "$PW_DOWNLOAD_HOST" ]; then \
+        sed -i "s|^export PLAYWRIGHT_DOWNLOAD_HOST=.*|export PLAYWRIGHT_DOWNLOAD_HOST=$PW_DOWNLOAD_HOST|" \
+            /etc/appkeeper-test/region.env; \
+    fi
+
+# ------------------------------------------------------------------- apt base
+# The cn line also switches the Debian mirrors: the browser layer's
+# `playwright install --with-deps` pulls its system libraries through apt, and
+# the default deb.debian.org endpoint is orders of magnitude slower from there.
+RUN set -eux; \
+    . /etc/appkeeper-test/region.env; \
+    if [ "$AK_REGION" = "cn" ]; then \
+        sed -i \
+            -e 's|http://deb.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|' \
+            -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|' \
+            /etc/apt/sources.list.d/debian.sources; \
+        cat /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential; \
+    rm -rf /var/lib/apt/lists/*
+
+# --------------------------------------------------------------- toolchain layer
+# One install path for both regions: rustup-init, the official Node tarball and
+# `npm install -g pnpm`; REGION only changes the base URLs sourced above.
+RUN set -eux; \
+    . /etc/appkeeper-test/region.env; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) RUSTUP_ARCH=x86_64-unknown-linux-gnu; NODE_ARCH=x64 ;; \
+      arm64) RUSTUP_ARCH=aarch64-unknown-linux-gnu; NODE_ARCH=arm64 ;; \
+      *) echo "ERROR: unsupported architecture $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /ak/.npm /ak/pnpm-store /ak/ms-playwright; \
+    curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 60 \
+        "$RUSTUP_DIST_SERVER/rustup/dist/$RUSTUP_ARCH/rustup-init" -o /tmp/rustup-init; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION"; \
+    rm -f /tmp/rustup-init; \
+    curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 60 \
+        "$NODE_BASE/v$NODE_VERSION/node-v$NODE_VERSION-linux-$NODE_ARCH.tar.gz" \
+        -o /tmp/node.tar.gz; \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1; \
+    rm -f /tmp/node.tar.gz; \
+    npm install -g "pnpm@$PNPM_VERSION"; \
+    if [ -n "$CRATES_INDEX" ]; then \
+        printf '[source.crates-io]\nreplace-with = "regional-mirror"\n\n[source.regional-mirror]\nregistry = "%s"\n' \
+            "$CRATES_INDEX" > "$CARGO_HOME/config.toml"; \
+    fi; \
+    printf 'registry=%s\nstore-dir=/ak/pnpm-store\n' "$NPM_CONFIG_REGISTRY" > /ak/.npmrc; \
+    cargo --version; node --version; npm --version; pnpm --version; \
+    echo "pnpm store: $(pnpm store path)"; \
+    case "$(pnpm store path)" in /ak/*) ;; *) echo "ERROR: pnpm store outside /ak" >&2; exit 1 ;; esac
+
+# ------------------------------------------------------------- manifests layer
+# Only manifests and lock files: changing project sources must not invalidate
+# any layer below (image reuse across commits).
+WORKDIR /prebake
+COPY Cargo.toml Cargo.lock /prebake/
+COPY xtask/Cargo.toml /prebake/xtask/Cargo.toml
+COPY appkeeper-bench/Cargo.toml /prebake/appkeeper-bench/Cargo.toml
+COPY webui/package.json webui/pnpm-lock.yaml /prebake/webui/
+
+# --------------------------------------------------------------- pre-bake layer
+# Fetches every crate from Cargo.lock, every package from pnpm-lock.yaml and
+# chromium (with its system libraries) into the image. The empty stub sources
+# only let cargo resolve manifests; no project source is copied.
+RUN set -eux; \
+    . /etc/appkeeper-test/region.env; \
+    mkdir -p src xtask/src appkeeper-bench/src; \
+    for f in src/main.rs xtask/src/main.rs appkeeper-bench/src/main.rs; do \
+        [ -e "$f" ] || echo 'fn main() {}' > "$f"; \
+    done; \
+    cargo metadata --no-deps --format-version 1 > /dev/null; \
+    cargo fetch --locked; \
+    cd /prebake/webui; \
+    CI=true pnpm fetch; \
+    cd /prebake; \
+    npx --yes "playwright@$PLAYWRIGHT_VERSION" install --with-deps chromium; \
+    test -n "$(find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 1 -type d -name 'chromium-*' -print -quit)"; \
+    PLAYWRIGHT_DIR="$(find "$HOME/.npm/_npx" -maxdepth 3 -type d -name playwright -path '*/node_modules/playwright' -print -quit)"; \
+    test -n "$PLAYWRIGHT_DIR"; \
+    test -f "$PLAYWRIGHT_DIR/package.json"
+
+WORKDIR /work
+RUN mkdir -p /work /out
+
+# One-shot acceptance entrypoint: no arguments (the default CMD) runs the full
+# suite; any argument (e.g. `bash`) replaces it for interactive use.
+# profile.d keeps `bash -l` sessions on the same PATH as the entrypoint.
+RUN printf '%s\n' 'export PATH=/ak/cargo/bin:$PATH' > /etc/profile.d/appkeeper-test.sh
+COPY docker/entrypoint.sh /usr/local/bin/ak-test-entrypoint
+RUN chmod +x /usr/local/bin/ak-test-entrypoint
+ENTRYPOINT ["/usr/local/bin/ak-test-entrypoint"]
+CMD ["all"]

@@ -82,6 +82,11 @@ cargo run -p appkeeper-bench -- --case firehose --duration 10
                                        #   --socket <path> 连同机已运行 daemon，
                                        #   --json <path> 导出机器可读报告；无阈值门禁
 
+scripts/docker-test.sh                 # Docker 一次性全量验收（debian:bookworm-slim 基座）：
+                                       #   cargo test --workspace + webui 三连 + xtask e2e（含浏览器段）
+                                       #   + bench firehose 报告；产物落 docker-out/<时间戳>/
+                                       #   --region cn 切大陆镜像；--no-build 复用镜像；--stages 选段
+
 ## OpenSpec 规范驱动开发（`.agents`）
 
 本仓库使用 [OpenSpec](https://github.com/Fission-AI/OpenSpec) 管理变更流程，

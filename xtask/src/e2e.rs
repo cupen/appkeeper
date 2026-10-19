@@ -231,7 +231,9 @@ struct Daemon {
 fn curl_socket(endpoint: &Path, args: &[&str], path: &str) -> Command {
     let mut cmd = Command::new("curl");
     cmd.arg("-s");
-    cmd.arg(format!("--unix-socket={}", endpoint.display()));
+    // Separate value: `--unix-socket=<path>` is only accepted by curl 8.15+,
+    // while Debian bookworm ships 7.88.
+    cmd.arg("--unix-socket").arg(endpoint);
     cmd.args(args);
     cmd.arg(format!("http://localhost{path}"));
     cmd
