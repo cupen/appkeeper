@@ -88,17 +88,30 @@ pub fn release_cleanup() {
 /// truncated, because a truncated path would point bench and the daemon at
 /// two different endpoints.
 fn isolated_socket(root: &Path) -> Result<PathBuf> {
-    let path = root.join("ak.sock");
-    let len = path.display().to_string().len();
-    const MAX: usize = 100;
-    if len > MAX {
-        bail!(
-            "the isolated control endpoint path is {len} bytes, over the {MAX}-byte limit a \
-             local socket can carry: {} — set TMPDIR to a shorter path",
-            path.display()
-        );
+    #[cfg(windows)]
+    {
+        // The IPC form on Windows is a named pipe; derive a unique pipe name
+        // from the workspace directory name so two benches never collide.
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        return Ok(PathBuf::from(format!(r"\\.\pipe\{name}.sock")));
     }
-    Ok(path)
+    #[cfg(unix)]
+    {
+        let path = root.join("ak.sock");
+        let len = path.display().to_string().len();
+        const MAX: usize = 100;
+        if len > MAX {
+            bail!(
+                "the isolated control endpoint path is {len} bytes, over the {MAX}-byte limit a \
+                 local socket can carry: {} — set TMPDIR to a shorter path",
+                path.display()
+            );
+        }
+        Ok(path)
+    }
 }
 
 /// 5.4: the isolated daemon's endpoint must be owner-only, in a private
@@ -300,18 +313,23 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
             .with_context(|| format!("chmod 0700 {}", root.display()))?;
     }
     let control_socket = isolated_socket(root)?;
+    // A unix socket path needs forward slashes to stay a valid TOML basic
+    // string; the Windows named pipe keeps its backslashes and rides a
+    // single-quoted TOML literal string instead.
+    let socket = if cfg!(windows) {
+        format!("'{}'", control_socket.to_string_lossy())
+    } else {
+        format!("\"{}\"", control_socket.to_string_lossy().replace('\\', "/"))
+    };
     // Forward slashes so the TOML basic string stays valid on Windows.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
-    let socket = control_socket
-        .to_string_lossy()
-        .replace('\\', "/");
     // No [webui] section: the bench environment never serves the console.
     // `app_dir` is explicit so the bench workspace is independent of the
     // built-in default name (run-daemon-first changed it to `app.d`).
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nsocket = \"{socket}\"\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"app.d\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"app.d\"\n",
         ),
     )
     .with_context(|| format!("write daemon.toml in {}", root.display()))?;

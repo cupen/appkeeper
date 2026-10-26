@@ -128,6 +128,25 @@ pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        // Rust's Command always spawns with bInheritHandles=TRUE, which hands
+        // the child every inheritable handle we hold — including the stdout /
+        // stderr pipe a caller like `add --apply` was captured with. The
+        // detached daemon would then keep that write end open forever and the
+        // caller's `.output()` would never see EOF (a full client hang). The
+        // daemon's stdio is redirected to `log_path` anyway, so drop the
+        // inherit flag on our own console handles before spawning.
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(which) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
     }
     let child = cmd
         .spawn()
