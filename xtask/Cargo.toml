@@ -12,3 +12,17 @@ clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+
+# Windows-only: the service-registration e2e (SCM roundtrip) reads the service
+# back through the `windows-service` crate and checks elevation via
+# CheckTokenMembership against BUILTIN\Administrators. The raw windows-sys
+# calls complement the crate where it has no getter: the description read-back
+# (QueryServiceConfig2W) needs Win32_System_Services.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Services",
+    "Win32_System_SystemServices",
+] }

@@ -79,13 +79,106 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
+/// Windows: one-shot `cmd /C <text>` parses its argument as a single command
+/// line and silently drops everything after the first newline, so a
+/// multi-line action command must be staged as a `.cmd` batch file and run
+/// as `cmd /C <file>` — batch files execute line by line. cmd.exe reads
+/// batch files in the OEM codepage (it does NOT understand UTF-16 or
+/// UTF-8-with-BOM scripts), so the text is converted with
+/// `WideCharToMultiByte(CP_OEMCP)`: characters the codepage cannot
+/// represent degrade to `?`, which is the best any batch file can carry.
+/// `@echo off` keeps the action output to the script's own output (no
+/// command-echo noise).
+#[cfg(windows)]
+fn stage_multiline_script(command: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CP_OEMCP, WideCharToMultiByte};
+
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "appkeeper-action-{}-{}.cmd",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let wide: Vec<u16> = std::ffi::OsStr::new(command).encode_wide().collect();
+    let len = unsafe {
+        WideCharToMultiByte(
+            CP_OEMCP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if len == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut body = vec![0u8; len as usize];
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_OEMCP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            body.as_mut_ptr(),
+            len,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if written == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    body.truncate(written as usize);
+    let mut bytes = b"@echo off\r\n".to_vec();
+    bytes.extend_from_slice(&body);
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(&bytes)?;
+    Ok(path)
+}
+
+/// Staged `.cmd` for a multi-line Windows action; deleted on every exit path
+/// (the guard fires after `execute` returns, however that happens).
+#[cfg(windows)]
+struct StagedScript(Option<PathBuf>);
+
+#[cfg(windows)]
+impl StagedScript {
+    /// Stage `command` when it contains line breaks; otherwise leave the
+    /// plain one-shot `cmd /C` form in place.
+    fn for_command(command: &str) -> std::io::Result<Self> {
+        if command.contains(&['\n', '\r'][..]) {
+            Ok(Self(Some(stage_multiline_script(command)?)))
+        } else {
+            Ok(Self(None))
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StagedScript {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Kill the action process tree: the child was put in its own process group
 /// (unix) / job object (windows), so grandchildren die with it.
-fn kill_tree(child: &mut Child, job: Option<platform::JobHandle>, pid: u32) {
+fn kill_tree(child: &mut Child, job: Option<platform::JobHandle>, _pid: u32) {
     #[cfg(unix)]
     {
         let _ = job; // placeholder only on unix
-        platform::kill_group(pid);
+        platform::kill_group(_pid);
     }
     #[cfg(windows)]
     {
@@ -109,7 +202,24 @@ pub fn execute(
 ) -> ActionResult {
     let started = Instant::now();
     let prefix = log_prefix(program, action);
+    // Windows: a multi-line command cannot survive the one-shot `cmd /C`
+    // form, so stage it as a temporary .cmd batch file first; the guard
+    // removes the file when this run ends (any exit path).
+    #[cfg(windows)]
+    let staged = match StagedScript::for_command(command) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("{prefix} failed to stage multi-line action as a batch file ({e}); running it as a one-shot command instead");
+            StagedScript(None)
+        }
+    };
     let mut cmd = shell_command(command);
+    #[cfg(windows)]
+    if let Some(script) = staged.path() {
+        let mut c = Command::new("cmd");
+        c.args(["/C", &script.to_string_lossy()]);
+        cmd = c;
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -385,6 +495,19 @@ mod tests {
         assert!(!r.timed_out);
         assert!(r.output.contains(expect), "output: {:?}", r.output);
         assert!(r.duration_ms < 10_000);
+    }
+
+    /// action: a multi-line command runs as one shell script — every line
+    /// executes (spec: 命令文本整体交给平台 shell). Regression: one-shot
+    /// `cmd /C` on Windows drops everything after the first newline.
+    #[test]
+    fn multiline_command_runs_all_lines() {
+        let cmd = "echo ml-one\necho ml-two\n";
+        let r = execute(&spec(cmd, 10), "p", "a", cmd, &work_dir("multiline"));
+        assert_eq!(r.exit_code, Some(0));
+        assert!(!r.timed_out);
+        assert!(r.output.contains("ml-one"), "output: {:?}", r.output);
+        assert!(r.output.contains("ml-two"), "output: {:?}", r.output);
     }
 
     /// action: the child's exit code is carried through.

@@ -58,6 +58,14 @@
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
 //!   app's pending is untouched by the scoped apply.
+//! - windows service pass (Windows + admin only, add-windows-service-registration):
+//!   `service install --name xk-e2e-<pid> --desc e2e --now` against a throwaway
+//!   config, read the registration back through the windows-service crate
+//!   (binpath/AutoStart/failure actions/description), watch the service reach
+//!   RUNNING and supervise the test app via the control plane, then uninstall
+//!   and confirm an idempotent second uninstall. A non-admin shell warns and
+//!   skips; an sc.exe stop+delete scrub guard guarantees no `xk-e2e-*` service
+//!   is left behind on failure.
 //!
 //! Fast correctness tests stay in `cargo test` + `pnpm test`; this harness
 //! exists because these paths span process boundaries (child processes, HTTP,
@@ -203,6 +211,28 @@ fn current_uid_e2e() -> u32 {
     }
 }
 
+/// Does the printed value match the platform's built-in default control
+/// endpoint? Unix: the uid-layered socket path; Windows: the per-user named
+/// pipe (its exact name carries the account, asserted by unit tests).
+fn default_socket_matches(out: &str) -> bool {
+    let value = out.trim();
+    if cfg!(unix) {
+        value == format!("/run/appkeeper/{}/ak.sock", current_uid_e2e())
+    } else {
+        value.starts_with(r"\\.\pipe\ak-") && value.ends_with(".sock")
+    }
+}
+
+/// The `apps/web.toml` fragment as the CLI prints it: path separators differ
+/// per platform.
+fn apps_web_seg() -> String {
+    if cfg!(windows) {
+        r"apps\web.toml".to_string()
+    } else {
+        "apps/web.toml".to_string()
+    }
+}
+
 /// Register a config as `app_dir/<name>.toml` — symlink where available,
 /// hard-link fallback (unprivileged Windows), mirroring registry::make_link.
 fn link_registration(target: &Path, link: &Path) -> Result<()> {
@@ -241,17 +271,111 @@ fn curl_socket(endpoint: &Path, args: &[&str], path: &str) -> Command {
 
 /// GET a control-plane path over the socket; returns (status, body).
 fn socket_get(endpoint: &Path, path: &str) -> Result<(u16, String)> {
-    let out = curl_socket(endpoint, &["-o", "-", "-w", "\n%{http_code}"], path)
-        .output()
-        .context("curl the control socket")?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
-    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+    control_http(endpoint, "GET", path, None)
 }
 
 /// Is the daemon healthy on this control endpoint?
 fn socket_health_ok(endpoint: &Path) -> bool {
     matches!(socket_get(endpoint, "/v1/health"), Ok((c, _)) if c == 200)
+}
+
+/// One raw HTTP exchange with the control endpoint; returns (status, body).
+///
+/// Unix shells out to `curl --unix-socket`. Windows cannot: curl's AF_UNIX
+/// never reaches a Win32 named pipe (unix-socket-control-plane), so it speaks
+/// HTTP/1.1 through PowerShell's NamedPipeClientStream — request headers end
+/// with `Connection: close` and the body is read to EOF, matching the
+/// control plane's own framing.
+fn control_http(
+    endpoint: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    if cfg!(unix) {
+        let mut args: Vec<&str> = vec!["-o", "-", "-w", "\n%{http_code}", "-X", method];
+        if let Some(b) = body {
+            args.extend(["-d", b]);
+        }
+        let out = curl_socket(endpoint, &args, path)
+            .output()
+            .context("curl the control socket")?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let (resp, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+        return Ok((code.trim().parse().unwrap_or(0), resp.to_string()));
+    }
+    let pipe_name = endpoint
+        .to_string_lossy()
+        .strip_prefix(r"\\.\pipe\")
+        .context("control endpoint is not a Win32 named pipe")?
+        .to_string();
+    // Parameters ride environment variables: no quoting/escaping of the
+    // endpoint name or JSON body survives into the PowerShell source.
+    let script = r#"
+$p = New-Object System.IO.Pipes.NamedPipeClientStream('.', $env:AK_PIPE, [System.IO.Pipes.PipeDirection]::InOut)
+$p.Connect(5000)
+$sw = New-Object System.IO.StreamWriter($p)
+$sw.NewLine = "`r`n"
+$sw.WriteLine(($env:AK_METHOD + ' ' + $env:AK_PATH + ' HTTP/1.1'))
+$sw.WriteLine('Host: localhost')
+$sw.WriteLine('Connection: close')
+$len = 0
+if ($env:AK_BODY) { $len = [System.Text.Encoding]::UTF8.GetByteCount($env:AK_BODY) }
+$sw.WriteLine(('Content-Length: ' + $len))
+$sw.WriteLine('')
+if ($env:AK_BODY) { $sw.Write($env:AK_BODY) }
+$sw.Flush()
+$ms = New-Object System.IO.MemoryStream
+$p.CopyTo($ms)
+$sw.Dispose(); $p.Dispose()
+$bytes = $ms.ToArray()
+$sep = -1
+for ($i = 0; $i -lt $bytes.Length - 3; $i++) {
+  if ($bytes[$i] -eq 13 -and $bytes[$i+1] -eq 10 -and $bytes[$i+2] -eq 13 -and $bytes[$i+3] -eq 10) { $sep = $i; break }
+}
+if ($sep -lt 0) { [Console]::Out.Write("`n0"); exit }
+$head = [System.Text.Encoding]::ASCII.GetString($bytes, 0, $sep)
+$first = ($head -split "`r`n")[0]
+$code = '0'
+if ($first -match 'HTTP/\S+ (\d{3})') { $code = $Matches[1] }
+# The run endpoint streams NDJSON as chunked transfer encoding; de-chunk at
+# the byte level (curl does this for the unix path).
+$out = New-Object System.IO.MemoryStream
+if ($head -match '(?i)Transfer-Encoding:\s*chunked') {
+  $pos = $sep + 4
+  while ($pos -lt $bytes.Length) {
+    $le = $pos
+    while ($le -lt $bytes.Length - 1 -and !($bytes[$le] -eq 13 -and $bytes[$le+1] -eq 10)) { $le++ }
+    $hex = [System.Text.Encoding]::ASCII.GetString($bytes, $pos, $le - $pos).Split(';')[0].Trim()
+    $size = [Convert]::ToInt32($hex, 16)
+    if ($size -eq 0) { break }
+    $out.Write($bytes, $le + 2, $size)
+    $pos = $le + 2 + $size + 2
+  }
+} else {
+  $out.Write($bytes, $sep + 4, $bytes.Length - $sep - 4)
+}
+$text = [System.Text.Encoding]::UTF8.GetString($out.ToArray())
+[Console]::Out.Write($text + "`n" + $code)
+"#;
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("AK_PIPE", &pipe_name)
+        .env("AK_METHOD", method)
+        .env("AK_PATH", path)
+        .env("AK_BODY", body.unwrap_or(""))
+        .output()
+        .context("powershell pipe client")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (resp, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), resp.to_string()))
 }
 
 fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
@@ -274,7 +398,8 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
             bail!("daemon did not become healthy in 20s");
         }
         if let Ok(Some(_)) = child.try_wait() {
-            bail!("daemon exited during startup");
+            let log = std::fs::read_to_string(ws.root.join("daemon.out.log")).unwrap_or_default();
+            bail!("daemon exited during startup: {}", log.trim());
         }
         // Readiness rides the control socket — there is no control port to
         // poll (and the console may not even be enabled in a given workspace).
@@ -287,7 +412,7 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
 }
 
 fn shutdown_daemon(ws: &Workspace, daemon: &mut Daemon) {
-    let _ = curl_socket(&ws.control_socket, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
+    let _ = control_http(&ws.control_socket, "POST", "/v1/shutdown", None);
     for _ in 0..60 {
         if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             return;
@@ -385,18 +510,15 @@ fn cli_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<String> {
     Ok(combined)
 }
 
-/// HTTP status code + body of a control-plane request (curl, like `api`,
-/// but the status code is kept so error mappings can be asserted).
+/// HTTP status code + body of a control-plane request (like `api`, but the
+/// status code is kept so error mappings can be asserted).
 fn api_checked(ws: &Workspace, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
-    let mut cmd = curl_socket(&ws.control_socket, &["-o", "-", "-w", "\n%{http_code}"], path);
-    cmd.arg("-X").arg(method);
-    if !body.is_empty() {
-        cmd.args(["-d", body]);
-    }
-    let out = cmd.output().context("curl control plane")?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
-    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+    control_http(
+        &ws.control_socket,
+        method,
+        path,
+        if body.is_empty() { None } else { Some(body) },
+    )
 }
 
 /// A `sleep` executable for the scaffold scenarios: standard locations on
@@ -410,22 +532,45 @@ fn find_sleep() -> Result<PathBuf> {
         }
     }
     let exe = if cfg!(windows) { "sleep.exe" } else { "sleep" };
+    let mut found = None;
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let cand = dir.join(exe);
             if cand.is_file() {
-                return Ok(cand);
+                found = Some(cand);
+                break;
             }
         }
     }
-    bail!("no `sleep` executable found — needed by the scaffold e2e scenario");
+    let src = found
+        .context("no `sleep` executable found — needed by the scaffold e2e scenario")?;
+    // A space-bearing path ("C:\Program Files\Git\...") makes the scaffold
+    // render one quoted command line and drop the `args` key; copy it (plus
+    // its MSYS runtime) to a space-free path so both keys stay in play.
+    if !src.display().to_string().chars().any(char::is_whitespace) {
+        return Ok(src);
+    }
+    let dst_dir = std::env::temp_dir().join("xk-e2e-bin");
+    std::fs::create_dir_all(&dst_dir)?;
+    let dst = dst_dir.join(exe);
+    if !dst.is_file() {
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+        if let Some(dll) = src.parent().map(|d| d.join("msys-2.0.dll")) {
+            if dll.is_file() {
+                let _ = std::fs::copy(&dll, dst_dir.join("msys-2.0.dll"));
+            }
+        }
+    }
+    Ok(dst)
 }
 
 fn api(ws: &Workspace, path: &str) -> Result<String> {
-    let out = curl_socket(&ws.control_socket, &["-sf"], path)
-        .output()
-        .context("curl control plane")?;
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    let (code, body) = control_http(&ws.control_socket, "GET", path, None)?;
+    if !(200..300).contains(&code) {
+        bail!("GET {path} -> {code}");
+    }
+    Ok(body)
 }
 
 /// pid of a program via the control plane (None = not running or unknown).
@@ -826,8 +971,13 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "auth_token is not rendered as a live (uncommented) key",
     )?;
     expect(
-        text.contains("socket = \"/run/appkeeper/") && text.contains("/ak.sock"),
-        "the socket default is rendered (uid-layered endpoint)",
+        if cfg!(unix) {
+            text.contains("socket = \"/run/appkeeper/") && text.contains("/ak.sock")
+        } else {
+            // single-quoted TOML literal: backslashes survive unescaped
+            text.contains(r"socket = '\\.\pipe\ak-")
+        },
+        "the socket default is rendered (platform endpoint)",
     )?;
     expect(
         text.contains("[app-default]") && text.contains("restart = \"always\""),
@@ -844,12 +994,13 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("K2. config --get: defaults for unset keys, bare value / key=value");
     let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
     expect(
-        out.trim() == format!("/run/appkeeper/{}/ak.sock", current_uid_e2e()),
-        &format!("a single key prints the bare (uid-derived) default: {out:?}"),
+        default_socket_matches(&out),
+        &format!("a single key prints the bare platform default: {out:?}"),
     )?;
     let out = cli_cfg(bin, &cfg, &["config", "--get", "socket", "--get", "log_level"])?;
     expect(
-        out.contains("socket=/run/appkeeper/") && out.contains("log_level=info"),
+        out.contains("socket=/run/appkeeper/") && out.contains("log_level=info")
+            || (cfg!(windows) && out.contains(r"socket=\\.\pipe\ak-")),
         &format!("multiple keys print key=value lines: {out:?}"),
     )?;
 
@@ -931,9 +1082,16 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("K6. illegal sets are rejected with the file unchanged");
     let before = std::fs::read_to_string(&cfg)?;
+    // Over-long endpoint: unix's sun_path budget (107) vs the Windows pipe
+    // name budget (MAX_PATH, 260) — each platform rejects past its own cap.
+    let overlong = if cfg!(unix) {
+        format!("socket=/tmp/{}/ak.sock", "x".repeat(200))
+    } else {
+        format!(r"socket=\\.\pipe\{}", "x".repeat(300))
+    };
     for bad in [
         "socket=", // empty: the transport gate rejects it
-        &format!("socket=/tmp/{}/ak.sock", "x".repeat(200)), // over sun_path
+        &overlong, // over the endpoint length budget
         "foo=1",
         "log_level=verbose",
         "monitor_interval=0",
@@ -1015,8 +1173,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     cli_cfg(bin, &cfg, &["config", "--delete", "socket"])?;
     let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
     expect(
-        out.trim() == format!("/run/appkeeper/{}/ak.sock", current_uid_e2e()),
-        "the deleted key answers with the uid-derived default",
+        default_socket_matches(&out),
+        "the deleted key answers with the platform default",
     )?;
     let text = std::fs::read_to_string(&cfg)?;
     expect(!text.contains("socket ="), "the socket line is gone")?;
@@ -1096,7 +1254,10 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("K11. config --edit through a fake $EDITOR (valid + invalid)");
-    if cfg!(unix) {
+    // Compile-time gating (not `cfg!`): the body uses std::os::unix, which
+    // does not exist in the Windows build of this crate.
+    #[cfg(unix)]
+    {
         let script = dir.join("fake-editor.sh");
         // Valid edit: the config passes validation afterwards.
         std::fs::write(
@@ -1140,9 +1301,9 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
         // Restore a legal config for the following scenario.
         std::fs::write(&cfg, "[daemon]\nsocket = \"/tmp/xk-e2e-edit.sock\"\n")?;
-    } else {
-        println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
     }
+    #[cfg(not(unix))]
+    println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
 
     step("K12. example.toml.sample is not scanned as an app");
     let out = cli_cfg(bin, &cfg, &["list"])?;
@@ -1183,7 +1344,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("K15. $VISUAL wins over $EDITOR for config --edit");
-    if cfg!(unix) {
+    #[cfg(unix)]
+    {
         let visual = dir.join("visual-editor.sh");
         let editor = dir.join("env-editor.sh");
         std::fs::write(
@@ -1213,9 +1375,9 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
                 "$VISUAL won over $EDITOR (visual.sock, not editor.sock): {out:?}"
             ),
         )?;
-    } else {
-        println!("    (windows: the $VISUAL-precedence scenario requires unix; skipping)");
     }
+    #[cfg(not(unix))]
+    println!("    (windows: the $VISUAL-precedence scenario requires unix; skipping)");
     Ok(())
 }
 
@@ -1671,8 +1833,8 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
 
     step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
     let sleep = find_sleep()?;
-    let sleep_s = sleep.to_str().unwrap();
-    let out = cli(bin, ws, &["run", "--", sleep_s, "123", "--name", "adhoc-a"])?;
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--name", "adhoc-a"])?;
     expect(
         out.contains("started") && out.contains("config:") && out.contains("pid:"),
         &format!("run -- registers and reports {{program, config, pid}}: {out:?}"),
@@ -1714,7 +1876,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     // this command line. Identical content is an idempotent success returning
     // the existing pid with no restart.
     let pid_before = pid_of(ws, "adhoc-a")?.expect("adhoc-a is running");
-    let out = cli(bin, ws, &["run", "--", sleep_s, "123", "--name", "adhoc-a"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--name", "adhoc-a"])?;
     expect(
         out.contains("started") && out.contains(&pid_before.to_string()),
         &format!("identical re-run is idempotent (same pid {pid_before}): {out:?}"),
@@ -1724,7 +1886,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "the identical re-run did not restart the process",
     )?;
     // Changed args → regenerated and restarted (new pid).
-    let out = cli(bin, ws, &["run", "--", sleep_s, "456", "--name", "adhoc-a"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "456", "--name", "adhoc-a"])?;
     expect(
         out.contains("started"),
         &format!("the changed re-run succeeds: {out:?}"),
@@ -1757,7 +1919,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         &[
             "run",
             "--",
-            sleep_s,
+            &sleep_s,
             "789",
             "--name",
             "adhoc-quiet",
@@ -1774,7 +1936,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "--restart=no registers but does not start",
     )?;
     // Reserved `all` is refused.
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "--name", "all"])?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--name", "all"])?;
     expect(!ok, "run --name all is rejected")?;
     expect(
         combined.contains("reserved"),
@@ -2017,28 +2179,7 @@ fn post_ndjson_at(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<(u16, String)> {
-    let out = curl_socket(
-        endpoint,
-        &[
-            "-N",
-            "-o",
-            "-",
-            "-w",
-            "\n%{http_code}",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            &body.to_string(),
-        ],
-        path,
-    )
-    .output()
-    .context("curl the ndjson endpoint")?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let (body, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
-    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
+    control_http(endpoint, "POST", path, Some(&body.to_string()))
 }
 
 /// Spawn the daemon against an explicit config, waiting for control-socket
@@ -2061,7 +2202,8 @@ fn spawn_daemon_at(bin: &Path, cfg: &Path, endpoint: &Path) -> Result<Daemon> {
             bail!("secondary daemon did not become healthy in 20s");
         }
         if let Ok(Some(_)) = child.try_wait() {
-            bail!("secondary daemon exited during startup");
+            let log = std::fs::read_to_string(cfg.with_extension("out.log")).unwrap_or_default();
+            bail!("secondary daemon exited during startup: {}", log.trim());
         }
         if socket_health_ok(endpoint) {
             break;
@@ -2086,7 +2228,7 @@ fn pid_of_at(endpoint: &Path, program: &str) -> Result<Option<u32>> {
 
 /// Shut down a daemon on an explicit control endpoint and reap it.
 fn shutdown_daemon_at(endpoint: &Path, daemon: &mut Daemon) {
-    let _ = curl_socket(endpoint, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
+    let _ = control_http(endpoint, "POST", "/v1/shutdown", None);
     for _ in 0..60 {
         if matches!(daemon.child.try_wait(), Ok(Some(_))) {
             return;
@@ -2119,7 +2261,7 @@ fn runfirst_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
 /// leaves `app_dir` untouched (background-daemon / control-plane spec).
 fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
     let sleep = find_sleep()?;
-    let sleep_s = sleep.to_str().unwrap();
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
     let before = app_dir_files(ws);
 
     step("RDF0. offline `run` forms exit 3 and derive no daemon (background-daemon)");
@@ -2130,7 +2272,7 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
     let cmd_form = format!("{sleep_s} 1");
     let forms: [&[&str]; 4] = [
         &["run", "web"],
-        &["run", "--", sleep_s, "--name", "cold"],
+        &["run", "--", &sleep_s, "--name", "cold"],
         &["run", "--cmd", &cmd_form, "--name", "cold2"],
         &["run", "--app", "ghost"],
     ];
@@ -2159,15 +2301,15 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
 /// The online half of the daemon-first acceptance (§8.1–8.3, §8.5–8.6).
 fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
     let sleep = find_sleep()?;
-    let sleep_s = sleep.to_str().unwrap();
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
     let apps = ws.root.join("apps");
 
     // -- 8.1: run <name> / run --app / run -- --json / blocking -------------
 
     step("RDF1. ad-hoc `run --` registers and returns {program, config, pid}");
-    let out = cli(bin, ws, &["run", "--", sleep_s, "300", "--name", "web"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "300", "--name", "web"])?;
     expect(
-        out.contains("web") && out.contains("apps/web.toml") && out.contains("pid:"),
+        out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid:"),
         &format!("run -- reports program/config/pid: {out:?}"),
     )?;
     expect(
@@ -2185,7 +2327,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     wait_state_in(ws, "web", &["stopped"])?;
     let out = cli(bin, ws, &["run", "web"])?;
     expect(
-        out.contains("web") && out.contains("apps/web.toml") && out.contains("pid="),
+        out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid="),
         &format!("run <name> renders the three fields: {out:?}"),
     )?;
     let web2 = wait_running(ws, "web")?;
@@ -2223,7 +2365,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--json", "--", sleep_s, "301", "--name", "json-web"],
+        &["run", "--json", "--", &sleep_s, "301", "--name", "json-web"],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("adhoc --json parses")?;
     expect(
@@ -2263,7 +2405,11 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("each fan-out line carries config and pid: {out:?}"),
     )?;
     expect(
-        out.contains("appkeeper.toml"),
+        // The config_path names the registered deployment file: with a
+        // symlink registration that resolves to the source body
+        // (appkeeper.toml); the hard-link fallback (unprivileged Windows)
+        // reports the link itself (fan.toml) - same file either way.
+        out.contains("appkeeper.toml") || out.contains("fan.toml"),
         &format!("the config_path names the app's config body: {out:?}"),
     )?;
     let json = cli(bin, ws, &["run", "--app", "fan", "--json"])?;
@@ -2366,7 +2512,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
     step("RDF8. a program that exits before startsecs fails with no residue");
     let (ok, code, combined) =
-        cli_try(bin, ws, &["run", "--", sleep_s, "0.05", "--name", "flaky"])?;
+        cli_try(bin, ws, &["run", "--", &sleep_s, "0.05", "--name", "flaky"])?;
     expect(!ok, &format!("early-exit ad-hoc fails: {combined:?}"))?;
     expect(code != 0, &format!("non-zero exit, got {code}"))?;
     expect(
@@ -2395,7 +2541,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         ],
     )?;
     cli(bin, ws, &["apply", "owner"])?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "302", "--name", "clash"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--name", "clash"])?;
     expect(
         !ok && code != 0,
         &format!("cross-app colliding --name is refused, got {code}: {combined:?}"),
@@ -2414,7 +2560,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     // `web` was ad-hoc registered in RDF1; re-submitting it is a full
     // regeneration (app-registry: 同名全量再生), immediate effect.
     let web_pid = pid_of(ws, "web")?.expect("web is running");
-    let out = cli(bin, ws, &["run", "--", sleep_s, "303", "--name", "web"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "303", "--name", "web"])?;
     expect(
         out.contains("started"),
         &format!("a same-name re-submission succeeds: {out:?}"),
@@ -2430,7 +2576,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     )?;
 
     step("RDF10. the reserved `all` name is refused with no residue");
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", sleep_s, "303", "--name", "all"])?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "303", "--name", "all"])?;
     expect(!ok, "run --name all is refused")?;
     expect(
         combined.contains("reserved"),
@@ -2446,7 +2592,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let mut atomic = Command::new(bin)
         .arg("--config")
         .arg(ws.config_arg())
-        .args(["run", "--", sleep_s, "400", "--name", "atomic"])
+        .args(["run", "--", &sleep_s, "400", "--name", "atomic"])
         .stdout(Stdio::from(atomic_log))
         .stderr(Stdio::null())
         .spawn()
@@ -2600,7 +2746,16 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     std::fs::write(&blocker, "not a directory")?;
     let ro_apps = blocker.join("apps");
     let ro_cfg = ws.root.join("daemon-ro.toml");
-    let ro_endpoint = ws.root.join("daemon-ro.sock");
+    // A raw file path is only an endpoint on unix; on Windows the IPC form
+    // is a named pipe, so give the read-only daemon its own pipe name.
+    let ro_endpoint = if cfg!(unix) {
+        ws.root.join("daemon-ro.sock")
+    } else {
+        PathBuf::from(format!(
+            r"\\.\pipe\ak-e2e-ro-{}.sock",
+            std::process::id()
+        ))
+    };
     let ro_logs = ws.root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
         &ro_cfg,
@@ -2643,7 +2798,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         // startup already succeeded — exactly the partial-failure path.
         std::fs::create_dir_all(apps.join("weird.toml"))?;
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", sleep_s, "400", "--name", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("the partial failure exits non-zero, got {code}: {combined:?}"),
@@ -2666,7 +2821,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
         step("RDF15. a re-run detects the residual state and asks (non-TTY refuses)");
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", sleep_s, "400", "--name", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("a non-interactive re-run refuses, got {code}: {combined:?}"),
@@ -2832,6 +2987,14 @@ fn setup_actions_app(ws: &Workspace, bin: &Path) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let bin_s = bin.display().to_string().replace('\\', "/");
     let cfg_s = ws.config_arg().replace('\\', "/");
+    // Command separator: sh takes `;`, cmd takes `&`.
+    let seq = if cfg!(windows) { "& " } else { "; " };
+    let chained = format!(
+        "echo old_svc_pid=${{program.svc.pid}}{seq}{bin} --config {cfg} restart svc{seq}{bin} --config {cfg} pid svc",
+        bin = bin_s,
+        cfg = cfg_s,
+        seq = seq,
+    );
     let text = format!(
         r#"[app]
 restart = "no"
@@ -2845,7 +3008,7 @@ command = "echo svc_pid=${{program.svc.pid}} svc_state=${{program.svc.state}}"
 timeout = 10
 
 [program.svc.action.workdir_probe]
-command = "pwd"
+command = "{workdir_probe}"
 timeout = 5
 
 [program.svc.action.slow]
@@ -2857,7 +3020,7 @@ command = "sleep 4"
 timeout = 30
 
 [program.svc.action.chained]
-command = "echo old_svc_pid=${{program.svc.pid}}; {bin} --config {cfg} restart svc; {bin} --config {cfg} pid svc"
+command = "{chained}"
 timeout = 60
 
 [program.svc.action.stopped_pid]
@@ -2894,8 +3057,10 @@ args = ["-c", "while true; do echo tick; sleep 0.2; done"]
 startsecs = 0.2
 restart = "no"
 "#,
-        bin = bin_s,
-        cfg = cfg_s,
+        chained = chained,
+        // MSYS `pwd` would print the /tmp POSIX form; cmd's builtin `cd`
+        // prints the native Windows cwd.
+        workdir_probe = if cfg!(windows) { "cd" } else { "pwd" },
     );
     std::fs::write(dir.join("appkeeper.toml"), text)?;
     link_registration(&dir.join("appkeeper.toml"), &ws.root.join("apps/acts.toml"))?;
@@ -3087,7 +3252,6 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         svc_running.is_none(),
         "acts programs are not started (restart = no)",
     )?;
-    let acts_dir = ws.root.join("acts");
 
     step("H5. `run --app acts` fans out in dependency order");
     let out = cli(bin, ws, &["run", "--app", "acts"])?;
@@ -3118,7 +3282,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             .spawn()
             .context("spawn `log -f`")?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut len1 = 0usize;
+        let len1: usize;
         loop {
             let text = std::fs::read_to_string(&follow_path).unwrap_or_default();
             if text.contains("tick") {
@@ -3238,9 +3402,17 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     step("H7. the action cwd is the program's work_dir");
     let out = cli(bin, ws, &["action", "svc", "workdir_probe"])?;
+    // The default work_dir is the directory of the app's RESOLVED deployment
+    // file. A symlink registration resolves to the source dir; the hard-link
+    // fallback (unprivileged Windows) is indistinguishable from its target,
+    // so resolution lands on the link's own directory — either way the
+    // invariant under test is "cwd == the app file the daemon loaded".
+    let app_file = std::fs::canonicalize(ws.root.join("apps/acts.toml"))?;
+    let expected = app_file.parent().unwrap();
+    let got = std::fs::canonicalize(out.trim())?;
     expect(
-        out.trim() == acts_dir.to_str().unwrap(),
-        &format!("pwd == work_dir ({}): {out:?}", acts_dir.display()),
+        got == std::fs::canonicalize(expected)?,
+        &format!("pwd == work_dir ({}): {out:?}", expected.display()),
     )?;
 
     step("H8. timeout kills the action process tree");
@@ -3695,7 +3867,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
                 "the console serves on the default listen without an explicit listen",
             )?;
             // The console exits with the daemon (POST /v1/shutdown).
-            let _ = curl_socket(&endpoint2, &["-m", "10", "-X", "POST"], "/v1/shutdown").output();
+            let _ = control_http(&endpoint2, "POST", "/v1/shutdown", None);
             for _ in 0..80 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     break;
@@ -3836,12 +4008,13 @@ fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         !stdout.contains("[bench]"),
         "stdout stays free of progress noise",
     )?;
-    if cfg!(unix) {
-        expect(
-            pids_with_arg("__generate").is_empty(),
-            "no leftover generator processes",
-        )?;
-    }
+    // pids_with_arg is unix-only (a /proc scan); gate at compile time so the
+    // Windows build does not reference it.
+    #[cfg(unix)]
+    expect(
+        pids_with_arg("__generate").is_empty(),
+        "no leftover generator processes",
+    )?;
     expect(
         bench_workspaces().is_empty(),
         "no leftover bench temp workspaces",
@@ -4371,6 +4544,358 @@ console.log('BROWSER PASS OK');
     )
 }
 
+// -- windows service pass (add-windows-service-registration) ----------------------
+
+/// Pure decision over the raw `CheckTokenMembership` outputs, kept separate
+/// from the unsafe SID plumbing so the elevation gate is unit-testable on
+/// every platform (6.1).
+fn token_is_elevated(check_ok: i32, is_member: i32) -> bool {
+    check_ok != 0 && is_member != 0
+}
+
+#[cfg(test)]
+mod elevation_tests {
+    use super::token_is_elevated;
+
+    #[test]
+    fn elevation_requires_a_successful_check_and_membership() {
+        assert!(token_is_elevated(1, 1), "elevated admin token");
+        assert!(!token_is_elevated(1, 0), "check passed but not a member");
+        assert!(!token_is_elevated(0, 1), "a failed check cannot vouch");
+        assert!(!token_is_elevated(0, 0), "failed check, not a member");
+    }
+}
+
+/// Windows-only SCM roundtrip support. Non-Windows builds never reference the
+/// `windows-service`/`windows-sys` crates.
+#[cfg(windows)]
+mod win_service {
+    use std::ffi::OsStr;
+    use std::ptr;
+
+    use windows_service::service::{
+        ServiceAccess, ServiceActionType, ServiceFailureResetPeriod, ServiceStartType, ServiceState,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SID_IDENTIFIER_AUTHORITY,
+    };
+    use windows_sys::Win32::System::Services::{
+        QueryServiceConfig2W, SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW,
+    };
+    use windows_sys::Win32::System::SystemServices::SECURITY_BUILTIN_DOMAIN_RID;
+
+    use super::*;
+
+    /// Collapse runs of whitespace so SCM read-back strings compare equal to
+    /// our render regardless of incidental spacing (same rule appkeeper's own
+    /// snapshot comparison uses).
+    fn normalize_ws(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Read a NUL-terminated wide string handed back by the SCM.
+    ///
+    /// SAFETY: `ptr` must point at a valid NUL-terminated UTF-16 buffer that
+    /// outlives the call (the SCM config buffers below qualify).
+    unsafe fn wide_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        // SAFETY: we only scan forward until the terminator inside the buffer.
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` elements precede the NUL, all initialized.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        String::from_utf16_lossy(slice)
+    }
+
+    /// Best-effort `sc` invocation whose outcome is deliberately ignored.
+    fn sc_quiet(args: &[&str]) {
+        let _ = Command::new("sc.exe")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    /// Cleanup backstop (6.3): whichever step of the roundtrip fails — or the
+    /// harness dies mid-pass — never leave an `xk-e2e-*` service registered
+    /// on the machine. After a successful uninstall both calls are no-ops.
+    struct Scrub(String);
+
+    impl Drop for Scrub {
+        fn drop(&mut self) {
+            sc_quiet(&["stop", &self.0]);
+            sc_quiet(&["delete", &self.0]);
+        }
+    }
+
+    /// Elevation gate (6.1): CheckTokenMembership against
+    /// BUILTIN\Administrators, the same probe appkeeper's own admin check runs.
+    pub(super) fn is_elevated() -> Result<bool> {
+        let authority = SID_IDENTIFIER_AUTHORITY {
+            Value: [0, 0, 0, 0, 0, 5], // SECURITY_NT_AUTHORITY
+        };
+        let mut sid = ptr::null_mut();
+        // SAFETY: one-shot SID construction per the Win32 contract; the SID
+        // is freed on every path below.
+        let ok = unsafe {
+            AllocateAndInitializeSid(
+                &authority,
+                2,
+                SECURITY_BUILTIN_DOMAIN_RID as u32,
+                0x220, // DOMAIN_ALIAS_RID_ADMINS
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &mut sid,
+            )
+        };
+        if ok == 0 {
+            bail!(
+                "AllocateAndInitializeSid failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut member: i32 = 0;
+        // SAFETY: `sid` is valid; a null token handle means the calling
+        // thread's impersonation token (falling back to the process token).
+        let check = unsafe { CheckTokenMembership(ptr::null_mut(), sid, &mut member) };
+        // SAFETY: `sid` was allocated above and is not used afterwards.
+        unsafe { FreeSid(sid) };
+        Ok(super::token_is_elevated(check, member))
+    }
+
+    /// SCM roundtrip (6.2): register the daemon as a Windows service against
+    /// a throwaway config (one long-running app), read every field back
+    /// through the `windows-service` crate — description via raw
+    /// QueryServiceConfig2W, which the crate cannot read — prove the service
+    /// actually supervises the app through the control plane, then uninstall
+    /// and confirm the SCM is clean again. `Scrub` guarantees no
+    /// `xk-e2e-*` service survives a failure.
+    pub(super) fn roundtrip(bin: &Path) -> Result<()> {
+        let name = format!("xk-e2e-{}", std::process::id());
+        let scrub = Scrub(name.clone());
+
+        // Throwaway daemon workspace: its own control port, one app with one
+        // long-running program. The service runs as LocalSystem, whose PATH
+        // lacks the unix-toolbox shims the interactive passes rely on — pin
+        // the absolute sleep path (quoted the way registry scaffolds render).
+        let root = std::env::temp_dir().join(format!("xk-xtask-win-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("apps"))?;
+        std::fs::create_dir_all(root.join("logs"))?;
+        let control_socket = control_socket_in(&root);
+        let ws = Workspace {
+            root: root.clone(),
+            control_socket,
+            webui_port: 0,
+        };
+        let log_dir = root.join("logs").display().to_string().replace('\\', "/");
+        std::fs::write(
+            root.join("daemon.toml"),
+            format!(
+                "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n",
+                socket = socket_toml_value(&ws.control_socket),
+            ),
+        )?;
+        let sleep = find_sleep()?;
+        let sleep_s = sleep.display().to_string().replace('\\', "/");
+        let sleep_tok = if sleep_s.chars().any(char::is_whitespace) {
+            format!("\"{sleep_s}\"")
+        } else {
+            sleep_s
+        };
+        let app_dir = root.join("app-winsvc");
+        std::fs::create_dir_all(&app_dir)?;
+        std::fs::write(
+            app_dir.join("ak.toml"),
+            format!(
+                "[app]\nautostart = true\n\n[program.sleeper]\ncommand = \"{sleep_tok} 100000\"\nstartsecs = 0.2\n"
+            ),
+        )?;
+        link_registration(&app_dir.join("ak.toml"), &root.join("apps/win.toml"))?;
+
+        step("M1. install --name <svc> --desc e2e --now registers and starts the service");
+        let out = cli(
+            bin,
+            &ws,
+            &[
+                "service", "install", "--name", &name, "--desc", "e2e", "--now",
+            ],
+        )?;
+        expect(
+            out.contains(&format!("service {name} installed")),
+            "install reports the new service",
+        )?;
+        expect(
+            out.contains(&format!("service {name} started")),
+            "--now starts the service immediately",
+        )?;
+
+        step("M2. the registration reads back through the windows-service crate");
+        let mgr = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)?;
+        let service = mgr.open_service(
+            &name,
+            ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+        )?;
+        let cfg = service.query_config()?;
+        // binpath: the exact render appkeeper computes, whitespace-normalized on
+        // both sides. The exe is canonicalized in the install child
+        // (current_exe + canonicalize), mirrored here with bin.canonicalize().
+        let exe = bin.canonicalize().context("resolve the daemon exe path")?;
+        let conf = std::path::absolute(ws.config_arg())?;
+        let expected_binpath = format!(
+            "\"{}\" run --config \"{}\" --service {name}",
+            exe.display(),
+            conf.display()
+        );
+        expect(
+            normalize_ws(&cfg.executable_path.to_string_lossy()) == normalize_ws(&expected_binpath),
+            "binpath reads back exactly as rendered (exe + run --config + --service)",
+        )?;
+        expect(
+            cfg.start_type == ServiceStartType::AutoStart,
+            "start type reads back as AutoStart",
+        )?;
+        let failure = service.get_failure_actions()?;
+        expect(
+            matches!(
+                failure.reset_period,
+                ServiceFailureResetPeriod::After(d) if d.as_secs() == 86400
+            ),
+            "failure counter resets after 24h",
+        )?;
+        let actions = failure.actions.unwrap_or_default();
+        expect(
+            actions.len() == 1
+                && actions[0].action_type == ServiceActionType::Restart
+                && actions[0].delay == Duration::from_millis(3000),
+            "an abnormal exit restarts the service after 3s",
+        )?;
+        // The crate has no description getter: SERVICE_CONFIG_DESCRIPTION via
+        // raw windows-sys, the same two-step sized query appkeeper uses.
+        let handle = service.raw_handle();
+        let mut desc_size: u32 = 0;
+        unsafe {
+            QueryServiceConfig2W(
+                handle,
+                SERVICE_CONFIG_DESCRIPTION,
+                ptr::null_mut(),
+                0,
+                &mut desc_size,
+            );
+        };
+        expect(desc_size > 0, "the service carries a description")?;
+        let mut dbuf = vec![0u8; desc_size as usize];
+        let ok = unsafe {
+            QueryServiceConfig2W(
+                handle,
+                SERVICE_CONFIG_DESCRIPTION,
+                dbuf.as_mut_ptr(),
+                dbuf.len() as u32,
+                &mut desc_size,
+            )
+        };
+        if ok == 0 {
+            bail!(
+                "cannot query service description: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let desc = unsafe { &*(dbuf.as_ptr() as *const SERVICE_DESCRIPTIONW) };
+        let description = unsafe { wide_to_string(desc.lpDescription) };
+        expect(description == "e2e", "description reads back as \"e2e\"")?;
+
+        step("M3. the service reaches RUNNING and supervises the test app");
+        let mut running = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if service.query_status()?.current_state == ServiceState::Running {
+                running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        expect(running, "service state reaches RUNNING")?;
+        // The control plane of the service-hosted daemon proves the binpath
+        // works end to end: sleeper must come up with a live pid.
+        let mut supervised = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(body) = api(&ws, "/v1/status") {
+                let v: serde_json::Value = serde_json::from_str(&body)?;
+                if let Some(p) = v["programs"]
+                    .as_array()
+                    .and_then(|ps| ps.iter().find(|p| p["name"] == "sleeper"))
+                    && p["state"] == "running"
+                    && p["pid"].as_u64().unwrap_or(0) > 0
+                {
+                    supervised = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        expect(
+            supervised,
+            "the service-hosted daemon reports sleeper running (pid) on the control plane",
+        )?;
+
+        step("M4. uninstall removes it; a second uninstall is a no-op");
+        let out = cli(bin, &ws, &["service", "uninstall", "--name", &name])?;
+        expect(
+            out.contains(&format!("service {name} uninstalled")),
+            "uninstall reports the removed service",
+        )?;
+        match mgr.open_service(&name, ServiceAccess::QUERY_STATUS) {
+            Err(windows_service::Error::Winapi(e))
+                if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+            {
+                expect(true, "the service is gone from the SCM")?
+            }
+            Ok(_) => bail!("service {name} still exists after uninstall"),
+            Err(e) => return Err(e).context("cannot re-open service after uninstall"),
+        }
+        let out = cli(bin, &ws, &["service", "uninstall", "--name", &name])?;
+        expect(
+            out.contains(&format!("service {name} is not installed")),
+            "the second uninstall is an idempotent no-op",
+        )?;
+        drop(scrub);
+        Ok(())
+    }
+}
+
+/// Windows service SCM roundtrip (6.2/6.3) behind a non-admin warn+skip gate
+/// (6.1): the pass leaves the SCM untouched from an unelevated shell instead
+/// of failing the run.
+#[cfg(windows)]
+fn windows_service_pass(bin: &Path) -> Result<()> {
+    step("M. windows service: install --now → read-back → supervised app → uninstall");
+    let elevated = match win_service::is_elevated() {
+        Ok(v) => v,
+        Err(e) => {
+            println!(
+                "    note: elevation check failed ({e:#}) — skipping the windows service roundtrip"
+            );
+            return Ok(());
+        }
+    };
+    if !elevated {
+        println!("    note: non-admin shell — skipping the windows service roundtrip");
+        return Ok(());
+    }
+    win_service::roundtrip(bin)
+}
+
 // -- entry ----------------------------------------------------------------------
 
 pub(crate) fn run(args: Args) -> Result<()> {
@@ -4406,6 +4931,8 @@ pub(crate) fn run(args: Args) -> Result<()> {
         }
         bench_pass(&bin, &ws)?;
         tcp_control_endpoint_pass(&bin)?;
+        #[cfg(windows)]
+        windows_service_pass(&bin)?;
         Ok(())
     })();
 

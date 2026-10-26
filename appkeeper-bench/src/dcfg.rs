@@ -86,8 +86,31 @@ mod tests {
             "[daemon]\napp_dir = \"/data/apps\"\nlog_dir = \"/data/logs\"\n",
         );
         let p = discover(&f).unwrap();
-        assert_eq!(p.app_dir, PathBuf::from("/data/apps"));
-        assert_eq!(p.log_dir, PathBuf::from("/data/logs"));
+        // The explicit path must win over the config-dir join. A rooted path
+        // without a drive letter is absolute on unix but drive-relative on
+        // Windows, where it picks up the config dir's drive.
+        #[cfg(unix)]
+        {
+            assert_eq!(p.app_dir, PathBuf::from("/data/apps"));
+            assert_eq!(p.log_dir, PathBuf::from("/data/logs"));
+        }
+        #[cfg(windows)]
+        {
+            use std::path::Component;
+            let drive = f
+                .parent()
+                .unwrap()
+                .components()
+                .find_map(|c| match c {
+                    Component::Prefix(p) => {
+                        Some(p.as_os_str().to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                })
+                .expect("the temp config lives on a drive");
+            assert_eq!(p.app_dir, PathBuf::from(format!("{drive}/data/apps")));
+            assert_eq!(p.log_dir, PathBuf::from(format!("{drive}/data/logs")));
+        }
         let _ = std::fs::remove_dir_all(f.parent().unwrap());
     }
 

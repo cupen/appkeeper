@@ -69,9 +69,9 @@ fn leftover_generators() -> Vec<u32> {
     out
 }
 
-// Portable on purpose: it only scans the temp dir, and the `--keep` test
-// asserts with it on every platform (unlike leftover_generators, which
-// needs /proc).
+// Portable: a pure temp-dir name scan (unlike leftover_generators, which
+// walks /proc and stays unix-only). Gating it #[cfg(unix)] broke the Windows
+// build of keep_preserves_the_spawn_workspace below.
 fn leftover_workspaces() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {

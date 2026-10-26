@@ -73,6 +73,11 @@ enum Cmd {
         /// the background log path once the daemon is ready)
         #[arg(long = "detach")]
         detach: bool,
+        /// Internal: run under the Windows Service Control Manager with this
+        /// service name. Never typed by hand — the installer puts it in the
+        /// service binary path. Hidden from help.
+        #[arg(long, value_name = "NAME", hide = true, conflicts_with = "detach")]
+        service: Option<String>,
     },
     /// The client "run" verb (control-plane spec): `run <name>` /
     /// `run --app <app>` starts an already-registered program or fans out
@@ -283,7 +288,8 @@ enum Cmd {
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
     },
-    /// Install/uninstall appkeeper as a system service (Linux systemd; root required)
+    /// Install/uninstall appkeeper as a system service (Windows SCM / Linux
+    /// systemd; administrator/root required)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
@@ -292,29 +298,46 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum ServiceCmd {
-    /// Generate the systemd unit, daemon-reload and enable it
+    /// Register appkeeper as a system service (Windows service / systemd unit)
     Install {
         /// Also start the service right after installing
         #[arg(long, visible_alias = "now")]
         start: bool,
-        /// Overwrite an existing unit whose content differs
+        /// Overwrite an existing service/unit whose configuration differs
         #[arg(long)]
         force: bool,
-        /// Full path to the unit file to write (must end in .service)
-        #[arg(long, value_name = "PATH", default_value = service::DEFAULT_UNIT_FILE)]
-        unit_file: PathBuf,
-        /// Run the service as this user (User= in the unit)
+        /// Linux only: full path to the unit file to write (must end in
+        /// .service). Defaults to /etc/systemd/system/ak.service.
+        /// Not supported on Windows (use --name to pick the service name)
+        #[arg(long, value_name = "PATH")]
+        unit_file: Option<PathBuf>,
+        /// Windows only: SCM service name (default "ak"). Validation:
+        /// non-empty, no '/' and no '\'. Not supported on Linux
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Service description (Windows) / Description= in the unit (Linux).
+        /// Default: "appkeeper process keeper"
+        #[arg(long, value_name = "TEXT")]
+        desc: Option<String>,
+        /// Run the service as this account. Windows: one of LocalSystem
+        /// (default) / LocalService / NetworkService (case-insensitive);
+        /// Linux: User= in the unit
         #[arg(long)]
         user: Option<String>,
         /// systemd Restart= policy written into the unit
         #[arg(long, value_name = "POLICY", default_value_t = service::RestartPolicy::Always)]
         restart: service::RestartPolicy,
     },
-    /// Stop, disable and remove the systemd unit
+    /// Unregister the appkeeper system service (Windows service / systemd unit)
     Uninstall {
-        /// Full path to the unit file to remove (must end in .service)
-        #[arg(long, value_name = "PATH", default_value = service::DEFAULT_UNIT_FILE)]
-        unit_file: PathBuf,
+        /// Linux only: full path to the unit file to remove. Defaults to
+        /// /etc/systemd/system/ak.service. Not supported on Windows
+        #[arg(long, value_name = "PATH")]
+        unit_file: Option<PathBuf>,
+        /// Windows only: SCM service name (default "ak"). Not supported
+        /// on Linux
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
 }
 
@@ -499,11 +522,11 @@ fn dispatch(cli: &Cli) -> Result<()> {
     }
     let config_path = config_path_of(cli);
     match &cli.cmd {
-        Some(Cmd::Daemon { detach }) => {
+        Some(Cmd::Daemon { detach, service }) => {
             if *detach {
                 run_detach(&config_path)
             } else {
-                run_daemon(&config_path)
+                run_daemon(&config_path, service.as_deref())
             }
         }
         Some(Cmd::Run {
@@ -779,20 +802,40 @@ fn dispatch(cli: &Cli) -> Result<()> {
         }
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
         Some(Cmd::Service { cmd }) => {
-            let (action, unit_file, user, force, start, restart) = match cmd {
+            let (action, unit_file, name, desc, user, force, start, restart) = match cmd {
                 ServiceCmd::Install {
                     start,
                     force,
                     unit_file,
+                    name,
+                    desc,
                     user,
                     restart,
-                } => ("install", unit_file, user, *force, *start, *restart),
-                ServiceCmd::Uninstall { unit_file } => {
-                    ("uninstall", unit_file, &None, false, false, service::RestartPolicy::Always)
-                }
+                } => (
+                    "install",
+                    unit_file,
+                    name,
+                    desc,
+                    user,
+                    *force,
+                    *start,
+                    *restart,
+                ),
+                ServiceCmd::Uninstall { unit_file, name } => (
+                    "uninstall",
+                    unit_file,
+                    name,
+                    &None,
+                    &None,
+                    false,
+                    false,
+                    service::RestartPolicy::Always,
+                ),
             };
             let opts = service::ServiceOptions {
                 unit_file: unit_file.clone(),
+                name: name.clone(),
+                desc: desc.clone(),
                 user: user.clone(),
                 force,
                 start,
@@ -2025,7 +2068,50 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 /// `daemon` is the only daemon entry. The web console is config-driven: its
 /// initial state comes from the `[webui]` section of the daemon config
 /// (absent = off), and `ak reload` converges it later at runtime.
-fn run_daemon(config_path: &Path) -> Result<()> {
+///
+/// `service_name` is set when the Windows Service Control Manager starts the
+/// daemon (`ak daemon --service <name>`); `None` is plain console mode.
+fn run_daemon(config_path: &Path, service_name: Option<&str>) -> Result<()> {
+    #[cfg(windows)]
+    if let Some(service_name) = service_name {
+        return service::run_windows_service(config_path, service_name);
+    }
+    #[cfg(not(windows))]
+    if service_name.is_some() {
+        anyhow::bail!("`--service` is only supported on Windows (Service Control Manager)");
+    }
+    run_daemon_console(config_path)
+}
+
+/// Foreground/console daemon: `ak daemon` without `--service`.
+fn run_daemon_console(config_path: &Path) -> Result<()> {
+    let sup = run_daemon_core(config_path)?;
+    info!(
+        "ak {} running (Ctrl+C to stop)",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let shutdown = {
+        let sup2 = sup.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        ctrlc::set_handler(move || {
+            info!("shutdown signal received");
+            sup2.request_shutdown();
+            let _ = f2;
+        })
+        .context("failed to install Ctrl+C / SIGTERM handler")?;
+        flag
+    };
+    let _ = shutdown;
+
+    sup.run();
+    Ok(())
+}
+
+/// Load config, wire the supervisor and its sidecar threads, bind the API and
+/// bootstrap the registry. Shared by console mode and Windows service mode.
+fn run_daemon_core(config_path: &Path) -> Result<Arc<Supervisor>> {
     let (config, existed) = DaemonConfig::load_or_default(config_path)
         .with_context(|| format!("failed to load daemon config {}", config_path.display()))?;
     if !existed {
@@ -2107,29 +2193,10 @@ fn run_daemon(config_path: &Path) -> Result<()> {
             .context("failed to spawn api accept loop")?;
     }
 
-    // Bootstrap the registry and enter the supervision loop.
+    // Bootstrap the registry; the caller decides how to wait for shutdown
+    // (Ctrl+C handler in console mode, SCM status reporting in service mode).
     sup.bootstrap()?;
-    info!(
-        "appkeeper {} running (Ctrl+C to stop)",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    let shutdown = {
-        let sup2 = sup.clone();
-        let flag = Arc::new(AtomicBool::new(false));
-        let f2 = flag.clone();
-        ctrlc::set_handler(move || {
-            info!("shutdown signal received");
-            sup2.request_shutdown();
-            let _ = f2;
-        })
-        .context("failed to install Ctrl+C / SIGTERM handler")?;
-        flag
-    };
-    let _ = shutdown;
-
-    sup.run();
-    Ok(())
+    Ok(sup)
 }
 
 #[cfg(test)]
@@ -2756,14 +2823,14 @@ mod cli_verb_tests {
     #[test]
     fn daemon_subcommand_parses() {
         match parse(&["daemon"]).cmd {
-            Some(Cmd::Daemon { detach }) => assert!(!detach, "bare daemon is foreground"),
+            Some(Cmd::Daemon { detach, .. }) => assert!(!detach, "bare daemon is foreground"),
             other => panic!("expected Daemon, got {other:?}"),
         }
         let cli = parse(&["daemon", "--detach"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true })));
+        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true, .. })));
         // The global `-c/--config` keeps working in both positions.
         let cli = parse(&["-c", "/tmp/x.toml", "daemon", "--detach"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true })));
+        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true, .. })));
         assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/x.toml")));
     }
 

@@ -961,13 +961,27 @@ sudo ak service uninstall          # stop + disable + 删除 unit + daemon-reloa
 - `[daemon] socket` 可显式覆盖端点路径（unix 限 107 字节内；指向自定义目录时
   daemon 不会改动该目录的权限位）。
 
-Windows 暂不支持 `ak service`（nssm 仍可用）：
+Windows（SCM）同样一条命令（需要管理员 shell）：
 
 ```bat
-nssm install appkeeper D:\tools\appkeeper\ak.exe
-nssm set appkeeper AppParameters daemon
-nssm start appkeeper
+ak service install            :: 注册为自动启动的 Windows 服务
+ak service install --start    :: 安装后立即 start（--now 为其别名）
+ak service uninstall          :: stop + 删除服务
 ```
+
+可选参数：`--name <名称>`（服务名，默认 `ak`；非空、不含 `/` 与 `\`；
+Windows 专用，Linux 下使用会直接报错）、`--desc <文本>`（服务描述，默认
+`appkeeper process keeper`）、`--user <账户>`（仅内置账户 `LocalSystem`（默认）/
+`LocalService`/`NetworkService`，大小写不敏感，映射到 `NT AUTHORITY\...`；
+不支持密码，其他账户报错）、`--force`（同名服务已存在且配置不同时覆盖；不加时
+给出明确报错并提示使用 `--force`）。重复安装配置一致时幂等跳过。服务模式按
+SCM 状态机报告 START_PENDING → RUNNING → STOP_PENDING → STOPPED；stop 的等待
+预算按已注册程序的最大 `stop_timeout` 估算（2×最大值 + 10s，配置不可加载时
+90s）；异常退出 3s 后自动重启，失败计数 24h 重置——正常停止不触发重启。
+Linux 专用参数 `--unit-file` 在 Windows 下使用会直接报错。
+
+注意：服务模式下 daemon 没有控制台，stderr（包括 env_logger 输出）不可见——
+请通过 web console 或 `ak log <name>` 查看程序输出。
 
 appkeeper 被强杀时，Windows 上子进程树由 Job Object（kill-on-close）由内核
 兜底清理；Unix 上子进程位于独立进程组，正常路径按进程组终止。
