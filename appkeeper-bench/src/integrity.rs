@@ -145,7 +145,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "xk-bench-int-{}-{tag}-{}",
+            "ak-test-int-{}-{tag}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

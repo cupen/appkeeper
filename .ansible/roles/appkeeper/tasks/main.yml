@@ -13,7 +13,7 @@
 
 - name: Classify binary source (URL or local path)
   ansible.builtin.set_fact:
-    xk_binary_is_url: "{{ appkeeper_binary_src is string and appkeeper_binary_src | lower is match('https?://') }}"
+    ak_binary_is_url: "{{ appkeeper_binary_src is string and appkeeper_binary_src | lower is match('https?://') }}"
 
 # ---- 控制机侧：解析源文件与 checksum（不触碰目标机） ----
 - name: Prepare controller staging directory
@@ -21,7 +21,7 @@
     path: "{{ appkeeper_staging_dir }}"
     state: directory
     mode: "0755"
-  when: xk_binary_is_url | bool
+  when: ak_binary_is_url | bool
   delegate_to: localhost
   become: false
 
@@ -31,32 +31,32 @@
     dest: "{{ appkeeper_staging_dir }}/appkeeper-staged-{{ inventory_hostname }}"
     mode: "0755"
     checksum: "{{ ('sha256:' ~ appkeeper_binary_checksum) if appkeeper_binary_checksum | length > 0 else omit }}"
-  register: xk_stage_binary
-  when: xk_binary_is_url | bool
+  register: ak_stage_binary
+  when: ak_binary_is_url | bool
   delegate_to: localhost
   become: false
 
 - name: Resolve effective binary source path
   ansible.builtin.set_fact:
-    xk_binary_effective_src: "{{ xk_stage_binary.dest if xk_binary_is_url | bool else appkeeper_binary_src }}"
+    ak_binary_effective_src: "{{ ak_stage_binary.dest if ak_binary_is_url | bool else appkeeper_binary_src }}"
 
 - name: Stat binary source on controller
   ansible.builtin.stat:
-    path: "{{ xk_binary_effective_src }}"
+    path: "{{ ak_binary_effective_src }}"
     get_checksum: true
-  register: xk_src_binary
+  register: ak_src_binary
   delegate_to: localhost
   become: false
-  failed_when: not xk_src_binary.stat.exists
+  failed_when: not ak_src_binary.stat.exists
 
 - name: Stat config source on controller
   ansible.builtin.stat:
     path: "{{ appkeeper_config_src }}"
     get_checksum: true
-  register: xk_src_config
+  register: ak_src_config
   delegate_to: localhost
   become: false
-  failed_when: not xk_src_config.stat.exists
+  failed_when: not ak_src_config.stat.exists
 
 # ---- 目标机侧：护栏预检（只读），通过后才进入安装 ----
 - name: Run existing-install guard (read-only preflight)
@@ -64,7 +64,7 @@
 
 - name: Skip host on idempotent hit (no changes will be made)
   ansible.builtin.meta: end_host
-  when: xk_idempotent_hit | bool
+  when: ak_idempotent_hit | bool
 
 - name: Install appkeeper (binary, config, service)
   ansible.builtin.include_tasks: install.yml
@@ -73,6 +73,6 @@
   ansible.builtin.file:
     path: "{{ appkeeper_staging_dir }}"
     state: absent
-  when: xk_binary_is_url | bool
+  when: ak_binary_is_url | bool
   delegate_to: localhost
   become: false

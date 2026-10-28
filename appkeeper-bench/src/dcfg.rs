@@ -69,7 +69,7 @@ mod tests {
 
     fn write_tmp(name: &str, body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "xk-bench-dcfg-test-{}-{}",
+            "ak-test-dcfg-{}-{}",
             std::process::id(),
             name
         ));
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_a_clear_error() {
-        let err = discover(Path::new("/nonexistent/xk-bench/daemon.toml")).unwrap_err();
+        let err = discover(Path::new("/nonexistent/ak-bench/daemon.toml")).unwrap_err();
         assert!(
             format!("{err:#}").contains("same host"),
             "error explains the connect-mode requirement: {err:#}"
@@ -146,13 +146,13 @@ mod tests {
     fn windows_style_literal_strings_parse() {
         // the daemon config writer emits single-quoted literal TOML strings
         // for Windows paths; make sure the toml crate handles those here too.
-        let f = write_tmp("literal", "[daemon]\nlog_dir = 'C:\\xk\\logs'\n");
+        let f = write_tmp("literal", "[daemon]\nlog_dir = 'C:\\ak\\logs'\n");
         let p = discover(&f).unwrap();
         // resolve_path semantics: C:\... is absolute only on Windows
         let expected = if cfg!(windows) {
-            PathBuf::from("C:\\xk\\logs")
+            PathBuf::from("C:\\ak\\logs")
         } else {
-            f.parent().unwrap().join("C:\\xk\\logs")
+            f.parent().unwrap().join("C:\\ak\\logs")
         };
         assert_eq!(
             p.log_dir, expected,

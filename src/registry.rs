@@ -988,7 +988,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-reg-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-reg-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1477,7 +1477,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // root can write anything; can't simulate the failure
         }
-        let tmp = std::env::temp_dir().join(format!("xk-registry-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let app_dir = tmp.join("app.d");
         std::fs::create_dir_all(&app_dir).unwrap();

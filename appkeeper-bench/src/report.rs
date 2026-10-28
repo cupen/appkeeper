@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn json_file_round_trips() {
         let r = sample_report();
-        let dir = std::env::temp_dir().join(format!("xk-bench-report-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-report-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("report.json");
         r.write_json(&p).unwrap();

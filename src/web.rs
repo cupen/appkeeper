@@ -1223,7 +1223,7 @@ mod tests {
     /// into the shared sampler table.
     fn sup_with_metrics() -> (Arc<Supervisor>, String) {
         let config = DaemonConfig::default();
-        let dir = std::env::temp_dir().join(format!("xk-web-metrics-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-web-metrics-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sup = Supervisor::new(config, &dir).unwrap();
         let raw: AppRaw = toml::from_str("[program.m]\ncommand = 'true'\n").unwrap();
@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn control_plane_status_carries_metrics() {
         let (sup, name) = sup_with_metrics();
-        let dir = std::env::temp_dir().join(format!("xk-web-metrics-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-web-metrics-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("ak.sock");
         let cfg_path = dir.join("daemon.toml");
@@ -1514,7 +1514,7 @@ mod high_speed_tests {
     /// whose out-ring is directly pushable (stand-in for a firehose child).
     async fn firehose_setup() -> (Arc<Supervisor>, String, ClientWs, Arc<pump::Ring>) {
         let config = DaemonConfig::default();
-        let dir = std::env::temp_dir().join(format!("xk-hs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-hs-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sup = Supervisor::new(config, &dir).unwrap();
         let raw: AppRaw = toml::from_str("[program.m]\ncommand = 'true'\n").unwrap();
@@ -1673,7 +1673,7 @@ mod high_speed_tests {
     /// line-for-line while the ring stays bounded.
     #[test]
     fn pump_writes_every_line_to_disk_under_batching() {
-        let tmp = std::env::temp_dir().join(format!("xk-hs-disk-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-hs-disk-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let total = 50_000;
         let text: String = (0..total)
@@ -1710,7 +1710,7 @@ mod pending_ws_tests {
 
     fn sup_with_pending() -> std::sync::Arc<Supervisor> {
         let config = crate::config::DaemonConfig::default();
-        let dir = std::env::temp_dir().join(format!("xk-web-pending-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-web-pending-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sup = Supervisor::new(config, &dir).unwrap();
         {

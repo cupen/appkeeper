@@ -83,7 +83,7 @@ fn free_port() -> Result<u16> {
 }
 
 fn spawn_daemon(bin: &Path, _args: &Args) -> Result<Daemon> {
-    let workspace = std::env::temp_dir().join(format!("xk-xtask-stress-{}", std::process::id()));
+    let workspace = std::env::temp_dir().join(format!("ak-xtask-stress-{}", std::process::id()));
     let app_dir = workspace.join("app");
     std::fs::create_dir_all(&app_dir).context("create workspace")?;
 

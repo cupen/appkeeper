@@ -1236,13 +1236,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("xk-svc-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("ak-test-svc-{tag}-{}", std::process::id()))
     }
 
     #[test]
     fn unit_file_accepts_legal_and_rejects_illegal() {
         assert!(is_valid_unit_file(Path::new("/etc/systemd/system/ak.service")));
-        assert!(is_valid_unit_file(Path::new("xk-prod_1.service")));
+        assert!(is_valid_unit_file(Path::new("ak-prod_1.service")));
         assert!(is_valid_unit_file(Path::new("a.service")));
         assert!(is_valid_unit_file(Path::new("my-app_v2.service")));
         for bad in [
@@ -1263,8 +1263,8 @@ mod tests {
     #[test]
     fn unit_name_derived_from_file_stem() {
         assert_eq!(
-            unit_name_of(Path::new("/etc/systemd/system/xk.service")),
-            "xk"
+            unit_name_of(Path::new("/etc/systemd/system/ak.service")),
+            "ak"
         );
         assert_eq!(unit_name_of(Path::new("my-app.service")), "my-app");
     }
@@ -1340,14 +1340,14 @@ mod tests {
             Path::new("/opt/my tools/appkeeper"),
             Path::new("/etc/my conf/appkeeper.toml"),
             None,
-            Some("svc-xk"),
+            Some("svc-ak"),
             RestartPolicy::Always,
             60,
         );
         assert!(unit.contains(
             "ExecStart=\"/opt/my tools/appkeeper\" daemon --config \"/etc/my conf/appkeeper.toml\"\n"
         ));
-        assert!(unit.contains("User=svc-xk\n"));
+        assert!(unit.contains("User=svc-ak\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
     }
 
@@ -1509,7 +1509,7 @@ mod tests {
     #[test]
     fn service_name_must_be_non_empty_without_slashes() {
         assert!(is_valid_service_name("ak"));
-        assert!(is_valid_service_name("xk-e2e-1234"));
+        assert!(is_valid_service_name("ak-xtask-e2e-1234"));
         assert!(!is_valid_service_name(""));
         assert!(!is_valid_service_name("a/b"));
         assert!(!is_valid_service_name("a\\b"));
@@ -1556,13 +1556,13 @@ mod tests {
         );
         // Space-free paths are quoted too (uniform rule, read-back matches).
         let bp = render_binpath(
-            Path::new(r"C:\xk\ak.exe"),
-            Path::new(r"C:\xk\daemon.toml"),
-            "xk",
+            Path::new(r"C:\ak\ak.exe"),
+            Path::new(r"C:\ak\daemon.toml"),
+            "ak",
         );
         assert_eq!(
             bp,
-            r#""C:\xk\ak.exe" daemon --config "C:\xk\daemon.toml" --service xk"#
+            r#""C:\ak\ak.exe" daemon --config "C:\ak\daemon.toml" --service ak"#
         );
     }
 
@@ -1578,27 +1578,27 @@ mod tests {
     fn install_flags_reject_platform_misuse() {
         // Linux names units by --unit-file, never --name.
         let unix_with_name = ServiceOptions {
-            name: Some("xk".into()),
+            name: Some("ak".into()),
             ..opts()
         };
         assert!(check_install_flags(Platform::Unix, &unix_with_name).is_err());
         assert!(check_uninstall_flags(Platform::Unix, &unix_with_name).is_err());
         // Windows names the service with --name, never --unit-file.
         let win_with_unit = ServiceOptions {
-            unit_file: Some(PathBuf::from("/etc/systemd/system/xk.service")),
+            unit_file: Some(PathBuf::from("/etc/systemd/system/ak.service")),
             ..opts()
         };
         assert!(check_install_flags(Platform::Windows, &win_with_unit).is_err());
         assert!(check_uninstall_flags(Platform::Windows, &win_with_unit).is_err());
         // Properly-scoped combos pass.
         let unix_plain = ServiceOptions {
-            unit_file: Some(PathBuf::from("/etc/systemd/system/xk.service")),
+            unit_file: Some(PathBuf::from("/etc/systemd/system/ak.service")),
             ..opts()
         };
         assert!(check_install_flags(Platform::Unix, &unix_plain).is_ok());
         assert!(check_uninstall_flags(Platform::Unix, &unix_plain).is_ok());
         let win_plain = ServiceOptions {
-            name: Some("xk".into()),
+            name: Some("ak".into()),
             ..opts()
         };
         assert!(check_install_flags(Platform::Windows, &win_plain).is_ok());

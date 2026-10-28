@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn firehose_is_one_program_with_rotation_off() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-f", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-f", std::process::id()));
         let plans = plan(&eff(Case::Firehose), &fake_exe(), &dir).unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].name, "appkeeper-bench-firehose");
@@ -171,7 +171,7 @@ mod tests {
     fn fanout_spawns_named_programs_with_split() {
         let mut e = eff(Case::Fanout);
         e.programs = 3;
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-n", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-n", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         assert_eq!(
             plans.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
@@ -194,7 +194,7 @@ mod tests {
     fn rotation_uses_design_d9_sizing() {
         let mut e = eff(Case::Rotation);
         e.rows_per_program = 200_000;
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-r", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-r", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         // 200000 * 129 bytes = 25.8MB; threshold 65536 → 394 rotations + 2
         assert!(
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn rotation_without_row_bound_falls_back_to_a_generous_keep() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-u", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-u", std::process::id()));
         let plans = plan(&eff(Case::Rotation), &fake_exe(), &dir).unwrap();
         assert!(plans[0].toml.contains("log_rotate_keep = 64"));
         assert!(plans[0].toml.contains("log_max_size = \"65536\""));
@@ -224,7 +224,7 @@ mod tests {
         let mut e = eff(Case::Fanout);
         e.programs = 4;
         e.total_all = 1000;
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-s", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-s", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         for p in &plans {
             assert!(p.toml.contains("'--total-size', '250'"), "{}", p.toml);
@@ -236,7 +236,7 @@ mod tests {
     fn drip_keeps_explicit_rate_in_generator_args() {
         let mut e = eff(Case::Drip);
         e.rate = Some(100);
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-d", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-d", std::process::id()));
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         assert!(
             plans[0].toml.contains("'--rate', '100'"),
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn paths_with_single_quotes_are_refused() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-plan-{}-q", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-q", std::process::id()));
         let err = plan(&eff(Case::Firehose), &PathBuf::from("/fake'quote"), &dir).unwrap_err();
         assert!(format!("{err:#}").contains("single quote"));
         let _ = std::fs::remove_dir_all(&dir);

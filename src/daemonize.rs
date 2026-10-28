@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-daemonize-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-daemonize-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -369,7 +369,7 @@ mod tests {
         let config_path = dir.join("daemon.toml");
         std::fs::write(
             &config_path,
-            "[daemon]\nsocket = \"/tmp/xk-daemonize-spawn.sock\"\n",
+            "[daemon]\nsocket = \"/tmp/ak-test-daemonize-spawn.sock\"\n",
         )
         .unwrap();
         let pid = spawn_detached(&config_path, &log).expect("spawn");

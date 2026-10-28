@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn slow_subscriber_gets_gap_ring_and_disk_stay_complete() {
-        let tmp = std::env::temp_dir().join(format!("xk-gap-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-gap-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let ring = Ring::new(1000);
         let path = tmp.join("g.log");
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn pump_batches_lines_and_flushes_on_eof() {
-        let tmp = std::env::temp_dir().join(format!("xk-pump-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-pump-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let data = "l1\nl2\nl3\n";
         let reader = std::io::Cursor::new(data.as_bytes().to_vec());
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn pump_flushes_partial_line_at_eof() {
-        let tmp = std::env::temp_dir().join(format!("xk-pump-eof-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-pump-eof-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let reader = std::io::Cursor::new(b"complete\npartial-no-newline".to_vec());
         let ring = Ring::new(10);
@@ -658,7 +658,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // root can write anywhere; the scenario cannot be built
         }
-        let tmp = std::env::temp_dir().join(format!("xk-ro-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-ro-{}", std::process::id()));
         let dir = tmp.join("readonly");
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn rotation_shifts_files() {
-        let tmp = std::env::temp_dir().join(format!("xk-rot-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-rot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let p = tmp.join("t.log");
         std::fs::write(&p, "current").unwrap();

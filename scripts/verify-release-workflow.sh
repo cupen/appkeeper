@@ -482,7 +482,7 @@ printf 'two\n' > "$r/assets/ak-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
 printf 'three\n' > "$r/assets/ak-0.1.0-x86_64-pc-windows-msvc.zip"
 ( cd "$r/assets" && bash "$tmp/sums.sh" >/dev/null 2>&1 )
 notes="$r/notes.md"
-if ( cd "$r" && PATH="$tmp/bin:$PATH" GITHUB_REF_NAME=v0.1.0 GITHUB_REPOSITORY=cupen/xkeeper \
+if ( cd "$r" && PATH="$tmp/bin:$PATH" GITHUB_REF_NAME=v0.1.0 GITHUB_REPOSITORY=cupen/appkeeper \
      bash "$tmp/notes.sh" > "$notes" 2>/dev/null ); then
   ok "notes assembled"
 else
@@ -548,7 +548,7 @@ for f in ak-*-x86_64-unknown-linux-musl.tar.gz \
   : > "$r/assets/$(basename "$f")"
 done
 run_create() {
-  ( cd "$r" && PATH="$tmp/bin:$PATH" GITHUB_REF_NAME="$1" GITHUB_REPOSITORY=cupen/xkeeper \
+  ( cd "$r" && PATH="$tmp/bin:$PATH" GITHUB_REF_NAME="$1" GITHUB_REPOSITORY=cupen/appkeeper \
     bash "$tmp/create.sh" 2>/dev/null )
 }
 # Formal, all three prerelease spellings, and a dash-bearing tag that is *not*
@@ -574,7 +574,7 @@ done
 # The release job has no checkout step, so `gh release create` must be told the
 # repo explicitly; and the assembled notes file must be what gets published.
 out="$(run_create v0.1.0)"
-if grep -qF -- '--repo cupen/xkeeper' <<<"$out"; then
+if grep -qF -- '--repo cupen/appkeeper' <<<"$out"; then
   ok "--repo <owner/name> passed (release job has no checkout)"
 else
   bad "--repo missing: gh would run outside a repository in the release job"

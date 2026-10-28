@@ -563,7 +563,7 @@ mod tests {
     /// 目标不可达 → 非零退出并报错说明连接失败).
     #[test]
     fn unreachable_endpoint_is_reported_with_its_path() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-api-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-api-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("absent.sock");
@@ -578,7 +578,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_endpoint_file_is_refused() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-api2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-api2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("ak.sock");

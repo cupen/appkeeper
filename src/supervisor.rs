@@ -2730,7 +2730,7 @@ mod tests {
     }
 
     fn setup(app_name: &str, toml_text: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("xk-apply-{}-{}", unique_tag(), app_name));
+        let dir = std::env::temp_dir().join(format!("ak-test-apply-{}-{}", unique_tag(), app_name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
@@ -2987,7 +2987,7 @@ mod tests {
     /// apply-workflow: a scoped apply leaves other apps' pending intact.
     #[test]
     fn scoped_apply_does_not_touch_other_apps() {
-        let dir = std::env::temp_dir().join(format!("xk-scope-{}", unique_tag()));
+        let dir = std::env::temp_dir().join(format!("ak-test-scope-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
@@ -3129,7 +3129,7 @@ mod tests {
     /// apply-workflow: cross-app validation failure aborts with no pending.
     #[test]
     fn detect_refuses_cross_app_conflict() {
-        let dir = std::env::temp_dir().join(format!("xk-conflict-{}", unique_tag()));
+        let dir = std::env::temp_dir().join(format!("ak-test-conflict-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
@@ -3939,7 +3939,7 @@ mod tests {
     /// `unless-stopped` program down, while `always` is pulled up regardless.
     #[test]
     fn user_stop_record_persists_across_daemon_restart() {
-        let dir = std::env::temp_dir().join(format!("xk-persist-{}", unique_tag()));
+        let dir = std::env::temp_dir().join(format!("ak-test-persist-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let logs = dir.join("logs");
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
@@ -3990,7 +3990,7 @@ mod tests {
     /// user-stop set (worst case one extra pull-up) instead of failing.
     #[test]
     fn corrupt_state_file_is_tolerated() {
-        let dir = std::env::temp_dir().join(format!("xk-state-{}", unique_tag()));
+        let dir = std::env::temp_dir().join(format!("ak-test-state-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let logs = dir.join("logs");
         std::fs::create_dir_all(&logs).unwrap();
@@ -4061,7 +4061,7 @@ mod tests {
     /// A bare supervisor (no registered apps) with a private app_dir/log_dir
     /// and a running supervision loop, for ad-hoc tests.
     fn adhoc_harness(tag: &str) -> (Arc<Supervisor>, PathBuf, std::thread::JoinHandle<()>) {
-        let dir = std::env::temp_dir().join(format!("xk-adhoc-{}-{}", unique_tag(), tag));
+        let dir = std::env::temp_dir().join(format!("ak-test-adhoc-{}-{}", unique_tag(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");

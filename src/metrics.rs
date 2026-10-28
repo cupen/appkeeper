@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn sampler_populates_and_degrades() {
-        let dir = std::env::temp_dir().join(format!("xk-metrics-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-metrics-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (sup, name) = make_sup_with_sleeper(&dir);
         {
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn sampler_panic_is_isolated_from_daemon() {
-        let dir = std::env::temp_dir().join(format!("xk-metrics-panic-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-metrics-panic-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (sup, name) = make_sup_with_sleeper(&dir);
         {

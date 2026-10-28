@@ -6,4 +6,4 @@
     name: "{{ appkeeper_service_name }}"
     state: restarted
     enabled: true
-  when: xk_unit_pre.stat.exists
+  when: ak_unit_pre.stat.exists

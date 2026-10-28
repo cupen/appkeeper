@@ -230,7 +230,7 @@ export class AkApp extends LitElement {
     return html`
       <nav aria-label="Primary">
         <a class="brand" href="/">
-          <span class="mark" aria-hidden="true">xk</span>
+          <span class="mark" aria-hidden="true">ak</span>
           <span class="name">appkeeper<small>console</small></span>
         </a>
         <ak-console-tree

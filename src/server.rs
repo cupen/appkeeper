@@ -1424,7 +1424,7 @@ mod tests {
     /// metric fields from the shared sampler table; not-running → null.
     #[test]
     fn program_info_merges_metrics_from_table() {
-        let dir = std::env::temp_dir().join(format!("xk-proj-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-proj-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::config::DaemonConfig::default();
         let sup = Supervisor::new(config, &dir).unwrap();
@@ -1506,7 +1506,7 @@ mod tests {
     /// private app_dir/log_dir; returns (sup, dir, endpoint). Caller shuts
     /// down.
     fn serve_harness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
-        let dir = std::env::temp_dir().join(format!("xk-srv-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-srv-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let socket = dir.join("ak.sock");
@@ -1939,7 +1939,7 @@ mod tests {
     /// `tcp://127.0.0.1:<port>` with a Bearer token — the `tcp://` shape of
     /// `[daemon] socket` (task 2.1).
     fn serve_harness_tcp(tag: &str, token: &str) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
-        let dir = std::env::temp_dir().join(format!("xk-srv-tcp-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-srv-tcp-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let port = free_tcp_port();

@@ -529,7 +529,7 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-prog-{}-{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-prog-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     }

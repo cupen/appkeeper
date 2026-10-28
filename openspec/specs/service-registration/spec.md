@@ -108,8 +108,8 @@
 
 #### Scenario: 自定义 unit 名安装与卸载
 
-- **WHEN** 用户执行 `ak service install --name xk-prod` 随后 `ak service uninstall --name xk-prod`
-- **THEN** 安装生成 `/etc/systemd/system/xk-prod.service`，卸载删除该文件且不影响其他 unit
+- **WHEN** 用户执行 `ak service install --name ak-prod` 随后 `ak service uninstall --name ak-prod`
+- **THEN** 安装生成 `/etc/systemd/system/ak-prod.service`，卸载删除该文件且不影响其他 unit
 
 #### Scenario: 非法 unit 名
 

@@ -15,7 +15,7 @@
 
 - name: Distribute appkeeper binary
   ansible.builtin.copy:
-    src: "{{ xk_binary_effective_src }}"
+    src: "{{ ak_binary_effective_src }}"
     dest: "{{ appkeeper_binary_dest }}"
     owner: root
     group: root
@@ -33,20 +33,20 @@
 
 - name: Build service install argument list
   ansible.builtin.set_fact:
-    xk_service_install_argv: >-
+    ak_service_install_argv: >-
       {{ [appkeeper_binary_dest, 'service', 'install', '--now', '--name', appkeeper_service_name]
-         + (['--force'] if (appkeeper_force_overwrite | bool and xk_traces | length > 0) else [])
+         + (['--force'] if (appkeeper_force_overwrite | bool and ak_traces | length > 0) else [])
          + (['--user', appkeeper_service_user] if appkeeper_service_user | length > 0 else []) }}
 
 - name: Register and start ak service
   ansible.builtin.command:
-    argv: "{{ xk_service_install_argv }}"
-  changed_when: not xk_unit_pre.stat.exists
+    argv: "{{ ak_service_install_argv }}"
+  changed_when: not ak_unit_pre.stat.exists
 
 - name: Verify service is running
   ansible.builtin.command: "systemctl is-active {{ appkeeper_service_name }}"
-  register: xk_active_post
+  register: ak_active_post
   changed_when: false
-  failed_when: xk_active_post.rc != 0
+  failed_when: ak_active_post.rc != 0
   # check 模式不会真正注册服务，无从验证
   when: not ansible_check_mode

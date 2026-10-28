@@ -454,7 +454,7 @@ mod tests {
     }
 
     fn work_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-action-{}-{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-action-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     }
@@ -651,7 +651,7 @@ mod tests {
                 state: "running".into(),
                 app: "demo".into(),
                 work_dir: PathBuf::from("/opt/api"),
-                log_dir: PathBuf::from("/var/log/xk"),
+                log_dir: PathBuf::from("/var/log/ak"),
             },
         );
         ctx.programs.insert(
@@ -664,7 +664,7 @@ mod tests {
         );
         assert_eq!(
             ctx.substitute("pid=${program.api.pid} state=${program.api.state} app=${program.api.app} wd=${program.api.work_dir} ld=${program.api.log_dir}"),
-            "pid=4242 state=running app=demo wd=/opt/api ld=/var/log/xk"
+            "pid=4242 state=running app=demo wd=/opt/api ld=/var/log/ak"
         );
         // Cross-program reference by global name.
         assert_eq!(ctx.substitute("api=${program.api.pid}"), "api=4242");

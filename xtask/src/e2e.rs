@@ -59,12 +59,12 @@
 //!   (app-scope) confirms and applies, the result text renders, and a second
 //!   app's pending is untouched by the scoped apply.
 //! - windows service pass (Windows + admin only, add-windows-service-registration):
-//!   `service install --name xk-e2e-<pid> --desc e2e --now` against a throwaway
+//!   `service install --name ak-xtask-e2e-<pid> --desc e2e --now` against a throwaway
 //!   config, read the registration back through the windows-service crate
 //!   (binpath/AutoStart/failure actions/description), watch the service reach
 //!   RUNNING and supervise the test app via the control plane, then uninstall
 //!   and confirm an idempotent second uninstall. A non-admin shell warns and
-//!   skips; an sc.exe stop+delete scrub guard guarantees no `xk-e2e-*` service
+//!   skips; an sc.exe stop+delete scrub guard guarantees no `ak-xtask-e2e-*` service
 //!   is left behind on failure.
 //!
 //! Fast correctness tests stay in `cargo test` + `pnpm test`; this harness
@@ -107,7 +107,7 @@ fn free_port() -> Result<u16> {
 
 /// alpha: web + worker. beta: job. Both restart = "always".
 fn setup_workspace(tag: &str) -> Result<Workspace> {
-    let root = std::env::temp_dir().join(format!("xk-xtask-e2e-{tag}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ak-xtask-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["apps", "logs", "app-alpha", "app-beta"] {
         std::fs::create_dir_all(root.join(d)).context("create workspace dirs")?;
@@ -550,7 +550,7 @@ fn find_sleep() -> Result<PathBuf> {
     if !src.display().to_string().chars().any(char::is_whitespace) {
         return Ok(src);
     }
-    let dst_dir = std::env::temp_dir().join("xk-e2e-bin");
+    let dst_dir = std::env::temp_dir().join("ak-xtask-e2e-bin");
     std::fs::create_dir_all(&dst_dir)?;
     let dst = dst_dir.join(exe);
     if !dst.is_file() {
@@ -1262,7 +1262,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         // Valid edit: the config passes validation afterwards.
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-edit.sock\"\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/ak-xtask-edit.sock\"\\n' > \"$1\"\n",
         )?;
         chmod_exec(&script)?;
         let out = Command::new(bin)
@@ -1275,7 +1275,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         expect(out.status.success(), "a valid edit exits 0")?;
         let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
         expect(
-            out.trim() == "/tmp/xk-e2e-edit.sock",
+            out.trim() == "/tmp/ak-xtask-edit.sock",
             "the edited value is effective",
         )?;
         // Invalid edit: exit 2 and the file keeps the editor's content.
@@ -1300,7 +1300,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "the file keeps the editor's content (no rollback)",
         )?;
         // Restore a legal config for the following scenario.
-        std::fs::write(&cfg, "[daemon]\nsocket = \"/tmp/xk-e2e-edit.sock\"\n")?;
+        std::fs::write(&cfg, "[daemon]\nsocket = \"/tmp/ak-xtask-edit.sock\"\n")?;
     }
     #[cfg(not(unix))]
     println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
@@ -1350,11 +1350,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         let editor = dir.join("env-editor.sh");
         std::fs::write(
             &visual,
-            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-visual.sock\"\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/ak-xtask-visual.sock\"\\n' > \"$1\"\n",
         )?;
         std::fs::write(
             &editor,
-            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/xk-e2e-editor.sock\"\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf '[daemon]\\nsocket = \"/tmp/ak-xtask-editor.sock\"\\n' > \"$1\"\n",
         )?;
         for s in [&visual, &editor] {
             chmod_exec(s)?;
@@ -1370,7 +1370,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         expect(out.status.success(), "the edit through $VISUAL exits 0")?;
         let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
         expect(
-            out.trim() == "/tmp/xk-e2e-visual.sock",
+            out.trim() == "/tmp/ak-xtask-visual.sock",
             &format!(
                 "$VISUAL won over $EDITOR (visual.sock, not editor.sock): {out:?}"
             ),
@@ -1553,7 +1553,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "--args",
             "100000",
             "--env",
-            "XK_E2E=1",
+            "AK_E2E=1",
         ],
     )?;
     expect(out.contains("generated"), "add prints the generated file")?;
@@ -1579,7 +1579,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "summary prints the args",
     )?;
     expect(
-        out.contains("env:") && out.contains("XK_E2E=1"),
+        out.contains("env:") && out.contains("AK_E2E=1"),
         "summary prints the env",
     )?;
     expect(out.contains("work_dir:"), "summary prints the work_dir")?;
@@ -1587,7 +1587,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(abc_file.is_file(), "apps/abc.toml is a real file")?;
     let abc_text = std::fs::read_to_string(&abc_file)?;
     expect(
-        abc_text.contains("XK_E2E"),
+        abc_text.contains("AK_E2E"),
         "env written into the generated file",
     )?;
     // toml emits Windows paths as single-quoted literal strings; accept both
@@ -1642,7 +1642,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "--args",
             "100000",
             "--env",
-            "XK_E2E=1",
+            "AK_E2E=1",
         ],
     )?;
     expect(out.contains("no change"), "identical re-add is a no change")?;
@@ -2108,7 +2108,7 @@ fn run_daemon_first_pass(bin: &Path) -> Result<()> {
 /// No `[app-default]` section, so the built-in `startsecs` default (3.0) is
 /// exactly what the ad-hoc startup window uses.
 fn setup_runfirst_workspace() -> Result<Workspace> {
-    let root = std::env::temp_dir().join(format!("xk-xtask-e2e-runfirst-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ak-xtask-e2e-runfirst-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["apps", "logs", "fan-app", "slow-app", "mixed-app"] {
         std::fs::create_dir_all(root.join(d)).context("create runfirst dirs")?;
@@ -2925,7 +2925,7 @@ fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
 /// already-running instance (no second process).
 fn detach_pass(bin: &Path) -> Result<()> {
     step("R9. `daemon --detach` cold start + second instance reports already-running");
-    let root = std::env::temp_dir().join(format!("xk-xtask-detach-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ak-xtask-detach-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("logs"))?;
     let endpoint = control_socket_in(&root);
@@ -3904,14 +3904,14 @@ fn build_bench() -> Result<PathBuf> {
 }
 
 /// Temp dirs that follow the bench spawn-workspace naming
-/// (`xk-bench-<pid>-<nanos>`); anything present after a bench run is residue.
+/// (`ak-bench-<pid>-<nanos>`); anything present after a bench run is residue.
 #[cfg(unix)]
 fn bench_workspaces() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            let rest = match name.strip_prefix("xk-bench-") {
+            let rest = match name.strip_prefix("ak-bench-") {
                 Some(r) => r,
                 None => continue,
             };
@@ -4138,7 +4138,7 @@ fn tcp_wait_dead(ws: &TcpWs) -> Result<()> {
 fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     step("T. tcp:// control endpoint: same protocol, Bearer admission, full CLI");
 
-    let root = std::env::temp_dir().join(format!("xk-xtask-tcp-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ak-xtask-tcp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("apps"))?;
     std::fs::create_dir_all(root.join("logs"))?;
@@ -4461,6 +4461,14 @@ try {{
   }});
   ok('console loads with no pending badge');
 
+  // Brand identity: the visible logo mark reads `ak` (branding spec).
+  const mark = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    return app?.shadowRoot?.querySelector('.brand .mark')?.textContent?.trim() ?? null;
+  }});
+  if (mark !== 'ak') throw new Error('brand mark should read ak, got ' + JSON.stringify(mark));
+  ok('brand mark reads ak');
+
   // Edit alpha's config on disk → badge with count 1.
   const fs = await import('node:fs');
   fs.writeFileSync(ALPHA_CFG, [
@@ -4623,7 +4631,7 @@ mod win_service {
     }
 
     /// Cleanup backstop (6.3): whichever step of the roundtrip fails — or the
-    /// harness dies mid-pass — never leave an `xk-e2e-*` service registered
+    /// harness dies mid-pass — never leave an `ak-xtask-e2e-*` service registered
     /// on the machine. After a successful uninstall both calls are no-ops.
     struct Scrub(String);
 
@@ -4679,16 +4687,16 @@ mod win_service {
     /// QueryServiceConfig2W, which the crate cannot read — prove the service
     /// actually supervises the app through the control plane, then uninstall
     /// and confirm the SCM is clean again. `Scrub` guarantees no
-    /// `xk-e2e-*` service survives a failure.
+    /// `ak-xtask-e2e-*` service survives a failure.
     pub(super) fn roundtrip(bin: &Path) -> Result<()> {
-        let name = format!("xk-e2e-{}", std::process::id());
+        let name = format!("ak-xtask-e2e-{}", std::process::id());
         let scrub = Scrub(name.clone());
 
         // Throwaway daemon workspace: its own control port, one app with one
         // long-running program. The service runs as LocalSystem, whose PATH
         // lacks the unix-toolbox shims the interactive passes rely on — pin
         // the absolute sleep path (quoted the way registry scaffolds render).
-        let root = std::env::temp_dir().join(format!("xk-xtask-win-svc-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ak-xtask-win-svc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("apps"))?;
         std::fs::create_dir_all(root.join("logs"))?;

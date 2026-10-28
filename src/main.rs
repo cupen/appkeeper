@@ -2207,7 +2207,7 @@ mod edit_tests {
 
     #[cfg(unix)]
     fn temp_root(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-edit-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-edit-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -2254,7 +2254,7 @@ mod edit_tests {
     fn editor_must_exist() {
         let dir = temp_root("noeditor");
         let path = dir.join("daemon.toml");
-        let r = edit_config_with("xk-definitely-not-an-editor", &path);
+        let r = edit_config_with("ak-definitely-not-an-editor", &path);
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2294,7 +2294,7 @@ mod sync_tests {
 /// A private control endpoint for tests: the mock control plane binds it
 /// before the client is allowed to connect, so there is no startup race.
 fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
-    let dir = std::env::temp_dir().join(format!("xk-mock-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("ak.sock");
@@ -2352,7 +2352,7 @@ fn config_with_socket(socket: &Path) -> DaemonConfig {
     #[test]
     fn offline_sync_is_a_silent_success() {
         // Nothing is bound at this path, so the probe cannot succeed.
-        let config = config_with_socket(Path::new("/tmp/xk-mock-absent/ak.sock"));
+        let config = config_with_socket(Path::new("/tmp/ak-test-mock-absent/ak.sock"));
         sync_if_online(&config).expect("offline sync must be a silent success");
     }
 
@@ -2413,7 +2413,7 @@ fn config_with_socket(socket: &Path) -> DaemonConfig {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("xk-apply-online-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-apply-online-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("daemon.toml");
@@ -2435,7 +2435,7 @@ mod config_cmd_tests {
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("xk-cmd-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("ak-test-cmd-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -2701,7 +2701,7 @@ mod config_cmd_tests {
 /// A private control endpoint for tests: the mock control plane binds it
 /// before the client is allowed to connect, so there is no startup race.
 fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
-    let dir = std::env::temp_dir().join(format!("xk-mock-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("ak.sock");
@@ -2742,7 +2742,7 @@ fn config_with_socket(socket: &Path) -> DaemonConfig {
 
     #[test]
     fn sync_hint_offline_names_next_start() {
-        let config = config_with_socket(Path::new("/tmp/xk-mock-absent/ak.sock"));
+        let config = config_with_socket(Path::new("/tmp/ak-test-mock-absent/ak.sock"));
         let msg = config_sync_hint(&config);
         assert!(
             msg.contains("offline") && msg.contains("next start"),

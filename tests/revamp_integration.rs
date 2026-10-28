@@ -100,7 +100,7 @@ struct Ws {
 
 impl Ws {
     /// The `[daemon] socket` value for this workspace. On unix the path must
-    /// stay under `sun_path` (~107 bytes): `/tmp/xk-revamp-it-<tag>-<pid>` is
+    /// stay under `sun_path` (~107 bytes): `/tmp/ak-test-revamp-it-<tag>-<pid>` is
     /// comfortably short for every tag used here.
     fn endpoint_for(root: &Path, tag: &str) -> String {
         #[cfg(unix)]
@@ -129,7 +129,7 @@ impl Ws {
     }
 
     fn new(tag: &str) -> Ws {
-        let root = std::env::temp_dir().join(format!("xk-revamp-it-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ak-test-revamp-it-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("logs")).unwrap();

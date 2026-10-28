@@ -2735,7 +2735,7 @@ mod tests {
 
     #[test]
     fn legacy_import_converts_shape() {
-        let tmp = std::env::temp_dir().join(format!("xk-legacy-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-legacy-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let legacy = tmp.join("config.toml");
         std::fs::write(
@@ -3491,7 +3491,7 @@ log_buffer_lines = 7
     /// but an existing one is kept untouched (spec: 重复 init 幂等安全).
     #[test]
     fn init_creates_workspace_and_skips_existing_sample() {
-        let tmp = std::env::temp_dir().join(format!("xk-cfg-init-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-cfg-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg_path = tmp.join("conf").join("daemon.toml"); // nested parents
         let rep = config_init(&cfg_path).unwrap();
@@ -3525,7 +3525,7 @@ log_buffer_lines = 7
     /// scan (task 3.3): a directory holding only the sample lists no apps.
     #[test]
     fn sample_suffix_is_ignored_by_registry_scan() {
-        let tmp = std::env::temp_dir().join(format!("xk-cfg-scan-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-cfg-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg_path = tmp.join("daemon.toml");
         let rep = config_init(&cfg_path).unwrap();
@@ -3559,7 +3559,7 @@ log_buffer_lines = 7
     /// no temp file behind (design D4).
     #[test]
     fn atomic_write_rejects_invalid_and_leaves_no_tmp() {
-        let tmp = std::env::temp_dir().join(format!("xk-cfg-atomic-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-cfg-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg_path = tmp.join("daemon.toml");
@@ -3780,7 +3780,7 @@ log_buffer_lines = 7
         // The opt-in hint is present (first-contact discoverability).
         assert!(text.contains("[webui]"), "the template explains the opt-in");
         // config --init over the real filesystem loads with no webui section.
-        let tmp = std::env::temp_dir().join(format!("xk-cfg-init-webui-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ak-test-cfg-init-webui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let cfg_path = tmp.join("daemon.toml");
         config_init(&cfg_path).unwrap();

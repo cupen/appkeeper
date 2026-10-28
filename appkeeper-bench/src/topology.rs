@@ -280,7 +280,7 @@ fn daemon_exited() -> bool {
 pub fn spawn_site(daemon_bin: Option<&Path>) -> Result<Site> {
     let bin = discover_daemon(daemon_bin)?;
     let root = std::env::temp_dir().join(format!(
-        "xk-bench-{}-{}",
+        "ak-bench-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
@@ -402,7 +402,7 @@ pub fn connect_site(socket: &str, token: Option<&str>) -> Result<Site> {
     }
 
     let count_dir = std::env::temp_dir().join(format!(
-        "xk-bench-counts-{}-{}",
+        "ak-bench-counts-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
@@ -545,10 +545,10 @@ mod tests {
 
     #[test]
     fn cleanup_is_idempotent_on_missing_files() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-cln-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-cln-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = CleanupCtx {
-            client: Client::new("/tmp/xk-bench-no-daemon/ak.sock").unwrap(),
+            client: Client::new("/tmp/ak-test-no-daemon/ak.sock").unwrap(),
             app_files: vec![dir.join("nope.toml")],
             app_names: vec!["appkeeper-bench-nope".into()],
             log_dir: dir.clone(),
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn remove_log_files_takes_the_whole_chain() {
-        let dir = std::env::temp_dir().join(format!("xk-bench-logs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ak-test-logs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for f in [
             "p.out.log",

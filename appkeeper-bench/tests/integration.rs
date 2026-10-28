@@ -8,7 +8,7 @@
 //! cargo test -p appkeeper-bench --test integration -- --ignored --test-threads=1
 //! ```
 //!
-//! Every cycle asserts the cleanup contract: no `xk-bench-*` workspaces and
+//! Every cycle asserts the cleanup contract: no `ak-bench-*` workspaces and
 //! no leftover generator processes after the run.
 
 use std::path::{Path, PathBuf};
@@ -77,9 +77,9 @@ fn leftover_workspaces() -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            // spawn workspaces are exactly xk-bench-<pid>-<nanos>; ignore the
+            // spawn workspaces are exactly ak-bench-<pid>-<nanos>; ignore the
             // it- report files and counts dirs that share the prefix
-            let rest = name.strip_prefix("xk-bench-").unwrap_or("");
+            let rest = name.strip_prefix("ak-bench-").unwrap_or("");
             let mut parts = rest.split('-');
             let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
             if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
@@ -137,7 +137,7 @@ impl Drop for ScratchDaemon {
 /// Spawn a scratch daemon with its own temp app_dir/log_dir on a random port.
 /// `extra_daemon_keys` splices raw keys into the [daemon] table (e.g. auth_token).
 fn spawn_scratch_daemon(tag: &str, extra_daemon_keys: &str) -> ScratchDaemon {
-    let dir = std::env::temp_dir().join(format!("xk-bench-it-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ak-test-bench-it-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("apps")).unwrap();
     std::fs::create_dir_all(dir.join("logs")).unwrap();
@@ -425,7 +425,7 @@ fn integrity_failure_exits_nonzero_with_report() {
         if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if !name.starts_with("xk-bench-") {
+                if !name.starts_with("ak-bench-") {
                     continue;
                 }
                 let logs = e.path().join("logs");
@@ -471,7 +471,7 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
     use std::process::{Command as Cmd, Stdio};
 
     // scratch daemon on a random port with its own temp app_dir/log_dir
-    let scratch = std::env::temp_dir().join(format!("xk-bench-it-connect-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("ak-test-bench-it-connect-{}", std::process::id()));
     std::fs::create_dir_all(scratch.join("apps")).unwrap();
     std::fs::create_dir_all(scratch.join("logs")).unwrap();
     let port = {
@@ -562,7 +562,7 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
 
     // collision: plant a bench-named app file in a scratch daemon's app_dir
     use std::process::{Command as Cmd, Stdio};
-    let scratch = std::env::temp_dir().join(format!("xk-bench-it-collide-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("ak-test-bench-it-collide-{}", std::process::id()));
     std::fs::create_dir_all(scratch.join("apps")).unwrap();
     std::fs::create_dir_all(scratch.join("logs")).unwrap();
     let port = {
@@ -909,9 +909,9 @@ fn ctrl_c_interrupt_cleans_up_spawn_site() {
     }
     assert_no_residue();
     assert!(
-        pids_referencing("xk-bench-").is_empty(),
+        pids_referencing("ak-bench-").is_empty(),
         "the bench-spawned daemon is still alive: {:?}",
-        pids_referencing("xk-bench-")
+        pids_referencing("ak-bench-")
     );
 }
 

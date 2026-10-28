@@ -158,8 +158,8 @@ version=0.1.0
 target=x86_64-unknown-linux-musl   # 或 x86_64-unknown-linux-gnu
 
 # 下载归档与校验和清单（SHA256SUMS 覆盖全部三个归档）
-curl -LO "https://github.com/cupen/xkeeper/releases/download/v${version}/ak-${version}-${target}.tar.gz"
-curl -LO "https://github.com/cupen/xkeeper/releases/download/v${version}/SHA256SUMS"
+curl -LO "https://github.com/cupen/appkeeper/releases/download/v${version}/ak-${version}-${target}.tar.gz"
+curl -LO "https://github.com/cupen/appkeeper/releases/download/v${version}/SHA256SUMS"
 
 # 校验完整性：只校验已下载的归档，全部输出 OK 且退出码为 0
 sha256sum -c SHA256SUMS --ignore-missing
@@ -173,8 +173,8 @@ tar -xzf "ak-${version}-${target}.tar.gz"
 ```powershell
 $version = "0.1.0"
 $zip = "ak-$version-x86_64-pc-windows-msvc.zip"
-Invoke-WebRequest "https://github.com/cupen/xkeeper/releases/download/v$version/$zip" -OutFile $zip
-Invoke-WebRequest "https://github.com/cupen/xkeeper/releases/download/v$version/SHA256SUMS" -OutFile SHA256SUMS
+Invoke-WebRequest "https://github.com/cupen/appkeeper/releases/download/v$version/$zip" -OutFile $zip
+Invoke-WebRequest "https://github.com/cupen/appkeeper/releases/download/v$version/SHA256SUMS" -OutFile SHA256SUMS
 # 校验和内容同样内嵌在 release 说明的代码块里，可肉眼比对
 Expand-Archive $zip -DestinationPath .
 .\ak-$version-x86_64-pc-windows-msvc\ak.exe --version
