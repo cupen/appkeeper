@@ -772,7 +772,7 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
     match rx.recv_timeout(Duration::from_secs(120)) {
         Ok(Ok(json)) => match serde_json::from_str::<crate::supervisor::FanoutResult>(&json) {
             Ok(fr) => {
-                // run-daemon-first: `run --app` blocks per program until its
+                // run-daemon-first: `start <app>` (wait=1) blocks per program until its
                 // startup judgement; the shell/webui keep the immediate reply.
                 if wait && kind == crate::supervisor::FanoutKind::Start {
                     for s in &fr.programs {
@@ -1407,6 +1407,35 @@ mod tests {
         }
     }
 
+    /// control-plane spec (refine-cli-verbs 2.2): `ak ps --out json` prints the
+    /// `/v1/status` projection verbatim, and the pending-change document
+    /// already rides inside it — no extra JSON field is added by the CLI.
+    #[test]
+    fn status_projection_carries_pending_for_ps_json() {
+        let mut doc = sample_doc();
+        doc.pending = crate::supervisor::PendingDoc {
+            programs: vec![crate::supervisor::PendingProgram {
+                app: "app".into(),
+                program: "a".into(),
+                running: true,
+            }],
+            apps_added: vec!["newapp".into()],
+            apps_removed: vec!["gone".into()],
+            daemon_hints: vec!["[daemon] host".into()],
+            errors: vec!["bad.toml: parse error".into()],
+        };
+        let v: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let pending = &v["pending"];
+        assert_eq!(pending["programs"][0]["app"], "app");
+        assert_eq!(pending["programs"][0]["program"], "a");
+        assert_eq!(pending["programs"][0]["running"], true);
+        assert_eq!(pending["apps_added"][0], "newapp");
+        assert_eq!(pending["apps_removed"][0], "gone");
+        assert_eq!(pending["daemon_hints"][0], "[daemon] host");
+        assert_eq!(pending["errors"][0], "bad.toml: parse error");
+    }
+
     /// webui-api: WS structured payloads and REST JSON must come from the
     /// same serde structs — decoding either encoding yields equal values.
     #[test]
@@ -1799,8 +1828,17 @@ mod tests {
             "/v1/run",
             &serde_json::json!({ "name": "web", "command": cmd, "args": args }),
         );
-        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        assert!(!resp.contains("401"), "{resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "the stream is served without an auth gate: {resp}"
+        );
+        // The admission gate is a status-line decision: matching "401"
+        // anywhere in the body would also hit a temp path or pid that happens
+        // to contain those digits.
+        assert!(
+            !resp.starts_with("HTTP/1.1 401"),
+            "no 401 branch in front of the stream: {resp}"
+        );
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2088,8 +2126,15 @@ mod tests {
         // The existing harness endpoint is a local IPC path; any header must
         // be ignored, including a token that matches nothing.
         let resp = ep.get_auth("/v1/status", Some("leftover-token"));
-        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        assert!(!resp.contains("401"), "{resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "the header is ignored: {resp}"
+        );
+        // Status-line only: "401" inside the body could be a temp path or pid.
+        assert!(
+            !resp.starts_with("HTTP/1.1 401"),
+            "no 401 for an ignored header: {resp}"
+        );
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

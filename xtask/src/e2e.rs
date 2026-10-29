@@ -32,24 +32,25 @@
 //!      keys ride the same engine (K16: set/get/delete on webui.listen and
 //!      the whole [webui] table).
 //!   RDF. run-daemon-first (run-daemon-first change): its own workspace with
-//!      an EMPTY app_dir. Offline every `run` form exits 3 without deriving a
-//!      daemon (RDF0). Online: `run --` / `run <name>` / `run --app` return
-//!      `{program, config_path, pid}` and `--json` is machine-readable
-//!      (RDF1-5), a single-program `run` blocks for `startsecs` (RDF6);
-//!      failure paths (unresolvable command, early exit, name collision,
-//!      reserved `all`) leave no `.toml`/`.toml.pending` residue (RDF7-10);
-//!      a mid-flight reload sees only the non-`.toml` placeholder (RDF11);
-//!      health-probed runs stream progress and either return a pid or fail
-//!      with no residue (RDF12-13); a failed rename keeps the process and
-//!      prints the full config, and a re-run detects the residual, refuses
-//!      non-interactively, then re-lands on confirm without restarting
-//!      (RDF14-16); the built-in `app_dir` default is `app.d` (RDF17).
+//!        an EMPTY app_dir. Offline every `start` form and ad-hoc `run` form
+//!        exits 3 without deriving a daemon (RDF0). Online: ad-hoc `run --`
+//!        and `start <app> [<program>]` return `{program, config_path, pid}`
+//!        and `--json` is machine-readable (RDF1-5); a single-program `start`
+//!        blocks for `startsecs` (RDF6); failure paths (unresolvable command,
+//!        early exit, name collision, reserved `all`) leave no
+//!        `.toml`/`.toml.pending` residue (RDF7-10); a mid-flight reload sees
+//!        only the non-`.toml` placeholder (RDF11); health-probed runs stream
+//!        progress and either return a pid or fail with no residue (RDF12-13);
+//!        a failed rename keeps the process and prints the full config, and a
+//!        re-run detects the residual, refuses non-interactively, then
+//!        re-lands on confirm without restarting (RDF14-16); the built-in
+//!        `app_dir` default is `app.d` (RDF17).
 //! - webui lifecycle pass (config-driven-webui): the daemon boots with
-//!   `ak run` and a `[webui]` section in daemon.toml; W1 deletes the
-//!   section + reload → connection refused, W2 sets a new listen + reload →
-//!   serving on the new address, W3 restores the listen + reload → rebind,
-//!   W4/W5 occupy then free the listen → reload degrades with a note and
-//!   recovers, W7 boots a second daemon with a bare `[webui]` → serves the
+//!   `ak daemon start` and a `[webui]` section in daemon.toml; W1 deletes the
+//!   section + `ak config --reload` → connection refused, W2 sets a new listen
+//!   + reload → serving on the new address, W3 restores the listen + reload →
+//!   rebind, W4/W5 occupy then free the listen → reload degrades with a note
+//!   and recovers, W7 boots a second daemon with a bare `[webui]` → serves the
 //!   built-in default 127.0.0.1:9877 and the console exits with the daemon.
 //!   Offline: G0c2 pins the removed `webui`/`system webui` subcommands,
 //!   G0c3 covers the shell exit-3 contract, G0d2 rejects an unknown
@@ -783,9 +784,9 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the error says the daemon is unreachable",
     )?;
 
-    step("G0c1. five removed verbs and bare `daemon` are usage errors (exit 2)");
-    // control-plane spec: `ak status|list|shutdown|add|service ...` report an
-    // unknown subcommand — no alias, no migration hint — and bare `ak daemon`
+    step("G0c1. six removed verbs and bare `daemon` are usage errors (exit 2)");
+    // control-plane spec: `ak status|list|shutdown|add|service|reload ...` report
+    // an unknown subcommand — no alias, no migration hint — and bare `ak daemon`
     // reports the four-subcommand usage error.
     for bad in [
         &["status"][..],
@@ -794,6 +795,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         &["add", "."][..],
         &["service", "install"][..],
         &["service", "uninstall"][..],
+        &["reload"][..],
     ] {
         let (ok, code, combined) = cli_try(bin, ws, bad)?;
         expect(
@@ -901,15 +903,40 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
 
-    step("G0c3. `shell -e status` with no daemon exits 3 (shell 纳入退出码约定)");
-    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "status"])?;
+    step("G0c3. `shell -e ps` with no daemon exits 3 (shell 纳入退出码约定)");
+    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "ps"])?;
     expect(
         !ok && code == 3,
-        &format!("shell -e status without a daemon exits 3, got {code}"),
+        &format!("shell -e ps without a daemon exits 3, got {code}"),
     )?;
     expect(
         combined.contains("unreachable"),
         "the shell reports the daemon as unreachable",
+    )?;
+    // The retired `status`/`st`/`reload` words are unknown commands in the
+    // shell (shell-client spec); `-e` passes the parse error through as a
+    // general error (exit 1) and the hint names the successor word.
+    for (word, want) in [
+        (&["status"][..], "ps"),
+        (&["st"][..], "ps"),
+        (&["reload"][..], "pending"),
+    ] {
+        let (ok, _code, combined) = cli_try(bin, ws, &["shell", "-e", word[0]])?;
+        expect(!ok, &format!("`shell -e {}` is a usage error", word[0]))?;
+        expect(
+            combined.contains("unknown command") && combined.contains(want),
+            &format!(
+                "the retired word {} hints its successor {want}: {combined:?}",
+                word[0]
+            ),
+        )?;
+    }
+    // `run` is no longer a shell word either (the start verb took over).
+    let (ok, _code, combined) = cli_try(bin, ws, &["shell", "-e", "run web"])?;
+    expect(!ok, "`shell -e run web` is a usage error")?;
+    expect(
+        combined.contains("unknown command") && combined.contains("start"),
+        &format!("the retired `run` word hints `start`: {combined:?}"),
     )?;
 
     step("G0c4. removed daemon forms of `run` are intercepted pre-clap (daemon-subcommand)");
@@ -945,19 +972,32 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
     // Bare `run` carries no daemon marker: it reaches dispatch and reports the
-    // three-form usage error (design D4), not the migration interceptor.
+    // two-form usage error (design D4), not the migration interceptor.
     let (ok, code, combined) = cli_try_raw(bin, &["run"])?;
     expect(
         !ok && code == 2,
         &format!("bare `run` exits 2 with the usage error, got {code}: {combined:?}"),
     )?;
     expect(
-        combined.contains("run <name>")
-            && combined.contains("run --app")
-            && combined.contains("run --"),
-        "the bare-run error lists all three client forms",
+        combined.contains("run -- <cmd...>") && combined.contains("run --cmd"),
+        "the bare-run error lists the two ad-hoc forms",
     )?;
-    // `run <name>` is a client call: with the daemon still down it reports
+    expect(
+        !combined.contains("run <name>") && !combined.contains("run --app"),
+        &format!("the retired start forms are no longer listed: {combined:?}"),
+    )?;
+    // `run --name <x>` is no longer accepted: the ad-hoc naming flag is
+    // `--app`, so clap reports an unknown argument with exit 2.
+    let (ok, code, combined) = cli_try_raw(bin, &["run", "--name", "x"])?;
+    expect(
+        !ok && code == 2,
+        &format!("`run --name x` is rejected with exit 2, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("--name") || combined.contains("unexpected argument"),
+        &format!("the rejection names the unknown argument: {combined:?}"),
+    )?;
+    // A client form is not intercepted: with the daemon still down it reports
     // unreachable (exit 3) instead of the interception (exit 2). A dead-port
     // config keeps this hermetic — the bare form would read the machine's
     // default config (/etc/appkeeper/daemon.toml), where a real daemon may be
@@ -973,14 +1013,26 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             socket_toml_value(&ws.root.join("daemon-dead.sock"))
         ),
     )?;
-    let (ok, code, combined) = cli_try_cfg(bin, &dead_cfg, &["run", "web"])?;
+    // `start <app>` is a client call (the old `run <name>` form moved here).
+    let (ok, code, combined) = cli_try_cfg(bin, &dead_cfg, &["start", "web"])?;
     expect(
         !ok && code == 3,
-        &format!("`run web` stays a client call (unreachable, exit 3), got {code}: {combined:?}"),
+        &format!("`start web` stays a client call (unreachable, exit 3), got {code}: {combined:?}"),
     )?;
     expect(
         combined.contains("unreachable") && !combined.contains("daemon form of `run`"),
-        "`run <name>` is not caught by the daemon-form guard",
+        "`start <app>` is not caught by the daemon-form guard",
+    )?;
+    let (ok, code, combined) = cli_try_cfg(bin, &dead_cfg, &["run", "--cmd", "true"])?;
+    expect(
+        !ok && code == 3,
+        &format!(
+            "ad-hoc `run --cmd` is a client call (unreachable, exit 3), got {code}: {combined:?}"
+        ),
+    )?;
+    expect(
+        combined.contains("unreachable") && !combined.contains("daemon form of `run`"),
+        "the ad-hoc run form is not caught by the daemon-form guard",
     )?;
     // control-plane spec「daemon shutdown 停机」: with the daemon down the
     // client contract is exit 3 (never a silent success).
@@ -1088,17 +1140,25 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         combined.contains("Usage: ak"),
         &format!("bare `ak` prints the usage line: {combined:?}"),
     )?;
-    for sub in ["daemon", "run", "ps", "compose"] {
+    for sub in ["daemon", "run", "ps", "compose", "start", "stop"] {
         expect(
             combined.contains(&format!("\n  {sub} ")),
             &format!("the help lists the {sub} subcommand: {combined:?}"),
         )?;
     }
     // The removed verbs must not appear as subcommand lines (design D7).
-    for gone in ["status", "list", "shutdown", "add", "service"] {
+    for gone in ["status", "list", "shutdown", "add", "service", "reload"] {
         expect(
             !combined.contains(&format!("\n  {gone} ")),
             &format!("the help no longer lists the removed `{gone}` verb: {combined:?}"),
+        )?;
+    }
+    // The three-line usage examples ride at the end of the top-level help
+    // (design D7): daemon start → start app → stop app.
+    for example in ["ak daemon start", "ak start <app>", "ak stop <app>"] {
+        expect(
+            combined.contains(example),
+            &format!("the help ends with the {example:?} example: {combined:?}"),
         )?;
     }
     expect(
@@ -1576,9 +1636,9 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the init-produced app_dir lists no apps (.sample ignored)",
     )?;
 
-    step("K13. bare `ak config` prints the five-action usage and exits 0");
+    step("K13. bare `ak config` prints the action usage and exits 0");
     let out = cli_cfg(bin, &cfg, &["config"])?;
-    for flag in ["--set", "--get", "--delete", "--edit", "--init"] {
+    for flag in ["--set", "--get", "--delete", "--edit", "--init", "--reload"] {
         expect(
             out.contains(flag),
             &format!("the usage mentions {flag}: {out}"),
@@ -1591,6 +1651,38 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(
         combined.contains("unknown"),
         "the error names the key as unknown",
+    )?;
+    // refine-cli-verbs 1.3: `--reload` conflicts with `--get` and `--init`
+    // (usage error, exit 2) — it is a daemon action, not a read/init one.
+    for combo in [
+        &["config", "--reload", "--get", "socket"][..],
+        &["config", "--reload", "--init"][..],
+    ] {
+        let (ok, code, combined) = cli_try_cfg(bin, &cfg, combo)?;
+        expect(
+            !ok && code == 2,
+            &format!("{combo:?} is a usage error with exit 2, got {code}: {combined:?}"),
+        )?;
+    }
+    // Offline, `--reload` is daemon-first: exit 3 (no implicit pull-up).
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--reload"])?;
+    expect(
+        !ok && code == 3,
+        &format!("offline `config --reload` exits 3, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("unreachable"),
+        "offline `config --reload` reports the daemon unreachable",
+    )?;
+    // The retired top-level verb is an unknown subcommand (exit 2).
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["reload"])?;
+    expect(
+        !ok && code == 2,
+        &format!("`ak reload` is an unknown subcommand (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("unrecognized subcommand"),
+        &format!("`ak reload` reports an unrecognized subcommand: {combined:?}"),
     )?;
     let missing = ws.root.join("cfgcmd-missing.toml");
     let (ok, code, combined) = cli_try_cfg(bin, &missing, &["config", "--delete", "socket"])?;
@@ -1677,7 +1769,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         pid_of(ws, "worker")? == Some(worker_pid),
         "worker still runs the old definition",
     )?;
-    let out = cli(bin, ws, &["reload"])?;
+    let out = cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains("worker") && out.contains("run `ak apply`"),
         "reload prints a preview, applies nothing",
@@ -1685,6 +1777,27 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(
         pid_of(ws, "worker")? == Some(worker_pid),
         "reload left worker alone",
+    )?;
+    // refine-cli-verbs: the shared `ps` renderer carries the PENDING column
+    // and the tail summary rows; the changed program is marked.
+    let table = cli(bin, ws, &["ps"])?;
+    expect(
+        table.contains("PENDING"),
+        &format!("ps carries the PENDING column: {table:?}"),
+    )?;
+    let row_of = |text: &str, name: &str| -> String {
+        text.lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    expect(
+        row_of(&table, "worker").contains("changed"),
+        &format!("the pending worker is marked changed: {table:?}"),
+    )?;
+    expect(
+        table.contains("pending: run `ak apply` to apply"),
+        &format!("the table ends with the apply hint: {table:?}"),
     )?;
 
     step("B. scoped apply leaves other apps untouched");
@@ -1717,6 +1830,24 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         progs.len() == 1 && progs[0].get("program").and_then(|p| p.as_str()) == Some("job"),
         "beta's pending survived the alpha apply",
     )?;
+    // refine-cli-verbs: the applied program loses its PENDING marker while
+    // beta's still carries one.
+    let table = cli(bin, ws, &["ps"])?;
+    let row_of = |name: &str| -> String {
+        table
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(name))
+            .unwrap_or("")
+            .to_string()
+    };
+    expect(
+        !row_of("worker").contains("changed"),
+        &format!("the applied worker is no longer marked: {table:?}"),
+    )?;
+    expect(
+        row_of("job").contains("changed"),
+        &format!("beta's pending job stays marked: {table:?}"),
+    )?;
 
     step("B2. shell pending + scoped apply mirror the CLI with real pending");
     let out = cli(bin, ws, &["shell", "-e", "pending"])?;
@@ -1732,7 +1863,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     wait_running(ws, "job")?;
 
     step("C. --restart restarts unchanged programs but keeps user-stopped ones");
-    cli(bin, ws, &["stop", "web"])?;
+    cli(bin, ws, &["stop", "alpha", "web"])?;
     let out = cli(bin, ws, &["apply", "--restart"])?;
     expect(
         out.contains("restarted (--restart)"),
@@ -1776,16 +1907,34 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // control-plane spec: online `ps` is the projection only; `ps --all` adds
     // the registered-but-not-applied app to the full view; `--out json`
-    // carries the same registry array under `registry`.
+    // carries the same registry array under `registry`. Plain `ps` may name
+    // the pending app in the tail summary (refine-cli-verbs PENDING column),
+    // but it must have no row for it.
     let plain = cli(bin, ws, &["ps"])?;
     expect(
-        !plain.contains("gamma"),
-        &format!("plain `ps` shows only loaded programs: {plain:?}"),
+        !plain
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some("gamma")),
+        &format!("plain `ps` has no row for an unloaded program: {plain:?}"),
+    )?;
+    expect(
+        plain.contains("pending: app[gamma] registered (new)"),
+        &format!("plain `ps` names the pending-added app in the summary: {plain:?}"),
     )?;
     let full = cli(bin, ws, &["ps", "--all"])?;
     expect(
         full.contains("gamma") && full.contains("not-applied"),
         &format!("`ps --all` lists the pending app as not-applied: {full:?}"),
+    )?;
+    // refine-cli-verbs: an unloaded registry row that is also pending-added
+    // carries the PENDING marker in the full view (control-plane spec).
+    let gamma_row = full
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("gamma"))
+        .unwrap_or("");
+    expect(
+        gamma_row.contains("new"),
+        &format!("`ps --all` marks the pending-added row new: {gamma_row:?}"),
     )?;
     expect(
         full.contains(&gamma.join("appkeeper.toml").display().to_string()),
@@ -1996,7 +2145,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
-    cli(bin, ws, &["reload"])?; // publish the pending preview
+    cli(bin, ws, &["config", "--reload"])?; // publish the pending preview
     let out = cli(
         bin,
         ws,
@@ -2032,7 +2181,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         ws.root.join("app-alpha/appkeeper.toml"),
         "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n\n[program.worker]\ncommand = \"sleep 200000\"\nstartsecs = 0.2\n",
     )?;
-    cli(bin, ws, &["reload"])?;
+    cli(bin, ws, &["config", "--reload"])?;
     wait_pending_empty(ws)?;
 
     step("G6. `--name all` is rejected (reserved apply-all keyword)");
@@ -2101,30 +2250,48 @@ fn revamp_pass(bin: &Path) -> Result<()> {
 /// The scenarios run against `daemon`, which they may restart in place (the
 /// live handle is kept in `daemon` so `revamp_pass` always shuts it down).
 fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
-    step("R1. `start` is gone (BREAKING) with a `run` hint; `run <name>` starts");
-    let (ok, _code, combined) = cli_try(bin, ws, &["start", "web"])?;
-    expect(!ok, "`ak start web` is rejected")?;
-    expect(
-        combined.contains("start") && combined.contains("run"),
-        &format!("the error names the removed verb and the replacement: {combined:?}"),
-    )?;
-    // `run <name>` behaves like the old start: stop then start.
-    cli(bin, ws, &["stop", "web"])?;
+    step("R1. `start <app>` starts a stopped program; `--app` is gone");
+    // The old commentary: `start` used to be removed. It is the start verb
+    // again (refine-cli-verbs): the bare app name fans out over the app and
+    // the second positional narrows to one program.
+    cli(bin, ws, &["stop", "alpha", "web"])?;
     wait_state_in(ws, "web", &["stopped"])?;
-    let out = cli(bin, ws, &["run", "web"])?;
+    let out = cli(bin, ws, &["start", "alpha", "web"])?;
     expect(
         out.contains("web"),
-        &format!("run <name> reports the program: {out:?}"),
+        &format!("start <app> <program> reports the program: {out:?}"),
     )?;
     wait_running(ws, "web")?;
+    // The removed fan-out flag is a clap error (exit 2), for all three verbs.
+    for verb in ["start", "stop", "restart"] {
+        let (ok, code, combined) = cli_try(bin, ws, &[verb, "--app", "alpha"])?;
+        expect(
+            !ok && code == 2,
+            &format!("`{verb} --app alpha` is rejected with exit 2, got {code}: {combined:?}"),
+        )?;
+    }
 
-    step("R2. `run --app` fans out; an unknown program is a 404 → exit 1");
-    let out = cli(bin, ws, &["run", "--app", "beta"])?;
+    step("R2. bare `<app>` fans out over the app; the second arg narrows one program");
+    // alpha has two programs (web, worker): the bare name starts both.
+    let out = cli(bin, ws, &["start", "alpha"])?;
     expect(
-        out.contains("job"),
-        &format!("run --app reports the app's programs: {out:?}"),
+        out.contains("web") && out.contains("worker"),
+        &format!("start <app> fans out over both programs: {out:?}"),
     )?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "nosuch"])?;
+    wait_running(ws, "web")?;
+    wait_running(ws, "worker")?;
+    // The second positional narrows to one program and reports the three
+    // fields `{program, config, pid}`.
+    cli(bin, ws, &["stop", "alpha", "worker"])?;
+    wait_state_in(ws, "worker", &["stopped"])?;
+    let out = cli(bin, ws, &["start", "alpha", "worker"])?;
+    expect(
+        out.contains("worker") && out.contains("pid=") && out.contains("started"),
+        &format!("start <app> <program> reports the single program: {out:?}"),
+    )?;
+    wait_running(ws, "worker")?;
+    // An unknown program is a 404 → exit 1, with the ad-hoc registration hint.
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "alpha", "nosuch"])?;
     expect(
         !ok && code == 1,
         &format!("unknown program exits 1, got {code}"),
@@ -2137,15 +2304,31 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         combined.contains("run -- <cmd...>"),
         "the 404 points at the ad-hoc `run --` registration form",
     )?;
+    // A program of another app is a scope error, not a silent retarget.
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "beta", "web"])?;
+    expect(
+        !ok && code == 1,
+        &format!("a cross-app program is a scope error (exit 1), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("does not belong to app"),
+        &format!("the error explains the scope mismatch: {combined:?}"),
+    )?;
+    // Starting an already-running program is the control-plane 409 → exit 1.
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "alpha", "web"])?;
+    expect(
+        !ok && code == 1,
+        &format!("starting a running program is a 409 (exit 1), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("409") || combined.contains("already running"),
+        &format!("the error carries the 409/already-running message: {combined:?}"),
+    )?;
 
     step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
     let sleep = find_sleep()?;
     let sleep_s = sleep.to_string_lossy().replace('\\', "/");
-    let out = cli(
-        bin,
-        ws,
-        &["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
-    )?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--app", "adhoc-a"])?;
     expect(
         out.contains("started") && out.contains("config:") && out.contains("pid:"),
         &format!("run -- registers and reports {{program, config, pid}}: {out:?}"),
@@ -2169,7 +2352,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "run",
             "--cmd",
             &format!("{sleep_s} 123"),
-            "--name",
+            "--app",
             "adhoc-b",
         ],
     )?;
@@ -2187,11 +2370,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     // this command line. Identical content is an idempotent success returning
     // the existing pid with no restart.
     let pid_before = pid_of(ws, "adhoc-a")?.expect("adhoc-a is running");
-    let out = cli(
-        bin,
-        ws,
-        &["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
-    )?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--app", "adhoc-a"])?;
     expect(
         out.contains("started") && out.contains(&pid_before.to_string()),
         &format!("identical re-run is idempotent (same pid {pid_before}): {out:?}"),
@@ -2201,11 +2380,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "the identical re-run did not restart the process",
     )?;
     // Changed args → regenerated and restarted (new pid).
-    let out = cli(
-        bin,
-        ws,
-        &["run", "--", &sleep_s, "456", "--name", "adhoc-a"],
-    )?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "456", "--app", "adhoc-a"])?;
     expect(
         out.contains("started"),
         &format!("the changed re-run succeeds: {out:?}"),
@@ -2240,7 +2415,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "--",
             &sleep_s,
             "789",
-            "--name",
+            "--app",
             "adhoc-quiet",
             "--restart=no",
         ],
@@ -2255,8 +2430,8 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "--restart=no registers but does not start",
     )?;
     // Reserved `all` is refused.
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--name", "all"])?;
-    expect(!ok, "run --name all is rejected")?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--app", "all"])?;
+    expect(!ok, "run --app all is rejected")?;
     expect(
         combined.contains("reserved"),
         "the reserved-word error explains",
@@ -2265,7 +2440,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     step("R4. restart = no stays down; always pull-up after a daemon restart");
     // adhoc-quiet (restart = no) stays stopped across a daemon restart, while
     // a user-stopped `always` program is pulled back up.
-    cli(bin, ws, &["stop", "job"])?;
+    cli(bin, ws, &["stop", "beta", "job"])?;
     wait_state_in(ws, "job", &["stopped"])?;
     shutdown_and_wait(bin, ws)?;
     *daemon = spawn_daemon(bin, ws)?;
@@ -2283,13 +2458,13 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "run",
             "--cmd",
             &format!("{sleep_s} 999"),
-            "--name",
+            "--app",
             "adhoc-us",
             "--restart=unless-stopped",
         ],
     )?;
     wait_running(ws, "adhoc-us")?;
-    cli(bin, ws, &["stop", "adhoc-us"])?;
+    cli(bin, ws, &["stop", "adhoc-us", "adhoc-us"])?;
     let state_file = ws.root.join("logs/state.json");
     let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
     expect(
@@ -2306,7 +2481,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     )?;
     wait_running(ws, "job")?;
     // An explicit start clears the record.
-    cli(bin, ws, &["run", "adhoc-us"])?;
+    cli(bin, ws, &["start", "adhoc-us", "adhoc-us"])?;
     wait_running(ws, "adhoc-us")?;
     let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
     expect(
@@ -2347,10 +2522,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         &format!("ps default prints the table header: {table:?}"),
     )?;
     // control-plane spec: the table adds the registry information — the
-    // config-object path (per program) and the app description.
+    // config-object path (per program) and the app description — plus the
+    // shared PENDING column (refine-cli-verbs).
     expect(
-        table.contains("CONFIG") && table.contains("DESCRIPTION"),
-        &format!("ps adds the CONFIG / DESCRIPTION columns: {table:?}"),
+        table.contains("CONFIG") && table.contains("DESCRIPTION") && table.contains("PENDING"),
+        &format!("ps adds the CONFIG / DESCRIPTION / PENDING columns: {table:?}"),
     )?;
     expect(
         table.contains(
@@ -2620,10 +2796,10 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     let cmd_form = format!("{sleep_s} 1");
     let forms: [&[&str]; 4] = [
-        &["run", "web"],
-        &["run", "--", &sleep_s, "--name", "cold"],
-        &["run", "--cmd", &cmd_form, "--name", "cold2"],
-        &["run", "--app", "ghost"],
+        &["start", "web"],
+        &["run", "--", &sleep_s, "--app", "cold"],
+        &["run", "--cmd", &cmd_form, "--app", "cold2"],
+        &["start", "ghost"],
     ];
     for args in forms {
         let (ok, code, combined) = cli_try(bin, ws, args)?;
@@ -2653,10 +2829,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let sleep_s = sleep.to_string_lossy().replace('\\', "/");
     let apps = ws.root.join("apps");
 
-    // -- 8.1: run <name> / run --app / run -- --json / blocking -------------
+    // -- 8.1: start <app> / ad-hoc run -- / --json / blocking ----------------
 
     step("RDF1. ad-hoc `run --` registers and returns {program, config, pid}");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "300", "--name", "web"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "300", "--app", "web"])?;
     expect(
         out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid:"),
         &format!("run -- reports program/config/pid: {out:?}"),
@@ -2671,13 +2847,13 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the reported pid is the live one ({web_pid})"),
     )?;
 
-    step("RDF2. `run <name>` returns name/config/pid for a stopped registered program");
-    cli(bin, ws, &["stop", "web"])?;
+    step("RDF2. `start <app>` returns name/config/pid for a stopped registered program");
+    cli(bin, ws, &["stop", "web", "web"])?;
     wait_state_in(ws, "web", &["stopped"])?;
-    let out = cli(bin, ws, &["run", "web"])?;
+    let out = cli(bin, ws, &["start", "web", "web"])?;
     expect(
         out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid="),
-        &format!("run <name> renders the three fields: {out:?}"),
+        &format!("start <app> renders the three fields: {out:?}"),
     )?;
     let web2 = wait_running(ws, "web")?;
     expect(
@@ -2685,10 +2861,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the pid in the output is the live one ({web2})"),
     )?;
 
-    step("RDF3. `run <name> --json` is a machine-readable single object");
-    cli(bin, ws, &["stop", "web"])?;
+    step("RDF3. `start <app> <program> --json` is a machine-readable single object");
+    cli(bin, ws, &["stop", "web", "web"])?;
     wait_state_in(ws, "web", &["stopped"])?;
-    let out = cli(bin, ws, &["run", "web", "--json"])?;
+    let out = cli(bin, ws, &["start", "web", "web", "--json"])?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("run --json parses")?;
     expect(
         v.get("name").and_then(|n| n.as_str()) == Some("web"),
@@ -2714,7 +2890,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--json", "--", &sleep_s, "301", "--name", "json-web"],
+        &["run", "--json", "--", &sleep_s, "301", "--app", "json-web"],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("adhoc --json parses")?;
     expect(
@@ -2723,7 +2899,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("adhoc --json is a single object with name/pid: {out:?}"),
     )?;
 
-    step("RDF5. `run --app` fans out one line per program; `--json` is an array");
+    step("RDF5. `start <app>` fans out one line per program; `--json` is an array");
     std::fs::write(
         ws.root.join("fan-app/appkeeper.toml"),
         format!(
@@ -2743,7 +2919,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     cli(bin, ws, &["apply", "fan"])?;
     wait_running(ws, "fa")?;
     wait_running(ws, "fb")?;
-    let out = cli(bin, ws, &["run", "--app", "fan"])?;
+    let out = cli(bin, ws, &["start", "fan"])?;
     let (pa, pb) = (out.find("fa "), out.find("fb "));
     expect(
         matches!((pa, pb), (Some(a), Some(b)) if a < b),
@@ -2761,7 +2937,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         out.contains("appkeeper.toml") || out.contains("fan.toml"),
         &format!("the config_path names the app's config body: {out:?}"),
     )?;
-    let json = cli(bin, ws, &["run", "--app", "fan", "--json"])?;
+    let json = cli(bin, ws, &["start", "fan", "--json"])?;
     let arr: serde_json::Value =
         serde_json::from_str(json.trim()).context("fan-out json parses")?;
     let arr = arr.as_array().context("fan-out --json is an array")?;
@@ -2773,7 +2949,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     }
 
     step("RDF5b. a partial fan-out failure exits non-zero and lists the failing program");
-    // `bad` exits before its (short) startsecs, so the `run --app` wait sees it
+    // `bad` exits before its (short) startsecs, so the `start <app>` wait sees it
     // as not-running and must report the app as failed.
     std::fs::write(
         ws.root.join("fan-app/appkeeper.toml"),
@@ -2798,7 +2974,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         ],
     )?;
     cli(bin, ws, &["apply", "mixed"])?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "--app", "mixed"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "mixed"])?;
     expect(
         !ok && code != 0,
         &format!("a partial fan-out failure exits non-zero, got {code}: {combined:?}"),
@@ -2812,7 +2988,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the successful program is still reported: {combined:?}"),
     )?;
 
-    step("RDF6. a single-program `run` blocks until the startup judgement returns");
+    step("RDF6. a single-program `start` blocks until the startup judgement returns");
     std::fs::write(
         ws.root.join("slow-app/appkeeper.toml"),
         format!(
@@ -2830,22 +3006,22 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         ],
     )?;
     cli(bin, ws, &["apply", "slow"])?;
-    // `restart = "no"`: the app is registered but not started, so the `run`
-    // below is the first start and its 1.5s startsecs is a pure wait.
+    // `restart = "no"`: the app is registered but not started, so the
+    // `start` below is the first start and its 1.5s startsecs is a pure wait.
     expect(
         pid_of(ws, "slow")?.is_none(),
         "slow is registered but stopped",
     )?;
     let t0 = Instant::now();
-    let out = cli(bin, ws, &["run", "slow"])?;
+    let out = cli(bin, ws, &["start", "slow"])?;
     let elapsed = t0.elapsed();
     expect(
         elapsed >= Duration::from_millis(1400),
-        &format!("run blocked for the 1.5s startsecs (took {elapsed:?})"),
+        &format!("start blocked for the 1.5s startsecs (took {elapsed:?})"),
     )?;
     expect(
         out.contains("pid=") && out.contains("slow"),
-        &format!("the blocked run still reports the result: {out:?}"),
+        &format!("the blocked start still reports the result: {out:?}"),
     )?;
 
     // -- 8.2: failures leave no residue -------------------------------------
@@ -2861,7 +3037,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
     step("RDF8. a program that exits before startsecs fails with no residue");
     let (ok, code, combined) =
-        cli_try(bin, ws, &["run", "--", &sleep_s, "0.05", "--name", "flaky"])?;
+        cli_try(bin, ws, &["run", "--", &sleep_s, "0.05", "--app", "flaky"])?;
     expect(!ok, &format!("early-exit ad-hoc fails: {combined:?}"))?;
     expect(code != 0, &format!("non-zero exit, got {code}"))?;
     expect(
@@ -2890,8 +3066,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         ],
     )?;
     cli(bin, ws, &["apply", "owner"])?;
-    let (ok, code, combined) =
-        cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--name", "clash"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--app", "clash"])?;
     expect(
         !ok && code != 0,
         &format!("cross-app colliding --name is refused, got {code}: {combined:?}"),
@@ -2910,7 +3085,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     // `web` was ad-hoc registered in RDF1; re-submitting it is a full
     // regeneration (app-registry: 同名全量再生), immediate effect.
     let web_pid = pid_of(ws, "web")?.expect("web is running");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "303", "--name", "web"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "303", "--app", "web"])?;
     expect(
         out.contains("started"),
         &format!("a same-name re-submission succeeds: {out:?}"),
@@ -2926,8 +3101,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     )?;
 
     step("RDF10. the reserved `all` name is refused with no residue");
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "303", "--name", "all"])?;
-    expect(!ok, "run --name all is refused")?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "303", "--app", "all"])?;
+    expect(!ok, "run --app all is refused")?;
     expect(
         combined.contains("reserved"),
         &format!("the error explains the reserved word: {combined:?}"),
@@ -2942,7 +3117,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let mut atomic = Command::new(bin)
         .arg("--config")
         .arg(ws.config_arg())
-        .args(["run", "--", &sleep_s, "400", "--name", "atomic"])
+        .args(["run", "--", &sleep_s, "400", "--app", "atomic"])
         .stdout(Stdio::from(atomic_log))
         .stderr(Stdio::null())
         .spawn()
@@ -2986,7 +3161,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         "the in-flight app is not in pending",
     )?;
     // A reload mid-flight must not disturb the staging.
-    cli(bin, ws, &["reload"])?;
+    cli(bin, ws, &["config", "--reload"])?;
     let status = atomic.wait()?;
     expect(
         status.success(),
@@ -3160,7 +3335,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         // startup already succeeded — exactly the partial-failure path.
         std::fs::create_dir_all(apps.join("weird.toml"))?;
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--app", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("the partial failure exits non-zero, got {code}: {combined:?}"),
@@ -3183,7 +3358,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
         step("RDF15. a re-run detects the residual state and asks (non-TTY refuses)");
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--app", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("a non-interactive re-run refuses, got {code}: {combined:?}"),
@@ -3204,7 +3379,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         step("RDF16. confirming the residual re-lands the record without restarting");
         std::fs::remove_dir(apps.join("weird.toml"))?;
         let cmd = format!(
-            "{} --config {} run -- {} 400 --name weird",
+            "{} --config {} run -- {} 400 --app weird",
             bin.display(),
             ws.config_arg(),
             sleep_s
@@ -3362,7 +3537,7 @@ fn setup_actions_app(ws: &Workspace, bin: &Path) -> Result<()> {
     // Command separator: sh takes `;`, cmd takes `&`.
     let seq = if cfg!(windows) { "& " } else { "; " };
     let chained = format!(
-        "echo old_svc_pid=${{program.svc.pid}}{seq}{bin} --config {cfg} restart svc{seq}{bin} --config {cfg} pid svc",
+        "echo old_svc_pid=${{program.svc.pid}}{seq}{bin} --config {cfg} restart acts svc{seq}{bin} --config {cfg} pid svc",
         bin = bin_s,
         cfg = cfg_s,
         seq = seq,
@@ -3627,9 +3802,9 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "acts programs are not started (restart = no)",
     )?;
 
-    step("H5. `run --app acts` fans out in dependency order");
-    let out = cli(bin, ws, &["run", "--app", "acts"])?;
-    // run-daemon-first re-renders the `run --app` fan-out as one
+    step("H5. `start acts` fans out in dependency order");
+    let out = cli(bin, ws, &["start", "acts"])?;
+    // run-daemon-first re-renders the `start <app>` fan-out as one
     // `{program}  config=...  pid=...  status (...)` line per program; the
     // dependency order is asserted on the program name at each line start.
     let pos = |p: &str| out.find(&format!("{p}  config="));
@@ -3733,7 +3908,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         &format!("unknown action exits 1, got {code}"),
     )?;
     expect(combined.contains("404"), "the CLI error reports the 404")?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "--app", "ghost"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "ghost"])?;
     expect(
         !ok && code == 1,
         &format!("unknown app fan-out exits 1, got {code}"),
@@ -3881,7 +4056,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("H11. actions run for stopped programs; pid substitutes to empty");
-    cli(bin, ws, &["stop", "svc"])?;
+    cli(bin, ws, &["stop", "acts", "svc"])?;
     wait_state(ws, "svc", "stopped")?;
     let out = cli(bin, ws, &["action", "svc", "stopped_pid"])?;
     expect(
@@ -3936,8 +4111,8 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         println!("    (windows: signal scenarios require unix; skipping)");
     }
 
-    step("H13. `stop --app acts` runs in reverse order");
-    let out = cli(bin, ws, &["stop", "--app", "acts"])?;
+    step("H13. `stop acts` runs in reverse order");
+    let out = cli(bin, ws, &["stop", "acts"])?;
     let (ptrap, psig, psvc) = (
         out.find("  trapper:"),
         out.find("  signalee:"),
@@ -3958,7 +4133,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Every acts program is user-stopped at this point (explicit stop above
     // and in H11); the fan-out start must pull all of them up and clear the
     // marker. Issued via the shell to prove the shell verb fans out too.
-    let out = cli(bin, ws, &["shell", "-e", "run --app acts"])?;
+    let out = cli(bin, ws, &["shell", "-e", "start acts"])?;
     expect(
         matches!((out.find("  svc:"), out.find("  signalee:"), out.find("  trapper:")),
             (Some(a), Some(b), Some(c)) if a < b && b < c),
@@ -3972,14 +4147,23 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
 
-    step("H15. shell: status table, unknown-command tolerance, restart, action exit code");
-    // status table: program name is the primary column, app is attribution.
-    let out = cli(bin, ws, &["shell", "-e", "status"])?;
+    step("H15. shell: ps table, unknown-command tolerance, restart, action exit code");
+    // ps table: program name is the primary column, app is attribution; the
+    // shared renderer adds the PENDING column (refine-cli-verbs).
+    let out = cli(bin, ws, &["shell", "-e", "ps"])?;
     expect(
-        ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"]
-            .iter()
-            .all(|h| out.contains(h)),
-        &format!("shell status prints the aligned table header: {out:?}"),
+        [
+            "NAME",
+            "APP",
+            "STATE",
+            "PID",
+            "RESTARTS",
+            "UNHEALTHY",
+            "PENDING",
+        ]
+        .iter()
+        .all(|h| out.contains(h)),
+        &format!("shell ps prints the aligned table header: {out:?}"),
     )?;
     expect(
         out.contains("svc") && out.contains("acts"),
@@ -4020,8 +4204,8 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the typo is reported as an unknown command",
     )?;
     expect(
-        combined.contains("status"),
-        "the did-you-mean hint suggests `status`",
+        combined.contains("ps"),
+        "the did-you-mean hint suggests the new `ps` word",
     )?;
     expect(
         combined.contains(&svc_pid2.to_string()),
@@ -4030,7 +4214,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     // restart through the shell hits the same control plane (same migration).
     let old_pid = wait_running(ws, "svc")?;
-    let out = cli(bin, ws, &["shell", "-e", "restart svc"])?;
+    let out = cli(bin, ws, &["shell", "-e", "restart acts svc"])?;
     expect(
         out.contains("svc"),
         &format!("shell restart reports the program: {out:?}"),
@@ -4072,20 +4256,34 @@ fn http_ok(url: &str) -> bool {
 fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let health = |port: u16| http_ok(&format!("http://127.0.0.1:{port}/api/health"));
 
-    step("W1. config --delete webui + reload stops the console (connection refused)");
+    step("W0. an online write without --reload points at `ak config --reload`");
+    // configuration spec (在线写后提示重载入口): the probe reads the control
+    // endpoint from the pre-modification config, so the daemon is found and the
+    // hint names the migrated entry point. The value written here (warn) is
+    // already in effect; the hint prints for any successful write.
+    let out = cli(bin, ws, &["config", "--set", "log_level=warn"])?;
+    expect(
+        out.contains("daemon is online") && out.contains("ak config --reload"),
+        &format!("the online write names the reload entry point: {out:?}"),
+    )?;
+
+    step("W1. config --delete webui --reload stops the console (one-step write+reload)");
     expect(
         health(ws.webui_port),
         "the console answers before the test (setup wrote [webui])",
     )?;
-    let out = cli(bin, ws, &["config", "--delete", "webui"])?;
+    let out = cli(bin, ws, &["config", "--delete", "webui", "--reload"])?;
     expect(
         out.contains("deleted webui"),
         &format!("delete reports the removed table: {out:?}"),
     )?;
-    let out = cli(bin, ws, &["reload"])?;
     expect(
         out.contains("webui: webui console disabled"),
-        &format!("reload reports the disabled console: {out:?}"),
+        &format!("the attached reload reports the disabled console: {out:?}"),
+    )?;
+    expect(
+        !out.contains("run `ak config --reload`"),
+        &format!("an attached reload prints no reload hint: {out:?}"),
     )?;
     expect(
         !health(ws.webui_port),
@@ -4107,7 +4305,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("webui.listen"),
         &format!("set reports the written key: {out:?}"),
     )?;
-    let out = cli(bin, ws, &["reload"])?;
+    let out = cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains(&format!(
             "webui: webui console serving on http://127.0.0.1:{new_port}"
@@ -4116,6 +4314,41 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(health(new_port), "the console answers on the new port")?;
     expect(!health(ws.webui_port), "the old port stays closed")?;
+
+    step("W2b. config --set + --reload in one command takes effect immediately");
+    // configuration spec (写动作与 --reload 一步生效): the local write succeeds
+    // and the reload follows in the same invocation; the "run `ak config
+    // --reload`" hint is suppressed because it is already attached.
+    let one_step_port = free_port()?;
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "config",
+            "--set",
+            &format!("webui.listen=127.0.0.1:{one_step_port}"),
+            "--reload",
+        ],
+    )?;
+    expect(
+        out.contains(&format!("set webui.listen = 127.0.0.1:{one_step_port}")),
+        &format!("the write is reported: {out:?}"),
+    )?;
+    expect(
+        out.contains(&format!(
+            "webui: webui console serving on http://127.0.0.1:{one_step_port}"
+        )),
+        &format!("the attached reload applied the console immediately: {out:?}"),
+    )?;
+    expect(
+        !out.contains("run `ak config --reload`"),
+        &format!("an attached reload prints no reload hint: {out:?}"),
+    )?;
+    expect(
+        health(one_step_port),
+        "the console serves on the new address right after the one-step command",
+    )?;
+    expect(!health(new_port), "the previous port is released")?;
 
     step("W3. restoring the listen + reload rebinds back (listen change)");
     let out = cli(
@@ -4131,7 +4364,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("webui.listen"),
         &format!("set reports the restored key: {out:?}"),
     )?;
-    let out = cli(bin, ws, &["reload"])?;
+    let out = cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains(&format!("serving on http://127.0.0.1:{}", ws.webui_port)),
         &format!("reload reports the restored address: {out:?}"),
@@ -4154,7 +4387,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("webui.listen=127.0.0.1:{occupied}"),
         ],
     )?;
-    let out = cli(bin, ws, &["reload"])?;
+    let out = cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains("webui: webui console unavailable"),
         &format!("reload reports the degraded console: {out:?}"),
@@ -4167,7 +4400,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("W5. freeing the port + reload recovers the console on the same address");
     drop(blocker);
     std::thread::sleep(Duration::from_millis(150));
-    let out = cli(bin, ws, &["reload"])?;
+    let out = cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains(&format!(
             "webui: webui console serving on http://127.0.0.1:{occupied}"
@@ -4186,7 +4419,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("webui.listen=127.0.0.1:{}", ws.webui_port),
         ],
     )?;
-    let _ = cli(bin, ws, &["reload"])?;
+    let _ = cli(bin, ws, &["config", "--reload"])?;
     expect(health(ws.webui_port), "the setup port serves again")?;
     expect(!health(occupied), "the temporary port is released")?;
 
@@ -4657,7 +4890,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
             "--",
             sleep.to_str().unwrap(),
             "100000",
-            "--name",
+            "--app",
             "tcpadhoc",
         ],
     )?;
@@ -4675,7 +4908,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
             sleep.display().to_string()
         ),
     )?;
-    let out = tcp_cli(bin, &ws, &["reload"])?;
+    let out = tcp_cli(bin, &ws, &["config", "--reload"])?;
     expect(
         out.contains("tcpdemo") && out.contains("apply"),
         &format!("reload previews the pending change over tcp://: {out:?}"),
@@ -4693,12 +4926,12 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // stop + start round the gate as well.
     tcp_cli(bin, &ws, &["stop", "tcpadhoc"])?;
     let (ok, _code, combined) = {
-        // start-or-hint on a registered program goes through `run <name>`.
-        tcp_cli_try(bin, &ws, &["run", "tcpadhoc"])
+        // Starting a registered app goes through `start <app>`.
+        tcp_cli_try(bin, &ws, &["start", "tcpadhoc"])
     };
     expect(
         ok,
-        &format!("run <name> restarts the stopped program: {combined:?}"),
+        &format!("start <app> restarts the stopped program: {combined:?}"),
     )?;
     tcp_wait_running(bin, &ws, "tcpadhoc")?;
     expect(

@@ -45,8 +45,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// Readiness-poll budget: a listener that accepts but never answers must not
 /// eat the whole pull-up window (`daemonize::READY_TIMEOUT`).
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
-/// `run --app` / custom actions block until the daemon's startup judgement,
-/// which can legitimately take minutes.
+/// `start <app>` fan-out / custom actions block until the daemon's startup
+/// judgement, which can legitimately take minutes.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// How the response body is framed.
@@ -318,8 +318,8 @@ impl Client {
         self.call("POST", &format!("/v1/apps/{app}/{verb}"))
     }
 
-    /// `run --app`: fan out and block until every program's startup judgement
-    /// (`?wait=1`).
+    /// `start <app>`: fan out and block until every program's startup
+    /// judgement (`?wait=1`).
     pub fn app_start_and_wait(&self, app: &str) -> Result<serde_json::Value> {
         self.send(
             "POST",

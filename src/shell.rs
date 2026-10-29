@@ -3,7 +3,7 @@
 //! untouched: every command reuses `client::Client` and the shared exit-code
 //! contract. The `open` verb probes the web console (`GET /api/health`) and
 //! launches the system browser; enabling the console itself is a daemon
-//! config concern (`[webui]` section + `ak reload`).
+//! config concern (`[webui]` section + `ak config --reload`).
 
 use std::io::Write;
 
@@ -16,19 +16,21 @@ use crate::config::DEFAULT_WEBUI_LISTEN;
 /// daemon config's `[webui]` section (`webui.listen`, 127.0.0.1:9877).
 const DEFAULT_WEBUI_URL: &str = "http://127.0.0.1:9877";
 
-/// What a start/stop/restart targets: one program (bare name, unchanged
-/// semantics) or a whole app (`--app`, fan-out expanded server-side).
+/// What a start/stop/restart targets: a whole app (bare `<app>`, fan-out
+/// expanded server-side) or one program of that app (the second positional).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Target {
-    Program(String),
+    /// The whole app.
     App(String),
+    /// One program inside an app (validated against its owning app).
+    Program { app: String, program: String },
 }
 
 /// One parsed shell line.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ShellCmd {
-    Status,
-    Run(Target),
+    Ps,
+    Start(Target),
     Stop(Target),
     Restart(Target),
     Action {
@@ -46,7 +48,6 @@ pub(crate) enum ShellCmd {
         tail: usize,
         stream: String,
     },
-    Reload,
     Pending,
     Apply {
         app: Option<String>,
@@ -66,8 +67,8 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         return Ok(None);
     };
     let cmd = match head.as_str() {
-        "status" | "st" => ShellCmd::Status,
-        "run" => parse_target("run", args).map(ShellCmd::Run)?,
+        "ps" => ShellCmd::Ps,
+        "start" => parse_target("start", args).map(ShellCmd::Start)?,
         "stop" => parse_target("stop", args).map(ShellCmd::Stop)?,
         "restart" => parse_target("restart", args).map(ShellCmd::Restart)?,
         "action" => parse_two_args("action", args, "action <program> <action>")
@@ -76,7 +77,6 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
             .map(|(program, signal)| ShellCmd::Signal { program, signal })?,
         "pid" => ShellCmd::Pid(one_arg(head, args)?),
         "log" => parse_log(args)?,
-        "reload" => ShellCmd::Reload,
         "pending" => ShellCmd::Pending,
         "apply" => parse_apply(args)?,
         "shutdown" => ShellCmd::Shutdown,
@@ -88,38 +88,24 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
     Ok(Some(cmd))
 }
 
-/// Parse `<name>` (program) or `--app <app>` for start/stop/restart.
+/// Parse `<app> [<program>]` for start/stop/restart (the same range syntax as
+/// the single-shot CLI verbs).
 fn parse_target(cmd: &str, args: &[String]) -> Result<Target> {
-    let mut name: Option<String> = None;
-    let mut app: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--app" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--app needs an app name"))?;
-                if app.is_some() {
-                    bail!("{cmd} takes --app only once");
-                }
-                app = Some(v.clone());
-            }
-            other if other.starts_with('-') => bail!("unknown {cmd} flag {other:?}"),
-            other => {
-                if name.is_some() {
-                    bail!("{cmd} takes exactly one program name");
-                }
-                name = Some(other.to_string());
-            }
+    let mut positional: Vec<String> = Vec::new();
+    for a in args {
+        if a.starts_with('-') {
+            bail!("unknown {cmd} flag {a:?}");
         }
-        i += 1;
+        positional.push(a.clone());
     }
-    match (name, app) {
-        (Some(n), None) => Ok(Target::Program(n)),
-        (None, Some(a)) => Ok(Target::App(a)),
-        (Some(_), Some(_)) => bail!("{cmd} takes a program name OR --app <app>, not both"),
-        (None, None) => bail!("{cmd} needs a program name (or --app <app>)"),
+    match positional.as_slice() {
+        [app] => Ok(Target::App(app.clone())),
+        [app, program] => Ok(Target::Program {
+            app: app.clone(),
+            program: program.clone(),
+        }),
+        [] => bail!("{cmd} needs an app name: {cmd} <app> [<program>]"),
+        _ => bail!("{cmd} takes at most two positional args: <app> [<program>]"),
     }
 }
 
@@ -248,22 +234,37 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
     })
 }
 
-/// Naive "did you mean" for the unknown-command hint.
+/// Naive "did you mean" for the unknown-command hint. The word list mirrors
+/// the CLI vocabulary (`start|stop|restart|ps`, no `reload`, no `status`).
 fn similar_hint(input: &str) -> String {
-    const COMMANDS: [&str; 15] = [
-        "status", "run", "stop", "restart", "action", "signal", "pid", "log", "reload", "pending",
-        "apply", "shutdown", "open", "help", "exit",
+    const COMMANDS: [&str; 13] = [
+        "ps", "start", "stop", "restart", "action", "signal", "pid", "log", "pending", "apply",
+        "shutdown", "open", "help",
     ];
     let input = input.to_lowercase();
-    let similar: Vec<&str> = COMMANDS
-        .iter()
-        .copied()
-        .filter(|c| {
-            // cheap similarity: shared prefix or edit distance <= 2 on short words
-            c.starts_with(input.chars().next().unwrap_or_default()) && levenshtein(&input, c) <= 2
-        })
-        .collect();
-    match similar.as_slice() {
+    let mut words: Vec<&'static str> = Vec::new();
+    // The retired words keep a route to their successor, including near-miss
+    // typos: `status`/`st` → `ps`, `reload` → `pending`/`apply`
+    // (shell-client spec).
+    if input == "st" || levenshtein(&input, "status") <= 2 {
+        words.push("ps");
+    }
+    if levenshtein(&input, "reload") <= 2 {
+        words.extend(["pending", "apply"]);
+    }
+    if levenshtein(&input, "run") <= 1 {
+        words.push("start");
+    }
+    for c in COMMANDS {
+        // cheap similarity: shared prefix or edit distance <= 2 on short words
+        if !words.contains(&c)
+            && c.starts_with(input.chars().next().unwrap_or_default())
+            && levenshtein(&input, c) <= 2
+        {
+            words.push(c);
+        }
+    }
+    match words.as_slice() {
         [] => String::new(),
         [one] => format!(" (did you mean {one}?)"),
         many => format!(" (did you mean one of: {}?)", many.join(", ")),
@@ -289,17 +290,15 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 pub(crate) const HELP_TEXT: &str = "\
 Built-in commands:
-  status                              list all programs (app, state, pid, restarts)
-  run|stop|restart <name>             control a program
-  run|stop|restart --app <app>        fan out over every program of an app
+  ps                                  list all programs (app, state, pid, restarts, pending)
+  start|stop|restart <app> [<program>]  control an app, or one program of it
   action <program> <action>           run a custom action (prints its output tail;
                                       -e mode exits with the action's exit code)
   signal <program> <SIGNAL>           send a whitelist signal to the program's
                                       child (TERM INT HUP QUIT USR1 USR2; unix only)
-  pid <name>                          print a program's pid
-  log <name> [-f] [--tail N] [--stream out|err]
+  pid <program>                       print a program's pid
+  log <program> [-f] [--tail N] [--stream out|err]
                                       view program logs
-  reload                              rescan config and show pending changes (no restarts)
   pending                             show pending (detected but not applied) changes
   apply [<app> [<program>]] [--restart]
                                       apply pending changes; the literal `all`
@@ -412,8 +411,8 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
 /// Execute one parsed command against the control-plane client.
 fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
     match cmd {
-        ShellCmd::Status => print_status(c).map(|_| Outcome::Continue),
-        ShellCmd::Run(t) => run_target(c, t, "start"),
+        ShellCmd::Ps => print_status(c).map(|_| Outcome::Continue),
+        ShellCmd::Start(t) => run_target(c, t, "start"),
         ShellCmd::Stop(t) => run_target(c, t, "stop"),
         ShellCmd::Restart(t) => run_target(c, t, "restart"),
         ShellCmd::Action { program, name } => run_custom_action(c, program, name),
@@ -448,16 +447,6 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
                     println!("{line}");
                 }
             }
-            Ok(Outcome::Continue)
-        }
-        ShellCmd::Reload => {
-            let v = c.reload()?;
-            println!(
-                "{}",
-                v.get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("reloaded")
-            );
             Ok(Outcome::Continue)
         }
         ShellCmd::Pending => {
@@ -533,11 +522,11 @@ fn print_action(c: &Client, name: &str, action: &str) -> Result<Outcome> {
     Ok(Outcome::Continue)
 }
 
-/// start/stop/restart against a program (bare name) or a whole app (--app);
-/// both shapes print the per-target result the CLI prints.
+/// start/stop/restart against a whole app (bare `<app>`, server-side fan-out)
+/// or one program of it (the second positional, ownership-checked here since
+/// the program endpoints are name-addressed).
 fn run_target(c: &Client, t: &Target, verb: &str) -> Result<Outcome> {
     match t {
-        Target::Program(name) => print_action(c, name, verb),
         Target::App(app) => {
             let v = c.app_action(app, verb)?;
             println!(
@@ -545,6 +534,14 @@ fn run_target(c: &Client, t: &Target, verb: &str) -> Result<Outcome> {
                 v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
             );
             Ok(Outcome::Continue)
+        }
+        Target::Program { app, program } => {
+            let info = c.program(program)?;
+            let owner = info.get("app").and_then(|a| a.as_str()).unwrap_or("");
+            if owner != app {
+                bail!("program {program:?} does not belong to app {app:?} (its app is {owner:?})");
+            }
+            print_action(c, program, verb)
         }
     }
 }
@@ -576,10 +573,9 @@ fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
     }
 }
 
-/// Aligned status table: name / app / state / pid / restarts / unhealthy.
-/// Shared by the shell's `status` built-in (shell-client spec: its word list
-/// is unchanged); the top-level `ak ps` builds on the same columns and adds
-/// the registry information (see [`render_ps_table`]).
+/// Aligned status table: name / app / state / pid / restarts / unhealthy /
+/// pending. Shared by the shell's `ps` built-in (shell-client spec) and by
+/// `ak ps`, which adds the registry columns (see [`render_ps_table`]).
 pub(crate) fn print_status(c: &Client) -> Result<()> {
     let v = c.status()?;
     print!("{}", render_status_table(&v));
@@ -599,61 +595,222 @@ pub(crate) struct RegistryRow {
     pub description: Option<String>,
 }
 
-/// Column header of the `ak ps` table: the shell status columns plus the
-/// registry information (config path, description).
-const PS_HEADER: [&str; 8] = [
+/// One rendered status row. The projection feeds the first six fields; the
+/// pending marker comes from `StatusDoc.pending`, the last two from the local
+/// registry (`ak ps` only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusRow {
+    name: String,
+    app: String,
+    state: String,
+    pid: String,
+    restarts: String,
+    unhealthy: String,
+    pending: String,
+    config: String,
+    description: String,
+}
+
+const PS_HEADER: [&str; 9] = [
     "NAME",
     "APP",
     "STATE",
     "PID",
     "RESTARTS",
     "UNHEALTHY",
+    "PENDING",
     "CONFIG",
     "DESCRIPTION",
 ];
 
-/// Pure renderer for `ak ps`'s online table: the shell status columns plus
-/// the config path (from the projection's per-program `config_path`) and the
+/// The shell table columns (the shared prefix of [`PS_HEADER`]).
+const STATUS_WIDTH: usize = 7;
+
+/// Pending-change view lifted from the `StatusDoc.pending` projection: the
+/// per-program markers plus the tail summary lines.
+#[derive(Debug, Default, Clone)]
+struct PendingView {
+    /// `(app, program)` pairs with an unapplied change.
+    programs: std::collections::BTreeSet<(String, String)>,
+    apps_added: std::collections::BTreeSet<String>,
+    summary: Vec<String>,
+}
+
+impl PendingView {
+    fn from_status(v: &serde_json::Value) -> Self {
+        let Some(p) = v.get("pending") else {
+            return Self::default();
+        };
+        let programs: std::collections::BTreeSet<(String, String)> = p
+            .get("programs")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        let app = e.get("app").and_then(|x| x.as_str())?;
+                        let program = e.get("program").and_then(|x| x.as_str())?;
+                        Some((app.to_string(), program.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let apps_added: std::collections::BTreeSet<String> = p
+            .get("apps_added")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut summary = Vec::new();
+        for a in &apps_added {
+            summary.push(format!("pending: app[{a}] registered (new)"));
+        }
+        for key in ["apps_removed", "daemon_hints", "errors"] {
+            if let Some(list) = p.get(key).and_then(|x| x.as_array()) {
+                for item in list {
+                    if let Some(text) = item.as_str() {
+                        summary.push(format!("pending: {text}"));
+                    }
+                }
+            }
+        }
+        if !programs.is_empty() || !summary.is_empty() {
+            summary.push("pending: run `ak apply` to apply".to_string());
+        }
+        Self {
+            programs,
+            apps_added,
+            summary,
+        }
+    }
+
+    /// The PENDING cell of one program row: a short marker (`changed`) when
+    /// the disk definition differs, empty otherwise.
+    fn marker(&self, app: &str, program: &str) -> String {
+        if self
+            .programs
+            .contains(&(app.to_string(), program.to_string()))
+        {
+            "changed".to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Projection rows expanded to the full `ps` column set (no PENDING yet).
+fn program_rows(
+    v: &serde_json::Value,
+    descriptions: &std::collections::BTreeMap<String, String>,
+) -> Vec<StatusRow> {
+    v.get("programs")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    let app = str_field(p, "app");
+                    StatusRow {
+                        name: str_field(p, "name"),
+                        app: app.clone(),
+                        state: str_field(p, "state"),
+                        pid: match p.get("pid") {
+                            Some(x) if !x.is_null() => x.to_string(),
+                            _ => "-".into(),
+                        },
+                        restarts: p
+                            .get("total_exits")
+                            .and_then(|x| x.as_u64())
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| "0".into()),
+                        unhealthy: if p
+                            .get("unhealthy")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false)
+                        {
+                            "yes".into()
+                        } else {
+                            "-".into()
+                        },
+                        pending: String::new(),
+                        config: p
+                            .get("config_path")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| "-".into()),
+                        description: descriptions
+                            .get(&app)
+                            .filter(|d| !d.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| "-".into()),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Fill each row's PENDING marker from the projection's pending set.
+fn mark_pending(rows: &mut [StatusRow], pending: &PendingView) {
+    for row in rows.iter_mut() {
+        row.pending = pending.marker(&row.app, &row.name);
+    }
+}
+
+/// Pure renderer for `ak ps`'s online table: the shared status columns plus
+/// the config path (from the projection's per-program `config_path`), the
 /// description (supplied by the CLI from the local registry, keyed by app
-/// name). An empty program list renders the registration hint.
+/// name) and the PENDING marker. An empty program list renders the
+/// registration hint.
 pub(crate) fn render_ps_table(
     v: &serde_json::Value,
     descriptions: &std::collections::BTreeMap<String, String>,
 ) -> String {
+    let pending = PendingView::from_status(v);
     let mut rows = program_rows(v, descriptions);
+    mark_pending(&mut rows, &pending);
     if rows.is_empty() {
         return ps_empty_hint();
     }
     sort_rows(&mut rows);
-    render_ps_rows(&rows)
+    render_ps_rows(&rows, &pending.summary)
 }
 
 /// Pure renderer for `ak ps --all` (online): the projection is authoritative;
-/// registry apps it does not cover are appended and labelled not applied.
+/// registry apps it does not cover are appended and labelled not applied. A
+/// registry-only app that is also pending-added carries the `new` marker.
 pub(crate) fn render_ps_all_table(
     v: &serde_json::Value,
     descriptions: &std::collections::BTreeMap<String, String>,
     registry: &[RegistryRow],
 ) -> String {
+    let pending = PendingView::from_status(v);
     let mut rows = program_rows(v, descriptions);
-    let known: std::collections::BTreeSet<String> = rows.iter().map(|r| r[1].clone()).collect();
+    mark_pending(&mut rows, &pending);
+    let known: std::collections::BTreeSet<String> = rows.iter().map(|r| r.app.clone()).collect();
     for app in registry.iter().filter(|a| !known.contains(&a.name)) {
-        rows.push([
-            app.name.clone(),
-            app.name.clone(),
-            "not-applied".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            app.path.clone(),
-            app.description.clone().unwrap_or_else(|| "-".to_string()),
-        ]);
+        rows.push(StatusRow {
+            name: app.name.clone(),
+            app: app.name.clone(),
+            state: "not-applied".to_string(),
+            pid: "-".to_string(),
+            restarts: "-".to_string(),
+            unhealthy: "-".to_string(),
+            pending: if pending.apps_added.contains(&app.name) {
+                "new".to_string()
+            } else {
+                String::new()
+            },
+            config: app.path.clone(),
+            description: app.description.clone().unwrap_or_else(|| "-".to_string()),
+        });
     }
     if rows.is_empty() {
         return ps_empty_hint();
     }
     sort_rows(&mut rows);
-    render_ps_rows(&rows)
+    render_ps_rows(&rows, &pending.summary)
 }
 
 /// Pure renderer for the offline `ps --all` degradation: a daemon-offline
@@ -705,75 +862,61 @@ fn ps_empty_hint() -> String {
     "no programs (register an app with `ak compose <dir>`)\n".to_string()
 }
 
-/// Projection rows expanded to the `ps` column set.
-fn program_rows(
-    v: &serde_json::Value,
-    descriptions: &std::collections::BTreeMap<String, String>,
-) -> Vec<[String; 8]> {
-    v.get("programs")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|p| {
-                    let app = str_field(p, "app");
-                    [
-                        str_field(p, "name"),
-                        app.clone(),
-                        str_field(p, "state"),
-                        match p.get("pid") {
-                            Some(x) if !x.is_null() => x.to_string(),
-                            _ => "-".into(),
-                        },
-                        p.get("total_exits")
-                            .and_then(|x| x.as_u64())
-                            .map(|x| x.to_string())
-                            .unwrap_or_else(|| "0".into()),
-                        if p.get("unhealthy")
-                            .and_then(|x| x.as_bool())
-                            .unwrap_or(false)
-                        {
-                            "yes".into()
-                        } else {
-                            "-".into()
-                        },
-                        p.get("config_path")
-                            .and_then(|x| x.as_str())
-                            .map(String::from)
-                            .unwrap_or_else(|| "-".into()),
-                        descriptions
-                            .get(&app)
-                            .filter(|d| !d.is_empty())
-                            .cloned()
-                            .unwrap_or_else(|| "-".into()),
-                    ]
-                })
-                .collect()
+fn sort_rows(rows: &mut [StatusRow]) {
+    rows.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
+}
+
+/// Render the `ps` column set, then the pending summary lines (if any).
+fn render_ps_rows(rows: &[StatusRow], summary: &[String]) -> String {
+    render_table(rows, &PS_HEADER, summary, true)
+}
+
+/// Render a table over the shared column set. `full` selects the `ps`
+/// columns (all nine); otherwise the shell's status columns (the first seven)
+/// are used.
+fn render_table(rows: &[StatusRow], header: &[&str], summary: &[String], full: bool) -> String {
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let all = vec![
+                r.name.clone(),
+                r.app.clone(),
+                r.state.clone(),
+                r.pid.clone(),
+                r.restarts.clone(),
+                r.unhealthy.clone(),
+                r.pending.clone(),
+                r.config.clone(),
+                r.description.clone(),
+            ];
+            if full {
+                all
+            } else {
+                all[..STATUS_WIDTH].to_vec()
+            }
         })
-        .unwrap_or_default()
-}
-
-fn sort_rows(rows: &mut [[String; 8]]) {
-    rows.sort_by(|a, b| (&a[1], &a[0]).cmp(&(&b[1], &b[0])));
-}
-
-fn render_ps_rows(rows: &[[String; 8]]) -> String {
-    let mut width = [0usize; 8];
-    for (i, h) in PS_HEADER.iter().enumerate() {
+        .collect();
+    let mut width = vec![0usize; header.len()];
+    for (i, h) in header.iter().enumerate() {
         width[i] = h.len();
     }
-    for row in rows {
+    for row in &cells {
         for (i, cell) in row.iter().enumerate() {
             width[i] = width[i].max(cell.chars().count());
         }
     }
     let mut out = String::new();
     out.push_str(&emit_cells(
-        &PS_HEADER.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &header.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         &width,
     ));
     out.push_str(&separator(&width));
-    for row in rows {
+    for row in &cells {
         out.push_str(&emit_cells(row, &width));
+    }
+    for line in summary {
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
@@ -807,81 +950,24 @@ fn separator(width: &[usize]) -> String {
 /// input), so both callers share one format and it is unit-testable without a
 /// live daemon. An empty program list renders the registration hint.
 pub(crate) fn render_status_table(v: &serde_json::Value) -> String {
-    let rows: Vec<[String; 6]> = v
-        .get("programs")
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|p| {
-                    [
-                        str_field(p, "name"),
-                        str_field(p, "app"),
-                        str_field(p, "state"),
-                        match p.get("pid") {
-                            Some(x) if !x.is_null() => x.to_string(),
-                            _ => "-".into(),
-                        },
-                        p.get("total_exits")
-                            .and_then(|x| x.as_u64())
-                            .map(|x| x.to_string())
-                            .unwrap_or_else(|| "0".into()),
-                        if p.get("unhealthy")
-                            .and_then(|x| x.as_bool())
-                            .unwrap_or(false)
-                        {
-                            "yes".into()
-                        } else {
-                            "-".into()
-                        },
-                    ]
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
+    let pending = PendingView::from_status(v);
+    let empty = std::collections::BTreeMap::new();
+    let mut rows = program_rows(v, &empty);
+    mark_pending(&mut rows, &pending);
     if rows.is_empty() {
         return "no programs (register an app with `ak compose <dir>`)\n".to_string();
     }
-    let header = ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"];
-    let mut width = [4usize; 6];
-    for (i, h) in header.iter().enumerate() {
-        width[i] = h.len();
-    }
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            width[i] = width[i].max(cell.chars().count());
-        }
-    }
-    let mut out = String::new();
-    let emit = |out: &mut String, cells: Vec<String>| {
-        out.push_str(
-            &cells
-                .iter()
-                .enumerate()
-                .map(|(i, cell)| {
-                    if i + 1 == cells.len() {
-                        cell.clone()
-                    } else {
-                        format!("{cell:<width$}  ", width = width[i])
-                    }
-                })
-                .collect::<String>(),
-        );
-        out.push('\n');
-    };
-    emit(&mut out, header.iter().map(|s| s.to_string()).collect());
-    out.push_str(
-        &width
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("  "),
-    );
-    out.push('\n');
-    for row in &rows {
-        emit(&mut out, row.to_vec());
-    }
-    out
+    sort_rows(&mut rows);
+    let header = [
+        "NAME",
+        "APP",
+        "STATE",
+        "PID",
+        "RESTARTS",
+        "UNHEALTHY",
+        "PENDING",
+    ];
+    render_table(&rows, &header, &pending.summary, false)
 }
 
 fn str_field(v: &serde_json::Value, key: &str) -> String {
@@ -945,7 +1031,7 @@ fn open_webui(url: &str) -> Result<()> {
         eprintln!(
             "webui not reachable at {url} — enable it in the daemon config \
              (`ak config --set webui.listen={DEFAULT_WEBUI_LISTEN}`) and run \
-             `ak reload`, then retry"
+             `ak config --reload`, then retry"
         );
         bail!("{e:#}");
     }
@@ -978,8 +1064,7 @@ mod tests {
         assert_eq!(parse("?"), Some(ShellCmd::Help));
         assert_eq!(parse("quit"), Some(ShellCmd::Exit));
         assert_eq!(parse("exit"), Some(ShellCmd::Exit));
-        assert_eq!(parse("status"), Some(ShellCmd::Status));
-        assert_eq!(parse("reload"), Some(ShellCmd::Reload));
+        assert_eq!(parse("ps"), Some(ShellCmd::Ps));
         assert_eq!(parse("pending"), Some(ShellCmd::Pending));
         assert_eq!(
             parse("apply"),
@@ -1017,41 +1102,64 @@ mod tests {
     #[test]
     fn unknown_and_missing_args() {
         assert!(parse_line("sttaus").is_err());
-        assert!(parse_line("start").is_err(), "`start` is no longer a verb");
-        assert!(parse_line("run").is_err());
-        assert!(parse_line("run a b").is_err());
+        assert!(parse_line("start").is_err(), "`start` needs an app name");
         assert!(parse_line("log").is_err());
         assert!(parse_line("log web --tail").is_err());
         assert!(parse_line("log web --stream both").is_err());
     }
 
-    /// actions: run/stop/restart take a bare program name or --app <app>.
+    /// actions: start/stop/restart take `<app> [<program>]` (the CLI range
+    /// syntax); `--app` is gone.
     #[test]
-    fn target_parsing_program_and_app() {
+    fn target_parsing_app_and_program() {
         assert_eq!(
-            parse("run web"),
-            Some(ShellCmd::Run(Target::Program("web".into())))
+            parse("start web"),
+            Some(ShellCmd::Start(Target::App("web".into())))
         );
         assert_eq!(
             parse("stop web"),
-            Some(ShellCmd::Stop(Target::Program("web".into())))
+            Some(ShellCmd::Stop(Target::App("web".into())))
         );
         assert_eq!(
-            parse("restart --app gateway"),
+            parse("restart gateway"),
             Some(ShellCmd::Restart(Target::App("gateway".into())))
         );
         assert_eq!(
-            parse("run --app demo"),
-            Some(ShellCmd::Run(Target::App("demo".into())))
+            parse("start web api"),
+            Some(ShellCmd::Start(Target::Program {
+                app: "web".into(),
+                program: "api".into()
+            }))
         );
-        // Both shapes at once, a missing --app value, or an unknown flag: all errors.
-        assert!(parse_line("run web --app demo").is_err());
-        assert!(parse_line("run --app").is_err());
-        assert!(parse_line("run --bogus x").is_err());
-        assert!(parse_line("stop a b").is_err());
-        // `start` was renamed: it is an unknown command now (no alias).
-        let e = parse_line("start web").unwrap_err().to_string();
-        assert!(e.contains("unknown command"), "{e}");
+        assert_eq!(
+            parse("stop demo worker"),
+            Some(ShellCmd::Stop(Target::Program {
+                app: "demo".into(),
+                program: "worker".into()
+            }))
+        );
+        // A missing app, too many positionals, or the removed --app flag: errors.
+        assert!(parse_line("start").is_err());
+        assert!(parse_line("start --app web").is_err());
+        assert!(parse_line("start a b c").is_err());
+        assert!(parse_line("stop --bogus x").is_err());
+    }
+
+    /// The retired words are unknown and get the successor hint (shell-client
+    /// spec): `status`/`st` → `ps`, `reload` → `pending`/`apply`, `run` → gone.
+    #[test]
+    fn retired_words_are_unknown_with_successors() {
+        for (word, want) in [
+            ("status", "ps"),
+            ("st", "ps"),
+            ("sttaus", "ps"),
+            ("reload", "pending"),
+            ("run web", "start"),
+        ] {
+            let e = parse_line(word).unwrap_err().to_string();
+            assert!(e.contains("unknown command"), "{word}: {e}");
+            assert!(e.contains(want), "{word} should hint {want}: {e}");
+        }
     }
 
     /// actions: `action`/`signal` verbs parse two positional arguments.
@@ -1124,14 +1232,15 @@ mod tests {
 
     #[test]
     fn similar_hint_suggests() {
-        assert!(similar_hint("sttaus").contains("status"));
+        assert!(similar_hint("pss").contains("ps"));
         assert!(similar_hint("resart").contains("restart"));
+        assert!(similar_hint("startt").contains("start"));
         assert!(!similar_hint("zzzzz").contains("did you mean"));
     }
     #[test]
     fn status_table_alignment() {
         // Pure formatting check: the shared renderer lines columns up and
-        // flags unhealthy programs. Same input the shell `status` built-in
+        // flags unhealthy programs. Same input the shell `ps` built-in
         // consumes (the top-level `ps` adds two registry columns on top).
         let v = serde_json::json!({
             "programs": [
@@ -1148,6 +1257,10 @@ mod tests {
         assert!(lines[0].contains("APP") && lines[0].contains("STATE"));
         assert!(lines[0].contains("PID") && lines[0].contains("RESTARTS"));
         assert!(lines[0].contains("UNHEALTHY"));
+        assert!(
+            lines[0].contains("PENDING"),
+            "the shared renderer has the column: {out}"
+        );
         assert!(lines[1].starts_with("----"), "{out}");
         assert!(lines[2].contains("web") && lines[2].contains("42"));
         assert!(lines[3].contains("worker-a"));
@@ -1272,6 +1385,85 @@ mod tests {
             render_ps_all_table(&v, &desc, &[]),
             render_ps_table(&v, &desc)
         );
+    }
+
+    /// `ps` PENDING column: a program whose disk definition differs carries a
+    /// short marker; the rest stay empty, and the app-level registration /
+    /// error entries render as tail summary lines (control-plane spec).
+    #[test]
+    fn ps_table_marks_pending_and_renders_summary() {
+        let mut v = projection();
+        v["pending"] = serde_json::json!({
+            "programs": [{"app": "demo", "program": "worker", "running": true}],
+            "apps_added": ["fresh"],
+            "apps_removed": [],
+            "daemon_hints": [],
+            "errors": [],
+        });
+        let desc = std::collections::BTreeMap::new();
+        let out = render_ps_table(&v, &desc);
+        let lines: Vec<&str> = out.lines().collect();
+        let header = lines[0];
+        assert!(header.contains("PENDING"), "{header}");
+        let worker = lines.iter().find(|l| l.contains("worker")).unwrap();
+        assert!(worker.contains("changed"), "worker is marked: {worker}");
+        let web = lines.iter().find(|l| l.contains("web")).unwrap();
+        assert!(!web.contains("changed"), "web carries no marker: {web}");
+        // The tail summary names the new app and points at apply.
+        assert!(
+            out.contains("pending: app[fresh] registered (new)"),
+            "{out}"
+        );
+        assert!(out.contains("pending: run `ak apply` to apply"), "{out}");
+    }
+
+    /// A `ps --all` registry-only app that is also pending-added carries the
+    /// `new` marker; no pending section means no marker and no summary.
+    #[test]
+    fn ps_all_marks_pending_added_registry_rows() {
+        let mut v = projection();
+        v["pending"] = serde_json::json!({
+            "programs": [],
+            "apps_added": ["pending-app"],
+            "apps_removed": [],
+            "daemon_hints": [],
+            "errors": [],
+        });
+        let desc = std::collections::BTreeMap::new();
+        let registry = vec![RegistryRow {
+            name: "pending-app".to_string(),
+            path: "/opt/pending/appkeeper.toml".to_string(),
+            description: None,
+        }];
+        let out = render_ps_all_table(&v, &desc, &registry);
+        let row = out
+            .lines()
+            .find(|l| l.contains("pending-app"))
+            .expect("registry row");
+        assert!(row.contains("new"), "pending-added app marked new: {row}");
+
+        // Without pending data the column is empty and no summary follows.
+        let plain = render_ps_all_table(&projection(), &desc, &[]);
+        assert!(!plain.contains("pending:"), "{plain}");
+        assert!(!plain.contains("changed"), "{plain}");
+    }
+
+    /// The shell `ps` built-in shares the renderer: the same table (including
+    /// the PENDING marker) minus the two registry columns.
+    #[test]
+    fn status_table_shares_the_pending_column() {
+        let mut v = projection();
+        v["pending"] = serde_json::json!({
+            "programs": [{"app": "gateway", "program": "api", "running": false}],
+        });
+        let out = render_status_table(&v);
+        assert!(out.contains("PENDING"), "{out}");
+        assert!(
+            !out.contains("CONFIG") && !out.contains("DESCRIPTION"),
+            "{out}"
+        );
+        let api = out.lines().find(|l| l.contains("api")).unwrap();
+        assert!(api.contains("changed"), "{api}");
     }
 
     /// 4.3: the offline degradation is a daemon-offline note plus the local

@@ -6,7 +6,7 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 **本地 IPC**（unix `/run/appkeeper/<uid>/ak.sock`、Windows 命名管道，身份由 OS
 属主强制），或显式 `tcp://host:port`（Bearer 凭据准入，`auth_token` 必配）；
 同一时刻只监听一种形态。内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动
-（缺省关闭，`ak reload` 热生效；`webui.auth_token` 可选配置后以 cookie 会话
+（缺省关闭，`ak config --reload` 热生效；`webui.auth_token` 可选配置后以 cookie 会话
 保护 `/api/*`）。
 
 ## Architecture
@@ -14,21 +14,27 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 - `src/main.rs` — CLI 入口：`daemon` 子命令族（唯一守护入口：`start`
   后台缺省拉起 / `start --foreground` 前台 / `install` / `uninstall` 系统服务 /
   `shutdown` 停止全部程序并退出；裸 `ak daemon` 为退出码 2 的 usage 错误；daemon
-  配置含 `[webui]` 段时伺服内嵌控制台）| `run`（纯客户端动词，**daemon-first**：
-  `<名>`/`--app` 启动、`--`/`--cmd` ad-hoc 注册全部经控制面 API 由守护进程执行，
-  统一返回 `{程序名, 配置路径, PID}` 并支持 `--json`；ad-hoc 注册「先启动成功、
-  后落盘」，守护离线一律退出码 3 且不隐式拉起；守护形态的 `run` 在参数解析前
-  拦截并给迁移提示）| `validate`（含 webui 无 token 的暴露警告）| `config`
-  （daemon 配置本地管理：init/set/get/delete/edit 五动作，白名单键表与读改写/
-  原子落盘引擎在 `src/config.rs`；`[daemon]` 死键 host/port 报错，
+  配置含 `[webui]` 段时伺服内嵌控制台）| `start|stop|restart <app> [<program>]`
+  （应用管理动词，双位置范围参数：裸 `<app>` 整 app 按序扇出、第二参数收窄单程序；
+  `start` 返回 `{程序名, 配置路径, PID}` 并支持 `--json`；`--app` 旗标已删）|
+  `run`（**仅** ad-hoc 注册：`--`/`--cmd` 二选一，应用命名 `--app`，**daemon-first**：
+  经控制面 API 由守护进程执行，返回同样的 `{程序名, 配置路径, PID}` 并支持 `--json`；
+  「先启动成功、后落盘」，守护离线一律退出码 3 且不隐式拉起；裸 `run` 为退出码 2
+  的用法错误并列出 ad-hoc 两形态；守护形态的 `run` 在参数解析前拦截并给迁移提示）|
+  `validate`（含 webui 无 token 的暴露警告）| `config`
+  （daemon 配置动作：init/set/get/delete/edit/reload，白名单键表与读改写/
+  原子落盘引擎在 `src/config.rs`；`--reload` 经 `/v1/reload` 触发在线重扫，
+  可与 `--set`/`--delete`/`--edit` 组合、与 `--get`/`--init` 互斥；
+  `[daemon]` 死键 host/port 报错，
   `auth_token` 为条件键：`tcp://` 形态必配、路径形态拒绝，
   组合校验 `auth_pair_error` 被 load/validate/set/get 共用）；
-  控制子命令 `ps/stop/restart/log/pid/reload/apply` 走配置端点上的 HTTP API
+  控制子命令 `ps/start/stop/restart/log/pid/apply` 走配置端点上的 HTTP API
   （`ps` 缺省只读在线投影、`--all` 客户端合并本地注册表、`--out json|table`，
-  离线时 `--all` 降级为注册表清单并退出 0）；`compose/remove` 管理 app 注册表
+  表格带 PENDING 列与 pending 摘要行；离线时 `--all` 降级为注册表清单并退出 0）；
+  `compose/remove` 管理 app 注册表
   （compose 按路径形态分派：目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成
   `app_dir/<name>.toml`，`apply all` 中 `all` 为全量保留字，不可作应用名；
-  `compose --apply` 保留离线隐式拉起）。
+  `compose --apply` 保留离线隐式拉起）。顶层 `reload` 已删（`ak reload` 为未知子命令）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
   新增「暂存应用」`staged`（已启动未落盘的 ad-hoc app，检测合并使巡检不清理）与
   `AdhocUp/AdhocCommit/AdhocAbort` 命令；启动判定等待（`wait_startup`）跑在 HTTP
@@ -78,7 +84,7 @@ cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--r
                                        #   + appkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用
 cargo run -- daemon start --foreground # 守护（缺省后台用 `daemon start`；daemon 配置含 [webui] 段时
-                                       #   伺服内嵌控制台；config --set webui.listen=... + reload 可热开启）
+                                       #   伺服内嵌控制台；config --set webui.listen=... + config --reload 可热开启）
 cargo run -- ps                        # 控制面 CLI（经控制 socket；无任何 TCP 端口；
                                        #   --all 含未运行 app，--out json 等价 /v1/status）
 

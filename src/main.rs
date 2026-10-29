@@ -2,9 +2,10 @@
 //! layered config (global daemon config + per-app deployment files).
 //!
 //! `ak daemon start` is the daemon entry (the only one); everything else is a
-//! client: `run` is a client verb (control-plane actions over the HTTP/1.1
-//! API carried on a local IPC endpoint), `ps` is the runtime overview, and
-//! compose/remove manage the app registry (app_dir links).
+//! client: `start`/`stop`/`restart` control registered apps (control-plane
+//! actions over the HTTP/1.1 API carried on a local IPC endpoint), `run`
+//! registers and starts an ad-hoc command line, `ps` is the runtime overview,
+//! and compose/remove manage the app registry (app_dir links).
 
 mod action;
 mod api;
@@ -47,11 +48,14 @@ const EXIT_UNREACHABLE: i32 = 3;
 #[command(
     name = "ak",
     version,
-    about = "Cross-platform application-layer process keeper (daemon + CLI)"
+    about = "Cross-platform application-layer process keeper (daemon + CLI)",
+    after_help = "Examples:
+  ak daemon start   # start the daemon in the background
+  ak start <app>    # start an app (all its programs, in order)
+  ak stop <app>     # stop an app"
 )]
 struct Cli {
-    /// Path to the daemon config file. Defaults to the platform location
-    /// (/etc/appkeeper/daemon.toml on Linux, %APPDATA%\appkeeper\daemon.toml on Windows).
+    /// Path to the daemon config file (default: platform location)
     #[arg(short = 'c', long, global = true)]
     config: Option<PathBuf>,
 
@@ -61,31 +65,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// The daemon subcommand family: `start` / `install` / `uninstall` /
-    /// `shutdown` (control-plane + background-daemon specs). Bare `daemon`
-    /// is a usage error (exit 2) listing the four subcommands. The web
-    /// console is config-driven: add a `[webui]` section to the daemon
-    /// config (or `ak config --set webui.listen=...` + reload) to enable it.
+    /// Run or manage the daemon (start / install / uninstall / shutdown)
     Daemon {
         #[command(subcommand)]
         cmd: Option<DaemonCmd>,
     },
-    /// The client "run" verb (control-plane spec): `run <name>` /
-    /// `run --app <app>` starts an already-registered program or fans out
-    /// over a whole app; the ad-hoc form (`run -- <cmd...>` or
-    /// `run --cmd "<string>"`) registers a command line and takes effect
-    /// immediately. The removed daemon forms of `run` are intercepted before
-    /// clap (see `reject_removed_run`).
+    /// Start an app (all its programs, in order) or one program of it
+    Start {
+        /// App name
+        #[arg(value_name = "APP")]
+        app: String,
+        /// Only this program of the app (default: the whole app)
+        #[arg(value_name = "PROGRAM")]
+        program: Option<String>,
+        /// Machine-readable JSON output
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Register and start a new command line (ad-hoc; daemon required)
     Run {
-        /// Start this already-registered program
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
-        /// Start every program of this app, in the established order
-        #[arg(long = "app", conflicts_with = "name")]
-        app: Option<String>,
-        /// (ad-hoc) register this command line as a new app; everything after
-        /// `--` (the clap end-of-flags separator) is the command.
-        /// Mutually exclusive with `--cmd`
+        /// The command line: everything after `--`
         #[arg(
             last = true,
             num_args = 1..,
@@ -94,190 +93,170 @@ enum Cmd {
             conflicts_with = "cmd_str"
         )]
         cmd: Vec<String>,
-        /// (ad-hoc) the command line as one string, split like a shell line.
-        /// Mutually exclusive with the `--` form
+        /// The command line as one shell-like string
         #[arg(long = "cmd", value_name = "COMMAND")]
         cmd_str: Option<String>,
-        /// (ad-hoc) app name (default: the command's file name stem; `all` is
-        /// reserved)
-        #[arg(long = "name", value_name = "APP")]
+        /// Ad-hoc app name (default: the command file stem)
+        #[arg(long = "app", value_name = "APP")]
         scaffold_name: Option<String>,
-        /// (ad-hoc) description for the generated app
+        /// Ad-hoc app description
         #[arg(long = "description")]
         description: Option<String>,
-        /// (ad-hoc) startup/restart policy literal written into the generated
-        /// config: no | on-failure | always | unless-stopped
+        /// Ad-hoc restart policy: no | on-failure | always | unless-stopped
         #[arg(long = "restart", value_parser = ["no", "on-failure", "always", "unless-stopped"])]
         restart: Option<String>,
-        /// (ad-hoc) first restart delay in seconds (exponential backoff)
+        /// Ad-hoc first restart delay in seconds
         #[arg(long = "restart-backoff")]
         restart_backoff: Option<f64>,
-        /// (ad-hoc) environment variable K=V; repeat for more
+        /// Ad-hoc environment variable K=V (repeatable)
         #[arg(long = "env")]
         envs: Vec<String>,
-        /// (ad-hoc) working directory for the program
-        /// (default: the directory `run` is invoked in)
+        /// Ad-hoc working directory (default: current directory)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
-        /// Machine-readable output: a single program object, or an array for
-        /// `run --app` fan-out (run-daemon-first control-plane spec)
+        /// Machine-readable JSON output
         #[arg(long = "json")]
         json: bool,
     },
-    /// Validate the daemon config + all registered apps, or one app file
+    /// Validate the daemon config and all registered apps
     Validate {
-        /// Optional path to a single app config file
+        /// Validate only this app config file
         path: Option<PathBuf>,
     },
-    /// Manage the daemon config file locally: --init / --set / --get /
-    /// --delete / --edit. Actions are mutually exclusive — one class of
-    /// action per call. Purely local file operations; a running daemon is
-    /// only probed for a "reload needed" hint after a successful write.
+    /// Manage the daemon config file (--init/--set/--get/--delete/--edit/--reload)
     Config {
-        /// Set a daemon config key (repeatable): --set port=8080 or
-        /// --set webui.listen=127.0.0.1:9877. Strong-typed whitelist; unknown
-        /// keys / type violations are rejected untouched and the result is
-        /// validated before it is written atomically
+        /// Set a daemon config key (repeatable): --set log_level=debug
         #[arg(long = "set", value_name = "KEY=VALUE", conflicts_with_all = ["get", "delete", "edit", "init"])]
         set: Vec<String>,
-        /// Print the effective value of a daemon config key (repeatable; a
-        /// bare value per key; unset keys answer with the built-in default,
-        /// e.g. `webui.listen` falls back to 127.0.0.1:9877)
-        #[arg(long = "get", value_name = "KEY", conflicts_with_all = ["delete", "edit", "init"])]
+        /// Print a key's effective value (repeatable)
+        #[arg(long = "get", value_name = "KEY", conflicts_with_all = ["delete", "edit", "init", "reload"])]
         get: Vec<String>,
-        /// Remove a daemon config key or whole section (repeatable): bare
-        /// keys are shorthand for [daemon] leaves, dotted paths like
-        /// daemon.socket or webui.listen name them directly, and a bare
-        /// section name (`webui`) removes the whole table — deleting
-        /// `[webui]` turns the console off. Idempotent — absent targets
-        /// change nothing
+        /// Remove a key or whole section (repeatable), e.g. --delete webui
         #[arg(long = "delete", value_name = "KEY", conflicts_with_all = ["edit", "init"])]
         delete: Vec<String>,
-        /// Open the daemon config in $VISUAL/$EDITOR (vi/notepad), creating
-        /// it when missing, then validate the result
+        /// Edit the config in $VISUAL/$EDITOR, then validate it
         #[arg(long = "edit", conflicts_with = "init")]
         edit: bool,
-        /// Initialize a fresh daemon config (refuses to overwrite) plus the
-        /// app registry directory and an example.toml.sample template
-        #[arg(long = "init")]
+        /// Create a fresh config, app dir and example template
+        #[arg(long = "init", conflicts_with = "reload")]
         init: bool,
+        /// Ask the daemon to re-read the config and rescan (daemon required)
+        #[arg(long = "reload")]
+        reload: bool,
     },
-    /// Overview of the daemon and its programs (`ps`, control-plane spec):
-    /// online-only by default (offline exits 3), `--all` adds the local
-    /// registry view (and degrades to a registry listing when offline).
+    /// Show programs and their state
     Ps {
-        /// Include registered-but-not-running apps: join the local registry
-        /// with the `/v1` projection (online), or print the registry listing
-        /// with a daemon-offline note (offline, exit 0)
+        /// Include registered apps that are not running (offline: local list)
         #[arg(long = "all")]
         all: bool,
-        /// Output format: `table` (default, human-readable) or `json`
-        /// (the `GET /v1/status` projection, pretty-printed)
+        /// Output format: table (default) or json
         #[arg(long = "out", value_parser = ["json", "table"], default_value = "table")]
         out: String,
     },
-    /// Stop a program (graceful, then force after stop timeout), or every
-    /// program of one app with --app
+    /// Stop an app (all its programs, in reverse order) or one program of it
     Stop {
-        /// Program name (the bare form keeps per-program semantics)
-        #[arg(required_unless_present = "app", conflicts_with = "app")]
-        name: Option<String>,
-        /// Stop every program of this app, in reverse start order
-        #[arg(long = "app")]
-        app: Option<String>,
+        /// App name
+        #[arg(value_name = "APP")]
+        app: String,
+        /// Only this program of the app (default: the whole app)
+        #[arg(value_name = "PROGRAM")]
+        program: Option<String>,
     },
-    /// Restart a program, or every program of one app with --app
+    /// Restart an app (all its programs) or one program of it
     Restart {
-        /// Program name (the bare form keeps per-program semantics)
-        #[arg(required_unless_present = "app", conflicts_with = "app")]
-        name: Option<String>,
-        /// Restart every program of this app
-        #[arg(long = "app")]
-        app: Option<String>,
+        /// App name
+        #[arg(value_name = "APP")]
+        app: String,
+        /// Only this program of the app (default: the whole app)
+        #[arg(value_name = "PROGRAM")]
+        program: Option<String>,
     },
-    /// Execute a program's declared custom action; the CLI exit code is the
-    /// action's own exit code (call failures: 1, daemon unreachable: 3)
-    Action { program: String, name: String },
-    /// Send a whitelist signal (TERM INT HUP QUIT USR1 USR2) to a program's
-    /// child process; unix only
-    Signal { program: String, signal: String },
-    /// Print a program's pid
-    Pid { name: String },
-    /// Show the logs of one or more programs (multi-program output is
-    /// prefixed with `[name] `)
+    /// Run a custom action of one program (exit code passed through)
+    Action {
+        /// Program name (a single-program app's program has the app's name)
+        #[arg(value_name = "PROGRAM")]
+        program: String,
+        /// Action name
+        #[arg(value_name = "ACTION")]
+        name: String,
+    },
+    /// Send a whitelist signal to one program (unix only)
+    Signal {
+        /// Program name (a single-program app's program has the app's name)
+        #[arg(value_name = "PROGRAM")]
+        program: String,
+        /// Signal: TERM | INT | HUP | QUIT | USR1 | USR2
+        #[arg(value_name = "SIGNAL")]
+        signal: String,
+    },
+    /// Print a program's PID
+    Pid {
+        /// Program name (a single-program app's program has the app's name)
+        #[arg(value_name = "PROGRAM")]
+        name: String,
+    },
+    /// Show or follow program logs
     Log {
         /// One or more program names
-        #[arg(required = true, value_name = "NAME")]
+        #[arg(required = true, value_name = "PROGRAM")]
         names: Vec<String>,
+        /// Lines to show (default 20)
         #[arg(long = "tail", default_value = "20")]
         tail: usize,
+        /// Follow new output
         #[arg(short = 'f', long = "follow")]
         follow: bool,
+        /// Which stream: out (default), err, or both
         #[arg(long = "stream", value_parser = ["out", "err", "both"], default_value = "out")]
         stream: String,
     },
-    /// Reload daemon config and all registered apps (per-app atomic)
-    Reload,
-    /// Apply pending config changes (scope: all | <app> | <app> <program>).
-    /// The literal `all` means everything (same as no argument) and is a
-    /// reserved word — it can never select an app named "all".
+    /// Apply pending config changes (all, or one app/program)
     Apply {
-        /// Restrict the apply to one app (and optionally one program);
-        /// the literal `all` applies everything
+        /// App name (`all` = everything, the default)
         #[arg(default_value = None)]
         app: Option<String>,
+        /// Program name within that app
         #[arg(default_value = None)]
         program: Option<String>,
         /// Also restart unchanged programs (user-stopped ones stay stopped)
         #[arg(long = "restart")]
         restart: bool,
     },
-    /// Compose an app into the registry (app-registry spec): a deployment
-    /// directory with appkeeper.toml, a config file path, or an executable
-    /// program (scaffolds a fresh config in app_dir). Re-running `compose`
-    /// on the same executable regenerates its whole config from the given
-    /// flags — manual edits to the generated file are overwritten.
+    /// Register an app (deploy dir, config file, or executable)
     Compose {
-        /// App directory (containing appkeeper.toml), a config file path, or
-        /// an executable program to scaffold a config from
+        /// App dir, config file, or executable to scaffold from
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// App name (default: directory name, or the executable's file
-        /// name without extension for scaffolds; `all` is reserved)
+        /// App name (default: directory or executable name; `all` is reserved)
         #[arg(long = "name")]
         name: Option<String>,
         #[arg(long = "description")]
         description: Option<String>,
-        /// Startup/restart policy written into the [app] table (as an
-        /// app-level default): no | on-failure | always | unless-stopped
+        /// Restart policy for this app: no | on-failure | always | unless-stopped
         #[arg(long = "restart", value_parser = ["no", "on-failure", "always", "unless-stopped"])]
         restart: Option<String>,
         #[arg(long = "restart-backoff")]
         restart_backoff: Option<f64>,
         #[arg(long = "priority")]
         priority: Option<i32>,
-        /// (scaffold) startup args as one string, split like a shell line:
-        /// --args "--port 8080 --mode x"
+        /// (scaffold) startup args as one string: --args "--port 8080"
         #[arg(long = "args")]
         args: Option<String>,
-        /// (scaffold) environment variable K=V; repeat for more
+        /// (scaffold) environment variable K=V (repeatable)
         #[arg(long = "env")]
         envs: Vec<String>,
-        /// (scaffold) working directory for the program
-        /// (default: the directory `compose` runs in)
+        /// (scaffold) working directory (default: current directory)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
-        /// Apply this app right after registering; when the daemon is
-        /// offline it is pulled up in the background first
+        /// Apply this app right after registering
         #[arg(long = "apply")]
         apply: bool,
     },
-    /// Unregister an app: external deployment configs are kept; a
-    /// scaffold-generated record (a real file inside app_dir) is deleted
+    /// Unregister an app (deployment configs are kept)
     Remove { name: String },
-    /// Interactive shell client (like supervisorctl)
+    /// Interactive shell client (supervisorctl style)
     Shell {
-        /// Execute a single shell command and exit (script-friendly)
+        /// Execute one command and exit
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
     },
@@ -290,71 +269,55 @@ enum Cmd {
 /// plane (former top-level `shutdown`).
 #[derive(Subcommand, Debug)]
 enum DaemonCmd {
-    /// Start the daemon: background by default (detached, returns once it is
-    /// serving); `--foreground` keeps it attached to the terminal
+    /// Start the daemon (background by default)
     Start {
-        /// Run in the foreground (Ctrl+C / SIGTERM for a graceful stop).
-        /// This is what systemd's ExecStart and the background re-exec use
+        /// Keep it attached to the terminal (Ctrl+C stops it)
         #[arg(long = "foreground", conflicts_with = "service")]
         foreground: bool,
-        /// Internal: run under the Windows Service Control Manager with this
-        /// service name. Never typed by hand — the installer puts it in the
-        /// service binary path. Hidden from help
+        /// Internal: run under the Windows SCM with this service name
+        /// (set by the installer, never typed by hand)
         #[arg(long, value_name = "NAME", hide = true)]
         service: Option<String>,
     },
-    /// Register appkeeper as a system service (Windows service / systemd
-    /// unit; administrator/root required)
+    /// Register appkeeper as a system service (root/admin required)
     Install {
-        /// Also start the service right after installing
+        /// Start the service right after installing
         #[arg(long, visible_alias = "now")]
         start: bool,
-        /// Overwrite an existing service/unit whose configuration differs
+        /// Overwrite an existing service/unit with different settings
         #[arg(long)]
         force: bool,
-        /// Linux only: full path to the unit file to write (must end in
-        /// .service). Defaults to /etc/systemd/system/ak.service.
-        /// Not supported on Windows (use --name to pick the service name)
+        /// Linux only: unit file path (default /etc/systemd/system/ak.service)
         #[arg(long, value_name = "PATH")]
         unit_file: Option<PathBuf>,
-        /// Windows only: SCM service name (default "ak"). Validation:
-        /// non-empty, no '/' and no '\'. Not supported on Linux
+        /// Windows only: service name (default "ak")
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Service description (Windows) / Description= in the unit (Linux).
-        /// Default: "appkeeper process keeper"
+        /// Service description (default "appkeeper process keeper")
         #[arg(long, value_name = "TEXT")]
         desc: Option<String>,
-        /// Run the service as this account. Windows: one of LocalSystem
-        /// (default) / LocalService / NetworkService (case-insensitive);
-        /// Linux: User= in the unit
+        /// Account to run the service as (Linux: User=; Windows: LocalSystem /
+        /// LocalService / NetworkService)
         #[arg(long)]
         user: Option<String>,
-        /// systemd Restart= policy written into the unit
+        /// systemd Restart= policy
         #[arg(long, value_name = "POLICY", default_value_t = service::RestartPolicy::Always)]
         restart: service::RestartPolicy,
     },
-    /// Unregister the appkeeper system service (Windows service / systemd unit)
+    /// Unregister the appkeeper system service
     Uninstall {
-        /// Linux only: full path to the unit file to remove. Defaults to
-        /// /etc/systemd/system/ak.service. Not supported on Windows
+        /// Linux only: unit file path to remove
         #[arg(long, value_name = "PATH")]
         unit_file: Option<PathBuf>,
-        /// Windows only: SCM service name (default "ak"). Not supported
-        /// on Linux
+        /// Windows only: service name (default "ak")
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
-    /// Stop all programs and exit the daemon (client operation, over the
-    /// control plane)
+    /// Stop all programs and exit the daemon
     Shutdown,
 }
 
 fn main() {
-    // `start` was removed in favour of the unified `run` verb (control-plane
-    // spec). Intercept it before clap so the error carries the migration hint
-    // instead of a generic "unknown subcommand".
-    reject_removed_start();
     // The old systemd ExecStart / Windows binPath `daemon --config <path>`
     // is a usage error now; intercept it first so the message also names the
     // unit regeneration (service-registration upgrade compatibility).
@@ -372,31 +335,6 @@ fn main() {
         }
     };
     std::process::exit(code);
-}
-
-/// The removed `start` verb (and only it — bare `start` as a first positional
-/// argument, not a flag value) gets an explicit "use `run`" hint.
-fn reject_removed_start() {
-    let mut args = std::env::args_os().skip(1);
-    while let Some(a) = args.next() {
-        let s = a.to_string_lossy();
-        if s == "-c" || s == "--config" {
-            let _ = args.next();
-            continue;
-        }
-        if s.starts_with('-') {
-            continue;
-        }
-        if s == "start" {
-            eprintln!(
-                "ak: error: the `start` verb has been removed — use `ak run <name>` \
-                 (or `ak run --app <app>`) instead"
-            );
-            std::process::exit(EXIT_CONFIG);
-        }
-        // The first non-flag token is the subcommand; anything after is its args.
-        break;
-    }
 }
 
 /// The removed daemon form of `run` (design D2): the first subcommand token is
@@ -705,8 +643,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }),
         },
         Some(Cmd::Run {
-            name,
-            app,
             cmd,
             cmd_str,
             scaffold_name,
@@ -718,56 +654,33 @@ fn dispatch(cli: &Cli) -> Result<()> {
             json,
         }) => {
             let adhoc = !cmd.is_empty() || cmd_str.is_some();
-            if adhoc {
-                // The ad-hoc form conflicts with the start forms (design D10);
-                // clap cannot express this across optional positionals
-                // cleanly, so reject here.
-                if name.is_some() || app.is_some() {
-                    eprintln!(
-                        "ak: error: the ad-hoc command form (`--`/`--cmd`) cannot be \
-                         combined with a program name or --app"
-                    );
-                    std::process::exit(EXIT_CONFIG);
-                }
-                run_adhoc(
-                    &config_path,
-                    cmd,
-                    cmd_str.as_deref(),
-                    scaffold_name.as_deref(),
-                    description.as_deref(),
-                    restart.as_deref(),
-                    *restart_backoff,
-                    envs,
-                    workdir.as_deref(),
-                    *json,
-                )
-            } else if name.is_some() || app.is_some() {
-                // Strategy flags describe a new registration; accepting them
-                // here would silently drop them (design D10: ad-hoc only).
-                if restart.is_some() || restart_backoff.is_some() {
-                    eprintln!(
-                        "ak: error: --restart/--restart-backoff only apply when \
-                         registering a new command (`ak run -- <cmd...>`)"
-                    );
-                    std::process::exit(EXIT_CONFIG);
-                }
-                match (name, app) {
-                    (Some(n), _) => start_or_hint(&config_path, n, *json),
-                    (None, Some(a)) => fanout_cmd(&config_path, a, "start", *json),
-                    (None, None) => unreachable!("checked above"),
-                }
-            } else {
-                // Design D4: bare `run` has no operand — in the new semantics
-                // `run` is a client verb only, so there is nothing to run.
-                // clap cannot express "at least one of the optional forms",
-                // so this lives next to the ad-hoc conflict check.
+            if !adhoc {
+                // Design D4 / control-plane spec: `run` is the ad-hoc
+                // registration verb only. clap cannot express "one of the two
+                // forms", so the bare form is reported here.
                 eprintln!(
-                    "ak: error: nothing to run — `run` is a client verb; use one of:\n  {}",
+                    "ak: error: nothing to run — `run` registers a new command line; use one of:\n  {}",
                     run_client_forms_hint()
                 );
                 std::process::exit(EXIT_CONFIG);
             }
+            run_adhoc(
+                &config_path,
+                cmd,
+                cmd_str.as_deref(),
+                scaffold_name.as_deref(),
+                description.as_deref(),
+                restart.as_deref(),
+                *restart_backoff,
+                envs,
+                workdir.as_deref(),
+                *json,
+            )
         }
+        Some(Cmd::Start { app, program, json }) => match program {
+            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Start, *json),
+            None => fanout_cmd(&config_path, app, "start", *json),
+        },
         None => {
             // Bare `ak` is a legal exploratory call (design D1): print the
             // full help to stdout and exit 0. Not clap's
@@ -783,8 +696,10 @@ fn dispatch(cli: &Cli) -> Result<()> {
             delete,
             edit,
             init,
+            reload,
         }) => {
-            if set.is_empty() && get.is_empty() && delete.is_empty() && !*edit && !*init {
+            if set.is_empty() && get.is_empty() && delete.is_empty() && !*edit && !*init && !*reload
+            {
                 // `ak config` with no action flag prints its own usage
                 // and exits 0 (a global --config alone must stay legal, so
                 // clap's arg_required_else_help does not apply here).
@@ -795,7 +710,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 println!("{}", sub.render_help());
                 return Ok(());
             }
-            let code = config_cmd(&config_path, set, get, delete, *edit, *init)?;
+            let code = config_cmd(&config_path, set, get, delete, *edit, *init, *reload)?;
             if code != EXIT_OK {
                 std::process::exit(code);
             }
@@ -810,15 +725,13 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }),
-        Some(Cmd::Stop { name, app }) => match (name, app) {
-            (Some(n), _) => action_cmd(&config_path, &n, "stop"),
-            (None, Some(a)) => fanout_cmd(&config_path, &a, "stop", false),
-            (None, None) => unreachable!("clap enforces name xor app"),
+        Some(Cmd::Stop { app, program }) => match program {
+            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Stop, false),
+            None => fanout_cmd(&config_path, app, "stop", false),
         },
-        Some(Cmd::Restart { name, app }) => match (name, app) {
-            (Some(n), _) => action_cmd(&config_path, &n, "restart"),
-            (None, Some(a)) => fanout_cmd(&config_path, &a, "restart", false),
-            (None, None) => unreachable!("clap enforces name xor app"),
+        Some(Cmd::Restart { app, program }) => match program {
+            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Restart, false),
+            None => fanout_cmd(&config_path, app, "restart", false),
         },
         Some(Cmd::Action { program, name }) => custom_action_cmd(&config_path, program, name),
         Some(Cmd::Signal { program, signal }) => client_cmd(&config_path, |c| {
@@ -828,16 +741,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 v.get("result")
                     .and_then(|r| r.as_str())
                     .unwrap_or("delivered")
-            );
-            Ok(())
-        }),
-        Some(Cmd::Reload) => client_cmd(&config_path, |c| {
-            let v = c.reload()?;
-            println!(
-                "{}",
-                v.get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("reloaded")
             );
             Ok(())
         }),
@@ -1283,7 +1186,8 @@ fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
 /// recognized flag (design D10 / app-registry spec examples).
 #[derive(Debug, Default, PartialEq)]
 struct AdhocFlags {
-    name: Option<String>,
+    /// The ad-hoc app name (`--app`; formerly `--name`).
+    app: Option<String>,
     description: Option<String>,
     restart: Option<String>,
     restart_backoff: Option<f64>,
@@ -1298,7 +1202,7 @@ fn split_adhoc_trailing(
     trailing: &[String],
 ) -> std::result::Result<(Vec<String>, AdhocFlags), String> {
     const FLAGS: [&str; 6] = [
-        "--name",
+        "--app",
         "--description",
         "--restart",
         "--restart-backoff",
@@ -1333,7 +1237,7 @@ fn split_adhoc_trailing(
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match flag.as_str() {
-            "--name" => flags.name = Some(take_value(&mut i)?),
+            "--app" => flags.app = Some(take_value(&mut i)?),
             "--description" => flags.description = Some(take_value(&mut i)?),
             "--restart" => flags.restart = Some(take_value(&mut i)?),
             "--restart-backoff" => {
@@ -1383,7 +1287,7 @@ fn run_adhoc(
         }
     };
     // clap-level flags (before `--`) win when set; otherwise the trailing ones.
-    let name = flags.name.as_deref().or(name);
+    let name = flags.app.as_deref().or(name);
     let description = flags.description.as_deref().or(description);
     let restart = flags.restart.as_deref().or(restart);
     let restart_backoff = flags.restart_backoff.or(restart_backoff);
@@ -1738,7 +1642,7 @@ fn sync_if_online(config: &DaemonConfig) -> Result<()> {
         // `ak apply` makes it take effect (app-registry spec).
         c.reload().with_context(|| {
             "registry change persisted, but the running daemon failed to rescan; \
-             run `ak reload` once the problem is fixed, then `ak apply`"
+             run `ak config --reload` once the problem is fixed, then `ak apply`"
         })?;
         println!("daemon synced: registration is pending — run `ak apply` to take effect");
     }
@@ -1759,47 +1663,96 @@ fn client_cmd(config_path: &Path, f: impl FnOnce(&client::Client) -> Result<()>)
     }
 }
 
-fn action_cmd(config_path: &Path, name: &str, action: &str) -> Result<()> {
-    client_cmd(config_path, |c| {
-        let v = c.action(name, action)?;
-        println!(
-            "{}",
-            v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
-        );
-        Ok(())
-    })
-}
-
 /// The three client forms listed by the bare-`run` usage error (design D4 /
-/// control-plane spec).
+/// control-plane spec). `run` is the ad-hoc registration verb only; starting
+/// registered programs/apps is `start`.
 fn run_client_forms_hint() -> &'static str {
-    "ak run <name>        start an already-registered program\n  \
-     ak run --app <app>   start every program of one app\n  \
-     ak run -- <cmd...>   (or `--cmd \"<string>\"`) register and run a new command line"
+    "ak run -- <cmd...>        register and start a new command line\n  \
+     ak run --cmd \"<string>\"   the same command line as one string"
 }
 
-/// `ak run <name>`: start an already-registered program. An unknown name
-/// is a control-plane 404; per the control-plane spec the error must also
-/// point at the ad-hoc form (a bare token can only ever be a program name —
-/// registering a new command line goes through `run --`). The startup
-/// response is rendered as `{程序名, 配置路径, PID}` (run-daemon-first D7).
-fn start_or_hint(config_path: &Path, name: &str, json: bool) -> Result<()> {
+/// The `start|stop|restart <app> <program>` 404 hint: the name is not a
+/// registered program, so the way to run an ad-hoc command line is `run --`.
+fn eprint_unknown_program_hint(program: &str, e: &anyhow::Error) {
+    if format!("{e:#}").contains("404") {
+        eprintln!(
+            "hint: `{program}` is not a registered program — to register and run \
+             a new command line, use `ak run -- <cmd...>`"
+        );
+    }
+}
+
+/// `ak start|stop|restart <app> <program>`: the second positional narrows the
+/// scope to one program of that app (design D1). The program must belong to
+/// the app — a cross-app name is a scope error, not a silent retarget. `start`
+/// blocks until the daemon's startup judgement and renders
+/// `{程序名, 配置路径, PID}`; stop/restart print the daemon's result text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartVerb {
+    Start,
+    Stop,
+    Restart,
+}
+
+fn program_scoped_cmd(
+    config_path: &Path,
+    app: &str,
+    program: &str,
+    verb: StartVerb,
+    json: bool,
+) -> Result<()> {
     let config = client::load_config(config_path)?;
     let c = client::Client::from_config(&config);
-    match c.start_and_wait(name) {
-        Ok(v) => {
-            render_program_result(&v, name, json);
-            Ok(())
-        }
+    // Resolve the program's owning app first: the control-plane program
+    // endpoints are name-addressed (program names are globally unique), so
+    // the app scope has to be checked here (control-plane spec: 未知 app 报错).
+    let info = match c.program(program) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("ak: error: {e:#}");
-            if format!("{e:#}").contains("404") {
-                eprintln!(
-                    "hint: `{name}` is not a registered program — to register and run a new \
-                     command line, use `ak run -- <cmd...>`"
-                );
-            }
+            eprint_unknown_program_hint(program, &e);
             std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    let owner = info.get("app").and_then(|a| a.as_str()).unwrap_or("");
+    if owner != app {
+        eprintln!(
+            "ak: error: program {program:?} does not belong to app {app:?} \
+             (its app is {owner:?})"
+        );
+        std::process::exit(EXIT_ERROR);
+    }
+    match verb {
+        StartVerb::Start => match c.start_and_wait(program) {
+            Ok(v) => {
+                render_program_result(&v, program, json);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("ak: error: {e:#}");
+                eprint_unknown_program_hint(program, &e);
+                std::process::exit(client::exit_code_of(&e));
+            }
+        },
+        StartVerb::Stop | StartVerb::Restart => {
+            let action = if verb == StartVerb::Stop {
+                "stop"
+            } else {
+                "restart"
+            };
+            match c.action(program, action) {
+                Ok(v) => {
+                    println!(
+                        "{}",
+                        v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("ak: error: {e:#}");
+                    std::process::exit(client::exit_code_of(&e));
+                }
+            }
         }
     }
 }
@@ -1875,10 +1828,10 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
     }
 }
 
-/// `ak start|stop|restart --app <name>`: app-level fan-out; the server
-/// expands it in the established order and reports per-program results.
-/// For the `run --app` (start) verb the per-program `{name, config_path, pid,
-/// status}` is rendered and any failure exits non-zero (run-daemon-first 6.3).
+/// `ak start|stop|restart <app>`: app-level fan-out; the server expands it in
+/// the established order and reports per-program results. For `start` the
+/// per-program `{name, config_path, pid, status}` is rendered and any failure
+/// exits non-zero (run-daemon-first 6.3).
 fn fanout_cmd(config_path: &Path, app: &str, verb: &str, json: bool) -> Result<()> {
     let config = client::load_config(config_path)?;
     let c = client::Client::from_config(&config);
@@ -1903,7 +1856,7 @@ fn fanout_cmd(config_path: &Path, app: &str, verb: &str, json: bool) -> Result<(
     Ok(())
 }
 
-/// Render a `run --app` fan-out: one line per program
+/// Render a `start <app>` fan-out: one line per program
 /// `{程序名, 配置路径, PID, 状态}`; all-success exits 0, any failure lists the
 /// failures and exits non-zero (task 6.3/6.4).
 fn render_fanout_start(v: &serde_json::Value, json: bool) -> Result<()> {
@@ -1920,7 +1873,7 @@ fn render_fanout_start(v: &serde_json::Value, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Pure rendering of a `run --app` fan-out into `(exit_code, stdout, stderr)`
+/// Pure rendering of a `start <app>` fan-out into `(exit_code, stdout, stderr)`
 /// (task 6.3/6.4).
 fn fanout_start_render(v: &serde_json::Value, json: bool) -> (i32, Vec<String>, Vec<String>) {
     let programs = v
@@ -2107,21 +2060,28 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
 /// One short health probe after a config write (design D6): online → a reload
 /// hint, offline/failure → an offline note. Never retries, never blocks and
 /// never fails the action; the probe address comes from the pre-modification
-/// config (a running daemon still listens on the old values).
-fn config_sync_hint(config: &DaemonConfig) -> &'static str {
+/// config (a running daemon still listens on the old values). `None` when the
+/// same command carries `--reload` (the reload follows immediately).
+fn config_sync_hint(config: &DaemonConfig, reload_attached: bool) -> Option<&'static str> {
+    if reload_attached {
+        return None;
+    }
     let c = client::Client::from_config(config);
     if c.health().is_ok() {
-        "note: daemon is online — run `ak reload` (then `ak apply` if apps changed) \
-         for the new config to take effect"
+        Some(
+            "note: daemon is online — run `ak config --reload` (then `ak apply` if apps \
+             changed) for the new config to take effect",
+        )
     } else {
-        "note: daemon is offline — the change takes effect at next start"
+        Some("note: daemon is offline — the change takes effect at next start")
     }
 }
 
-/// `ak config` body: perform exactly one action class (clap enforces
-/// the mutual exclusion). Returns the process exit code so tests can drive
-/// the branches; config-level problems print to stderr and return
-/// `EXIT_CONFIG` (2), IO errors bubble up (`EXIT_ERROR` via main).
+/// `ak config [--reload]`: run the local action class first (clap enforces the
+/// mutual exclusion and rejects `--reload` with `--get`/`--init`), then, when
+/// `--reload` was given, ask the daemon to re-read the config and rescan
+/// (design D3). `--reload` alone skips the local action entirely. Any failing
+/// step returns its own exit code so tests can drive the branches.
 fn config_cmd(
     config_path: &Path,
     sets: &[String],
@@ -2129,6 +2089,58 @@ fn config_cmd(
     deletes: &[String],
     edit: bool,
     init: bool,
+    reload: bool,
+) -> Result<i32> {
+    let local_action = !sets.is_empty() || !gets.is_empty() || !deletes.is_empty() || edit || init;
+    if local_action {
+        let code = config_local_cmd(config_path, sets, gets, deletes, edit, init, reload)?;
+        if code != EXIT_OK {
+            return Ok(code);
+        }
+    }
+    if reload {
+        return reload_cmd(config_path);
+    }
+    Ok(EXIT_OK)
+}
+
+/// The daemon reload half of `ak config --reload`: `POST /v1/reload`, print
+/// the daemon's pending preview, map a failed answer to its exit class
+/// (offline = 3, per the control-plane contract).
+fn reload_cmd(config_path: &Path) -> Result<i32> {
+    let config = client::load_config(config_path)?;
+    let c = client::Client::from_config(&config);
+    match c.reload() {
+        Ok(v) => {
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("reloaded")
+            );
+            Ok(EXIT_OK)
+        }
+        Err(e) => {
+            eprintln!("ak: error: {e:#}");
+            Ok(client::exit_code_of(&e))
+        }
+    }
+}
+
+/// `ak config` local half: perform exactly one action class (clap enforces
+/// the mutual exclusion). Returns the process exit code so tests can drive
+/// the branches; config-level problems print to stderr and return
+/// `EXIT_CONFIG` (2), IO errors bubble up (`EXIT_ERROR` via main).
+/// `reload_attached` suppresses the "run `ak config --reload`" hint — the
+/// reload follows immediately.
+fn config_local_cmd(
+    config_path: &Path,
+    sets: &[String],
+    gets: &[String],
+    deletes: &[String],
+    edit: bool,
+    init: bool,
+    reload_attached: bool,
 ) -> Result<i32> {
     // The pre-action config feeds the online probe: the daemon still listens
     // on the values that were in effect before this write. A broken config
@@ -2197,7 +2209,9 @@ fn config_cmd(
         for (k, kv) in &parsed {
             println!("set {k} = {kv}");
         }
-        println!("{}", config_sync_hint(&pre_config));
+        if let Some(hint) = config_sync_hint(&pre_config, reload_attached) {
+            println!("{hint}");
+        }
         return Ok(EXIT_OK);
     }
 
@@ -2228,7 +2242,9 @@ fn config_cmd(
                 for k in deletes {
                     println!("deleted {k}");
                 }
-                println!("{}", config_sync_hint(&pre_config));
+                if let Some(hint) = config_sync_hint(&pre_config, reload_attached) {
+                    println!("{hint}");
+                }
             }
             None => {
                 println!("no change: {} was not set", deletes.join(", "));
@@ -2239,8 +2255,10 @@ fn config_cmd(
 
     if edit {
         let code = edit_config(config_path)?;
-        if code == EXIT_OK {
-            println!("{}", config_sync_hint(&pre_config));
+        if code == EXIT_OK
+            && let Some(hint) = config_sync_hint(&pre_config, reload_attached)
+        {
+            println!("{hint}");
         }
         return Ok(code);
     }
@@ -2263,7 +2281,9 @@ fn config_cmd(
             println!("kept existing {}", rep.sample_file.display());
         }
         println!("next: `ak config --edit` to customize, `ak compose <dir>` to register apps");
-        println!("{}", config_sync_hint(&pre_config));
+        if let Some(hint) = config_sync_hint(&pre_config, reload_attached) {
+            println!("{hint}");
+        }
         return Ok(EXIT_OK);
     }
 
@@ -2348,8 +2368,8 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 /// `daemon start` is the only daemon run entry (`--foreground` for the
 /// attached form, `--service <name>` for the SCM-managed form). The web
 /// console is config-driven: its initial state comes from the `[webui]`
-/// section of the daemon config (absent = off), and `ak reload` converges
-/// it later at runtime.
+/// section of the daemon config (absent = off), and `ak config --reload`
+/// converges it later at runtime.
 ///
 /// `service_name` is set when the Windows Service Control Manager starts the
 /// daemon (`ak daemon start --service <name>`); `None` is plain console mode.
@@ -2737,9 +2757,10 @@ mod config_cmd_tests {
                 delete,
                 edit,
                 init,
+                reload,
             }) => {
                 assert_eq!(set, vec!["port=1", "host=x"]);
-                assert!(get.is_empty() && delete.is_empty() && !edit && !init);
+                assert!(get.is_empty() && delete.is_empty() && !edit && !init && !reload);
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -2760,9 +2781,10 @@ mod config_cmd_tests {
                 delete,
                 edit,
                 init,
+                reload,
             }) => {
                 assert!(set.is_empty() && get.is_empty() && delete.is_empty());
-                assert!(!edit && !init);
+                assert!(!edit && !init && !reload);
             }
             other => panic!("expected Config, got {other:?}"),
         }
@@ -2813,6 +2835,7 @@ mod config_cmd_tests {
             &[],
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(code, EXIT_CONFIG, "missing file set must exit 2");
@@ -2824,7 +2847,16 @@ mod config_cmd_tests {
     fn delete_missing_file_is_rejected() {
         let dir = temp_root("del-missing");
         let path = dir.join("daemon.toml");
-        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &[],
+            &[],
+            &["socket".to_string()],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_CONFIG);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2833,7 +2865,16 @@ mod config_cmd_tests {
     fn get_missing_file_answers_defaults_and_exits_zero() {
         let dir = temp_root("get-missing");
         let path = dir.join("nested").join("daemon.toml");
-        let code = config_cmd(&path, &[], &["socket".to_string()], &[], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &[],
+            &["socket".to_string()],
+            &[],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_OK, "--get on a missing file is all defaults");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2855,6 +2896,7 @@ mod config_cmd_tests {
             &[],
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(code, EXIT_OK);
@@ -2865,16 +2907,43 @@ mod config_cmd_tests {
         );
         // A rejected set leaves the file byte-identical.
         let before = text.clone();
-        let code = config_cmd(&path, &["socket=".to_string()], &[], &[], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &["socket=".to_string()],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_CONFIG, "an empty socket exits 2");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         // A removed key is refused with an explanation and writes nothing.
-        let code = config_cmd(&path, &["port=8080".to_string()], &[], &[], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &["port=8080".to_string()],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_CONFIG, "a removed key exits 2");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         // delete: exit 0, key gone; second delete of an absent key is still 0.
-        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &[],
+            &[],
+            &["socket".to_string()],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("/tmp/new.sock"), "{text}");
@@ -2883,7 +2952,16 @@ mod config_cmd_tests {
             "untouched key kept: {text}"
         );
         let before = text.clone();
-        let code = config_cmd(&path, &[], &[], &["socket".to_string()], false, false).unwrap();
+        let code = config_cmd(
+            &path,
+            &[],
+            &[],
+            &["socket".to_string()],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(code, EXIT_OK, "absent-key delete is idempotent success");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2894,7 +2972,7 @@ mod config_cmd_tests {
         let dir = temp_root("get-unknown");
         let path = dir.join("daemon.toml");
         std::fs::write(&path, "[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
-        let code = config_cmd(&path, &[], &["foo".to_string()], &[], false, false).unwrap();
+        let code = config_cmd(&path, &[], &["foo".to_string()], &[], false, false, false).unwrap();
         assert_eq!(code, EXIT_CONFIG, "an unknown --get key must exit 2");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2916,6 +2994,7 @@ mod config_cmd_tests {
             &["socket".to_string(), "log_buffer_lines".to_string()],
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(code, EXIT_OK);
@@ -2935,13 +3014,13 @@ mod config_cmd_tests {
     fn init_creates_workspace_and_second_init_is_rejected() {
         let dir = temp_root("init");
         let path = dir.join("conf").join("daemon.toml");
-        let code = config_cmd(&path, &[], &[], &[], false, true).unwrap();
+        let code = config_cmd(&path, &[], &[], &[], false, true, false).unwrap();
         assert_eq!(code, EXIT_OK);
         assert!(path.is_file());
         assert!(dir.join("conf/app.d/example.toml.sample").is_file());
         // Second init on the existing config: exit 2, file untouched.
         let before = std::fs::read_to_string(&path).unwrap();
-        let code = config_cmd(&path, &[], &[], &[], false, true).unwrap();
+        let code = config_cmd(&path, &[], &[], &[], false, true, false).unwrap();
         assert_eq!(code, EXIT_CONFIG);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2952,7 +3031,7 @@ mod config_cmd_tests {
         let dir = temp_root("init-flow");
         let path = dir.join("daemon.toml");
         assert_eq!(
-            config_cmd(&path, &[], &[], &[], false, true).unwrap(),
+            config_cmd(&path, &[], &[], &[], false, true, false).unwrap(),
             EXIT_OK
         );
         // set on the init-produced file works (8-key template is legal).
@@ -2962,6 +3041,7 @@ mod config_cmd_tests {
                 &["monitor_interval=2.5".to_string()],
                 &[],
                 &[],
+                false,
                 false,
                 false
             )
@@ -2974,6 +3054,7 @@ mod config_cmd_tests {
                 &[],
                 &["monitor_interval".to_string()],
                 &[],
+                false,
                 false,
                 false
             )
@@ -3024,19 +3105,31 @@ mod config_cmd_tests {
             std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
         });
         let config = config_with_socket(&socket);
-        let msg = config_sync_hint(&config);
+        let msg = config_sync_hint(&config, false).expect("online hint");
         assert!(msg.contains("online") && msg.contains("reload"), "{msg}");
+        assert!(
+            msg.contains("ak config --reload"),
+            "the hint names the migrated entry point: {msg}"
+        );
         server.join().unwrap();
     }
 
     #[test]
     fn sync_hint_offline_names_next_start() {
         let config = config_with_socket(Path::new("/tmp/ak-test-mock-absent/ak.sock"));
-        let msg = config_sync_hint(&config);
+        let msg = config_sync_hint(&config, false).expect("offline hint");
         assert!(
             msg.contains("offline") && msg.contains("next start"),
             "{msg}"
         );
+    }
+
+    /// A write combined with `--reload` prints no "run the reload" hint — the
+    /// reload follows in the same command (configuration spec).
+    #[test]
+    fn sync_hint_suppressed_when_reload_is_attached() {
+        let config = config_with_socket(Path::new("/tmp/ak-test-mock-absent/ak.sock"));
+        assert!(config_sync_hint(&config, true).is_none());
     }
 }
 
@@ -3257,7 +3350,7 @@ mod cli_verb_tests {
         assert_eq!(s(&["run", "--app", "demo"]), None);
         assert_eq!(s(&["run", "--", "node", "x"]), None);
         assert_eq!(s(&["run", "--cmd", "node x"]), None);
-        assert_eq!(s(&["run", "--name", "web"]), None);
+        assert_eq!(s(&["run", "--app", "web"]), None);
         assert_eq!(s(&["run", "start"]), None);
         // Other subcommands and empty argv are untouched.
         assert_eq!(s(&["ps"]), None);
@@ -3265,32 +3358,34 @@ mod cli_verb_tests {
         assert_eq!(s(&[]), None);
     }
 
-    /// The bare-`run` usage error (design D4) lists the three client forms:
-    /// `run <name>` / `run --app <app>` / `run -- <cmd...>`.
+    /// The bare-`run` usage error (design D4) lists the two ad-hoc forms.
+    /// The bare-`run` usage error lists the two ad-hoc forms only (the start
+    /// forms moved to `start`, design D2/D4).
     #[test]
-    fn nothing_to_run_hint_lists_all_three_client_forms() {
+    fn nothing_to_run_hint_lists_the_two_adhoc_forms() {
         let hint = run_client_forms_hint();
-        assert!(hint.contains("ak run <name>"), "{hint}");
-        assert!(hint.contains("ak run --app <app>"), "{hint}");
         assert!(hint.contains("ak run -- <cmd...>"), "{hint}");
+        assert!(hint.contains("ak run --cmd"), "{hint}");
+        assert!(!hint.contains("run <name>"), "{hint}");
+        assert!(!hint.contains("run --app"), "{hint}");
     }
 
-    /// `run <name>` and `run --app <app>` are the start forms; both at once is
-    /// rejected (name xor app). The daemon-only `--detach` flag is gone.
+    /// `run` carries no positional start form and no fan-out flag: a bare
+    /// token or `--app <app>` is no longer accepted (the ad-hoc app name is
+    /// `--app`, so a *value* parses but a positional does not).
     #[test]
-    fn run_start_forms_parse_and_conflict() {
-        let cli = parse(&["run", "web"]);
-        match cli.cmd {
-            Some(Cmd::Run { name, app, cmd, .. }) => {
-                assert_eq!(name.as_deref(), Some("web"));
-                assert!(app.is_none() && cmd.is_empty());
-            }
+    fn run_start_forms_are_gone() {
+        assert!(parse_err(&["run", "web"]).contains("unexpected argument"));
+        // `--app` now names the ad-hoc app (it takes a value, so it parses);
+        // the removed program-level fan-out semantics are gone with it.
+        let cli = parse(&["run", "--", "python", "-c", "x", "--app", "demo"]);
+        let cmd = match cli.cmd {
+            Some(Cmd::Run { cmd, .. }) => cmd,
             other => panic!("expected Run, got {other:?}"),
-        }
-        let cli = parse(&["run", "--app", "demo"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Run { app: Some(ref a), .. }) if a == "demo"));
-        // name xor app.
-        assert!(parse_err(&["run", "web", "--app", "demo"]).contains("cannot be used with"));
+        };
+        let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
+        assert_eq!(argv, vec!["python", "-c", "x"]);
+        assert_eq!(flags.app.as_deref(), Some("demo"));
     }
 
     /// The ad-hoc `--` form captures everything after `--` as the command
@@ -3317,7 +3412,7 @@ mod cli_verb_tests {
             "--",
             "node",
             "server.js",
-            "--name",
+            "--app",
             "worker",
             "--restart",
             "unless-stopped",
@@ -3328,23 +3423,17 @@ mod cli_verb_tests {
         };
         let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
         assert_eq!(argv, vec!["node", "server.js"]);
-        assert_eq!(flags.name.as_deref(), Some("worker"));
+        assert_eq!(flags.app.as_deref(), Some("worker"));
         assert_eq!(flags.restart.as_deref(), Some("unless-stopped"));
         // `--flag=value` form too.
         let (argv, flags) =
-            split_adhoc_trailing(&["/bin/echo".into(), "hi".into(), "--name=w2".into()]).unwrap();
+            split_adhoc_trailing(&["/bin/echo".into(), "hi".into(), "--app=w2".into()]).unwrap();
         assert_eq!(argv, vec!["/bin/echo", "hi"]);
-        assert_eq!(flags.name.as_deref(), Some("w2"));
+        assert_eq!(flags.app.as_deref(), Some("w2"));
         // A missing value is a diagnostic error.
-        assert!(split_adhoc_trailing(&["x".into(), "--name".into()]).is_err());
+        assert!(split_adhoc_trailing(&["x".into(), "--app".into()]).is_err());
         // `--cmd "<string>"` is the equivalent single-string entry.
-        let cli = parse(&[
-            "run",
-            "--cmd",
-            "python -m http.server 8000",
-            "--name",
-            "web",
-        ]);
+        let cli = parse(&["run", "--cmd", "python -m http.server 8000", "--app", "web"]);
         match cli.cmd {
             Some(Cmd::Run {
                 cmd,
@@ -3358,6 +3447,8 @@ mod cli_verb_tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+        // `--name` is no longer an accepted ad-hoc naming flag.
+        assert!(parse_err(&["run", "--cmd", "x", "--name", "web"]).contains("unexpected argument"));
         // The two entry forms are mutually exclusive.
         assert!(parse_err(&["run", "--cmd", "x", "--", "y"]).contains("cannot be used with"));
     }
@@ -3376,10 +3467,10 @@ mod cli_verb_tests {
         assert!(config::parse_restart_cli(flags.restart.as_deref().unwrap()).is_err());
     }
 
-    /// `start` is gone: no such subcommand parses (the hint is added in main).
+    /// `reload` is gone from the top level (it moved into `config --reload`).
     #[test]
-    fn start_subcommand_is_gone() {
-        let e = parse_err(&["start", "web"]);
+    fn reload_subcommand_is_gone() {
+        let e = parse_err(&["reload"]);
         assert!(
             e.contains("unrecognized subcommand") || e.contains("invalid subcommand"),
             "{e}"
@@ -3588,13 +3679,47 @@ mod cli_verb_tests {
         assert!(parse_err(&["compose", ".", "--restart", "never"]).contains("invalid value"));
     }
 
-    /// The removed-`start` interception fires only for a bare `start`
-    /// subcommand, not for a program literally named start passed to `run`.
+    /// `start` is a first-class verb again (parallel to stop/restart). The
+    /// three take `<app> [<program>]`; the old `--app` flag is rejected.
     #[test]
-    fn removed_start_interception_scope() {
-        // `run start` is a program name, not the removed verb.
-        let cli = parse(&["run", "start"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Run { name: Some(ref n), .. }) if n == "start"));
+    fn start_stop_restart_take_app_and_program() {
+        match parse(&["start", "demo"]).cmd {
+            Some(Cmd::Start { app, program, json }) => {
+                assert_eq!(app, "demo");
+                assert!(program.is_none() && !json);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+        match parse(&["start", "demo", "web", "--json"]).cmd {
+            Some(Cmd::Start { app, program, json }) => {
+                assert_eq!(app, "demo");
+                assert_eq!(program.as_deref(), Some("web"));
+                assert!(json);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+        match parse(&["stop", "demo", "web"]).cmd {
+            Some(Cmd::Stop { app, program }) => {
+                assert_eq!((app.as_str(), program.as_deref()), ("demo", Some("web")));
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+        match parse(&["restart", "demo"]).cmd {
+            Some(Cmd::Restart { app, program }) => {
+                assert_eq!(app, "demo");
+                assert!(program.is_none());
+            }
+            other => panic!("expected Restart, got {other:?}"),
+        }
+        // `--app` is gone from all three (control-plane spec).
+        for verb in ["start", "stop", "restart"] {
+            let e = parse_err(&[verb, "--app", "demo"]);
+            assert!(e.contains("unexpected argument"), "{verb}: {e}");
+        }
+        // A missing app name is a clap usage error.
+        for verb in ["start", "stop", "restart"] {
+            assert!(parse_err(&[verb]).contains("required"), "{verb}");
+        }
     }
 
     /// Multi-program log lines carry the `[name] ` prefix; a single program
