@@ -113,6 +113,6 @@
 
 ## 7. 归档收口
 
-- [ ] 7.1 `openspec validate refactor-cli-verbs` 与 `openspec validate --specs`
+- [x] 7.1 `openspec validate refactor-cli-verbs` 与 `openspec validate --specs`
   通过后归档：`openspec archive refactor-cli-verbs --yes`，确认 delta 无损合入
   四个能力的主 spec。验证：两条 validate 退出码 0、archive 后主 spec 含新需求文本
