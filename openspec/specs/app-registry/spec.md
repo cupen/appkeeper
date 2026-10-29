@@ -6,11 +6,9 @@
 
 ## Requirements
 
-### Requirement: 注册应用（add）
+### Requirement: 注册应用（compose）
 
-> 需求锚点：本命令历史上名为 `add`，现行名称为 `compose`（旧动词已移除）。
-
-`ak compose [path] [flags]` SHALL 注册一个应用，按 `path` 形态分派：
+`ak compose [path] [flags]` SHALL 注册一个应用，按 `path` 形态分派（原 `add` 动词的改名，行为等价；帮助文案与生成的脚手架注释 SHALL 按 compose 编排隐喻组织，为将来的声明式编排能力铺垫）：
 
 - `path` 为部署目录（取其中默认名 `appkeeper.toml`，如 `ak compose .`）或直接指向 `.toml` 配置文件时，走既有注册流程：校验（文件存在、格式合法、程序名全局唯一、依赖不成环）；在 `app_dir` 创建以应用名命名的 `<name>.toml` 链接指向配置本体（链接即注册记录）；将微调 flag 幂等写入该 app 配置的 `[app]` 表（`--restart`、`--restart-backoff`、`--priority` 等，作为应用级默认；flag 写入失败 SHALL 回滚整个注册）。
 - `path` 为其他存在的普通文件（可执行程序）时，走脚手架生成流程：SHALL 在 `app_dir` 下生成真实配置文件 `<name>.toml`（非链接，注册记录即文件本身），内容为单程序 app：program 名 = 应用名，`[app]` 表与 `[program.<name>]` 表按给定 flag 渲染。`command` SHALL 写绝对路径（canonicalize 解析后）；`work_dir` SHALL 缺省取执行 compose 命令时的当前工作目录（以绝对路径写入），可用 `--workdir <路径>` 覆盖。启动参数 SHALL 以 `--args "<字符串>"` 传入（按 shell 词法切分为 argv），环境变量 SHALL 以 `--env K=V` 传入（可重复）。应用名 SHALL 取 `--name`，缺省取可执行文件名（去扩展名的 stem）。脚手架 SHALL 至少同样支持：`--name`、`--description`、`--restart`、`--restart-backoff`、`--priority`。
@@ -118,7 +116,7 @@
 - **WHEN** 守护进程运行中执行 `ak compose ./proc --name abc --apply`
 - **THEN** 配置生成后自动以本 app 范围执行 apply，`abc` 的程序按 `restart` 启动语义处理，其他 app 的 pending 不受影响，输出含 apply 结果
 
-#### Scenario: --apply 离线报错
+#### Scenario: --apply 离线自动拉起
 
 > 本变更将 run 的 ad-hoc 形态移出隐式拉起名单（标题为既有场景锚点，现行行为以下文为准）：`compose --apply` 仍自动拉起守护进程；run 的 ad-hoc 形态离线时改为退出码 3。
 
@@ -139,10 +137,9 @@
 
 - **WHEN** 对同名应用（目录或 `.toml` 来源）再次 compose 并修改 flag
 - **THEN** 链接与 `[app]` 表字段被更新，不产生重复注册
-
 ### Requirement: 移除与查看
 
-`ak remove <app>` SHALL 删除 `app_dir` 中该应用的注册记录并注销；守护进程运行中时其程序 SHALL 被停止并清理。注册记录为链接（外部部署目录注册）时，部署目录中的配置本体 MUST NOT 被删除；注册记录为位于 `app_dir` 内的真实文件（脚手架生成）时，SHALL 连带删除该文件并打印被删除的路径。注册表查看 SHALL 由 `ak ps` 承接（原顶层 `list` 动词移除）：`ak ps --all` 在线时展示含已注册未运行 app 的全量视图，离线时降级输出全部已注册应用（名称、配置本体路径、描述），见 `control-plane` 能力规范。
+`ak remove <app>` SHALL 删除 `app_dir` 中该应用的注册记录并注销；守护进程运行中时其程序 SHALL 被停止并清理。注册记录为链接（外部部署目录注册）时，部署目录中的配置本体 MUST NOT 被删除；注册记录为位于 `app_dir` 内的真实文件（脚手架生成）时，SHALL 连带删除该文件并打印被删除的路径。注册表查看 SHALL 由 `ak ps` 承接（原顶层 `list` 动词移除）：`ak ps --all` 在线时展示含未运行 app 的全量视图，离线时降级输出全部已注册应用（名称、配置本体路径、描述，见 `control-plane` 能力规范）。
 
 #### Scenario: 移除运行中的应用
 
@@ -156,12 +153,13 @@
 
 #### Scenario: 列出注册表
 
+> 本变更将 `list` 动词并入 `ps --all`（标题为既有场景锚点，现行行为以下文为准）。
+
 - **WHEN** 守护进程未运行时执行 `ak ps --all`
 - **THEN** 输出注明 daemon offline 的清单，含每个已注册应用的名称、配置本体路径与描述
-
 ### Requirement: 离线可用
 
-compose / remove MUST NOT 依赖守护进程运行（注册表查看见 `ak ps --all` 的离线降级）：守护进程离线时 SHALL 直接维护 `app_dir` 链接完成操作（离线时 MUST NOT 因无法同步而报错）；守护进程在线时 SHALL 在持久化后通过控制 API 触发同步（重扫检出），使注册变化进入待应用（pending）状态，由 `ak apply` 落地生效。在线同步失败 SHALL 视为本次命令失败：错误信息 MUST 说明注册已持久化但守护进程未同步及补救方式（`ak reload` 重扫后 `ak apply`），并以非零码退出，MUST NOT 仅以警告带过。
+compose / remove MUST NOT 依赖守护进程运行：守护进程离线时 SHALL 直接维护 `app_dir` 链接完成操作（离线时 MUST NOT 因无法同步而报错）；守护进程在线时 SHALL 在持久化后通过控制 API 触发同步（重扫检出），使注册变化进入待应用（pending）状态，由 `ak apply` 落地生效。在线同步失败 SHALL 视为本次命令失败：错误信息 MUST 说明注册已持久化但守护进程未同步及补救方式（`ak reload` 重扫后 `ak apply`），并以非零码退出，MUST NOT 仅以警告带过。
 
 `ak run` 的 ad-hoc 形态为**守护进程执行**（daemon-first），MUST NOT 适用上述离线直写路径：守护进程离线时该形态 SHALL 以退出码 3 报错，MUST NOT 离线写盘或隐式拉起守护进程。
 
@@ -184,7 +182,6 @@ compose / remove MUST NOT 依赖守护进程运行（注册表查看见 `ak ps -
 
 - **WHEN** 守护进程未运行时执行 `ak run -- ./server --name web`
 - **THEN** 以退出码 3 报守护进程不可达，`app_dir` 不变，守护进程未被拉起
-
 ### Requirement: 启动成功后再落盘的注册契约
 
 ad-hoc 注册（run 的 `--`/`--cmd` 形态）的落盘 SHALL 遵循「先确认启动成功、后写入注册记录」的顺序，且写入 SHALL 具备原子性与失败无残留保证：
@@ -224,7 +221,6 @@ ad-hoc 注册（run 的 `--`/`--cmd` 形态）的落盘 SHALL 遵循「先确认
 
 - **WHEN** 对已注册且内容一致的 `web` 再次执行相同的 ad-hoc 注册
 - **THEN** 不重复写盘、不重启进程，幂等成功并返回现有 PID
-
 ### Requirement: 残留态的提示与确认
 
 对上次「启动成功但落盘失败」而留下的进程（未注册但同名程序在运行），再次以相同参数执行 ad-hoc 注册时，守护进程 SHALL 回传该残留状况，CLI SHALL 提示当前状况并询问用户是否重新落盘；用户确认后 SHALL 仅完成落盘（复用已在运行的进程，MUST NOT 重复启动或重启）；用户拒绝时 SHALL 以非零码退出且不写盘。

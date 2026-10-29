@@ -5,12 +5,11 @@
 
 ## Requirements
 
-### Requirement: 后台运行守护进程（run --detach）
+### Requirement: 后台运行守护进程（daemon start）
 
-> 需求锚点：历史标题引用 `run --detach`；现行入口为 `ak daemon start`（后台缺省）
-> 与 `ak daemon start --foreground`（前台），`--detach` 已移除。
+`ak daemon start` SHALL 以后台方式启动守护进程（原 `ak daemon --detach` 的语义成为缺省，`--detach` 旗标移除）：进程 SHALL 在分离的进程组中运行（调用方终端的 Ctrl+C / 退出不影响它），stdout/stderr SHALL 追加重定向到 daemon 配置 `log_dir` 下的守护进程后台日志文件。后台实现 SHALL 以分离的子进程重新执行自身（re-exec argv 为 `ak daemon start --foreground -c <config>`），父进程等待守护进程就绪。命令 SHALL 等待守护进程就绪（控制端口健康探测通过）后返回：就绪 SHALL 打印监听地址与后台日志路径并以 0 退出；就绪超时或启动失败 SHALL 以非零码退出并指明日志位置。端口冲突行为 SHALL 沿用「启动冲突处理」规范（明确报错，不静默成功）。
 
-`ak daemon start` SHALL 以后台方式启动守护进程（后台即缺省语义）：进程 SHALL 在分离的进程组中运行（调用方终端的 Ctrl+C / 退出不影响它），stdout/stderr SHALL 追加重定向到 daemon 配置 `log_dir` 下的守护进程后台日志文件。命令 SHALL 等待守护进程就绪（控制端口健康探测通过）后返回：就绪 SHALL 打印监听地址与后台日志路径并以 0 退出；就绪超时或启动失败 SHALL 以非零码退出并指明日志位置。端口冲突行为 SHALL 沿用「启动冲突处理」规范（明确报错，不静默成功）。`ak daemon start --foreground` MUST 保持前台语义（Ctrl+C / SIGTERM 优雅停机），供 systemd ExecStart、调试与 re-exec 子进程使用。裸 `ak daemon`（无子命令）SHALL 以退出码 2 报 usage 错误并列出 `start` / `install` / `uninstall` / `shutdown`。`run --detach` 不再是合法入口：守护形态的 `run` 被拦截的语义见 `control-plane` 能力规范。
+`ak daemon start --foreground` MUST 保持前台语义（Ctrl+C / SIGTERM 优雅停机），供 systemd ExecStart、调试与 re-exec 子进程使用。隐藏旗标 `--service <NAME>` SHALL 落于 start 之上（与 `--foreground` 互斥）：由系统服务安装器写入服务启动命令（Windows SCM 的 binPath，见 `service-registration`），以服务托管模式运行而非控制台模式；人手输入 SHALL 得到用法说明。裸 `ak daemon`（无子命令）SHALL 以退出码 2 报 usage 错误并列出 `start` / `install` / `uninstall` / `shutdown`。`run --detach` 不再是合法入口：守护形态的 `run` 被拦截的语义见 `control-plane` 能力规范。
 
 #### Scenario: 后台启动并就绪
 
@@ -30,8 +29,17 @@
 #### Scenario: 前台语义不变
 
 - **WHEN** 执行 `ak daemon start --foreground`
-- **THEN** 守护进程前台运行，Ctrl+C 优雅停机（与本变更之前裸 `ak run` 的行为一致）
+- **THEN** 守护进程前台运行，Ctrl+C 优雅停机
 
+#### Scenario: re-exec 指向前台形态
+
+- **WHEN** 执行 `ak daemon start` 触发后台拉起
+- **THEN** 派生子进程的 argv 为 `ak daemon start --foreground -c <config>`，父进程就绪探测通过后退出
+
+#### Scenario: 裸 daemon 报 usage 错误
+
+- **WHEN** 执行 `ak daemon`（无子命令）
+- **THEN** 以退出码 2 报 usage 错误并列出四个子命令，不启动守护进程
 ### Requirement: 立即生效入口的隐式拉起协议
 
 `compose --apply` 在守护进程离线时 SHALL 自动后台拉起守护进程后继续应用：
@@ -52,6 +60,8 @@
 - **THEN** 守护进程被自动后台拉起，`web` 注册并立即生效进入运行状态，命令以 0 退出
 
 #### Scenario: add --apply 离线同样自动拉起
+
+> 本变更将 `add` 改名 `compose`（标题为既有场景锚点，现行行为以下文为准）。
 
 - **WHEN** 守护进程未运行时执行 `ak compose ./server --name abc --apply`
 - **THEN** 行为与在线一致：守护进程被拉起后 `abc` 生效，不报「守护进程离线」错误
