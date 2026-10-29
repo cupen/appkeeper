@@ -22,13 +22,13 @@ mod registry;
 mod server;
 mod service;
 mod shell;
+mod shutdown_signal;
 mod supervisor;
 mod transport;
 mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -271,7 +271,7 @@ enum Cmd {
 enum DaemonCmd {
     /// Start the daemon (background by default)
     Start {
-        /// Keep it attached to the terminal (Ctrl+C stops it)
+        /// Keep it attached to the terminal (Ctrl+C; SIGTERM/SIGQUIT on unix)
         #[arg(long = "foreground", conflicts_with = "service")]
         foreground: bool,
         /// Internal: run under the Windows SCM with this service name
@@ -2392,23 +2392,43 @@ fn run_daemon(config_path: &Path, service_name: Option<&str>) -> Result<()> {
 /// `--service`.
 fn run_daemon_console(config_path: &Path) -> Result<()> {
     let sup = run_daemon_core(config_path)?;
-    info!("ak {} running (Ctrl+C to stop)", env!("CARGO_PKG_VERSION"));
+    install_stop_signals(&sup)?;
+    sup.run();
+    Ok(())
+}
 
-    let shutdown = {
-        let sup2 = sup.clone();
-        let flag = Arc::new(AtomicBool::new(false));
-        let f2 = flag.clone();
+/// Wire the console daemon's stop signals to the existing shutdown intent.
+///
+/// Unix (handle-daemon-quit-signal D1/D2): SIGINT, SIGTERM and SIGQUIT all
+/// feed one self-pipe notifier thread, which only raises
+/// [`Supervisor::request_shutdown`]. The signal actions stay installed for the
+/// rest of the process, so a repeated delivery during a graceful stop cannot
+/// fall back to the default (terminating) action; the intent itself is
+/// idempotent (design D3). An installation failure aborts startup rather than
+/// entering the supervised loop unprotected.
+///
+/// Windows keeps the `ctrlc` Ctrl+C path here; the SCM service shell
+/// (`service::run_windows_service`) is a separate entry and is untouched.
+fn install_stop_signals(sup: &Arc<Supervisor>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let sup = sup.clone();
+        shutdown_signal::install(move || sup.request_shutdown())?;
+        info!(
+            "ak {} running (Ctrl+C / SIGTERM / SIGQUIT to stop)",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let sup = sup.clone();
         ctrlc::set_handler(move || {
             info!("shutdown signal received");
-            sup2.request_shutdown();
-            let _ = f2;
+            sup.request_shutdown();
         })
-        .context("failed to install Ctrl+C / SIGTERM handler")?;
-        flag
-    };
-    let _ = shutdown;
-
-    sup.run();
+        .context("failed to install Ctrl+C handler")?;
+        info!("ak {} running (Ctrl+C to stop)", env!("CARGO_PKG_VERSION"));
+    }
     Ok(())
 }
 

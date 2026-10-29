@@ -4774,6 +4774,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// handle-daemon-quit-signal 1.3: the stop-signal path only raises the
+    /// existing shutdown intent, so repeated deliveries are idempotent — the
+    /// loop runs `shutdown_all` once, every program is stopped once, and a
+    /// second request while the graceful stop is in flight neither restarts
+    /// the stop nor shortens a program's `stop_timeout`.
+    #[test]
+    fn repeated_shutdown_requests_are_idempotent() {
+        let (sup, dir, h) = adhoc_harness("shutdown-idempotent");
+        adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("slow".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = sup.state.lock().unwrap().programs["slow"].pid().unwrap();
+        // First request: the loop leaves its tick and begins shutdown_all.
+        sup.request_shutdown();
+        // A second and third delivery during the graceful stop (what a
+        // repeated TERM/QUIT does) must be a no-op intent.
+        sup.request_shutdown();
+        sup.request_shutdown();
+        h.join().unwrap();
+        let st = sup.state.lock().unwrap();
+        assert_eq!(st.programs["slow"].state(), ProgramState::Stopped);
+        assert_eq!(
+            st.programs["slow"].pid(),
+            None,
+            "the child is reaped exactly as the single-stop path does"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // The reaped child is gone: no /proc entry for it.
+            let _ = pid;
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "no orphaned child {pid}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// handle-daemon-quit-signal 1.3: shutdown keeps the established reverse
+    /// stop order (highest priority app first) and reaps every child; the
+    /// signal path adds no second stop algorithm. The programs record their
+    /// own TERM handling into a marker file so the observed order is real.
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_stops_in_reverse_priority_order() {
+        let dir = std::env::temp_dir().join(format!("ak-test-shutdown-order-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let marker = dir.join("stop-order.txt");
+        // `sh` traps TERM itself and appends its app name before exiting:
+        // the file's line order is the real stop order.
+        let program = |app: &str, priority: i32| {
+            format!(
+                "[app]\npriority = {priority}\nrestart = 'always'\n\n[program.{app}]\n\
+                 command = 'sh'\nargs = ['-c', 'trap \"echo {app} >> {}; exit 0\" TERM; \
+                 while :; do sleep 0.05; done']\nstartsecs = 0.2\n",
+                marker.display()
+            )
+        };
+        for (app, priority) in [("alpha", 10), ("beta", 0)] {
+            let file = dir.join(format!("{app}.toml"));
+            std::fs::write(&file, program(app, priority)).unwrap();
+            link_for_test(&file, &dir.join("app.d").join(format!("{app}.toml")));
+        }
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup: Arc<Supervisor> = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        wait_state(&sup, "alpha", ProgramState::Running);
+        wait_state(&sup, "beta", ProgramState::Running);
+
+        let sup2 = Arc::clone(&sup);
+        let h = std::thread::Builder::new()
+            .name("shutdown-order-supervisor".into())
+            .spawn(move || sup2.run())
+            .unwrap();
+        sup.request_shutdown();
+        h.join().unwrap();
+
+        let observed = std::fs::read_to_string(&marker).unwrap_or_default();
+        let lines: Vec<&str> = observed.lines().map(str::trim).collect();
+        assert_eq!(
+            lines,
+            ["alpha", "beta"],
+            "shutdown stops the highest-priority app first: {observed:?}"
+        );
+        let st = sup.state.lock().unwrap();
+        for name in ["alpha", "beta"] {
+            assert_eq!(st.programs[name].state(), ProgramState::Stopped);
+            assert!(st.programs[name].pid().is_none(), "{name} reaped");
+        }
+        drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// D1: a staged app is not recorded in `st.apps` by apply — so an abort
     /// leaves no phantom app record behind, while the program survives the
     /// apply's `keep` filter.

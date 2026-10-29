@@ -3522,6 +3522,448 @@ fn detach_pass(bin: &Path) -> Result<()> {
     Ok(())
 }
 
+// -- unix stop-signal pass (handle-daemon-quit-signal) -----------------------
+
+/// The daemon under a signal scenario: either a foreground child this harness
+/// spawned (`daemon start --foreground`) or a background daemon found by pid
+/// (the `daemon start` re-exec chain).
+struct SignalCase {
+    daemon: SignalDaemon,
+    /// Pids of the app programs taken before the signal; asserted dead at the
+    /// end (belt and braces next to the guard's process sweep).
+    app_pids: Vec<u32>,
+    /// The scenario workspace: the fallback sweep in `Drop` finds leftover
+    /// script processes by their unique argv under this root.
+    root: PathBuf,
+}
+
+enum SignalDaemon {
+    Child(Child),
+    /// A pid we do not own a `Child` for (the background re-exec form).
+    Pid(u32),
+}
+
+impl SignalCase {
+    fn daemon_pid(&self) -> u32 {
+        match self.daemon {
+            SignalDaemon::Child(ref c) => c.id(),
+            SignalDaemon::Pid(pid) => pid,
+        }
+    }
+
+    /// Has the daemon exited, and did it complete gracefully? The owned-child
+    /// form reports the real status; the background-pid form cannot observe
+    /// its exit status (not its parent), so it reports `Some(Exited)` as soon
+    /// as the pid is gone and the graceful completion is asserted through the
+    /// daemon log instead.
+    fn daemon_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        match self.daemon {
+            SignalDaemon::Child(ref mut c) => c.try_wait().ok().flatten(),
+            SignalDaemon::Pid(pid) => {
+                if pid_alive(pid) {
+                    return None;
+                }
+                #[cfg(unix)]
+                {
+                    Some(std::os::unix::process::ExitStatusExt::from_raw(0))
+                }
+                #[cfg(not(unix))]
+                {
+                    unreachable!("only used by the unix signal pass")
+                }
+            }
+        }
+    }
+
+    fn daemon_alive(&mut self) -> bool {
+        match self.daemon {
+            SignalDaemon::Child(ref mut c) => matches!(c.try_wait(), Ok(None)),
+            SignalDaemon::Pid(pid) => pid_alive(pid),
+        }
+    }
+}
+
+impl Drop for SignalCase {
+    fn drop(&mut self) {
+        // Best-effort cleanup on every path (assertion failures included):
+        // the daemon first, then every app it may have left behind.
+        let pid = self.daemon_pid();
+        kill_pid(pid);
+        for app in &self.app_pids {
+            kill_pid(*app);
+        }
+        // The app scripts run in their own process groups, so a SIGKILLed
+        // daemon leaves them behind. Sweep them by their unique argv (the
+        // workspace path), independent of the pids captured above.
+        #[cfg(unix)]
+        {
+            let app_dir = self.root.join("app-stop");
+            for name in ["boot", "quick", "stubborn"] {
+                let script = app_dir.join(format!("{name}.sh"));
+                for pid in pids_with_arg(&script.display().to_string()) {
+                    kill_pid(pid);
+                }
+            }
+        }
+        if let SignalDaemon::Child(ref mut c) = self.daemon {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// SIGKILL one pid through `/bin/kill`, ignoring "no such process".
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_pid(_pid: u32) {}
+
+/// Is the pid still alive (`kill -0` succeeds)?
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Send one Unix signal (by name: `TERM`, `QUIT`) to a pid — never to a
+/// process group (design D4).
+#[cfg(unix)]
+fn signal_pid(pid: u32, sig: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()
+        .context("run kill(1)")?;
+    if !status.success() {
+        bail!("failed to send SIG{sig} to pid {pid}: {status}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn signal_pid(_pid: u32, _sig: &str) -> Result<()> {
+    bail!("unix signals are not available on this platform")
+}
+
+/// The stop-marker app used by the signal scenarios. Every program records
+/// its name into `stops.txt` at the moment its TERM trap runs (so the file's
+/// line order is the observed stop order), except `stubborn`, which ignores
+/// TERM and can only be stopped by the `stop_timeout` hard kill — it records
+/// `stubborn-term` when it receives the (ignored) TERM, which also proves the
+/// daemon reached it. `stop_timeout` is 1s for `stubborn`, small enough to
+/// keep the suite fast yet long enough to observe the daemon still waiting.
+///
+/// The bodies live in small shell scripts instead of inline `args` strings:
+/// the trap command itself contains single quotes, which TOML's literal
+/// strings cannot carry.
+#[cfg(unix)]
+fn write_signal_apps(root: &Path) -> Result<()> {
+    let stops = root.join("stops.txt");
+    let app_dir = root.join("app-stop");
+    std::fs::create_dir_all(&app_dir)?;
+    let mut text = String::from("[app]\nrestart = 'always'\n\n");
+    // Start order is name-sorted within the app (boot, quick, stubborn), which
+    // is also the shutdown iteration order of the existing `shutdown_all`.
+    let mut add = |name: &str, trap_body: &str, stop_timeout: f64| -> Result<()> {
+        let script = app_dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n{trap_body}\nwhile :; do sleep 0.05; done\n",
+                trap_body = trap_body
+            ),
+        )?;
+        chmod_exec(&script)?;
+        text.push_str(&format!(
+            "[program.{name}]\ncommand = '/bin/sh'\nargs = ['{script}']\n\
+             startsecs = 0.2\nstop_timeout = {stop_timeout}\n\n",
+            script = script.display()
+        ));
+        Ok(())
+    };
+    add(
+        "boot",
+        &format!("trap 'echo boot >> {f}; exit 0' TERM", f = stops.display()),
+        5.0,
+    )?;
+    add(
+        "quick",
+        &format!("trap 'echo quick >> {f}; exit 0' TERM", f = stops.display()),
+        5.0,
+    )?;
+    add(
+        "stubborn",
+        &format!("trap 'echo stubborn-term >> {f}' TERM", f = stops.display()),
+        1.0,
+    )?;
+    let file = app_dir.join("appkeeper.toml");
+    std::fs::write(&file, text)?;
+    link_registration(&file, &root.join("apps/stop.toml"))?;
+    Ok(())
+}
+
+/// Isolated workspace for the stop-signal scenarios: no webui, a private
+/// control endpoint and log dir.
+#[cfg(unix)]
+fn setup_signal_workspace(tag: &str) -> Result<Workspace> {
+    let root = std::env::temp_dir().join(format!("ak-xtask-signal-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["apps", "logs", "app-stop"] {
+        std::fs::create_dir_all(root.join(d)).context("create signal dirs")?;
+    }
+    let control_socket = control_socket_in(&root);
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"info\"\nmonitor_interval = 0.2\napp_dir = \"apps\"\n",
+            socket = socket_toml_value(&control_socket),
+        ),
+    )?;
+    write_signal_apps(&root)?;
+    Ok(Workspace {
+        root,
+        control_socket,
+        webui_port: 0,
+    })
+}
+
+/// The line order of the stop marker (names only).
+#[cfg(unix)]
+fn stop_order(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("stops.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// pid of the background daemon: the process whose argv carries this
+/// workspace's config path and the `start --foreground` re-exec form.
+#[cfg(unix)]
+fn find_daemon_pid(ws: &Workspace) -> Result<u32> {
+    let cfg = ws.root.join("daemon.toml").display().to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for pid in pids_with_arg(&cfg) {
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let argv: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+            if argv.iter().any(|a| *a == b"--foreground") {
+                return Ok(pid);
+            }
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "could not find the background daemon for {}",
+                ws.root.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The daemon's own stdout/stderr: `daemon.out.log` at the workspace root for
+/// the foreground form this harness spawns, and under `logs/` for the
+/// background re-exec.
+#[cfg(unix)]
+fn daemon_log_text(ws: &Workspace) -> String {
+    for p in [
+        ws.root.join("daemon.out.log"),
+        ws.root.join("logs/daemon.out.log"),
+    ] {
+        if let Ok(t) = std::fs::read_to_string(p) {
+            return t;
+        }
+    }
+    String::new()
+}
+
+/// One real-signal scenario: start the daemon, wait for all programs, send
+/// `sig` to the daemon pid, then assert the graceful contract.
+#[cfg(unix)]
+fn signal_scenario(bin: &Path, tag: &str, sig: &str, background: bool) -> Result<()> {
+    let label = format!("SIG{sig}");
+    let label = label.as_str();
+    let ws = setup_signal_workspace(tag)?;
+    let result = (|| -> Result<()> {
+        // The background form re-execs `ak daemon start --foreground -c
+        // <config>`, so it exercises the same chain systemd and the SCM use.
+        let daemon = if background {
+            let (ok, code, out) =
+                cli_try_cfg(bin, &ws.root.join("daemon.toml"), &["daemon", "start"])?;
+            if !ok {
+                bail!("background `daemon start` failed ({code}): {out}");
+            }
+            SignalDaemon::Pid(find_daemon_pid(&ws)?)
+        } else {
+            SignalDaemon::Child(spawn_daemon(bin, &ws)?.child)
+        };
+        let mut case = SignalCase {
+            daemon,
+            app_pids: Vec::new(),
+            root: ws.root.clone(),
+        };
+        // All three programs must be running before the signal is sent.
+        for program in ["boot", "quick", "stubborn"] {
+            let pid = wait_running(&ws, program)?;
+            case.app_pids.push(pid);
+        }
+        let before = stop_order(&ws.root);
+        expect(
+            before.is_empty(),
+            &format!("{label}: no stop marker before the signal: {before:?}"),
+        )?;
+
+        let t0 = Instant::now();
+        signal_pid(case.daemon_pid(), sig)?;
+
+        // The stubborn app ignores TERM and gets a 1s grace window: during it
+        // the daemon must still be alive, waiting, and the app must still run.
+        std::thread::sleep(Duration::from_millis(300));
+        let stubborn_pid = case.app_pids[2];
+        expect(
+            case.daemon_alive(),
+            &format!("{label}: the daemon is still alive while its apps stop"),
+        )?;
+        expect(
+            pid_alive(stubborn_pid),
+            &format!("{label}: the daemon waits for the stubborn app ({stubborn_pid})"),
+        )?;
+        expect(
+            stop_order(&ws.root) == ["boot", "quick", "stubborn-term"],
+            &format!(
+                "{label}: the graceful apps stopped first, the stubborn one is still holding: {:?}",
+                stop_order(&ws.root)
+            ),
+        )?;
+
+        // A repeated delivery during the graceful stop must not shorten it or
+        // restart the teardown (design D3): the same stop signal once more and
+        // the other stop signal once.
+        let other = if sig == "TERM" { "QUIT" } else { "TERM" };
+        signal_pid(case.daemon_pid(), sig)?;
+        signal_pid(case.daemon_pid(), other)?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = case.daemon_exit_status() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                bail!("{label}: the daemon did not exit within 30s of the signal");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let elapsed = t0.elapsed();
+        expect(
+            status.success(),
+            &format!("{label}: the daemon exited successfully ({status}) after {elapsed:?}"),
+        )?;
+        // The notifier saw the signal and the supervisor finished the whole
+        // shutdown (the log proof also covers the background form, whose exit
+        // status is not observable).
+        let log = daemon_log_text(&ws);
+        expect(
+            log.matches("shutdown signal received").count() >= 1,
+            &format!("{label}: the signal notifier ran: {log}"),
+        )?;
+        // Idempotency, observed rather than assumed: the repeated deliveries
+        // above must not re-enter the shutdown. `shutdown_all` announces itself
+        // once per call, so exactly one occurrence proves it ran once.
+        let shutdown_calls = log.matches("shutdown: stopping 3 program(s)").count();
+        expect(
+            shutdown_calls == 1,
+            &format!(
+                "{label}: the existing shutdown_all ran exactly once (saw {shutdown_calls}): {log}"
+            ),
+        )?;
+        let requested = log
+            .matches("shutdown requested, stopping all programs")
+            .count();
+        expect(
+            requested == 1,
+            &format!("{label}: the supervisor left its loop once (saw {requested}): {log}"),
+        )?;
+        expect(
+            log.contains("all programs stopped, appkeeper exits"),
+            &format!("{label}: the daemon exited only after every program stopped: {log}"),
+        )?;
+        // No app survives the daemon (the hard kill plus `wait` reaped it).
+        for (i, pid) in case.app_pids.iter().enumerate() {
+            expect(
+                !pid_alive(*pid),
+                &format!("{label}: app #{} ({pid}) is gone", i),
+            )?;
+        }
+        expect(
+            stop_order(&ws.root) == ["boot", "quick", "stubborn-term"],
+            &format!(
+                "{label}: the stop order is unchanged by repeated signals: {:?}",
+                stop_order(&ws.root)
+            ),
+        )?;
+        // The 1s `stop_timeout` of the stubborn app ran before the daemon
+        // exited: a repeated signal neither skipped nor shortened it.
+        expect(
+            elapsed >= Duration::from_millis(800),
+            &format!("{label}: the stubborn app's stop_timeout was honoured ({elapsed:?})"),
+        )?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+/// Unix stop-signal acceptance (handle-daemon-quit-signal tasks 2.1/2.2):
+/// SIGTERM, SIGQUIT and (the unchanged Ctrl+C path) SIGINT all drive the
+/// graceful shutdown through the same notifier, app processes are reaped
+/// before the daemon exits, the `stop_timeout` hard kill happens first, and
+/// repeated signals are idempotent. Windows has no POSIX signals: the SCM
+/// stop path is covered by `windows_service_pass`.
+fn stop_signal_pass(bin: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        step("S1. SIGTERM: apps are reaped by the existing shutdown path; the daemon exits last");
+        signal_scenario(bin, "term", "TERM", false)?;
+        step("S2. SIGQUIT through the background re-exec chain follows the same graceful stop");
+        signal_scenario(bin, "quit", "QUIT", true)?;
+        // SIGINT is the interactive Ctrl+C contract the change must preserve
+        // (background-daemon「前台语义不变」): it now rides the same notifier
+        // instead of `ctrlc`, so it needs the same evidence.
+        step("S3. SIGINT (Ctrl+C) keeps the foreground daemon on the graceful stop path");
+        signal_scenario(bin, "int", "INT", false)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bin;
+        println!("    (skipped on windows: no POSIX signals; SCM stop is covered by the M pass)");
+        Ok(())
+    }
+}
+
 // -- actions scenario group (actions + glossary change) ----------------------
 
 /// Write the scenario app used by the actions pass: one long-running service
@@ -5567,6 +6009,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         revamp_pass(&bin)?;
         run_daemon_first_pass(&bin)?;
         detach_pass(&bin)?;
+        stop_signal_pass(&bin)?;
         webui_pass(&bin, &ws)?;
         if args.no_browser {
             println!("\n(--no-browser: skipping browser pass)");
