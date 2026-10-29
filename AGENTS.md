@@ -48,7 +48,8 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册。
 - `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
   bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
-  外部采集（daemon 侧零改动）；轮转对账/清理契约见 README「性能基准」。
+  外部采集（daemon 侧零改动）；轮转对账/清理契约见 benchmark 规范
+  （openspec/specs/benchmark）。
 - `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
   supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
   SPA + `/api/*`（复用控制面投影；可选 `webui.auth_token` → `/api/auth` 换票
