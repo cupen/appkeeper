@@ -206,8 +206,7 @@ fn write_placeholder(dist: &Path) {
          </body></html>\n",
     )
     .expect("write placeholder index.html");
-    fs::write(dist.join(".ak-placeholder"), "placeholder\n")
-        .expect("write placeholder marker");
+    fs::write(dist.join(".ak-placeholder"), "placeholder\n").expect("write placeholder marker");
 }
 
 /// Newest mtime across the given paths, recursing into directories.

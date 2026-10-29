@@ -16,8 +16,8 @@
 //! sessions close gracefully (queued frames flush, then a Close frame).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -128,7 +128,12 @@ async fn program_detail(State(sup): State<Arc<Supervisor>>, Path(name): Path<Str
     match st.programs.get(&name) {
         Some(p) => {
             let st = sup.state.lock().unwrap();
-            Json(crate::server::program_info_state(&st, p, Some(&sup.metrics))).into_response()
+            Json(crate::server::program_info_state(
+                &st,
+                p,
+                Some(&sup.metrics),
+            ))
+            .into_response()
         }
         None => api_error(StatusCode::NOT_FOUND, &format!("unknown program {name:?}")),
     }
@@ -249,11 +254,7 @@ async fn program_action(
 /// isolation is whatever `webui.listen` grants — see the `webui-api`
 /// capability); non-empty = `/api/*` (except `/api/health`) and `/ws` require
 /// a session established by exchanging the token at `/api/auth`.
-pub fn build_router(
-    sup: Arc<Supervisor>,
-    stop: Arc<WebuiLifecycle>,
-    auth_token: &str,
-) -> Router {
+pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>, auth_token: &str) -> Router {
     let auth = console_auth_for(&sup, auth_token);
     let guarded = Router::new()
         .route("/api/overview", get(overview))
@@ -451,7 +452,10 @@ async fn auth_login(
 }
 
 /// Drop this browser's session cookie.
-async fn auth_logout(headers: axum::http::HeaderMap, State(sup): State<Arc<Supervisor>>) -> Response {
+async fn auth_logout(
+    headers: axum::http::HeaderMap,
+    State(sup): State<Arc<Supervisor>>,
+) -> Response {
     let auth = console_auth_of(&sup);
     if let Some(id) = cookie_value(
         headers
@@ -507,7 +511,6 @@ async fn console_auth(
             .into_response(),
     }
 }
-
 
 /// Serve the console on `listen`. Blocks the calling thread; run it on a
 /// dedicated worker thread. Exits when the daemon shuts down (flag is set by
@@ -1075,7 +1078,10 @@ mod tests {
         assert!(set_cookie.starts_with("ak_console="), "{set_cookie}");
         assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
         assert!(set_cookie.contains("SameSite=Strict"), "{set_cookie}");
-        assert!(!set_cookie.contains("s3cr3t"), "the token is never in the cookie");
+        assert!(
+            !set_cookie.contains("s3cr3t"),
+            "the token is never in the cookie"
+        );
         let cookie = set_cookie.split(';').next().unwrap().to_string();
 
         // The cookie opens the gated surface.
@@ -1083,14 +1089,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         // ...and logging out closes it again.
-        let (status, _, _) = call(
-            app.clone(),
-            "POST",
-            "/api/auth/logout",
-            Some(&cookie),
-            None,
-        )
-        .await;
+        let (status, _, _) =
+            call(app.clone(), "POST", "/api/auth/logout", Some(&cookie), None).await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -1099,14 +1099,8 @@ mod tests {
     #[tokio::test]
     async fn token_in_query_string_is_not_accepted() {
         let app = authed_app("s3cr3t");
-        let (status, body, _) = call(
-            app.clone(),
-            "GET",
-            "/api/overview?token=s3cr3t",
-            None,
-            None,
-        )
-        .await;
+        let (status, body, _) =
+            call(app.clone(), "GET", "/api/overview?token=s3cr3t", None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(!String::from_utf8_lossy(&body).contains("programs"));
     }
@@ -1319,7 +1313,9 @@ mod tests {
         std::thread::spawn(move || crate::server::serve(sup, listener));
 
         let client = crate::client::Client::from_config(&config);
-        let v = client.status().expect("/v1/status over the control endpoint");
+        let v = client
+            .status()
+            .expect("/v1/status over the control endpoint");
         let p = v["programs"]
             .as_array()
             .unwrap()

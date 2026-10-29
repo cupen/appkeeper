@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 /// One byte-stream connection to the control endpoint.
@@ -42,8 +42,7 @@ impl Client {
             ));
         }
         Ok(Client {
-            endpoint: Endpoint::parse(endpoint)
-                .map_err(|e| anyhow!("--socket {e}"))?,
+            endpoint: Endpoint::parse(endpoint).map_err(|e| anyhow!("--socket {e}"))?,
             token,
         })
     }
@@ -87,10 +86,7 @@ impl Client {
         if let Some(token) = &self.token {
             // Trim: a credential with stray whitespace is a user typo, and
             // the header must stay well-formed.
-            req.push_str(&format!(
-                "Authorization: Bearer {}\r\n",
-                token.trim()
-            ));
+            req.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
         }
         req.push_str("Content-Type: application/json\r\n");
         req.push_str(&format!("Content-Length: {}\r\n", payload.len()));
@@ -306,7 +302,9 @@ impl Endpoint {
                 ));
             };
             if host.is_empty() {
-                return Err(format!("tcp:// endpoint host must not be empty, got {rest:?}"));
+                return Err(format!(
+                    "tcp:// endpoint host must not be empty, got {rest:?}"
+                ));
             }
             let port_err = || {
                 format!("tcp:// endpoint port must be an integer in 1..=65535, got {port_raw:?}")
@@ -487,7 +485,12 @@ mod tests {
         // IPC stays verbatim.
         let c = Client::new("/tmp/ak.sock").unwrap();
         assert_eq!(c.addr(), "/tmp/ak.sock");
-        for bad in ["tcp://127.0.0.1", "tcp://127.0.0.1:99999", "tcp://:1", "tcp://127.0.0.1:0"] {
+        for bad in [
+            "tcp://127.0.0.1",
+            "tcp://127.0.0.1:99999",
+            "tcp://:1",
+            "tcp://127.0.0.1:0",
+        ] {
             let err = Client::new(bad).unwrap_err().to_string();
             assert!(err.contains("--socket"), "{bad}: {err}");
         }
@@ -516,8 +519,7 @@ mod tests {
             let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
             req
         });
-        let c = Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("bt".into()))
-            .unwrap();
+        let c = Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("bt".into())).unwrap();
         assert_eq!(c.daemon_version().unwrap(), "t");
         let req = server.join().unwrap();
         assert!(
@@ -548,8 +550,8 @@ mod tests {
             );
             let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
         });
-        let c = Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("wrong".into()))
-            .unwrap();
+        let c =
+            Client::with_token(&format!("tcp://127.0.0.1:{port}"), Some("wrong".into())).unwrap();
         let err = c.status().unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("401"), "{text}");
@@ -584,8 +586,14 @@ mod tests {
         let sock = dir.join("ak.sock");
         std::fs::write(&sock, b"x").unwrap();
         let c = Client::new(&sock.display().to_string()).unwrap();
-        assert!(c.health().is_err(), "a plain file is not a control endpoint");
-        assert!(sock.exists(), "bench must not remove anything it did not create");
+        assert!(
+            c.health().is_err(),
+            "a plain file is not a control endpoint"
+        );
+        assert!(
+            sock.exists(),
+            "bench must not remove anything it did not create"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

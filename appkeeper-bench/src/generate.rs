@@ -185,7 +185,10 @@ pub fn write_count_file(path: &Path, c: &GenCounters) {
         path,
         serde_json::to_vec(c).unwrap_or_else(|_| b"{}".to_vec()),
     ) {
-        eprintln!("appkeeper-bench: warning: cannot write count file {}: {e}", path.display());
+        eprintln!(
+            "appkeeper-bench: warning: cannot write count file {}: {e}",
+            path.display()
+        );
     }
 }
 

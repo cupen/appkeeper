@@ -7,7 +7,7 @@
 
 ### Requirement: playbook 分发二进制并注册服务
 
-`appkeeper` Ansible role（`.ansible/roles/appkeeper`，本机入口 `.ansible/site.yml`）SHALL 在每台目标机上完成：将 appkeeper 二进制分发到目标路径、安装daemon 配置到目标机、执行 `ak service install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。daemon 配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认daemon 配置路径。
+`appkeeper` Ansible role（`.ansible/roles/appkeeper`，本机入口 `.ansible/site.yml`）SHALL 在每台目标机上完成：将 appkeeper 二进制分发到目标路径、安装daemon 配置到目标机、执行 `ak daemon install --now` 注册 systemd 服务并启动。二进制来源 MUST 支持两种变量指定方式：控制机上的本地文件路径，或可下载的 URL。daemon 配置 MUST 由变量指定控制机上的本地文件路径，复制到目标机的平台默认daemon 配置路径。
 
 #### Scenario: 部署到全新主机
 

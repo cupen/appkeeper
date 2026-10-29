@@ -90,7 +90,7 @@ workspace 等）SHALL 采用统一前缀模式，不得自造散名：仓库测�
 
 #### Scenario: systemd unit 更名
 
-- **WHEN** 用户以 root 执行 `ak service install`
+- **WHEN** 用户以 root 执行 `ak daemon install`
 - **THEN** 生成 `/etc/systemd/system/ak.service`，其 `ExecStart` 指向当前
   `ak` 可执行文件，`Description` 使用全名 `appkeeper`
 
@@ -112,7 +112,7 @@ SHALL 仅限 `openspec/changes/**`（归档与进行中的变更工件）与 git
 #### Scenario: 旧配置文件不再被识别
 
 - **WHEN** 部署目录中只有旧名形态的 app 配置文件（无 `appkeeper.toml`）
-  并执行 `ak add .`
+  并执行 `ak compose .`
 - **THEN** 命令以非零码失败并提示未找到 `appkeeper.toml`，不静默回退读取
   旧文件名
 

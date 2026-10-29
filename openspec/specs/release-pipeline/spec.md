@@ -135,7 +135,7 @@ MUST NOT 发布。
 #### Scenario: 真实控制台被嵌入
 
 - **WHEN** 发布构建完成
-- **THEN** 三个产物中嵌入的是真实 Web 控制台资源，可用 `ak daemon`
+- **THEN** 三个产物中嵌入的是真实 Web 控制台资源，可用 `ak daemon start`
       启动并在浏览器加载控制台页面
 
 #### Scenario: 占位页视为失败

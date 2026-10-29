@@ -1,10 +1,10 @@
 //! appkeeper — a cross-platform, application-layer process keeper with a TOML
 //! layered config (global daemon config + per-app deployment files).
 //!
-//! `ak daemon` is the daemon entry (the only one); everything else is a
+//! `ak daemon start` is the daemon entry (the only one); everything else is a
 //! client: `run` is a client verb (control-plane actions over the HTTP/1.1
-//! API carried on a local IPC endpoint), and add/remove/list manage the app
-//! registry (app_dir links).
+//! API carried on a local IPC endpoint), `ps` is the runtime overview, and
+//! compose/remove manage the app registry (app_dir links).
 
 mod action;
 mod api;
@@ -41,7 +41,6 @@ const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
 /// Client contract: 3 = daemon unreachable (mapped by `client::exit_code_of`).
-#[allow(dead_code)]
 const EXIT_UNREACHABLE: i32 = 3;
 
 #[derive(Parser, Debug)]
@@ -62,22 +61,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// The single daemon entry point. Bare `daemon` runs the supervisor in
-    /// the foreground (Ctrl+C / SIGTERM for a graceful stop); `--detach`
-    /// starts it in the background and returns once it is serving
-    /// (background-daemon spec). The web console is config-driven: add a
-    /// `[webui]` section to the daemon config (or `ak config --set
-    /// webui.listen=...` + reload) to enable it.
+    /// The daemon subcommand family: `start` / `install` / `uninstall` /
+    /// `shutdown` (control-plane + background-daemon specs). Bare `daemon`
+    /// is a usage error (exit 2) listing the four subcommands. The web
+    /// console is config-driven: add a `[webui]` section to the daemon
+    /// config (or `ak config --set webui.listen=...` + reload) to enable it.
     Daemon {
-        /// Start the daemon in the background (prints the listen address and
-        /// the background log path once the daemon is ready)
-        #[arg(long = "detach")]
-        detach: bool,
-        /// Internal: run under the Windows Service Control Manager with this
-        /// service name. Never typed by hand — the installer puts it in the
-        /// service binary path. Hidden from help.
-        #[arg(long, value_name = "NAME", hide = true, conflicts_with = "detach")]
-        service: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<DaemonCmd>,
     },
     /// The client "run" verb (control-plane spec): `run <name>` /
     /// `run --app <app>` starts an already-registered program or fans out
@@ -171,13 +162,19 @@ enum Cmd {
         #[arg(long = "init")]
         init: bool,
     },
-    /// Overview of daemon and all programs (human-readable table by default;
-    /// `--json` keeps the machine-readable projection)
-    Status {
-        /// Print the pretty JSON projection instead of the table (script
-        /// migration path)
-        #[arg(long = "json")]
-        json: bool,
+    /// Overview of the daemon and its programs (`ps`, control-plane spec):
+    /// online-only by default (offline exits 3), `--all` adds the local
+    /// registry view (and degrades to a registry listing when offline).
+    Ps {
+        /// Include registered-but-not-running apps: join the local registry
+        /// with the `/v1` projection (online), or print the registry listing
+        /// with a daemon-offline note (offline, exit 0)
+        #[arg(long = "all")]
+        all: bool,
+        /// Output format: `table` (default, human-readable) or `json`
+        /// (the `GET /v1/status` projection, pretty-printed)
+        #[arg(long = "out", value_parser = ["json", "table"], default_value = "table")]
+        out: String,
     },
     /// Stop a program (graceful, then force after stop timeout), or every
     /// program of one app with --app
@@ -235,14 +232,12 @@ enum Cmd {
         #[arg(long = "restart")]
         restart: bool,
     },
-    /// Stop all programs and exit the daemon
-    Shutdown,
-    /// Register an app: a directory with appkeeper.toml, a config file path,
-    /// or an executable program (scaffolds a fresh config in app_dir).
-    /// Re-running `add` on the same executable regenerates its whole config
-    /// from the given flags — manual edits to the generated file are
-    /// overwritten.
-    Add {
+    /// Compose an app into the registry (app-registry spec): a deployment
+    /// directory with appkeeper.toml, a config file path, or an executable
+    /// program (scaffolds a fresh config in app_dir). Re-running `compose`
+    /// on the same executable regenerates its whole config from the given
+    /// flags — manual edits to the generated file are overwritten.
+    Compose {
         /// App directory (containing appkeeper.toml), a config file path, or
         /// an executable program to scaffold a config from
         #[arg(default_value = ".")]
@@ -269,7 +264,7 @@ enum Cmd {
         #[arg(long = "env")]
         envs: Vec<String>,
         /// (scaffold) working directory for the program
-        /// (default: the directory `add` runs in)
+        /// (default: the directory `compose` runs in)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
         /// Apply this app right after registering; when the daemon is
@@ -280,25 +275,36 @@ enum Cmd {
     /// Unregister an app: external deployment configs are kept; a
     /// scaffold-generated record (a real file inside app_dir) is deleted
     Remove { name: String },
-    /// List registered apps
-    List,
     /// Interactive shell client (like supervisorctl)
     Shell {
         /// Execute a single shell command and exit (script-friendly)
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
     },
-    /// Install/uninstall appkeeper as a system service (Windows SCM / Linux
-    /// systemd; administrator/root required)
-    Service {
-        #[command(subcommand)]
-        cmd: ServiceCmd,
-    },
 }
 
+/// The `daemon` subcommand family (control-plane + background-daemon specs).
+/// `start` runs the supervisor; `install`/`uninstall` manage the OS service
+/// registration (former `ak service` family, flags unchanged);
+/// `shutdown` stops every program and exits the daemon over the control
+/// plane (former top-level `shutdown`).
 #[derive(Subcommand, Debug)]
-enum ServiceCmd {
-    /// Register appkeeper as a system service (Windows service / systemd unit)
+enum DaemonCmd {
+    /// Start the daemon: background by default (detached, returns once it is
+    /// serving); `--foreground` keeps it attached to the terminal
+    Start {
+        /// Run in the foreground (Ctrl+C / SIGTERM for a graceful stop).
+        /// This is what systemd's ExecStart and the background re-exec use
+        #[arg(long = "foreground", conflicts_with = "service")]
+        foreground: bool,
+        /// Internal: run under the Windows Service Control Manager with this
+        /// service name. Never typed by hand — the installer puts it in the
+        /// service binary path. Hidden from help
+        #[arg(long, value_name = "NAME", hide = true)]
+        service: Option<String>,
+    },
+    /// Register appkeeper as a system service (Windows service / systemd
+    /// unit; administrator/root required)
     Install {
         /// Also start the service right after installing
         #[arg(long, visible_alias = "now")]
@@ -339,6 +345,9 @@ enum ServiceCmd {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
+    /// Stop all programs and exit the daemon (client operation, over the
+    /// control plane)
+    Shutdown,
 }
 
 fn main() {
@@ -346,6 +355,10 @@ fn main() {
     // spec). Intercept it before clap so the error carries the migration hint
     // instead of a generic "unknown subcommand".
     reject_removed_start();
+    // The old systemd ExecStart / Windows binPath `daemon --config <path>`
+    // is a usage error now; intercept it first so the message also names the
+    // unit regeneration (service-registration upgrade compatibility).
+    reject_removed_daemon_old_form();
     // The daemon form of `run` was removed in favour of the explicit `daemon`
     // subcommand (daemon-subcommand spec). Intercepted before clap for the
     // same reason — the error must carry the per-form migration hint.
@@ -453,9 +466,84 @@ fn daemon_run_form(args: &[String]) -> Option<bool> {
     Some(detach)
 }
 
+/// Argv snapshot for the pre-clap detectors (both are pure over this form so
+/// their signatures are unit-testable).
+fn argv() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The old systemd `ExecStart` / Windows SCM binPath signature
+/// `daemon --config <path>`: after the `daemon` token every remaining token
+/// is the `-c/--config` flag (either position, `--config=<path>` included)
+/// or the hidden `--service <name>` marker the old binPath carried, with at
+/// least one such marker so a truly bare `ak daemon` does not match.
+///
+/// This is the upgrade-compatibility form of service-registration: under the
+/// new CLI it is a usage error (exit 2), and the message must additionally
+/// point at `ak daemon install --force --now`. It is detected before clap
+/// because `--service` no longer exists on bare `daemon`, so clap would
+/// answer "unexpected argument" with no regeneration hint.
+fn bare_daemon_old_unit_form(args: &[String]) -> bool {
+    let mut marker = false;
+    // A global `-c/--config` before the subcommand is the same old entry
+    // (`ak -c <path> daemon` was the foreground daemon before this change).
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => {
+                marker = true;
+                i += 2;
+            }
+            _ if args[i].starts_with("--config=") => {
+                marker = true;
+                i += 1;
+            }
+            _ if args[i].starts_with('-') => i += 1,
+            _ => break, // first non-flag token = the subcommand
+        }
+    }
+    if args.get(i).map(String::as_str) != Some("daemon") {
+        return false;
+    }
+    let mut j = i + 1;
+    while j < args.len() {
+        match args[j].as_str() {
+            "-c" | "--config" => {
+                marker = true;
+                j += 2;
+            }
+            _ if args[j].starts_with("--config=") => {
+                marker = true;
+                j += 1;
+            }
+            // The pre-change Windows binPath: `--service <NAME>`.
+            "--service" => {
+                marker = true;
+                j += 2;
+            }
+            _ => return false,
+        }
+    }
+    marker
+}
+
+/// Exit-2 interception of the old `daemon --config <path>` entry
+/// (service-registration upgrade compatibility): prints the bare-`daemon`
+/// usage error with the unit-regeneration hint instead of clap's generic
+/// "unexpected argument" answer.
+fn reject_removed_daemon_old_form() {
+    if bare_daemon_old_unit_form(&argv()) {
+        eprintln!("ak: error: {}", daemon_usage_error(true));
+        std::process::exit(EXIT_CONFIG);
+    }
+}
+
 /// Exit-2 interception of the removed daemon form of `run`, with per-form
-/// hints (daemon-subcommand spec): the detached form points at
-/// `ak daemon --detach`; the bare/config-only form (the systemd old-ExecStart
+/// hints (control-plane spec + design D7): the detached form points at
+/// `ak daemon start`; the bare/config-only form (the systemd old-ExecStart
 /// signature) additionally tells the operator to regenerate the unit.
 fn reject_removed_run() {
     let args: Vec<String> = std::env::args_os()
@@ -465,19 +553,44 @@ fn reject_removed_run() {
     let Some(detach) = daemon_run_form(&args) else {
         return;
     };
-    if detach {
-        eprintln!(
-            "ak: error: the daemon form of `run` has been removed — use \
-             `ak daemon --detach` to start the daemon in the background"
-        );
-    } else {
-        eprintln!(
-            "ak: error: the daemon form of `run` has been removed — use `ak daemon` to \
-             start the daemon. a systemd unit with the old ExecStart must be regenerated: \
-             ak service install --force --now"
-        );
-    }
+    eprintln!("ak: error: {}", removed_run_hint(detach));
     std::process::exit(EXIT_CONFIG);
+}
+
+/// The per-form message of the removed daemon `run` (control-plane spec):
+/// `--detach` points at the background `ak daemon start`; the config-only
+/// form is also the old systemd `ExecStart`, so it names the foreground form
+/// that replaces it and the command that regenerates the unit.
+fn removed_run_hint(detach: bool) -> String {
+    if detach {
+        "the daemon form of `run` has been removed — use \
+         `ak daemon start` to start the daemon in the background"
+            .to_string()
+    } else {
+        "the daemon form of `run` has been removed — use `ak daemon start` \
+         for the background daemon or `ak daemon start --foreground` to run it in the \
+         foreground. a systemd unit with the old ExecStart must be regenerated: \
+         ak daemon install --force --now"
+            .to_string()
+    }
+}
+
+/// The bare-`daemon` usage error (exit 2): names all four subcommands.
+/// `old_unit` marks the `daemon --config <path>` signature — the previous
+/// systemd `ExecStart`, which lands here now that bare `daemon` is a usage
+/// error (service-registration spec: upgrade compatibility). That form
+/// additionally points at `ak daemon install --force --now`.
+fn daemon_usage_error(old_unit: bool) -> String {
+    let base = "`daemon` needs a subcommand: start | install | uninstall | shutdown \
+                (see `ak daemon --help`)";
+    if old_unit {
+        format!(
+            "{base}\n      a systemd unit with the old ExecStart (`daemon --config <path>`) \
+             must be regenerated: ak daemon install --force --now"
+        )
+    } else {
+        base.to_string()
+    }
 }
 
 /// Platform default location for the daemon config.
@@ -522,13 +635,75 @@ fn dispatch(cli: &Cli) -> Result<()> {
     }
     let config_path = config_path_of(cli);
     match &cli.cmd {
-        Some(Cmd::Daemon { detach, service }) => {
-            if *detach {
-                run_detach(&config_path)
-            } else {
-                run_daemon(&config_path, service.as_deref())
+        Some(Cmd::Daemon { cmd }) => match cmd {
+            None => {
+                // Bare `ak daemon` is a usage error (exit 2) that lists the
+                // four subcommands (background-daemon spec). The old
+                // `daemon --config <path>` forms never reach here: they are
+                // intercepted before clap with the unit-regeneration hint
+                // (`reject_removed_daemon_old_form`).
+                eprintln!("ak: error: {}", daemon_usage_error(false));
+                std::process::exit(EXIT_CONFIG);
             }
-        }
+            Some(DaemonCmd::Start {
+                foreground,
+                service,
+            }) => {
+                if *foreground {
+                    run_daemon(&config_path, service.as_deref())
+                } else {
+                    // Background is the default (the former `--detach`
+                    // semantics); `--service` implies the service-managed
+                    // foreground entry.
+                    match service {
+                        Some(name) => run_daemon(&config_path, Some(name)),
+                        None => run_background(&config_path),
+                    }
+                }
+            }
+            Some(DaemonCmd::Install {
+                start,
+                force,
+                unit_file,
+                name,
+                desc,
+                user,
+                restart,
+            }) => {
+                let opts = service::ServiceOptions {
+                    unit_file: unit_file.clone(),
+                    name: name.clone(),
+                    desc: desc.clone(),
+                    user: user.clone(),
+                    force: *force,
+                    start: *start,
+                    restart: *restart,
+                };
+                service::install(&config_path, &opts)
+            }
+            Some(DaemonCmd::Uninstall { unit_file, name }) => {
+                let opts = service::ServiceOptions {
+                    unit_file: unit_file.clone(),
+                    name: name.clone(),
+                    desc: None,
+                    user: None,
+                    force: false,
+                    start: false,
+                    restart: service::RestartPolicy::Always,
+                };
+                service::uninstall(&config_path, &opts)
+            }
+            Some(DaemonCmd::Shutdown) => client_cmd(&config_path, |c| {
+                let v = c.shutdown()?;
+                println!(
+                    "{}",
+                    v.get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("shutting down")
+                );
+                Ok(())
+            }),
+        },
         Some(Cmd::Run {
             name,
             app,
@@ -626,15 +801,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Status { json }) => client_cmd(&config_path, |c| {
-            if *json {
-                let v = c.status()?;
-                println!("{}", serde_json::to_string_pretty(&v)?);
-                Ok(())
-            } else {
-                shell::print_status(c)
-            }
-        }),
+        Some(Cmd::Ps { all, out }) => ps_cmd(&config_path, *all, out),
         Some(Cmd::Pid { name }) => client_cmd(&config_path, |c| {
             let v = c.program(name)?;
             match v.get("pid") {
@@ -688,23 +855,13 @@ fn dispatch(cli: &Cli) -> Result<()> {
             );
             Ok(())
         }),
-        Some(Cmd::Shutdown) => client_cmd(&config_path, |c| {
-            let v = c.shutdown()?;
-            println!(
-                "{}",
-                v.get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("shutting down")
-            );
-            Ok(())
-        }),
         Some(Cmd::Log {
             names,
             tail,
             follow,
             stream,
         }) => client_cmd(&config_path, |c| log_cmd(c, names, *tail, *follow, stream)),
-        Some(Cmd::Add {
+        Some(Cmd::Compose {
             path,
             name,
             description,
@@ -801,72 +958,6 @@ fn dispatch(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
-        Some(Cmd::Service { cmd }) => {
-            let (action, unit_file, name, desc, user, force, start, restart) = match cmd {
-                ServiceCmd::Install {
-                    start,
-                    force,
-                    unit_file,
-                    name,
-                    desc,
-                    user,
-                    restart,
-                } => (
-                    "install",
-                    unit_file,
-                    name,
-                    desc,
-                    user,
-                    *force,
-                    *start,
-                    *restart,
-                ),
-                ServiceCmd::Uninstall { unit_file, name } => (
-                    "uninstall",
-                    unit_file,
-                    name,
-                    &None,
-                    &None,
-                    false,
-                    false,
-                    service::RestartPolicy::Always,
-                ),
-            };
-            let opts = service::ServiceOptions {
-                unit_file: unit_file.clone(),
-                name: name.clone(),
-                desc: desc.clone(),
-                user: user.clone(),
-                force,
-                start,
-                restart,
-            };
-            if action == "install" {
-                service::install(&config_path, &opts)?;
-            } else {
-                service::uninstall(&config_path, &opts)?;
-            }
-            Ok(())
-        }
-        Some(Cmd::List) => {
-            let config = client::load_config(&config_path)?;
-            let config_dir = config_dir_of(&config_path);
-            let apps = registry::ListedApp::good(registry::list(&config, &config_dir)?);
-            if apps.is_empty() {
-                println!(
-                    "no apps registered (use `ak add <dir>` in an app deployment directory)"
-                );
-                return Ok(());
-            }
-            for a in apps {
-                let desc = a.description.as_deref().unwrap_or("");
-                println!("{:<20} {}", a.name, a.path.display());
-                if !desc.is_empty() {
-                    println!("{:<20} {desc}", "");
-                }
-            }
-            Ok(())
-        }
     }
 }
 
@@ -992,10 +1083,18 @@ fn log_cmd(
     Ok(())
 }
 
-/// `ak daemon --detach`: spawn the daemon in the background and report once
-/// it is serving (background-daemon spec). Non-zero exit on timeout / bind
-/// conflict, naming the background log.
-fn run_detach(config_path: &Path) -> Result<()> {
+/// `ak daemon start` (background default): spawn the daemon detached and
+/// report once it is serving (background-daemon spec). Non-zero exit on
+/// timeout / bind conflict, naming the background log.
+///
+/// An already-serving instance is a bind conflict for this entry point: the
+/// spec's「端口已占用时报错」scenario requires a non-zero exit and a message
+/// naming the existing instance (no second process is started). The
+/// `Ready { already_online }` outcome stays a success for the implicit
+/// pull-up (`compose --apply`, `daemonize::ensure_daemon`), which treats a
+/// healthy daemon as "nothing to do" — only this explicit entry maps it to an
+/// error.
+fn run_background(config_path: &Path) -> Result<()> {
     let config = client::load_config(config_path)?;
     let config_dir = config_dir_of(config_path);
     match daemonize::ensure_daemon(&config, config_path, &config_dir) {
@@ -1005,10 +1104,14 @@ fn run_detach(config_path: &Path) -> Result<()> {
                 .map(|e| e.display())
                 .unwrap_or_else(|_| config.daemon.socket.to_string_lossy().into_owned());
             if already_online {
-                println!("daemon already running on control endpoint {endpoint}");
-            } else {
-                println!("daemon running in the background on control endpoint {endpoint}");
+                eprintln!(
+                    "ak: error: another daemon is already running on control endpoint {endpoint} \
+                     (control endpoint already in use); no second instance was started — \
+                     use `ak ps` to inspect it or `ak daemon shutdown` to stop it"
+                );
+                std::process::exit(EXIT_ERROR);
             }
+            println!("daemon running in the background on control endpoint {endpoint}");
             println!(
                 "logs: {}",
                 daemonize::daemon_log_path(&config, &config_dir).display()
@@ -1018,12 +1121,160 @@ fn run_detach(config_path: &Path) -> Result<()> {
         daemonize::SpawnOutcome::TimedOut { log_path } => {
             eprintln!(
                 "ak: error: the daemon did not become ready; see {} \
-                 (a control-endpoint conflict is likely — check `ak status`)",
+                 (a control-endpoint conflict is likely — check `ak ps`)",
                 log_path.display()
             );
             std::process::exit(EXIT_ERROR);
         }
     }
+}
+
+/// Local registration rows for `ps` (name / config object / description).
+/// Broken records are filtered out (`ListedApp::good`), the same semantics the
+/// former `list` verb had.
+fn ps_registry_rows(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<shell::RegistryRow>> {
+    Ok(
+        registry::ListedApp::good(registry::list(config, config_dir)?)
+            .into_iter()
+            .map(|a| shell::RegistryRow {
+                name: a.name,
+                path: a.path.display().to_string(),
+                description: a.description,
+            })
+            .collect(),
+    )
+}
+
+/// The `/v1` projection's program rows grouped by app name: the set of apps
+/// the daemon knows about (the authoritative half of the `--all` join).
+fn projection_apps(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    v.get("programs")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("app").and_then(|a| a.as_str()))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a failed `/v1/status` call degrades `ps` to the local registry
+/// view instead of exiting: only `--all` degrades, and only when the daemon
+/// genuinely is not there (control-plane spec: `ps --all` offline exits 0; a
+/// plain `ps` stays at exit 3). A permission-denied endpoint or a rejected TCP
+/// credential proves a daemon IS serving, so neither may be reported as the
+/// offline degradation.
+fn ps_degrades_to_registry(all: bool, err: &anyhow::Error) -> bool {
+    all && client::is_unreachable(err)
+}
+
+/// `ak ps` (control-plane spec): online-only by default (offline exits 3 via
+/// the client error class); `--all` joins the local registry with the `/v1`
+/// projection (online: the projection is authoritative, the registry supplies
+/// only apps it does not cover) or degrades to the registry listing with a
+/// daemon-offline note (exit 0). `--out json` prints the `GET /v1/status`
+/// projection; `--all` adds a `registry` array for the apps the projection
+/// does not cover, and the offline degradation prints that array alone.
+fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let config_dir = config_dir_of(config_path);
+    // The local registry is advisory for the default view: it only supplies
+    // the DESCRIPTION column (the config path comes from the `/v1` projection).
+    // A registry read failure (e.g. an unreadable `app_dir`) MUST NOT turn a
+    // connection-class error into exit 1 — `ps` keeps the exit-3 / permission
+    // contract by asking the daemon first. `--all` keeps the hard dependency:
+    // its view and its offline degradation are registry-sourced by definition.
+    let registry_rows = match ps_registry_rows(&config, &config_dir) {
+        Ok(rows) => rows,
+        Err(e) if !all => {
+            eprintln!(
+                "note: the local registry could not be read; descriptions are omitted: {e:#}"
+            );
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let descriptions: std::collections::BTreeMap<String, String> = registry_rows
+        .iter()
+        .filter_map(|r| r.description.clone().map(|d| (r.name.clone(), d)))
+        .collect();
+    let c = client::Client::from_config(&config);
+    let status = match c.status() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            // Plain `ps` keeps the script contract (exit 3); `--all`
+            // degrades to the local registry view and exits 0. Only the
+            // daemon-unreachable class degrades — a caller fixable error
+            // (e.g. a malformed config answer) must not be masked.
+            if !ps_degrades_to_registry(all, &e) {
+                eprintln!("ak: error: {e:#}");
+                std::process::exit(client::exit_code_of(&e));
+            }
+            eprintln!("note: {e:#}");
+            None
+        }
+    };
+
+    if out == "json" {
+        match status {
+            Some(mut v) => {
+                if all {
+                    let known = projection_apps(&v);
+                    let registry: Vec<serde_json::Value> = registry_rows
+                        .iter()
+                        .filter(|r| !known.contains(&r.name))
+                        .map(|r| {
+                            serde_json::json!({
+                                "name": r.name,
+                                "config_path": r.path,
+                                "description": r.description,
+                                "state": "not-applied",
+                            })
+                        })
+                        .collect();
+                    v["registry"] = serde_json::Value::Array(registry);
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            }
+            // Offline `--all`: the registry JSON array alone (control-plane
+            // spec: `--all --out json` degradation).
+            None => {
+                let registry: Vec<serde_json::Value> = registry_rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "config_path": r.path,
+                            "description": r.description,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Array(registry))?
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    match status {
+        Some(v) => {
+            if all {
+                print!(
+                    "{}",
+                    shell::render_ps_all_table(&v, &descriptions, &registry_rows)
+                );
+            } else {
+                print!("{}", shell::render_ps_table(&v, &descriptions));
+            }
+        }
+        None => print!("{}", shell::render_registry_listing(&registry_rows, true)),
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    Ok(())
 }
 
 /// The scaffold flags recognized inside the trailing `run --` region (after
@@ -1149,9 +1400,7 @@ fn run_adhoc(
         argv
     };
     if argv.is_empty() {
-        eprintln!(
-            "ak: error: no command given (use `ak run -- <cmd...>` or `--cmd \"...\"`)"
-        );
+        eprintln!("ak: error: no command given (use `ak run -- <cmd...>` or `--cmd \"...\"`)");
         std::process::exit(EXIT_CONFIG);
     }
     let env = match parse_envs(&envs) {
@@ -1210,9 +1459,7 @@ fn run_adhoc(
         }
     };
     // Residual: prompt (or fail when non-interactive) and commit on confirm.
-    if terminal.get("residual").and_then(|r| r.as_bool()) == Some(true)
-        || residual.is_some()
-    {
+    if terminal.get("residual").and_then(|r| r.as_bool()) == Some(true) || residual.is_some() {
         let frame = residual.unwrap_or_else(|| terminal.clone());
         return handle_residual(&c, &frame, json);
     }
@@ -1231,13 +1478,21 @@ fn print_progress_frame(frame: &serde_json::Value) {
 fn progress_line(frame: &serde_json::Value) -> Option<String> {
     match frame.get("phase").and_then(|p| p.as_str()) {
         Some("staged") => {
-            let est = frame.get("estimate_secs").and_then(|e| e.as_f64()).unwrap_or(0.0);
+            let est = frame
+                .get("estimate_secs")
+                .and_then(|e| e.as_f64())
+                .unwrap_or(0.0);
             Some(format!("starting (estimated wait up to {est:.0}s)..."))
         }
         Some("waiting_startsecs") => Some("waiting for startsecs...".to_string()),
         Some("waiting_health") => {
-            let est = frame.get("estimate_secs").and_then(|e| e.as_f64()).unwrap_or(0.0);
-            Some(format!("waiting for the first health probe (up to {est:.0}s)..."))
+            let est = frame
+                .get("estimate_secs")
+                .and_then(|e| e.as_f64())
+                .unwrap_or(0.0);
+            Some(format!(
+                "waiting for the first health probe (up to {est:.0}s)..."
+            ))
         }
         _ => None,
     }
@@ -1307,9 +1562,14 @@ fn handle_residual(c: &client::Client, frame: &serde_json::Value, json: bool) ->
                 } else {
                     println!(
                         "{}",
-                        v.get("result").and_then(|r| r.as_str()).unwrap_or("registered")
+                        v.get("result")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("registered")
                     );
-                    println!("  config: {}", v.get("config_path").and_then(|p| p.as_str()).unwrap_or(""));
+                    println!(
+                        "  config: {}",
+                        v.get("config_path").and_then(|p| p.as_str()).unwrap_or("")
+                    );
                     println!("  pid:    {pid}");
                 }
                 Ok(())
@@ -1347,7 +1607,10 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
         // The full frame (error, partial, config_text) rides along so a
         // script can diagnose a partial failure too.
         let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("");
-        let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+        let config_path = frame
+            .get("config_path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
         let pid = frame.get("pid").cloned().unwrap_or(serde_json::Value::Null);
         let mut obj = serde_json::json!({
             "name": program,
@@ -1374,8 +1637,14 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
         return (code, vec![text], Vec::new());
     }
     if !ok {
-        let phase = frame.get("phase").and_then(|p| p.as_str()).unwrap_or("startup");
-        let err = frame.get("error").and_then(|e| e.as_str()).unwrap_or("startup failed");
+        let phase = frame
+            .get("phase")
+            .and_then(|p| p.as_str())
+            .unwrap_or("startup");
+        let err = frame
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("startup failed");
         let mut stderr = vec![format!("ak: error: {phase}: {err}")];
         if frame.get("partial").and_then(|p| p.as_bool()) == Some(true) {
             stderr.extend(partial_config_lines(frame));
@@ -1393,7 +1662,10 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
         return (EXIT_ERROR, Vec::new(), stderr);
     }
     let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
-    let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+    let config_path = frame
+        .get("config_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
     let pid = frame
         .get("pid")
         .and_then(|p| p.as_u64())
@@ -1413,7 +1685,10 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
 /// The full configuration information lines of a partial failure (task 6.8).
 fn partial_config_lines(frame: &serde_json::Value) -> Vec<String> {
     let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
-    let config_path = frame.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
+    let config_path = frame
+        .get("config_path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
     let mut out = vec![
         "the process is running but its registration was not written.".to_string(),
         format!("  app/program: {program}"),
@@ -1532,10 +1807,7 @@ fn start_or_hint(config_path: &Path, name: &str, json: bool) -> Result<()> {
 /// Render one start response as `{程序名, 配置路径, PID}` (task 6.3/6.4).
 fn render_program_result(v: &serde_json::Value, name: &str, json: bool) {
     let program = v.get("name").and_then(|n| n.as_str()).unwrap_or(name);
-    let config_path = v
-        .get("config_path")
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
+    let config_path = v.get("config_path").and_then(|p| p.as_str()).unwrap_or("");
     let pid = v.get("pid").cloned().unwrap_or(serde_json::Value::Null);
     if json {
         let obj = serde_json::json!({
@@ -1547,7 +1819,10 @@ fn render_program_result(v: &serde_json::Value, name: &str, json: bool) {
         println!("{obj}");
         return;
     }
-    println!("{}", program_result_line(program, config_path, &pid, "started"));
+    println!(
+        "{}",
+        program_result_line(program, config_path, &pid, "started")
+    );
 }
 
 /// One human-readable `run <name>` result line. Pure (task 6.3).
@@ -1672,7 +1947,11 @@ fn fanout_start_render(v: &serde_json::Value, json: bool) -> (i32, Vec<String>, 
             "result": result,
         }));
     }
-    let code = if failed.is_empty() { EXIT_OK } else { EXIT_ERROR };
+    let code = if failed.is_empty() {
+        EXIT_OK
+    } else {
+        EXIT_ERROR
+    };
     if json {
         let text = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into());
         return (code, vec![text], Vec::new());
@@ -1691,7 +1970,10 @@ fn fanout_start_render(v: &serde_json::Value, json: bool) -> (i32, Vec<String>, 
     }
     let mut err = Vec::new();
     if !failed.is_empty() {
-        err.push(format!("ak: error: {} program(s) failed to start:", failed.len()));
+        err.push(format!(
+            "ak: error: {} program(s) failed to start:",
+            failed.len()
+        ));
         for f in &failed {
             err.push(format!("  {f}"));
         }
@@ -1980,9 +2262,7 @@ fn config_cmd(
         } else {
             println!("kept existing {}", rep.sample_file.display());
         }
-        println!(
-            "next: `ak config --edit` to customize, `ak add <dir>` to register apps"
-        );
+        println!("next: `ak config --edit` to customize, `ak compose <dir>` to register apps");
         println!("{}", config_sync_hint(&pre_config));
         return Ok(EXIT_OK);
     }
@@ -2065,12 +2345,14 @@ fn edit_config_with(editor: &str, config_path: &Path) -> Result<i32> {
 }
 
 // -- daemon -----------------------------------------------------------------
-/// `daemon` is the only daemon entry. The web console is config-driven: its
-/// initial state comes from the `[webui]` section of the daemon config
-/// (absent = off), and `ak reload` converges it later at runtime.
+/// `daemon start` is the only daemon run entry (`--foreground` for the
+/// attached form, `--service <name>` for the SCM-managed form). The web
+/// console is config-driven: its initial state comes from the `[webui]`
+/// section of the daemon config (absent = off), and `ak reload` converges
+/// it later at runtime.
 ///
 /// `service_name` is set when the Windows Service Control Manager starts the
-/// daemon (`ak daemon --service <name>`); `None` is plain console mode.
+/// daemon (`ak daemon start --service <name>`); `None` is plain console mode.
 fn run_daemon(config_path: &Path, service_name: Option<&str>) -> Result<()> {
     #[cfg(windows)]
     if let Some(service_name) = service_name {
@@ -2078,18 +2360,19 @@ fn run_daemon(config_path: &Path, service_name: Option<&str>) -> Result<()> {
     }
     #[cfg(not(windows))]
     if service_name.is_some() {
-        anyhow::bail!("`--service` is only supported on Windows (Service Control Manager)");
+        // Usage-class error (control-plane spec exit-code contract): 2, not
+        // the generic 1 an `anyhow::bail!` would map to.
+        eprintln!("ak: error: `--service` is only supported on Windows (Service Control Manager)");
+        std::process::exit(EXIT_CONFIG);
     }
     run_daemon_console(config_path)
 }
 
-/// Foreground/console daemon: `ak daemon` without `--service`.
+/// Foreground/console daemon: `ak daemon start --foreground` without
+/// `--service`.
 fn run_daemon_console(config_path: &Path) -> Result<()> {
     let sup = run_daemon_core(config_path)?;
-    info!(
-        "ak {} running (Ctrl+C to stop)",
-        env!("CARGO_PKG_VERSION")
-    );
+    info!("ak {} running (Ctrl+C to stop)", env!("CARGO_PKG_VERSION"));
 
     let shutdown = {
         let sup2 = sup.clone();
@@ -2290,26 +2573,25 @@ mod edit_tests {
 mod sync_tests {
     use super::*;
 
+    /// A private control endpoint for tests: the mock control plane binds it
+    /// before the client is allowed to connect, so there is no startup race.
+    fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
+        let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("ak.sock");
+        let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
+        let listener = ep.bind().unwrap();
+        (socket, listener)
+    }
 
-/// A private control endpoint for tests: the mock control plane binds it
-/// before the client is allowed to connect, so there is no startup race.
-fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
-    let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("ak.sock");
-    let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
-    let listener = ep.bind().unwrap();
-    (socket, listener)
-}
-
-fn config_with_socket(socket: &Path) -> DaemonConfig {
-    toml::from_str(&format!(
-        "[daemon]\nsocket = {:?}\n",
-        socket.to_string_lossy()
-    ))
-    .unwrap()
-}
+    fn config_with_socket(socket: &Path) -> DaemonConfig {
+        toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            socket.to_string_lossy()
+        ))
+        .unwrap()
+    }
 
     /// A reachable daemon whose reload fails must surface as an error (main
     /// maps it to a non-zero exit), never a swallowed warning — the registry
@@ -2445,8 +2727,9 @@ mod config_cmd_tests {
 
     #[test]
     fn clap_config_repeated_set_parses() {
-        let cli = Cli::try_parse_from(["appkeeper", "config", "--set", "port=1", "--set", "host=x"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["appkeeper", "config", "--set", "port=1", "--set", "host=x"])
+                .unwrap();
         match cli.cmd {
             Some(Cmd::Config {
                 set,
@@ -2564,7 +2847,10 @@ mod config_cmd_tests {
         // set: exit 0, value lands on disk.
         let code = config_cmd(
             &path,
-            &["socket=/tmp/new.sock".to_string(), "log_level=debug".to_string()],
+            &[
+                "socket=/tmp/new.sock".to_string(),
+                "log_level=debug".to_string(),
+            ],
             &[],
             &[],
             false,
@@ -2634,7 +2920,10 @@ mod config_cmd_tests {
         .unwrap();
         assert_eq!(code, EXIT_OK);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("/tmp/old.sock") && !text.contains("log_buffer_lines"), "{text}");
+        assert!(
+            !text.contains("/tmp/old.sock") && !text.contains("log_buffer_lines"),
+            "{text}"
+        );
         assert!(
             text.contains("log_level = \"debug\""),
             "the untouched key survives: {text}"
@@ -2698,25 +2987,25 @@ mod config_cmd_tests {
 
     /// A /v1/health answerer on a private control socket, sync_tests style.
 
-/// A private control endpoint for tests: the mock control plane binds it
-/// before the client is allowed to connect, so there is no startup race.
-fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
-    let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("ak.sock");
-    let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
-    let listener = ep.bind().unwrap();
-    (socket, listener)
-}
+    /// A private control endpoint for tests: the mock control plane binds it
+    /// before the client is allowed to connect, so there is no startup race.
+    fn mock_socket(tag: &str) -> (PathBuf, crate::transport::Listener) {
+        let dir = std::env::temp_dir().join(format!("ak-test-mock-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("ak.sock");
+        let ep = crate::transport::Endpoint::parse(&socket.display().to_string()).unwrap();
+        let listener = ep.bind().unwrap();
+        (socket, listener)
+    }
 
-fn config_with_socket(socket: &Path) -> DaemonConfig {
-    toml::from_str(&format!(
-        "[daemon]\nsocket = {:?}\n",
-        socket.to_string_lossy()
-    ))
-    .unwrap()
-}
+    fn config_with_socket(socket: &Path) -> DaemonConfig {
+        toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            socket.to_string_lossy()
+        ))
+        .unwrap()
+    }
 
     #[test]
     fn sync_hint_online_suggests_reload() {
@@ -2780,9 +3069,8 @@ mod validate_warning_tests {
 
     #[test]
     fn console_with_token_stays_silent() {
-        let config = daemon_config(
-            "[webui]\nlisten = \"127.0.0.1:8527\"\nauth_token = \"s3cret\"\n",
-        );
+        let config =
+            daemon_config("[webui]\nlisten = \"127.0.0.1:8527\"\nauth_token = \"s3cret\"\n");
         assert!(webui_open_console_warning(&config).is_none());
     }
 
@@ -2818,20 +3106,111 @@ mod cli_verb_tests {
             .to_string()
     }
 
-    /// `daemon` is the daemon entry (daemon-subcommand spec): bare parses as
-    /// the foreground form, `--detach` rides along for the background form.
+    /// `daemon` is a subcommand family (control-plane / background-daemon
+    /// specs): `start` carries `--foreground` and the hidden `--service`;
+    /// `install`/`uninstall` keep the former `service` flags verbatim;
+    /// `shutdown` is the client stop; bare `daemon` parses to no subcommand
+    /// (dispatch turns that into the exit-2 usage error).
     #[test]
     fn daemon_subcommand_parses() {
         match parse(&["daemon"]).cmd {
-            Some(Cmd::Daemon { detach, .. }) => assert!(!detach, "bare daemon is foreground"),
-            other => panic!("expected Daemon, got {other:?}"),
+            Some(Cmd::Daemon { cmd: None }) => {}
+            other => panic!("expected bare Daemon, got {other:?}"),
         }
-        let cli = parse(&["daemon", "--detach"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true, .. })));
+        let cli = parse(&["daemon", "start"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Start {
+                    foreground: false,
+                    service: None
+                })
+            })
+        ));
+        let cli = parse(&["daemon", "start", "--foreground"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Start {
+                    foreground: true,
+                    ..
+                })
+            })
+        ));
+        // The hidden service marker conflicts with --foreground.
+        let cli = parse(&["daemon", "start", "--service", "ak"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Start {
+                    service: Some(ref s),
+                    ..
+                })
+            }) if s == "ak"
+        ));
+        assert!(
+            parse_err(&["daemon", "start", "--foreground", "--service", "ak"])
+                .contains("cannot be used with")
+        );
         // The global `-c/--config` keeps working in both positions.
-        let cli = parse(&["-c", "/tmp/x.toml", "daemon", "--detach"]);
-        assert!(matches!(cli.cmd, Some(Cmd::Daemon { detach: true, .. })));
+        let cli = parse(&["-c", "/tmp/x.toml", "daemon", "start"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Start { .. })
+            })
+        ));
         assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/x.toml")));
+        // `install` keeps the whole former service flag set.
+        let cli = parse(&[
+            "daemon",
+            "install",
+            "--now",
+            "--force",
+            "--name",
+            "ak",
+            "--desc",
+            "d",
+            "--user",
+            "u",
+            "--restart",
+            "on-failure",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Daemon {
+                cmd:
+                    Some(DaemonCmd::Install {
+                        start,
+                        force,
+                        name,
+                        desc,
+                        user,
+                        restart,
+                        ..
+                    }),
+            }) => {
+                assert!(start && force);
+                assert_eq!(name.as_deref(), Some("ak"));
+                assert_eq!(desc.as_deref(), Some("d"));
+                assert_eq!(user.as_deref(), Some("u"));
+                assert_eq!(restart, service::RestartPolicy::OnFailure);
+            }
+            other => panic!("expected daemon install, got {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["daemon", "uninstall", "--unit-file", "/etc/x.service"]).cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Uninstall { .. })
+            })
+        ));
+        assert!(matches!(
+            parse(&["daemon", "shutdown"]).cmd,
+            Some(Cmd::Daemon {
+                cmd: Some(DaemonCmd::Shutdown)
+            })
+        ));
+        // The removed `--detach` flag no longer exists.
+        assert!(parse_err(&["daemon", "--detach"]).contains("unexpected argument"));
     }
 
     /// Bare `ak` (cmd = None) prints the full help to stdout and exits 0 —
@@ -2881,8 +3260,8 @@ mod cli_verb_tests {
         assert_eq!(s(&["run", "--name", "web"]), None);
         assert_eq!(s(&["run", "start"]), None);
         // Other subcommands and empty argv are untouched.
-        assert_eq!(s(&["status"]), None);
-        assert_eq!(s(&["daemon", "--detach"]), None);
+        assert_eq!(s(&["ps"]), None);
+        assert_eq!(s(&["daemon", "start"]), None);
         assert_eq!(s(&[]), None);
     }
 
@@ -3048,44 +3427,165 @@ mod cli_verb_tests {
         assert!(parse_err(&["log", "web", "--stream", "side"]).contains("invalid value"));
     }
 
-    /// `status` defaults to the table and `--json` is an opt-in flag.
+    /// `ps` defaults to the table and `--out` selects json/table; any other
+    /// value is a clap error.
     #[test]
-    fn status_json_flag_parses() {
+    fn ps_out_flag_parses() {
         assert!(matches!(
-            parse(&["status"]).cmd,
-            Some(Cmd::Status { json: false })
+            parse(&["ps"]).cmd,
+            Some(Cmd::Ps {
+                all: false,
+                ref out
+            }) if out == "table"
         ));
         assert!(matches!(
-            parse(&["status", "--json"]).cmd,
-            Some(Cmd::Status { json: true })
+            parse(&["ps", "--out", "json"]).cmd,
+            Some(Cmd::Ps { ref out, .. }) if out == "json"
         ));
+        assert!(matches!(
+            parse(&["ps", "--out", "table"]).cmd,
+            Some(Cmd::Ps { ref out, .. }) if out == "table"
+        ));
+        assert!(matches!(
+            parse(&["ps", "--all"]).cmd,
+            Some(Cmd::Ps { all: true, .. })
+        ));
+        assert!(parse_err(&["ps", "--out", "yaml"]).contains("invalid value"));
     }
 
-    /// `add` no longer carries the deprecated flags; `--restart` is the single
-    /// policy flag.
+    /// The five removed verbs are gone: clap answers with an unknown
+    /// subcommand (no alias, no migration interception — design D7).
     #[test]
-    fn add_flags_converged_to_restart() {
-        let cli = parse(&["add", ".", "--restart", "on-failure", "--priority", "2"]);
+    fn removed_verbs_are_gone() {
+        for verb in ["status", "list", "shutdown", "add", "service"] {
+            let e = parse_err(&[verb]);
+            assert!(
+                e.contains("unrecognized subcommand") || e.contains("invalid subcommand"),
+                "{verb}: {e}"
+            );
+        }
+        // `compose` parses with the former `add` flag set.
+        let cli = parse(&["compose", ".", "--restart", "on-failure", "--priority", "2"]);
         match cli.cmd {
-            Some(Cmd::Add {
+            Some(Cmd::Compose {
                 restart, priority, ..
             }) => {
                 assert_eq!(restart.as_deref(), Some("on-failure"));
                 assert_eq!(priority, Some(2));
             }
-            other => panic!("expected Add, got {other:?}"),
+            other => panic!("expected Compose, got {other:?}"),
+        }
+    }
+
+    /// The bare-`daemon` usage error names all four subcommands (exit 2 at
+    /// dispatch time).
+    #[test]
+    fn daemon_usage_error_lists_four_subcommands() {
+        let msg = daemon_usage_error(false);
+        for sub in ["start", "install", "uninstall", "shutdown"] {
+            assert!(msg.contains(sub), "missing {sub}: {msg}");
+        }
+        assert!(
+            !msg.contains("--force --now"),
+            "plain usage error carries no unit hint: {msg}"
+        );
+        // 3.2 upgrade compatibility: the old `daemon --config <path>`
+        // ExecStart gets the regeneration hint.
+        let old = daemon_usage_error(true);
+        for sub in ["start", "install", "uninstall", "shutdown"] {
+            assert!(old.contains(sub), "missing {sub}: {old}");
+        }
+        assert!(
+            old.contains("ak daemon install --force --now"),
+            "old ExecStart hint must name the regeneration command: {old}"
+        );
+    }
+
+    /// The old `daemon --config <path>` signature (systemd ExecStart and the
+    /// Windows `--service` binPath) is recognized so the usage error can add
+    /// the unit-regeneration hint; client subcommands and bare `daemon` never
+    /// match.
+    #[test]
+    fn old_daemon_signature_detection() {
+        let s = |xs: &[&str]| -> bool {
+            bare_daemon_old_unit_form(&xs.iter().map(|x| x.to_string()).collect::<Vec<_>>())
+        };
+        // The two legacy entry forms (either flag position, `--config=` too).
+        assert!(s(&["daemon", "--config", "/etc/appkeeper/daemon.toml"]));
+        assert!(s(&["daemon", "-c", "/etc/appkeeper/daemon.toml"]));
+        assert!(s(&["daemon", "--config=/etc/appkeeper/daemon.toml"]));
+        assert!(s(&["-c", "/etc/x.toml", "daemon"]));
+        assert!(s(&[
+            "daemon",
+            "--config",
+            "/etc/appkeeper/daemon.toml",
+            "--service",
+            "ak"
+        ]));
+        // Bare `daemon` (the real usage error) and every subcommand form are
+        // not the old signature.
+        assert!(!s(&["daemon"]));
+        for sub in ["start", "install", "uninstall", "shutdown"] {
+            assert!(!s(&["daemon", sub]), "daemon {sub} is not the old form");
+        }
+        assert!(!s(&["daemon", "start", "--foreground"]));
+        assert!(!s(&["ps"]));
+        assert!(!s(&[]));
+    }
+
+    /// 2.3: the removed daemon `run` hints per form — `--detach` points at
+    /// the background entry, the config-only form also at the foreground one
+    /// and at the unit regeneration (control-plane spec).
+    #[test]
+    fn removed_run_hints_point_at_the_daemon_subcommands() {
+        let detach = removed_run_hint(true);
+        assert!(detach.contains("ak daemon start"), "{detach}");
+        assert!(
+            !detach.contains("--foreground"),
+            "the detach form keeps its hint short: {detach}"
+        );
+        let config_only = removed_run_hint(false);
+        assert!(config_only.contains("ak daemon start"), "{config_only}");
+        assert!(
+            config_only.contains("ak daemon start --foreground"),
+            "{config_only}"
+        );
+        assert!(
+            config_only.contains("ak daemon install --force --now"),
+            "the old ExecStart form names the regeneration command: {config_only}"
+        );
+        // The five removed verbs the new error must NOT mention (design D7).
+        for stale in ["ak service install", "ak daemon --detach"] {
+            assert!(!config_only.contains(stale), "{stale}: {config_only}");
+            assert!(!detach.contains(stale), "{stale}: {detach}");
+        }
+    }
+
+    /// `compose` no longer carries the deprecated flags; `--restart` is the
+    /// single policy flag.
+    #[test]
+    fn compose_flags_converged_to_restart() {
+        let cli = parse(&["compose", ".", "--restart", "on-failure", "--priority", "2"]);
+        match cli.cmd {
+            Some(Cmd::Compose {
+                restart, priority, ..
+            }) => {
+                assert_eq!(restart.as_deref(), Some("on-failure"));
+                assert_eq!(priority, Some(2));
+            }
+            other => panic!("expected Compose, got {other:?}"),
         }
         for bad in [
-            vec!["add", ".", "--autostart"],
-            vec!["add", ".", "--no-autostart"],
-            vec!["add", ".", "--autorestart", "always"],
+            vec!["compose", ".", "--autostart"],
+            vec!["compose", ".", "--no-autostart"],
+            vec!["compose", ".", "--autorestart", "always"],
         ] {
             assert!(
                 parse_err(&bad).contains("unexpected argument"),
                 "{bad:?} must be rejected"
             );
         }
-        assert!(parse_err(&["add", ".", "--restart", "never"]).contains("invalid value"));
+        assert!(parse_err(&["compose", ".", "--restart", "never"]).contains("invalid value"));
     }
 
     /// The removed-`start` interception fires only for a bare `start`
@@ -3145,23 +3645,23 @@ mod cli_verb_tests {
         );
     }
 
-    /// 7.1: `add --apply` keeps the implicit pull-up (`apply_after_add`), which
-    /// is the ONLY remaining caller of `daemonize::ensure_daemon` outside the
-    /// explicit `daemon --detach` entry.
+    /// 7.1: `compose --apply` keeps the implicit pull-up (`apply_after_add`),
+    /// which is the ONLY remaining caller of `daemonize::ensure_daemon`
+    /// outside the explicit `daemon start` entry.
     #[test]
-    fn add_apply_keeps_implicit_pull_up() {
+    fn compose_apply_keeps_implicit_pull_up() {
         let src = include_str!("main.rs");
-        // The add branch still routes through apply_after_add.
+        // The compose branch still routes through apply_after_add.
         let add_branch = src
             .split("if *apply_now {")
             .nth(1)
-            .expect("add --apply branch exists")
+            .expect("compose --apply branch exists")
             .split("\n        }\n")
             .next()
             .unwrap();
         assert!(
             add_branch.contains("apply_after_add("),
-            "add --apply keeps the implicit pull-up"
+            "compose --apply keeps the implicit pull-up"
         );
         // apply_after_add still calls ensure_daemon (offline pull-up intact).
         let apply_fn = src
@@ -3243,12 +3743,16 @@ mod cli_verb_tests {
     /// has no phase and yields nothing.
     #[test]
     fn progress_line_covers_phases() {
-        assert!(progress_line(&serde_json::json!({"phase": "staged", "estimate_secs": 3}))
-            .unwrap()
-            .contains('3'));
-        assert!(progress_line(&serde_json::json!({"phase": "waiting_startsecs"}))
-            .unwrap()
-            .contains("startsecs"));
+        assert!(
+            progress_line(&serde_json::json!({"phase": "staged", "estimate_secs": 3}))
+                .unwrap()
+                .contains('3')
+        );
+        assert!(
+            progress_line(&serde_json::json!({"phase": "waiting_startsecs"}))
+                .unwrap()
+                .contains("startsecs")
+        );
         let health =
             progress_line(&serde_json::json!({"phase": "waiting_health", "estimate_secs": 35}))
                 .unwrap();
@@ -3265,9 +3769,18 @@ mod cli_verb_tests {
             ResidualAction::Refuse("non-interactive session defaults to refusing")
         );
         assert_eq!(residual_decision(true, Some("y")), ResidualAction::Commit);
-        assert_eq!(residual_decision(true, Some("yes\n")), ResidualAction::Commit);
-        assert_eq!(residual_decision(true, Some("n")), ResidualAction::Refuse("declined by the user"));
-        assert_eq!(residual_decision(true, None), ResidualAction::Refuse("declined by the user"));
+        assert_eq!(
+            residual_decision(true, Some("yes\n")),
+            ResidualAction::Commit
+        );
+        assert_eq!(
+            residual_decision(true, Some("n")),
+            ResidualAction::Refuse("declined by the user")
+        );
+        assert_eq!(
+            residual_decision(true, None),
+            ResidualAction::Refuse("declined by the user")
+        );
     }
 
     /// 6.8: a partial failure renders the full config info and exits non-zero.
@@ -3320,5 +3833,67 @@ mod cli_verb_tests {
         let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "exited");
+    }
+
+    // -- ps (control-plane spec, tasks 4.x) ---------------------------------
+
+    /// 4.3: only the "no daemon there" case degrades `ps --all` to the
+    /// registry view. The other two exit-3 classes (permission-denied
+    /// endpoint, rejected TCP credential) prove a daemon IS serving, so the
+    /// control-plane spec forbids reporting them as the offline degradation.
+    #[test]
+    fn ps_degradation_is_limited_to_missing_daemon() {
+        // The client's marker literals (client.rs keeps them private, and the
+        // contract is what the operator actually reads).
+        let unreachable =
+            anyhow::anyhow!("daemon unreachable (is `ak daemon` active? /tmp/x.sock): not found");
+        assert!(ps_degrades_to_registry(true, &unreachable));
+        assert!(
+            !ps_degrades_to_registry(false, &unreachable),
+            "plain `ps` keeps the exit-3 contract"
+        );
+        assert_eq!(client::exit_code_of(&unreachable), EXIT_UNREACHABLE);
+
+        // Exit 3 but a live daemon: never the offline listing.
+        for live in [
+            "control endpoint access denied: endpoint /run/appkeeper/0/ak.sock is owned by uid 0",
+            "control endpoint rejected the credential (api error 401): a tcp:// control \
+             endpoint requires the daemon's `[daemon] auth_token`",
+        ] {
+            let e = anyhow::anyhow!("{live}");
+            assert_eq!(client::exit_code_of(&e), EXIT_UNREACHABLE, "{live}");
+            assert!(
+                !ps_degrades_to_registry(true, &e),
+                "must not degrade: {live}"
+            );
+        }
+
+        // A caller-fixable control-plane answer is not an offline listing.
+        let other = anyhow::anyhow!("api error 500: internal failure");
+        assert!(
+            !ps_degrades_to_registry(true, &other),
+            "a control-plane answer must not become a registry listing"
+        );
+    }
+
+    /// 4.3: the online `--all` JSON join takes the projection as
+    /// authoritative and lists only the apps it does not cover.
+    #[test]
+    fn projection_apps_collects_distinct_app_names() {
+        let v = serde_json::json!({
+            "programs": [
+                {"app": "demo", "name": "web"},
+                {"app": "demo", "name": "worker"},
+                {"app": "gateway", "name": "api"},
+                {"name": "no-app-field"},
+            ]
+        });
+        let apps = projection_apps(&v);
+        assert_eq!(
+            apps.iter().cloned().collect::<Vec<_>>(),
+            vec!["demo".to_string(), "gateway".to_string()]
+        );
+        assert!(projection_apps(&serde_json::json!({})).is_empty());
+        assert!(projection_apps(&serde_json::json!({"programs": []})).is_empty());
     }
 }

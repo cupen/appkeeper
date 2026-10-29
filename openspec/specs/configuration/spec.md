@@ -14,7 +14,7 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（控制端
 
 #### Scenario: 全新机器空启动
 
-- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `ak daemon`
+- **WHEN** 在没有任何 daemon 配置文件的机器上执行 `ak daemon start`
 - **THEN** 守护进程以默认设置启动，受管程序为空，控制平面正常可用，控制台不伺服
 
 #### Scenario: daemon 配置中的应用条目被拒绝
@@ -29,7 +29,7 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（控制端
 
 #### Scenario: app_dir 缺省名为 app.d
 
-- **WHEN** daemon 配置未声明 `app_dir`，执行 `ak add ./proc --name abc` 完成注册
+- **WHEN** daemon 配置未声明 `app_dir`，执行 `ak compose ./proc --name abc` 完成注册
 - **THEN** 注册记录写入 daemon 配置文件同级的 `app.d/abc.toml`（Linux 生产默认 `/etc/appkeeper/app.d/abc.toml`）
 
 #### Scenario: 显式 app_dir 覆盖默认名
@@ -49,12 +49,12 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（控制端
 
 #### Scenario: 已移除的键导致校验失败
 
-- **WHEN** daemon 配置中残留 `host` 或 `port` 任一键，执行 `ak validate` 或 `ak daemon`
+- **WHEN** daemon 配置中残留 `host` 或 `port` 任一键，执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并指明该键已移除及其替代（端点由 `socket` 的 URL 表达），守护进程拒绝以该配置启动
 
 #### Scenario: IPC 形态下 auth_token 被拒绝
 
-- **WHEN** daemon 配置声明缺省或路径形态的 `socket`，同时设置了 `auth_token`，执行 `ak validate` 或 `ak daemon`
+- **WHEN** daemon 配置声明缺省或路径形态的 `socket`，同时设置了 `auth_token`，执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并说明 `auth_token` 仅属于 `tcp://` 形态，守护进程拒绝以该配置启动
 
 ### Requirement: app 配置
@@ -64,7 +64,7 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（控制端
 #### Scenario: 最小 app 配置可用
 
 - **WHEN** 部署目录 `appkeeper.toml` 只写 `[program.api]` 与其 `command = "python -m http.server 8000"`
-- **THEN** `ak add .` 即可注册，程序名为 `api`，参数经拆分后按默认值运行
+- **THEN** `ak compose .` 即可注册，程序名为 `api`，参数经拆分后按默认值运行
 
 #### Scenario: 健康检查按协议分发
 
@@ -102,11 +102,11 @@ daemon 配置全局唯一，SHALL 只包含全局内容：`[daemon]`（控制端
 
 ### Requirement: app_dir 注册目录
 
-daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链接，且链接 SHALL 作为注册记录本体：守护进程与 `ak list` 通过扫描 `app_dir` 发现应用。注册成功时自动以应用名创建 `<name>.toml` 链接指向 app 配置本体（优先符号链接，平台不允许时回退硬链接）。链接 MUST 因任何原因（权限不足、平台限制等）无法建立时，注册 SHALL 视为失败：错误信息 MUST 指明 `app_dir` 路径与修复方式（如 sudo、目录归属）并以非零码退出，MUST NOT 输出注册成功。app 配置本体 MUST 始终以部署目录中的原件为准，链接仅为集中查看的投影；add/remove SHALL 同步维护链接，发现链接缺失或悬空时 SHALL 告警。
+daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链接，且链接 SHALL 作为注册记录本体：守护进程与 `ak ps --all` 通过扫描 `app_dir` 发现应用。注册成功时自动以应用名创建 `<name>.toml` 链接指向 app 配置本体（优先符号链接，平台不允许时回退硬链接）。链接 MUST 因任何原因（权限不足、平台限制等）无法建立时，注册 SHALL 视为失败：错误信息 MUST 指明 `app_dir` 路径与修复方式（如 sudo、目录归属）并以非零码退出，MUST NOT 输出注册成功。app 配置本体 MUST 始终以部署目录中的原件为准，链接仅为集中查看的投影；compose/remove SHALL 同步维护链接，发现链接缺失或悬空时 SHALL 告警。
 
 #### Scenario: 注册后自动链接
 
-- **WHEN** 在部署目录执行 `ak add . --name web` 成功且平台支持符号链接
+- **WHEN** 在部署目录执行 `ak compose . --name web` 成功且平台支持符号链接
 - **THEN** `app_dir/web.toml` 出现并指向部署目录中的配置本体，本体内容变化即时可见
 
 #### Scenario: 链接创建被拒绝
@@ -130,7 +130,7 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 #### Scenario: 相对 log_dir 拒绝启动
 
-- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `ak daemon` 或 `ak validate`
+- **WHEN** daemon 配置声明 `log_dir = "logs"`（相对路径）并执行 `ak daemon start` 或 `ak validate`
 - **THEN** 校验失败，错误信息指明 `daemon.log_dir` 必须为绝对路径，守护进程不启动
 
 #### Scenario: 非法字符名被拒绝
@@ -160,7 +160,7 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 #### Scenario: tcp 缺 token 组合被拒绝
 
-- **WHEN** daemon 配置声明 `socket = "tcp://127.0.0.1:7310"` 且未设置 `auth_token`，执行 `ak validate` 或 `ak daemon`
+- **WHEN** daemon 配置声明 `socket = "tcp://127.0.0.1:7310"` 且未设置 `auth_token`，执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并说明 `tcp://` 形态必须配置 `auth_token`，守护进程不启动
 
 #### Scenario: tcp 端口越界被拒绝
@@ -170,11 +170,11 @@ daemon 配置指定的 `app_dir` SHALL 集中存放全部已注册应用的链�
 
 ### Requirement: v0.1 旧配置迁移
 
-v0.1 的单文件配置（`[daemon]` + `[[program]]` 数组）SHALL 可通过 `ak add <旧文件>` 直接导入：导入器 SHALL 以独立的旧版 schema 解析，将 `[[program]]` 转写为 `[program.*]` 映射并注册为一个应用，`[daemon]` 段被检测并提示需要并入 daemon 配置；导入 MUST NOT 修改原文件。
+v0.1 的单文件配置（`[daemon]` + `[[program]]` 数组）SHALL 可通过 `ak compose <旧文件>` 直接导入：导入器 SHALL 以独立的旧版 schema 解析，将 `[[program]]` 转写为 `[program.*]` 映射并注册为一个应用，`[daemon]` 段被检测并提示需要并入 daemon 配置；导入 MUST NOT 修改原文件。
 
 #### Scenario: 一键迁移旧配置
 
-- **WHEN** 对 v0.1 的 `config.toml` 执行 `ak add config.toml`
+- **WHEN** 对 v0.1 的 `config.toml` 执行 `ak compose config.toml`
 - **THEN** 其中全部程序注册为一个应用并可被守护进程拉起，输出提示 `[daemon]` 段需并入 daemon 配置，原文件内容未变
 
 ### Requirement: 按应用粒度的热更新
@@ -347,7 +347,7 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 ### Requirement: config --init 初始化
 
-`ak config --init` SHALL 在解析后的 daemon 配置路径生成全新配置文件（父目录不存在时先创建）：渲染 `[daemon]` 表全部已知键（log_level、log_dir、monitor_interval、log_buffer_lines、app_dir、socket）并赋内置默认值，逐键附说明注释；已移除的 `host`、`port` MUST NOT 出现在模板中；`auth_token` SHALL 以注释形式出现在模板中并注明「仅 `socket = "tcp://..."` 形态生效，路径形态下设置将被校验拒绝」；另 SHALL 渲染一段全部注释掉的 `[app-default]` 模板段作为提示；`app_dir` SHALL 渲染相对值 `app.d`（注释说明其相对配置文件所在目录解析）。目标位置已存在任何配置文件时 MUST 拒绝（非零码退出），MUST NOT 覆盖或修改既有文件。init SHALL 连带初始化 app 配置目录：按渲染的 `app_dir` 创建目录，并在其中生成 `example.toml.sample`——内容为全部注释掉的 app 配置模板（`[app]` 表与 `[program.*]` 样例），已存在时 SHALL 跳过且不报错。成功 SHALL 打印生成的配置文件路径、app 配置目录与后续步骤提示（如 `ak config --edit`、`ak add`）。
+`ak config --init` SHALL 在解析后的 daemon 配置路径生成全新配置文件（父目录不存在时先创建）：渲染 `[daemon]` 表全部已知键（log_level、log_dir、monitor_interval、log_buffer_lines、app_dir、socket）并赋内置默认值，逐键附说明注释；已移除的 `host`、`port` MUST NOT 出现在模板中；`auth_token` SHALL 以注释形式出现在模板中并注明「仅 `socket = "tcp://..."` 形态生效，路径形态下设置将被校验拒绝」；另 SHALL 渲染一段全部注释掉的 `[app-default]` 模板段作为提示；`app_dir` SHALL 渲染相对值 `app.d`（注释说明其相对配置文件所在目录解析）。目标位置已存在任何配置文件时 MUST 拒绝（非零码退出），MUST NOT 覆盖或修改既有文件。init SHALL 连带初始化 app 配置目录：按渲染的 `app_dir` 创建目录，并在其中生成 `example.toml.sample`——内容为全部注释掉的 app 配置模板（`[app]` 表与 `[program.*]` 样例），已存在时 SHALL 跳过且不报错。成功 SHALL 打印生成的配置文件路径、app 配置目录与后续步骤提示（如 `ak config --edit`、`ak compose`）。
 
 #### Scenario: 全新机器初始化
 
@@ -361,7 +361,7 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 #### Scenario: example 样例不参与加载
 
-- **WHEN** init 完成后执行 `ak list`（或触发注册表扫描）
+- **WHEN** init 完成后执行 `ak ps --all`（或触发注册表扫描）
 - **THEN** `example.toml.sample` 不作为应用出现（`.sample` 后缀不被注册表扫描）
 
 #### Scenario: 重复 init 幂等安全
@@ -380,7 +380,7 @@ app 照常检出。跨应用校验失败时本轮 SHALL 整体不形成 pending�
 
 解析 SHALL 接受宽容写法：布尔 `false` 等价 `"no"`；四层级联到底均未设置（留空）时 SHALL 取内置默认 `"no"`。守护语义的开箱体验由模板引导：`ak config --init` 生成的 `[app-default]` SHALL 显式写入 `restart = "always"`，仓库随附的 daemon 配置模板同步。
 
-旧字段兼容（弃用别名，仅读取）：`autorestart`（`never` 映射 `no`，`on-failure`/`always` 原值）与 `autostart`（布尔，应用级）SHALL 继续可读，读取时按以下规则归并为 `restart`：`autostart = false` → `no`；`autostart = true`（或未设置）且 `autorestart = X` → `X` 的映射值；`autostart = true` 且 `autorestart = "never"` → `no`，并 SHALL 输出迁移警告（该组合的「守护启动拉起」行为在新模型中不存在）。同一层级同时显式出现新旧字段 SHALL 被校验拒绝（歧义，指明二者不得混用）。所有写入路径（add 微调 flag、run ad-hoc、脚手架生成、模板）SHALL 只写新字段 `restart`。
+旧字段兼容（弃用别名，仅读取）：`autorestart`（`never` 映射 `no`，`on-failure`/`always` 原值）与 `autostart`（布尔，应用级）SHALL 继续可读，读取时按以下规则归并为 `restart`：`autostart = false` → `no`；`autostart = true`（或未设置）且 `autorestart = X` → `X` 的映射值；`autostart = true` 且 `autorestart = "never"` → `no`，并 SHALL 输出迁移警告（该组合的「守护启动拉起」行为在新模型中不存在）。同一层级同时显式出现新旧字段 SHALL 被校验拒绝（歧义，指明二者不得混用）。所有写入路径（compose 微调 flag、run ad-hoc、脚手架生成、模板）SHALL 只写新字段 `restart`。
 
 #### Scenario: false 与留空等价 no
 
@@ -442,7 +442,7 @@ daemon 配置的 `[webui]` 段 SHALL 由 config 子命令按统一键表机制�
 
 #### Scenario: 段内未知键校验拒绝
 
-- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `ak validate` 或 `ak daemon`
+- **WHEN** daemon 配置的 `[webui]` 段内出现未知键（如 `auth = true`），执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并指明该未知字段，守护进程拒绝以该配置启动
 
 #### Scenario: 配置控制台 token

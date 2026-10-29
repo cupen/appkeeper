@@ -60,7 +60,7 @@
 
 #### Scenario: 新注册 app 随 apply 启动
 
-- **WHEN** `ak add` 注册了 `restart = "always"` 的新 app 后执行 `ak apply`
+- **WHEN** `ak compose` 注册了 `restart = "always"` 的新 app 后执行 `ak apply`
 - **THEN** 该 app 的程序被启动，出现在 apply 结果中
 
 #### Scenario: 新注册 no 策略程序只注册不启动

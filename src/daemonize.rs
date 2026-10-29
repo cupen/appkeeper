@@ -1,11 +1,11 @@
 //! Background daemon spawn + readiness polling (background-daemon spec).
 //!
-//! Two entry points share this module: the explicit `ak daemon --detach`
-//! and the implicit pull-up performed by the "take effect now" entries
-//! (`add --apply` and the run ad-hoc form) when the daemon is offline.
+//! Two entry points share this module: the explicit `ak daemon start`
+//! (background is its default) and the implicit pull-up performed by the
+//! "take effect now" entry (`compose --apply`) when the daemon is offline.
 //!
-//! Protocol (design D6): spawn `current_exe() daemon -c <config>` in a
-//! detached process group (unix `process_group(0)`, windows
+//! Protocol (design D6): spawn `current_exe() daemon start --foreground -c
+//! <config>` in a detached process group (unix `process_group(0)`, windows
 //! `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`), redirect stdout/stderr
 //! (append) to `{log_dir}/daemon.out.log`, then poll `/v1/health` over the
 //! configured control endpoint every ~200ms for up to ~10s — the endpoint
@@ -85,16 +85,23 @@ pub fn wait_ready(client: &Client, timeout: Duration) -> bool {
     }
 }
 
-/// Build the re-exec command for the background daemon: `ak daemon -c
-/// <config>`. `daemon` is the only daemon entry (daemon-subcommand spec);
-/// pure so the argv contract is unit-testable.
+/// Build the re-exec command for the background daemon: `ak daemon start
+/// --foreground -c <config>` (background-daemon spec). `daemon start` is
+/// the only daemon entry; the foreground form is what the detached child
+/// must take so it stays attached to its redirected log. Pure so the argv
+/// contract is unit-testable.
 fn daemon_command(exe: &Path, config_path: &Path) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.arg("daemon").arg("-c").arg(config_path);
+    cmd.arg("daemon")
+        .arg("start")
+        .arg("--foreground")
+        .arg("-c")
+        .arg(config_path);
     cmd
 }
 
-/// Spawn `ak daemon -c <config>` detached, with stdout/stderr appended to
+/// Spawn `ak daemon start --foreground -c <config>` detached, with
+/// stdout/stderr appended to
 /// `log_path`. Returns the child pid for diagnostics.
 pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
     let exe = std::env::current_exe().context("cannot locate the appkeeper executable")?;
@@ -164,15 +171,18 @@ mod tests {
 
     /// A config pointing at a private control socket and a private log dir.
     fn cfg_with_socket(socket: &Path, log_dir: &Path) -> DaemonConfig {
-        let mut c: DaemonConfig =
-            toml::from_str(&format!("[daemon]\nsocket = {:?}\n", socket.to_string_lossy()))
-                .unwrap();
+        let mut c: DaemonConfig = toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            socket.to_string_lossy()
+        ))
+        .unwrap();
         c.daemon.log_dir = log_dir.to_path_buf();
         c
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ak-test-daemonize-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("ak-test-daemonize-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -183,10 +193,7 @@ mod tests {
     #[test]
     fn daemon_log_path_resolves_against_config_dir() {
         let dir = tmp_dir("logpath");
-        let cfg = cfg_with_socket(
-            Path::new("/tmp/never-used.sock"),
-            Path::new("logs"),
-        );
+        let cfg = cfg_with_socket(Path::new("/tmp/never-used.sock"), Path::new("logs"));
         let p = daemon_log_path(&cfg, &dir);
         assert_eq!(p, dir.join("logs").join("daemon.out.log"));
         // An absolute log_dir ignores the config dir.
@@ -260,9 +267,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The re-exec argv targets the `daemon` subcommand (daemon-subcommand
-    /// spec): `daemon -c <config>` — the old `run` entry would be intercepted
-    /// with exit 2 before clap, silently breaking the pull-up protocol.
+    /// The re-exec argv targets the `daemon start --foreground` form
+    /// (background-daemon spec): `daemon start --foreground -c <config>`.
+    /// The removed `run --config` / bare `daemon --config` entries would be
+    /// intercepted (exit 2) before clap, silently breaking the pull-up
+    /// protocol.
     #[test]
     fn reexec_targets_the_daemon_subcommand() {
         let cmd = daemon_command(
@@ -275,8 +284,15 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["daemon", "-c", "/etc/appkeeper/daemon.toml"],
-            "the background daemon must be re-exec'd via `ak daemon -c <config>`"
+            vec![
+                "daemon",
+                "start",
+                "--foreground",
+                "-c",
+                "/etc/appkeeper/daemon.toml"
+            ],
+            "the background daemon must be re-exec'd via \
+             `ak daemon start --foreground -c <config>`"
         );
         assert_eq!(
             cmd.get_program().to_string_lossy(),
@@ -318,10 +334,7 @@ mod tests {
             );
             let _ = std::io::Write::write_all(&mut conn, resp.as_bytes());
         });
-        let cfg = cfg_with_socket(
-            Path::new(&format!("tcp://127.0.0.1:{port}")),
-            &dir,
-        );
+        let cfg = cfg_with_socket(Path::new(&format!("tcp://127.0.0.1:{port}")), &dir);
         let config_path = dir.join("daemon.toml");
         std::fs::write(&config_path, "").unwrap();
         match ensure_daemon(&cfg, &config_path, &dir) {
@@ -347,10 +360,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let cfg = cfg_with_socket(
-            Path::new(&format!("tcp://127.0.0.1:{port}")),
-            &dir,
-        );
+        let cfg = cfg_with_socket(Path::new(&format!("tcp://127.0.0.1:{port}")), &dir);
         let client = Client::from_config(&cfg);
         assert!(
             !wait_ready(&client, Duration::from_millis(300)),

@@ -577,13 +577,230 @@ fn run_custom_action(c: &Client, program: &str, name: &str) -> Result<Outcome> {
 }
 
 /// Aligned status table: name / app / state / pid / restarts / unhealthy.
-/// Shared by the shell's `status` built-in and the top-level `ak status`
-/// default output (control-plane spec: same columns and format).
+/// Shared by the shell's `status` built-in (shell-client spec: its word list
+/// is unchanged); the top-level `ak ps` builds on the same columns and adds
+/// the registry information (see [`render_ps_table`]).
 pub(crate) fn print_status(c: &Client) -> Result<()> {
     let v = c.status()?;
     print!("{}", render_status_table(&v));
     let _ = std::io::stdout().flush();
     Ok(())
+}
+
+/// One registered app as the CLI sees it locally (`registry::list`): the
+/// name, the config object the registration record points at, and the
+/// description. Used by `ps --all` (join with the projection / offline
+/// degradation listing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryRow {
+    pub name: String,
+    /// The config object the registration record points at (link target).
+    pub path: String,
+    pub description: Option<String>,
+}
+
+/// Column header of the `ak ps` table: the shell status columns plus the
+/// registry information (config path, description).
+const PS_HEADER: [&str; 8] = [
+    "NAME",
+    "APP",
+    "STATE",
+    "PID",
+    "RESTARTS",
+    "UNHEALTHY",
+    "CONFIG",
+    "DESCRIPTION",
+];
+
+/// Pure renderer for `ak ps`'s online table: the shell status columns plus
+/// the config path (from the projection's per-program `config_path`) and the
+/// description (supplied by the CLI from the local registry, keyed by app
+/// name). An empty program list renders the registration hint.
+pub(crate) fn render_ps_table(
+    v: &serde_json::Value,
+    descriptions: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut rows = program_rows(v, descriptions);
+    if rows.is_empty() {
+        return ps_empty_hint();
+    }
+    sort_rows(&mut rows);
+    render_ps_rows(&rows)
+}
+
+/// Pure renderer for `ak ps --all` (online): the projection is authoritative;
+/// registry apps it does not cover are appended and labelled not applied.
+pub(crate) fn render_ps_all_table(
+    v: &serde_json::Value,
+    descriptions: &std::collections::BTreeMap<String, String>,
+    registry: &[RegistryRow],
+) -> String {
+    let mut rows = program_rows(v, descriptions);
+    let known: std::collections::BTreeSet<String> = rows.iter().map(|r| r[1].clone()).collect();
+    for app in registry.iter().filter(|a| !known.contains(&a.name)) {
+        rows.push([
+            app.name.clone(),
+            app.name.clone(),
+            "not-applied".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            app.path.clone(),
+            app.description.clone().unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+    if rows.is_empty() {
+        return ps_empty_hint();
+    }
+    sort_rows(&mut rows);
+    render_ps_rows(&rows)
+}
+
+/// Pure renderer for the offline `ps --all` degradation: a daemon-offline
+/// note followed by the local registry listing (name / config path /
+/// description). Exit code is 0 by contract.
+pub(crate) fn render_registry_listing(registry: &[RegistryRow], offline: bool) -> String {
+    let mut flat: Vec<RegistryRow> = registry.to_vec();
+    flat.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::new();
+    if offline {
+        out.push_str("daemon offline — showing the local registry only\n");
+    }
+    if flat.is_empty() {
+        out.push_str(&ps_empty_hint());
+        return out;
+    }
+    let header = ["NAME", "CONFIG", "DESCRIPTION"];
+    let table: Vec<[String; 3]> = flat
+        .iter()
+        .map(|a| {
+            [
+                a.name.clone(),
+                a.path.clone(),
+                a.description.clone().unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect();
+    let mut width = [0usize; 3];
+    for (i, h) in header.iter().enumerate() {
+        width[i] = h.len();
+    }
+    for row in &table {
+        for (i, cell) in row.iter().enumerate() {
+            width[i] = width[i].max(cell.chars().count());
+        }
+    }
+    out.push_str(&emit_cells(
+        &header.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &width,
+    ));
+    out.push_str(&separator(&width));
+    for row in table {
+        out.push_str(&emit_cells(&row, &width));
+    }
+    out
+}
+
+fn ps_empty_hint() -> String {
+    "no programs (register an app with `ak compose <dir>`)\n".to_string()
+}
+
+/// Projection rows expanded to the `ps` column set.
+fn program_rows(
+    v: &serde_json::Value,
+    descriptions: &std::collections::BTreeMap<String, String>,
+) -> Vec<[String; 8]> {
+    v.get("programs")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    let app = str_field(p, "app");
+                    [
+                        str_field(p, "name"),
+                        app.clone(),
+                        str_field(p, "state"),
+                        match p.get("pid") {
+                            Some(x) if !x.is_null() => x.to_string(),
+                            _ => "-".into(),
+                        },
+                        p.get("total_exits")
+                            .and_then(|x| x.as_u64())
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| "0".into()),
+                        if p.get("unhealthy")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false)
+                        {
+                            "yes".into()
+                        } else {
+                            "-".into()
+                        },
+                        p.get("config_path")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| "-".into()),
+                        descriptions
+                            .get(&app)
+                            .filter(|d| !d.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| "-".into()),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sort_rows(rows: &mut [[String; 8]]) {
+    rows.sort_by(|a, b| (&a[1], &a[0]).cmp(&(&b[1], &b[0])));
+}
+
+fn render_ps_rows(rows: &[[String; 8]]) -> String {
+    let mut width = [0usize; 8];
+    for (i, h) in PS_HEADER.iter().enumerate() {
+        width[i] = h.len();
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            width[i] = width[i].max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&emit_cells(
+        &PS_HEADER.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &width,
+    ));
+    out.push_str(&separator(&width));
+    for row in rows {
+        out.push_str(&emit_cells(row, &width));
+    }
+    out
+}
+
+/// One table line: left-aligned cells, two-space gutters, no trailing spaces
+/// on the last column.
+fn emit_cells(cells: &[String], width: &[usize]) -> String {
+    let mut line = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i + 1 == cells.len() {
+            line.push_str(cell);
+        } else {
+            line.push_str(&format!("{cell:<width$}  ", width = width[i]));
+        }
+    }
+    line.push('\n');
+    line
+}
+
+fn separator(width: &[usize]) -> String {
+    let mut s = width
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("  ");
+    s.push('\n');
+    s
 }
 
 /// Pure renderer for the status table (the `GET /v1/status` projection is its
@@ -623,7 +840,7 @@ pub(crate) fn render_status_table(v: &serde_json::Value) -> String {
         .unwrap_or_default();
 
     if rows.is_empty() {
-        return "no programs (register an app with `ak add <dir>`)\n".to_string();
+        return "no programs (register an app with `ak compose <dir>`)\n".to_string();
     }
     let header = ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"];
     let mut width = [4usize; 6];
@@ -914,8 +1131,8 @@ mod tests {
     #[test]
     fn status_table_alignment() {
         // Pure formatting check: the shared renderer lines columns up and
-        // flags unhealthy programs. Same input the top-level `ak status`
-        // default consumes.
+        // flags unhealthy programs. Same input the shell `status` built-in
+        // consumes (the top-level `ps` adds two registry columns on top).
         let v = serde_json::json!({
             "programs": [
                 {"name": "web", "app": "demo", "state": "running", "pid": 42,
@@ -944,6 +1161,160 @@ mod tests {
     fn status_table_empty_hint() {
         let v = serde_json::json!({ "programs": [] });
         let out = render_status_table(&v);
+        assert!(out.contains("no programs"), "{out}");
+    }
+
+    fn projection() -> serde_json::Value {
+        serde_json::json!({
+            "programs": [
+                {"name": "web", "app": "demo", "state": "running", "pid": 42,
+                 "total_exits": 1, "unhealthy": false,
+                 "config_path": "/opt/demo/appkeeper.toml"},
+                {"name": "worker", "app": "demo", "state": "backoff", "pid": null,
+                 "total_exits": 0, "unhealthy": true,
+                 "config_path": "/opt/demo/appkeeper.toml"},
+                {"name": "api", "app": "gateway", "state": "running", "pid": 7,
+                 "total_exits": 0, "unhealthy": false, "config_path": null}
+            ]
+        })
+    }
+
+    /// 4.1: `ps` adds the config path (per-program `config_path`) and the
+    /// description (CLI-side, keyed by app name) to the shell status columns.
+    #[test]
+    fn ps_table_adds_config_path_and_description() {
+        let mut desc = std::collections::BTreeMap::new();
+        desc.insert("demo".to_string(), "the demo app".to_string());
+        let out = render_ps_table(&projection(), &desc);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "header + separator + 3 rows: {out}");
+        let header = lines[0];
+        for col in ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"] {
+            assert!(header.contains(col), "missing {col}: {header}");
+        }
+        assert!(
+            header.contains("CONFIG") && header.contains("DESCRIPTION"),
+            "{header}"
+        );
+        assert!(lines[1].starts_with("----"), "{out}");
+        // Rows are ordered by (app, name): demo/web, demo/worker, gateway/api.
+        assert!(lines[2].contains("web") && lines[2].contains("/opt/demo/appkeeper.toml"));
+        assert!(
+            lines[2].contains("the demo app"),
+            "description comes from the registry: {out}"
+        );
+        assert!(
+            lines[3].contains("worker") && lines[3].contains("yes"),
+            "{out}"
+        );
+        // An app without a registry description shows a placeholder.
+        assert!(lines[4].contains("api") && lines[4].contains("-"));
+        assert!(!out.contains('{') && !out.contains('}'), "{out}");
+    }
+
+    /// 4.1: the empty projection renders the registration hint.
+    #[test]
+    fn ps_table_empty_hint() {
+        let desc = std::collections::BTreeMap::new();
+        let out = render_ps_table(&serde_json::json!({ "programs": [] }), &desc);
+        assert!(out.contains("no programs"), "{out}");
+        // A projection without a `programs` array is empty too.
+        let out = render_ps_table(&serde_json::json!({}), &desc);
+        assert!(out.contains("no programs"), "{out}");
+    }
+
+    /// 4.3: `ps --all` online — the projection is authoritative and the
+    /// registry only fills in apps it does not cover, labelled not applied.
+    #[test]
+    fn ps_all_joins_registry_only_for_missing_apps() {
+        let desc = std::collections::BTreeMap::new();
+        let registry = vec![
+            RegistryRow {
+                name: "demo".to_string(),
+                path: "/opt/demo/appkeeper.toml".to_string(),
+                description: Some("the demo app".to_string()),
+            },
+            RegistryRow {
+                name: "pending-app".to_string(),
+                path: "/opt/pending/appkeeper.toml".to_string(),
+                description: Some("registered but not applied".to_string()),
+            },
+        ];
+        let out = render_ps_all_table(&projection(), &desc, &registry);
+        let lines: Vec<&str> = out.lines().collect();
+        // header + separator + 3 programs + 1 registry-only app.
+        assert_eq!(lines.len(), 6, "{out}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("pending-app")).count(),
+            1,
+            "the registry-only app is listed exactly once: {out}"
+        );
+        let added = lines.iter().find(|l| l.contains("pending-app")).unwrap();
+        assert!(added.contains("not-applied"), "{added}");
+        assert!(
+            added.contains("/opt/pending/appkeeper.toml"),
+            "the config object path is shown: {added}"
+        );
+        // The already-loaded app is not duplicated from the registry.
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("web")).count(),
+            1,
+            "no duplicate row for the applied app: {out}"
+        );
+    }
+
+    /// 4.3: `ps --all` online with an empty registry is just the projection.
+    #[test]
+    fn ps_all_without_registry_matches_plain_ps() {
+        let desc = std::collections::BTreeMap::new();
+        let v = projection();
+        assert_eq!(
+            render_ps_all_table(&v, &desc, &[]),
+            render_ps_table(&v, &desc)
+        );
+    }
+
+    /// 4.3: the offline degradation is a daemon-offline note plus the local
+    /// registry listing (name / config path / description), exit code 0.
+    #[test]
+    fn registry_listing_offline_note_and_columns() {
+        let registry = vec![
+            RegistryRow {
+                name: "zeta".to_string(),
+                path: "/opt/zeta/appkeeper.toml".to_string(),
+                description: None,
+            },
+            RegistryRow {
+                name: "alpha".to_string(),
+                path: "/opt/alpha/appkeeper.toml".to_string(),
+                description: Some("alpha app".to_string()),
+            },
+        ];
+        let out = render_registry_listing(&registry, true);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("daemon offline"), "{out}");
+        assert!(lines[1].starts_with("NAME"), "{out}");
+        assert!(lines[1].contains("CONFIG") && lines[1].contains("DESCRIPTION"));
+        assert!(lines[2].starts_with("----"), "{out}");
+        // Sorted by name.
+        assert!(
+            lines[3].contains("alpha") && lines[3].contains("alpha app"),
+            "{out}"
+        );
+        assert!(lines[4].contains("zeta") && lines[4].contains("-"), "{out}");
+        assert_eq!(lines.len(), 5, "{out}");
+
+        // Without the offline flag there is no note (the online empty case).
+        let plain = render_registry_listing(&registry, false);
+        assert!(!plain.contains("daemon offline"), "{plain}");
+        assert!(plain.starts_with("NAME"), "{plain}");
+    }
+
+    /// An empty registry still renders a hint rather than a bare header.
+    #[test]
+    fn registry_listing_empty_hint() {
+        let out = render_registry_listing(&[], true);
+        assert!(out.contains("daemon offline"), "{out}");
         assert!(out.contains("no programs"), "{out}");
     }
 

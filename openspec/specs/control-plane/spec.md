@@ -106,12 +106,12 @@
 
 ### Requirement: CLI 控制命令
 
-单二进制 SHALL 同时承担守护进程与客户端两种角色。守护进程 SHALL 由显式子命令 `ak daemon` 运行；`ak run` 为客户端动词（docker run 式心智：向守护进程发指令），SHALL NOT 承载任何守护入口语义：
+单二进制 SHALL 同时承担守护进程与客户端两种角色。守护进程 SHALL 由显式子命令族 `ak daemon`（`start` / `install` / `uninstall` / `shutdown`）运行；`ak run` 为客户端动词（docker run 式心智：向守护进程发指令），SHALL NOT 承载任何守护入口语义：
 
-- `daemon`（可带 `--detach`）为唯一守护形态：无 `--detach` 时前台运行（Ctrl+C / SIGTERM 优雅停机），后台形态与拉起协议见 `background-daemon` 能力规范；
+- `daemon start` 为唯一守护运行入口：缺省后台拉起、就绪即返回；`daemon start --foreground` 前台运行（Ctrl+C / SIGTERM 优雅停机）；裸 `ak daemon` 以退出码 2 报 usage 错误并列出子命令。后台形态与拉起协议见 `background-daemon` 能力规范；
 - `run <name>` / `run --app <app>` 为启动形态：启动已注册的程序或按既定顺序扇出启动整个 app 的程序，语义与控制面动作一致（经本地 API 操作守护进程；对已 `running` 程序启动返回 409，未知程序返回 404），即原 `start` 动词的语义——`start` 动词 SHALL 移除，调用 SHALL 得到未知子命令错误（含改用 `run` 的提示）；
 - run 的 ad-hoc 形态（`-- <命令行>` 或 `--cmd "<字符串>"`，二选一）：命令行由守护进程注册并立即生效，注册落盘顺序为「先启动成功、后落盘」（语义见 `app-registry` 能力规范）；
-- 守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）SHALL 被移除并在参数解析前拦截：以退出码 2 失败，错误提示按形态分流——`--detach` 形态提示改用 `ak daemon --detach`；仅带 `--config` 的形态（systemd 旧 ExecStart 特征）SHALL 额外提示用 `ak service install --force --now` 重新生成 unit（见 `service-registration`）。
+- 守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）SHALL 被移除并在参数解析前拦截：以退出码 2 失败，错误提示按形态分流——`--detach` 形态提示改用 `ak daemon start`；仅带 `--config` 的形态（systemd 旧 ExecStart 特征）SHALL 额外提示用 `ak daemon install --force --now` 重新生成 unit（见 `service-registration`）。
 
 `run` 的**全部四种形态** SHALL 统一为 daemon-first：CLI SHALL NOT 自行读写注册目录或自行拉起/操作进程，而是把意图交给守护进程，由守护进程完成启动与（ad-hoc 形态的）落盘，并把结果回传 CLI。`run` SHALL 阻塞等待守护进程返回最终结果为止，MUST NOT 提前退出。守护进程离线时 `run` 的**全部形态** SHALL 输出不可达提示并以退出码 3 退出，MUST NOT 隐式后台拉起守护进程。
 
@@ -121,19 +121,19 @@
 
 裸 `ak`（无子命令）SHALL 输出与 `ak --help` 等价的完整 help 到 stdout 并以退出码 0 退出，MUST NOT 启动守护进程。新语义下裸 `ak run`（无程序名、无 `--app`、无 `--`/`--cmd`、无 `--detach`）SHALL 报用法错误并列出三种客户端形态（`run <name>` / `run --app <app>` / `run -- <cmd...>`），以退出码 2 退出。
 
-`ak status|stop|restart|reload|apply|log|pid|shutdown` 为其余控制子命令（通过本地 API 操作守护进程），`ak add|remove|list` 为应用注册子命令（离线直接读写 daemon 配置，在线时经控制 API 同步）。`ak apply` SHALL 支持范围参数（缺省全部 / `<app>` / `<app> <program>`）与 `--restart` 开关，输出逐程序的变更与动作结果。
+`ak ps|stop|restart|reload|apply|log|pid` 为其余控制子命令（通过本地 API 操作守护进程）；`ak daemon shutdown` SHALL 停止全部程序并退出守护进程；`ak compose|remove` 为应用注册子命令（离线直接读写 daemon 配置，在线时经控制 API 同步，见 `app-registry`）。`ak apply` SHALL 支持范围参数（缺省全部 / `<app>` / `<app> <program>`）与 `--restart` 开关，输出逐程序的变更与动作结果。
 
 `ak log` SHALL 支持一次查看多个程序：`log <p1> [p2...] [-f] [--tail N] [--stream out|err|both]`。多程序时 SHALL 按 `[name] ` 前缀标识每行归属；单程序时输出 MUST NOT 添加前缀。`--stream both` SHALL 合并双流输出。`-f/--follow` 跟随输出与 `--tail N` 语义保持不变。
 
-`ak status` SHALL 默认输出人读表格：每程序一行，列与 `appkeeper shell` 的 status 表格一致（NAME、APP、STATE、PID、RESTARTS、UNHEALTHY），unhealthy 程序 SHALL 带标记；`--json` SHALL 输出与 `GET /v1/status` 等价的 pretty JSON（即本变更之前的默认输出，作为脚本迁移路径）。守护进程离线时两种形态均输出不可达提示并以退出码 3 退出。
+`ak ps` SHALL 默认输出人读表格：每程序一行，列与 `appkeeper shell` 的 status 表格一致（NAME、APP、STATE、PID、RESTARTS、UNHEALTHY）并增列配置本体路径与描述；unhealthy 程序 SHALL 带标记；`--out json` SHALL 输出与 `GET /v1/status` 等价的 pretty JSON（`--out table` 为缺省）。`--all` SHALL 展示全量视图：除守护进程已加载的程序外，还包含已注册但未运行/未 apply 的 app（由 CLI 本地读注册表与 `/v1` 投影在客户端合并）。守护进程离线时：不带 `--all` 的 `ps` SHALL 输出不可达提示并以退出码 3 退出；`ps --all` SHALL 降级为本地注册表清单（名称、配置本体路径、描述）并注明 daemon offline，以退出码 0 退出。
 
 `appkeeper action <program> <action>` SHALL 执行自定义动作并输出退出码与输出尾部，CLI 退出码 SHALL 透传动作自身的退出码（调用失败为 1，守护不可达为 3）；`appkeeper signal <program> <SIGNAL>` SHALL 投递白名单信号；`stop|restart --app <name>` SHALL 执行 app 级扇出（服务端按序展开），裸 `<name>` 参数维持既有程序名语义不变（启动扇出由 `run --app` 承接）。
 
-控制命令 SHALL 使用如下退出码约定：0 成功（含 apply 无变更的幂等情形、裸 `ak` 的 help 输出）；1 一般错误（如非法状态转换、未知程序、注册校验失败）；2 配置错误（含被拦截的守护形态 `run` 与无操作数的裸 `run` 用法错误、命令无法解析）；3 守护进程不可达。
+控制命令 SHALL 使用如下退出码约定：0 成功（含 apply 无变更的幂等情形、裸 `ak` 的 help 输出、`ps --all` 的离线降级清单）；1 一般错误（如非法状态转换、未知程序、注册校验失败）；2 配置错误（含被拦截的守护形态 `run`、无操作数的裸 `run` 用法错误、裸 `ak daemon` 的 usage 错误、命令无法解析）；3 守护进程不可达。
 
 #### Scenario: 守护进程未运行
 
-- **WHEN** 守护进程未启动时执行 `ak status`
+- **WHEN** 守护进程未启动时执行 `ak ps`
 - **THEN** 输出守护进程不可达的提示，退出码为 3
 
 #### Scenario: CLI 停止程序
@@ -208,18 +208,18 @@
 
 #### Scenario: daemon 前台守护
 
-- **WHEN** 执行 `ak daemon`
+- **WHEN** 执行 `ak daemon start --foreground`
 - **THEN** 守护进程前台运行（与本变更之前裸 `ak run` 的行为一致），Ctrl+C 优雅停机
 
 #### Scenario: 守护形态 run 被拦截并提示
 
 - **WHEN** 执行 `ak run --detach`
-- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon --detach`，不启动任何守护进程
+- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon start`，不启动任何守护进程
 
 #### Scenario: 仅带 config 的守护形态 run 提示 unit 重新生成
 
 - **WHEN** 执行 `ak run --config /etc/appkeeper/daemon.toml`（无其他操作数，systemd 旧 ExecStart 形态）
-- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon`，并提示既有 systemd unit 须以 `ak service install --force --now` 重新生成
+- **THEN** 以退出码 2 失败，错误信息提示改用 `ak daemon start --foreground`，并提示既有 systemd unit 须以 `ak daemon install --force --now` 重新生成
 
 #### Scenario: 无操作数的裸 run 报用法错误
 
@@ -228,12 +228,12 @@
 
 #### Scenario: status 默认输出人读表格
 
-- **WHEN** 执行 `ak status` 且守护进程在线、存在运行中与已停止的程序
-- **THEN** 输出每程序一行的表格，列与 shell 的 status 表格一致（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY），不健康程序带标记；无 JSON 大括号输出
+- **WHEN** 执行 `ak ps` 且守护进程在线、存在运行中与已停止的程序
+- **THEN** 输出每程序一行的表格，列与 shell 的 status 表格一致（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）并含配置本体路径与描述，不健康程序带标记；无 JSON 大括号输出
 
 #### Scenario: status --json 保留机器可读输出
 
-- **WHEN** 执行 `ak status --json`
+- **WHEN** 执行 `ak ps --out json`
 - **THEN** 输出与本变更之前默认输出等价的 pretty JSON（守护进程信息 + 程序状态投影），供脚本消费
 
 #### Scenario: log 多程序聚合跟随
@@ -362,7 +362,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 #### Scenario: TCP 无 token 不可启动
 
-- **WHEN** 配置 `socket = "tcp://127.0.0.1:7310"` 但未配置 `auth_token`，执行 `ak validate` 或 `ak daemon`
+- **WHEN** 配置 `socket = "tcp://127.0.0.1:7310"` 但未配置 `auth_token`，执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并说明 tcp:// 形态必须配置 auth_token，守护进程不启动
 
 ### Requirement: 控制 socket 端点
@@ -398,7 +398,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 #### Scenario: 远程管理即配置
 
-- **WHEN** 另一台机器的配置文件写 `socket = "tcp://<host>:7310"` 与对应 `auth_token`，执行 `ak -c <该配置> status`
+- **WHEN** 另一台机器的配置文件写 `socket = "tcp://<host>:7310"` 与对应 `auth_token`，执行 `ak -c <该配置> ps`
 - **THEN** CLI 经 TCP 端点操作远端守护进程；无需任何额外机制
 
 ### Requirement: 启动冲突与陈旧端点处理
@@ -430,15 +430,15 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 #### Scenario: 守护进程未运行时不可达
 
-- **WHEN** 守护进程未启动时执行 `ak status`
+- **WHEN** 守护进程未启动时执行 `ak ps`
 - **THEN** 输出守护进程不可达的提示，退出码为 3
 
 #### Scenario: 权限不足的专属提示
 
-- **WHEN** 守护进程以 uid 0 运行，而当前用户为 uid 1000，执行 `ak status`
+- **WHEN** 守护进程以 uid 0 运行，而当前用户为 uid 1000，执行 `ak ps`
 - **THEN** 退出码为 3，错误信息指出控制端点属主为 uid 0、当前用户为 uid 1000，并提示需要更高权限；MUST NOT 表述为守护进程未运行
 
 #### Scenario: TCP 凭据错误的专属提示
 
-- **WHEN** 配置指向 `tcp://` 端点且 `auth_token` 与守护进程不一致，执行 `ak status`
+- **WHEN** 配置指向 `tcp://` 端点且 `auth_token` 与守护进程不一致，执行 `ak ps`
 - **THEN** 退出码为 3，错误信息包含 401 与「tcp:// 形态需要 auth_token」的提示；MUST NOT 表述为守护进程未运行

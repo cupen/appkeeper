@@ -82,7 +82,7 @@
 
 #### Scenario: 守护正常关机不写停止记录
 
-- **WHEN** `unless-stopped` 程序随 `ak shutdown` 被停止后守护进程重新启动
+- **WHEN** `unless-stopped` 程序随 `ak daemon shutdown` 被停止后守护进程重新启动
 - **THEN** 无「用户停止」记录，该程序被自动拉起
 
 ### Requirement: 启动与停止排序

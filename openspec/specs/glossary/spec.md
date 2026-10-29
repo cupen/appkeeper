@@ -11,7 +11,7 @@
 
 #### Scenario: 状态输出中的术语指称
 
-- **WHEN** `ak status` 输出程序列表
+- **WHEN** `ak ps` 输出程序列表
 - **THEN** 每行的主名称为全局唯一的程序名，所属 app 仅作归属列展示
 
 #### Scenario: 文档用词一致
@@ -21,11 +21,11 @@
 
 ### Requirement: 动作词表边界
 
-「动作」SHALL 仅指改变运行状态的执行指令。观察类命令（status、pid、log、list、pending）MUST NOT 纳入动作词表，自定义动作名无需回避它们。`apply` SHALL 保持 apply-workflow 规范定义的配置应用工作流概念，不属于运行时动作。内置动作名（start、stop、restart、signal、reload、shutdown）SHALL 作为自定义动作的保留字。
+「动作」SHALL 仅指改变运行状态的执行指令。观察类命令（`ps`、`pid`、`log`、`pending`；shell 内对应词为 `status`）MUST NOT 纳入动作词表，自定义动作名无需回避它们。`apply` SHALL 保持 apply-workflow 规范定义的配置应用工作流概念，不属于运行时动作。内置动作名（start、stop、restart、signal、reload、shutdown）SHALL 作为自定义动作的保留字。
 
 #### Scenario: 查询不属于动作
 
-- **WHEN** 用户通过 status/pid/log/list/pending 获取信息
+- **WHEN** 用户通过 ps/pid/log/pending 获取信息
 - **THEN** 这些命令作为观察面板提供，不占用动作命名空间，自定义动作可使用同名（如动作名 `status`）而不冲突
 
 #### Scenario: apply 独立于动作

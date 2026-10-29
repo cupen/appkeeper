@@ -319,7 +319,10 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
     let socket = if cfg!(windows) {
         format!("'{}'", control_socket.to_string_lossy())
     } else {
-        format!("\"{}\"", control_socket.to_string_lossy().replace('\\', "/"))
+        format!(
+            "\"{}\"",
+            control_socket.to_string_lossy().replace('\\', "/")
+        )
     };
     // Forward slashes so the TOML basic string stays valid on Windows.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
@@ -341,7 +344,7 @@ fn spawn_site_inner(bin: &Path, root: &Path) -> Result<Site> {
     let child = Command::new(bin)
         .arg("--config")
         .arg(root.join("daemon.toml"))
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()

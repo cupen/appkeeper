@@ -168,7 +168,10 @@ pub(crate) fn program_info(
 }
 
 /// Look up an app's config path by app name from the live state.
-pub(crate) fn app_config_path(st: &crate::supervisor::SupervisorState, app: &str) -> Option<String> {
+pub(crate) fn app_config_path(
+    st: &crate::supervisor::SupervisorState,
+    app: &str,
+) -> Option<String> {
     st.apps
         .iter()
         .find(|a| a.name == app)
@@ -236,9 +239,9 @@ fn err_bytes(status: u16, msg: &str) -> Vec<u8> {
 pub fn bind(sup: &Arc<Supervisor>) -> Result<transport::Listener> {
     let endpoint = {
         let st = sup.state.lock().unwrap();
-        st.config.control_endpoint().map_err(|e| {
-            anyhow::anyhow!("invalid daemon.socket: {e}")
-        })?
+        st.config
+            .control_endpoint()
+            .map_err(|e| anyhow::anyhow!("invalid daemon.socket: {e}"))?
     };
     let listener = endpoint.bind().map_err(|e| match e {
         transport::BindError::AlreadyRunning => anyhow::anyhow!(
@@ -250,7 +253,10 @@ pub fn bind(sup: &Arc<Supervisor>) -> Result<transport::Listener> {
              (the daemon will not delete it for you)",
             endpoint.display()
         ),
-        other => anyhow::anyhow!("failed to bind control endpoint {}: {other}", endpoint.display()),
+        other => anyhow::anyhow!(
+            "failed to bind control endpoint {}: {other}",
+            endpoint.display()
+        ),
     })?;
     info!("control API listening on {}", endpoint.display());
     Ok(listener)
@@ -294,13 +300,9 @@ enum Admission {
 fn admission_for(sup: &Supervisor) -> Admission {
     let st = sup.state.lock().unwrap();
     match st.config.control_endpoint() {
-        Ok(ep) if ep.is_tcp() => Admission::Bearer(
-            st.config
-                .daemon
-                .auth_token
-                .clone()
-                .unwrap_or_default(),
-        ),
+        Ok(ep) if ep.is_tcp() => {
+            Admission::Bearer(st.config.daemon.auth_token.clone().unwrap_or_default())
+        }
         _ => Admission::OwnerOnly,
     }
 }
@@ -488,18 +490,14 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
                         match crate::supervisor::wait_startup(sup, name, estimate) {
                             crate::supervisor::StartupOutcome::Started { .. } => {}
                             crate::supervisor::StartupOutcome::Failed { phase, reason } => {
-                                let _ = writer.write_all(&err_bytes(
-                                    409,
-                                    &format!("{phase}: {reason}"),
-                                ));
+                                let _ = writer
+                                    .write_all(&err_bytes(409, &format!("{phase}: {reason}")));
                                 return;
                             }
                             crate::supervisor::StartupOutcome::TimedOut { waited_secs } => {
                                 let _ = writer.write_all(&err_bytes(
                                     500,
-                                    &format!(
-                                        "startup was not confirmed within {waited_secs:.1}s"
-                                    ),
+                                    &format!("startup was not confirmed within {waited_secs:.1}s"),
                                 ));
                                 return;
                             }
@@ -819,7 +817,10 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
                             && state != "running"
                             && state != "starting";
                         let result = if failed {
-                            format!("error: program {} is {state} (startup not confirmed)", s.program)
+                            format!(
+                                "error: program {} is {state} (startup not confirmed)",
+                                s.program
+                            )
                         } else if wait
                             && kind == crate::supervisor::FanoutKind::Start
                             && state == "running"
@@ -837,9 +838,12 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
                         })
                     })
                     .collect();
-                let failed = enriched
-                    .iter()
-                    .any(|p| p["result"].as_str().map(|r| r.starts_with("error")).unwrap_or(false));
+                let failed = enriched.iter().any(|p| {
+                    p["result"]
+                        .as_str()
+                        .map(|r| r.starts_with("error"))
+                        .unwrap_or(false)
+                });
                 json_bytes(
                     200,
                     serde_json::json!({
@@ -1548,10 +1552,8 @@ mod tests {
         std::thread::spawn(move || serve(sup2, listener));
         let sup3 = sup.clone();
         std::thread::spawn(move || sup3.run());
-        let endpoint = TestEndpoint(crate::transport::Endpoint::parse(
-            &socket.to_string_lossy(),
-        )
-        .unwrap());
+        let endpoint =
+            TestEndpoint(crate::transport::Endpoint::parse(&socket.to_string_lossy()).unwrap());
         (sup, dir, endpoint)
     }
 
@@ -1580,7 +1582,10 @@ mod tests {
 
     fn sleep_cmd() -> (&'static str, Vec<String>) {
         if cfg!(windows) {
-            ("C:\\Windows\\System32\\ping.exe", vec!["-n".into(), "30".into(), "127.0.0.1".into()])
+            (
+                "C:\\Windows\\System32\\ping.exe",
+                vec!["-n".into(), "30".into(), "127.0.0.1".into()],
+            )
         } else {
             ("/bin/sleep", vec!["30".into()])
         }
@@ -1628,13 +1633,20 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(frames.len(), 1, "no health check → terminal frame only: {frames:?}");
+        assert_eq!(
+            frames.len(),
+            1,
+            "no health check → terminal frame only: {frames:?}"
+        );
         let last = frames.last().unwrap();
         assert_eq!(last["ok"], true, "{frames:?}");
         assert_eq!(last["program"], "web");
         assert!(last["pid"].as_u64().unwrap() > 0);
         assert!(last["config_path"].as_str().unwrap().ends_with("web.toml"));
-        assert!(dir.join("app.d").join("web.toml").exists(), "record written");
+        assert!(
+            dir.join("app.d").join("web.toml").exists(),
+            "record written"
+        );
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1727,7 +1739,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         assert!(resp.contains("reserved"), "{resp}");
         // Missing command → 400.
-        let resp = ep.post( "/v1/run", &serde_json::json!({ "name": "web" }));
+        let resp = ep.post("/v1/run", &serde_json::json!({ "name": "web" }));
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1743,12 +1755,7 @@ mod tests {
         let (sup, dir, ep) = serve_harness("open");
         let bare = ep.get("/v1/status");
         assert!(bare.starts_with("HTTP/1.1 200"), "{bare}");
-        let with_token = ep.request(
-            "GET",
-            "/v1/status",
-            None,
-            Some("application/json"),
-        );
+        let with_token = ep.request("GET", "/v1/status", None, Some("application/json"));
         assert!(with_token.starts_with("HTTP/1.1 200"), "{with_token}");
         // Two calls are only comparable with time-variant fields (uptime,
         // metrics) stripped — under parallel load they straddle a boundary.
@@ -1834,8 +1841,8 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         // Stop it so start is legal, then start via the standard endpoint.
-        let _ = ep.post( "/v1/programs/web/stop", &serde_json::json!({}));
-        let resp = ep.post( "/v1/programs/web/start", &serde_json::json!({}));
+        let _ = ep.post("/v1/programs/web/stop", &serde_json::json!({}));
+        let resp = ep.post("/v1/programs/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1847,7 +1854,7 @@ mod tests {
         );
         assert!(v["pid"].as_u64().is_some(), "pid present: {v}");
         // /v1/status carries the new projection fields too.
-        let status = ep.get( "/v1/status");
+        let status = ep.get("/v1/status");
         let sbody = status.split("\r\n\r\n").nth(1).unwrap_or("");
         let sv: serde_json::Value = serde_json::from_str(sbody).unwrap();
         let p = sv["programs"]
@@ -1875,7 +1882,7 @@ mod tests {
         // The registered program uses the built-in 3s startsecs; measure that
         // the wait=1 call blocks at least ~3s and returns a pid.
         let t0 = std::time::Instant::now();
-        let resp = ep.post( "/v1/programs/web/start?wait=1", &serde_json::json!({}));
+        let resp = ep.post("/v1/programs/web/start?wait=1", &serde_json::json!({}));
         let elapsed = t0.elapsed();
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(
@@ -1886,9 +1893,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(v["pid"].as_u64().is_some(), "{v}");
         // Without wait the endpoint answers immediately.
-        let _ = ep.post( "/v1/programs/web/stop", &serde_json::json!({}));
+        let _ = ep.post("/v1/programs/web/stop", &serde_json::json!({}));
         let t0 = std::time::Instant::now();
-        let resp = ep.post( "/v1/programs/web/start", &serde_json::json!({}));
+        let resp = ep.post("/v1/programs/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(2),
@@ -1908,7 +1915,7 @@ mod tests {
             "/v1/run",
             &serde_json::json!({ "name": "web", "command": cmd, "args": args, "register_only": true, "restart": "no" }),
         );
-        let resp = ep.post( "/v1/apps/web/start", &serde_json::json!({}));
+        let resp = ep.post("/v1/apps/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1938,8 +1945,12 @@ mod tests {
     /// [`serve_harness`], but the control endpoint is
     /// `tcp://127.0.0.1:<port>` with a Bearer token — the `tcp://` shape of
     /// `[daemon] socket` (task 2.1).
-    fn serve_harness_tcp(tag: &str, token: &str) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
-        let dir = std::env::temp_dir().join(format!("ak-test-srv-tcp-{}-{tag}", std::process::id()));
+    fn serve_harness_tcp(
+        tag: &str,
+        token: &str,
+    ) -> (Arc<Supervisor>, std::path::PathBuf, TestEndpoint) {
+        let dir =
+            std::env::temp_dir().join(format!("ak-test-srv-tcp-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let port = free_tcp_port();
@@ -1960,10 +1971,9 @@ mod tests {
         std::thread::spawn(move || serve(sup2, listener));
         let sup3 = sup.clone();
         std::thread::spawn(move || sup3.run());
-        let endpoint = TestEndpoint(crate::transport::Endpoint::parse(&format!(
-            "tcp://127.0.0.1:{port}"
-        ))
-        .unwrap());
+        let endpoint = TestEndpoint(
+            crate::transport::Endpoint::parse(&format!("tcp://127.0.0.1:{port}")).unwrap(),
+        );
         (sup, dir, endpoint)
     }
 
@@ -1995,7 +2005,8 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
-            v["daemon"]["socket"], ep.0.display(),
+            v["daemon"]["socket"],
+            ep.0.display(),
             "the endpoint URL is what the projection carries"
         );
         // And /v1/health on the same form.
@@ -2029,7 +2040,8 @@ mod tests {
         // Health probe: exempt with no token and with a wrong token.
         assert!(ep.get_auth("/v1/health", None).starts_with("HTTP/1.1 200"));
         assert!(
-            ep.get_auth("/v1/health", Some("wrong")).starts_with("HTTP/1.1 200")
+            ep.get_auth("/v1/health", Some("wrong"))
+                .starts_with("HTTP/1.1 200")
         );
         // Bearer scheme is case-insensitive; a non-Bearer scheme never is.
         let mut conn = ep.0.connect().unwrap();
@@ -2038,7 +2050,10 @@ mod tests {
         std::io::Write::write_all(&mut conn, req.as_bytes()).unwrap();
         let mut out = String::new();
         conn.read_to_string(&mut out).unwrap();
-        assert!(out.starts_with("HTTP/1.1 200"), "lowercase bearer passes: {out}");
+        assert!(
+            out.starts_with("HTTP/1.1 200"),
+            "lowercase bearer passes: {out}"
+        );
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

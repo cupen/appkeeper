@@ -68,11 +68,8 @@ mod tests {
     use super::*;
 
     fn write_tmp(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ak-test-dcfg-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ak-test-dcfg-{}-{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("daemon.toml");
         std::fs::write(&f, body).unwrap();
@@ -102,9 +99,7 @@ mod tests {
                 .unwrap()
                 .components()
                 .find_map(|c| match c {
-                    Component::Prefix(p) => {
-                        Some(p.as_os_str().to_string_lossy().into_owned())
-                    }
+                    Component::Prefix(p) => Some(p.as_os_str().to_string_lossy().into_owned()),
                     _ => None,
                 })
                 .expect("the temp config lives on a drive");
@@ -120,7 +115,11 @@ mod tests {
         let p = discover(&f).unwrap();
         let dir = f.parent().unwrap();
         assert_eq!(p.app_dir, dir.join("app.d"));
-        assert_eq!(p.log_dir, default_log_dir(), "log_dir falls back to the default");
+        assert_eq!(
+            p.log_dir,
+            default_log_dir(),
+            "log_dir falls back to the default"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -28,9 +28,7 @@ fn main() {
     // (benchmark spec: 旧的 --connect 不再生效 → 非零码退出并说明替代).
     // `--token` returned with tcp-control-endpoint: `resolve` accepts it for
     // a tcp:// `--socket` and refuses it otherwise.
-    if std::env::args()
-        .any(|a| a == "--connect" || a.starts_with("--connect="))
-    {
+    if std::env::args().any(|a| a == "--connect" || a.starts_with("--connect=")) {
         eprintln!(
             "appkeeper-bench: error: --connect has been removed: use --socket <endpoint> \
              (a local IPC path or tcp://host:port)"

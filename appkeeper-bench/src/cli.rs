@@ -180,9 +180,9 @@ impl Effective {
 }
 
 pub fn resolve(a: &BenchArgs) -> Result<Effective> {
-    let case = a
-        .case
-        .ok_or_else(|| anyhow::anyhow!("--case is required (firehose | rotation | fanout | drip)"))?;
+    let case = a.case.ok_or_else(|| {
+        anyhow::anyhow!("--case is required (firehose | rotation | fanout | drip)")
+    })?;
     // --token only applies to a tcp:// control endpoint (tcp-control-endpoint
     // D5): the local IPC form has no application credential, and offering one
     // there is a user error — refused before any connection is attempted.
@@ -251,8 +251,9 @@ mod tests {
     use clap::Parser;
 
     fn parse(args: &[&str]) -> Result<Effective> {
-        let cli = Cli::try_parse_from(std::iter::once("appkeeper-bench").chain(args.iter().copied()))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cli =
+            Cli::try_parse_from(std::iter::once("appkeeper-bench").chain(args.iter().copied()))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         resolve(&cli.bench)
     }
 
@@ -304,16 +305,28 @@ mod tests {
 
     #[test]
     fn negative_and_non_numeric_values_are_rejected() {
-        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "-5"])
-            .is_err());
-        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "abc"])
-            .is_err());
         assert!(
-            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-row-size", "-1"])
+            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "-5"])
                 .is_err()
         );
-        assert!(Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--programs", "x"])
-            .is_err());
+        assert!(
+            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--log-rows", "abc"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "appkeeper-bench",
+                "--case",
+                "firehose",
+                "--log-row-size",
+                "-1"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--programs", "x"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -369,8 +382,14 @@ mod tests {
     /// accepts it for a tcp:// `--socket`.
     #[test]
     fn socket_option_replaces_connect() {
-        let cli = Cli::try_parse_from(["appkeeper-bench", "--case", "firehose", "--socket", "/run/appkeeper/0/ak.sock"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "appkeeper-bench",
+            "--case",
+            "firehose",
+            "--socket",
+            "/run/appkeeper/0/ak.sock",
+        ])
+        .unwrap();
         assert_eq!(
             cli.bench.socket.as_deref(),
             Some("/run/appkeeper/0/ak.sock")

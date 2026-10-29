@@ -209,7 +209,9 @@ pub fn execute(
     let staged = match StagedScript::for_command(command) {
         Ok(s) => s,
         Err(e) => {
-            warn!("{prefix} failed to stage multi-line action as a batch file ({e}); running it as a one-shot command instead");
+            warn!(
+                "{prefix} failed to stage multi-line action as a batch file ({e}); running it as a one-shot command instead"
+            );
             StagedScript(None)
         }
     };

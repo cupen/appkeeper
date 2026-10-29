@@ -1,4 +1,4 @@
-//! System service registration: `ak service install|uninstall`.
+//! System service registration: `ak daemon install|uninstall`.
 //!
 //! Linux: writes a systemd unit (default `/etc/systemd/system/ak.service`,
 //! override with `--unit-file`), then drives `systemctl` to reload/enable/start
@@ -30,7 +30,7 @@ const FALLBACK_TIMEOUT_STOP_SEC: u64 = 90;
 
 // The pure helpers below run on one platform in production but are exercised
 // by the unit tests on every platform, hence the windows dead_code allowances.
-/// systemd `Restart=` policies accepted by `service install --restart`.
+/// systemd `Restart=` policies accepted by `daemon install --restart`.
 /// Variants render as their exact systemd spelling in the unit file; the
 /// ValueEnum derive lists the same names as `[possible values:]` in `--help`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -186,25 +186,33 @@ pub fn builtin_account(user: &str) -> Result<&'static str> {
 /// Quote one token of an SCM command line. Paths containing spaces must be
 /// wrapped in double quotes as a whole — backslash-escaping the space does
 /// not work for the SCM binary-path parser (CreateService rule).
+///
+/// Windows-only in production (the binpath is only rendered there); kept
+/// under `test` so the pure renderer stays unit-tested on every platform.
+#[cfg(any(windows, test))]
 fn quote_scm_token(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\\\""))
 }
 
-/// Render the full service binpath: `"<exe>" run --config "<conf>" --service
-/// <name>`. Mirrors the Linux unit's ExecStart plus the hidden diversion
-/// flag the SCM shell needs to know which service name it is running as.
+/// Render the full service binpath: `"<exe>" daemon start --service <name>
+/// --config "<conf>"`. Mirrors the Linux unit's ExecStart plus the hidden
+/// `--service` run-mode marker the SCM shell needs to know which service
+/// name it is running as (background-daemon spec: `--service` lives on
+/// `daemon start` and conflicts with `--foreground`).
+#[cfg(any(windows, test))]
 pub fn render_binpath(exe: &Path, config_path: &Path, service_name: &str) -> String {
     format!(
-        "{} daemon --config {} --service {}",
+        "{} daemon start --service {} --config {}",
         quote_scm_token(&exe.display().to_string()),
-        quote_scm_token(&config_path.display().to_string()),
-        service_name
+        service_name,
+        quote_scm_token(&config_path.display().to_string())
     )
 }
 
 /// Normalize a binpath read back from the SCM before snapshot comparison:
 /// trim and collapse incidental whitespace runs between tokens. Applied to
 /// both sides, so exactly-rendered binpaths still compare equal.
+#[cfg(any(windows, test))]
 pub fn normalize_binpath(binpath: &str) -> String {
     binpath.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -276,7 +284,7 @@ pub fn render_unit(
     s.push('\n');
     s.push_str("[Service]\n");
     s.push_str(&format!(
-        "ExecStart={} daemon --config {}\n",
+        "ExecStart={} daemon start --foreground --config {}\n",
         quote_exec_arg(&exe.display().to_string()),
         quote_exec_arg(&config_path.display().to_string())
     ));
@@ -452,7 +460,7 @@ use anyhow::Context as _;
 #[cfg(unix)]
 fn require_root() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        bail!("service install/uninstall requires root (try sudo)");
+        bail!("daemon install/uninstall requires root (try sudo)");
     }
     Ok(())
 }
@@ -710,7 +718,7 @@ mod win {
     fn require_admin() -> Result<()> {
         if !is_admin() {
             bail!(
-                "service install/uninstall requires administrator privileges (run from an elevated shell)"
+                "daemon install/uninstall requires administrator privileges (run from an elevated shell)"
             );
         }
         Ok(())
@@ -1052,7 +1060,7 @@ mod win {
         Ok(())
     }
 
-    // -- service mode: the SCM side of `ak daemon --service <name>` ---------
+    // -- service mode: the SCM side of `ak daemon start --service <name>` ----
 
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1241,16 +1249,18 @@ mod tests {
 
     #[test]
     fn unit_file_accepts_legal_and_rejects_illegal() {
-        assert!(is_valid_unit_file(Path::new("/etc/systemd/system/ak.service")));
+        assert!(is_valid_unit_file(Path::new(
+            "/etc/systemd/system/ak.service"
+        )));
         assert!(is_valid_unit_file(Path::new("ak-prod_1.service")));
         assert!(is_valid_unit_file(Path::new("a.service")));
         assert!(is_valid_unit_file(Path::new("my-app_v2.service")));
         for bad in [
-            "appkeeper",             // missing .service
-            ".service",            // empty stem
-            "ends..service",       // stem ends with '.'
-            "my app.service",      // space in stem
-            "x.service.bak",       // wrong extension
+            "appkeeper",            // missing .service
+            ".service",             // empty stem
+            "ends..service",        // stem ends with '.'
+            "my app.service",       // space in stem
+            "x.service.bak",        // wrong extension
             "/etc/systemd/system/", // directory, no file name
         ] {
             assert!(
@@ -1286,7 +1296,7 @@ mod tests {
              After=network.target\n\
              \n\
              [Service]\n\
-             ExecStart=/usr/local/bin/ak daemon --config /etc/appkeeper/daemon.toml\n\
+             ExecStart=/usr/local/bin/ak daemon start --foreground --config /etc/appkeeper/daemon.toml\n\
              Restart=always\n\
              RestartSec=3\n\
              KillSignal=SIGTERM\n\
@@ -1345,7 +1355,7 @@ mod tests {
             60,
         );
         assert!(unit.contains(
-            "ExecStart=\"/opt/my tools/appkeeper\" daemon --config \"/etc/my conf/appkeeper.toml\"\n"
+            "ExecStart=\"/opt/my tools/appkeeper\" daemon start --foreground --config \"/etc/my conf/appkeeper.toml\"\n"
         ));
         assert!(unit.contains("User=svc-ak\n"));
         assert!(unit.contains("TimeoutStopSec=60\n"));
@@ -1552,7 +1562,7 @@ mod tests {
         );
         assert_eq!(
             bp,
-            r#""C:\Program Files\appkeeper\ak.exe" daemon --config "C:\ProgramData\appkeeper\daemon.toml" --service ak"#
+            r#""C:\Program Files\appkeeper\ak.exe" daemon start --service ak --config "C:\ProgramData\appkeeper\daemon.toml""#
         );
         // Space-free paths are quoted too (uniform rule, read-back matches).
         let bp = render_binpath(
@@ -1562,7 +1572,7 @@ mod tests {
         );
         assert_eq!(
             bp,
-            r#""C:\ak\ak.exe" daemon --config "C:\ak\daemon.toml" --service ak"#
+            r#""C:\ak\ak.exe" daemon start --service ak --config "C:\ak\daemon.toml""#
         );
     }
 

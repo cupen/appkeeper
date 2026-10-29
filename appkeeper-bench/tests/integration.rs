@@ -161,7 +161,7 @@ fn spawn_scratch_daemon(tag: &str, extra_daemon_keys: &str) -> ScratchDaemon {
     let child = Command::new(daemon_bin())
         .arg("--config")
         .arg(dir.join("daemon.toml"))
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -434,7 +434,8 @@ fn integrity_failure_exits_nonzero_with_report() {
                         .flatten()
                         .map(|f| f.path())
                         .filter(|p| {
-                            p.to_string_lossy().contains("appkeeper-bench-rotation.out.log.")
+                            p.to_string_lossy()
+                                .contains("appkeeper-bench-rotation.out.log.")
                         })
                         .collect();
                     if let Some(victim) = rotated.first() {
@@ -471,7 +472,8 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
     use std::process::{Command as Cmd, Stdio};
 
     // scratch daemon on a random port with its own temp app_dir/log_dir
-    let scratch = std::env::temp_dir().join(format!("ak-test-bench-it-connect-{}", std::process::id()));
+    let scratch =
+        std::env::temp_dir().join(format!("ak-test-bench-it-connect-{}", std::process::id()));
     std::fs::create_dir_all(scratch.join("apps")).unwrap();
     std::fs::create_dir_all(scratch.join("logs")).unwrap();
     let port = {
@@ -492,7 +494,7 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
     let mut daemon = Cmd::new(daemon_bin())
         .arg("--config")
         .arg(scratch.join("daemon.toml"))
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -545,7 +547,10 @@ fn connect_cycle_leaves_no_trace_on_the_target_daemon() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&status.stdout).to_string();
-    assert!(!text.contains("appkeeper-bench-"), "no bench programs on the daemon: {text}");
+    assert!(
+        !text.contains("appkeeper-bench-"),
+        "no bench programs on the daemon: {text}"
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -562,7 +567,8 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
 
     // collision: plant a bench-named app file in a scratch daemon's app_dir
     use std::process::{Command as Cmd, Stdio};
-    let scratch = std::env::temp_dir().join(format!("ak-test-bench-it-collide-{}", std::process::id()));
+    let scratch =
+        std::env::temp_dir().join(format!("ak-test-bench-it-collide-{}", std::process::id()));
     std::fs::create_dir_all(scratch.join("apps")).unwrap();
     std::fs::create_dir_all(scratch.join("logs")).unwrap();
     let port = {
@@ -588,7 +594,7 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
     let mut daemon = Cmd::new(daemon_bin())
         .arg("--config")
         .arg(scratch.join("daemon.toml"))
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -604,7 +610,12 @@ fn connect_unreachable_and_collision_exit_nonzero_without_registration() {
     assert_ne!(code, 0, "collision must be refused");
     assert!(stderr.contains("refusing"), "{stderr}");
     // the planted file is untouched
-    assert!(scratch.join("apps").join("appkeeper-bench-firehose.toml").is_file());
+    assert!(
+        scratch
+            .join("apps")
+            .join("appkeeper-bench-firehose.toml")
+            .is_file()
+    );
 
     let _ = daemon.kill();
     let _ = daemon.wait();
@@ -851,7 +862,10 @@ fn connect_auth_token_gate_and_success_cycle() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&status.stdout).to_string();
-    assert!(!text.contains("appkeeper-bench-"), "no bench programs left: {text}");
+    assert!(
+        !text.contains("appkeeper-bench-"),
+        "no bench programs left: {text}"
+    );
     #[cfg(unix)]
     assert_no_residue();
 }

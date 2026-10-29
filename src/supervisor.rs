@@ -19,8 +19,7 @@ use crate::registry;
 pub type Reply = std::sync::mpsc::Sender<Result<String>>;
 
 /// Reply channel for the structured ad-hoc results (run-daemon-first D3/D5).
-pub type AdhocUpReply =
-    std::sync::mpsc::Sender<std::result::Result<AdhocUpResult, AdhocUpError>>;
+pub type AdhocUpReply = std::sync::mpsc::Sender<std::result::Result<AdhocUpResult, AdhocUpError>>;
 pub type AdhocCommitReply = std::sync::mpsc::Sender<Result<AdhocCommitResult>>;
 pub type AdhocAbortReply = std::sync::mpsc::Sender<Result<String>>;
 
@@ -648,9 +647,7 @@ impl Supervisor {
             metrics: Arc::new(crate::metrics::MetricsTable::new()),
             actions: crate::action::ActionRuns::new(),
             webui: WebuiControl::new(),
-            console_auth: Mutex::new(std::sync::Arc::new(
-                crate::web::ConsoleAuth::disabled(),
-            )),
+            console_auth: Mutex::new(std::sync::Arc::new(crate::web::ConsoleAuth::disabled())),
             config_path: Mutex::new(config_dir.join("appkeeper.toml")),
             started: std::time::Instant::now(),
             interval,
@@ -1373,7 +1370,8 @@ impl Supervisor {
             env: spec.env.clone(),
             work_dir,
             health_check: spec.health_check.clone(),
-        };        let text = registry::render_scaffold(name, &scaf, &opts)
+        };
+        let text = registry::render_scaffold(name, &scaf, &opts)
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         // Validate the rendered config against the current registry (round-trip).
         let raw: crate::config::AppRaw = toml::from_str(&text).map_err(|e| {
@@ -1728,7 +1726,10 @@ impl Supervisor {
         }
         registry::discard_placeholder(&config, &config_dir, name);
         self.sync_health_tasks();
-        Ok(format!("program {} aborted (not registered)", staged.program))
+        Ok(format!(
+            "program {} aborted (not registered)",
+            staged.program
+        ))
     }
 
     /// `reload` now only detects: rescan and publish the pending preview.
@@ -2472,8 +2473,7 @@ pub fn webui_manager_loop(sup: Arc<Supervisor>) {
                 running = None;
                 if desired.enabled {
                     info!("webui console starting on {}", desired.listen);
-                    let (inst, ok, note) =
-                        start_webui(&sup, &desired.listen, &desired.auth_token);
+                    let (inst, ok, note) = start_webui(&sup, &desired.listen, &desired.auth_token);
                     running = inst;
                     // Log degraded starts (bind failure, early exit) right
                     // here so both `run` startup and `reload` record it —
@@ -3631,9 +3631,9 @@ mod tests {
         let mgr = spawn_manager(&sup);
 
         let generation = sup.webui.set_desired(WebuiIntent {
-              enabled: true,
-              listen: taken.clone(),
-              ..Default::default()
+            enabled: true,
+            listen: taken.clone(),
+            ..Default::default()
         });
         let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
         assert!(!ok, "occupied port must not report success: {note}");
@@ -3648,9 +3648,9 @@ mod tests {
         drop(blocker);
         std::thread::sleep(Duration::from_millis(100));
         let generation = sup.webui.set_desired(WebuiIntent {
-              enabled: true,
-              listen: taken.clone(),
-              ..Default::default()
+            enabled: true,
+            listen: taken.clone(),
+            ..Default::default()
         });
         wait_applied_ok(&sup, generation);
         assert!(
@@ -3674,9 +3674,9 @@ mod tests {
         assert_eq!(
             WebuiIntent::from_config(&bare),
             WebuiIntent {
-                  enabled: true,
-                  listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
-                  ..Default::default()
+                enabled: true,
+                listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
+                ..Default::default()
             }
         );
         // An explicit listen passes through verbatim.
@@ -3684,9 +3684,9 @@ mod tests {
         assert_eq!(
             WebuiIntent::from_config(&explicit),
             WebuiIntent {
-                  enabled: true,
-                  listen: "0.0.0.0:8080".to_string(),
-                  ..Default::default()
+                enabled: true,
+                listen: "0.0.0.0:8080".to_string(),
+                ..Default::default()
             }
         );
     }
@@ -4117,7 +4117,10 @@ mod tests {
         }
     }
 
-    fn adhoc_up(sup: &Supervisor, spec: AdhocSpec) -> std::result::Result<AdhocUpResult, AdhocUpError> {
+    fn adhoc_up(
+        sup: &Supervisor,
+        spec: AdhocSpec,
+    ) -> std::result::Result<AdhocUpResult, AdhocUpError> {
         sup.cmd_adhoc_up(&spec)
     }
 
@@ -4168,8 +4171,14 @@ mod tests {
         adhoc_up(&sup, spec).unwrap();
         for _ in 0..4 {
             let doc = sup.detect(true).unwrap();
-            assert!(doc.programs.is_empty(), "staged must not be pending: {doc:?}");
-            assert!(doc.apps_added.is_empty(), "staged must not be added: {doc:?}");
+            assert!(
+                doc.programs.is_empty(),
+                "staged must not be pending: {doc:?}"
+            );
+            assert!(
+                doc.apps_added.is_empty(),
+                "staged must not be added: {doc:?}"
+            );
             let st = sup.state.lock().unwrap();
             assert!(
                 st.programs.contains_key("web"),
@@ -4197,7 +4206,10 @@ mod tests {
         assert!(err.to_string().contains("reserved"), "{err}");
         assert_eq!(err.http_status(), 400);
         assert_eq!(err.phase(), "validation");
-        assert!(sup.state.lock().unwrap().programs.is_empty(), "nothing spawned");
+        assert!(
+            sup.state.lock().unwrap().programs.is_empty(),
+            "nothing spawned"
+        );
 
         // Invalid charset.
         let err = adhoc_up(
@@ -4408,7 +4420,10 @@ mod tests {
         let out = adhoc_commit(&sup, "web").unwrap();
         assert!(!out.partial && !out.unchanged);
         assert_eq!(out.app, "web");
-        assert_eq!(out.config_path, dir.join("app.d").join("web.toml").display().to_string());
+        assert_eq!(
+            out.config_path,
+            dir.join("app.d").join("web.toml").display().to_string()
+        );
         assert!(out.pid.is_some());
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
         {
@@ -4478,7 +4493,10 @@ mod tests {
         }
         let out = adhoc_commit(&sup, "web").unwrap();
         assert_eq!(out.pid, None);
-        assert!(dir.join("app.d").join("web.toml").exists(), "record written");
+        assert!(
+            dir.join("app.d").join("web.toml").exists(),
+            "record written"
+        );
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4623,7 +4641,10 @@ mod tests {
         )
         .unwrap();
         let outcome = wait_startup(&sup, "bad", Duration::from_secs(10));
-        assert!(matches!(outcome, StartupOutcome::Failed { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, StartupOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
         sup.cmd_adhoc_abort("bad").unwrap();
         let app_dir = dir.join("app.d");
         if app_dir.exists() {
@@ -4776,7 +4797,10 @@ mod tests {
                 "staged app must not enter apps: {:?}",
                 st.apps.iter().map(|a| &a.name).collect::<Vec<_>>()
             );
-            assert!(st.programs.contains_key("web"), "program survives the apply");
+            assert!(
+                st.programs.contains_key("web"),
+                "program survives the apply"
+            );
         }
         // Abort: no app record, no program, no file.
         sup.cmd_adhoc_abort("web").unwrap();

@@ -216,8 +216,7 @@ impl Endpoint {
             Inner::Ipc(e) => e.connect().map(|c| Box::new(c) as Box<dyn Conn>),
             Inner::Tcp(t) => {
                 let addr = format!("{}:{}", t.host, t.port);
-                std::net::TcpStream::connect(addr)
-                    .map(|s| Box::new(TcpConn(s)) as Box<dyn Conn>)
+                std::net::TcpStream::connect(addr).map(|s| Box::new(TcpConn(s)) as Box<dyn Conn>)
             }
         }
     }
@@ -516,15 +515,15 @@ mod platform {
         }
 
         /// Is this path an IPC endpoint (a socket), rather than an arbitrary
-    /// file that happens to sit where the endpoint goes? Checked before any
-    /// removal — the daemon must never delete something it did not create.
-    fn is_endpoint_file(meta: &std::fs::Metadata) -> bool {
-        use std::os::unix::fs::FileTypeExt;
-        meta.file_type().is_socket()
-    }
+        /// file that happens to sit where the endpoint goes? Checked before any
+        /// removal — the daemon must never delete something it did not create.
+        fn is_endpoint_file(meta: &std::fs::Metadata) -> bool {
+            use std::os::unix::fs::FileTypeExt;
+            meta.file_type().is_socket()
+        }
 
-    /// Create (or clear) the endpoint and return a listener.
-    pub fn bind(&self) -> Result<Listener, BindError> {
+        /// Create (or clear) the endpoint and return a listener.
+        pub fn bind(&self) -> Result<Listener, BindError> {
             let path = self.path().to_path_buf();
             Endpoint::ensure_dirs(&path)?;
             if path.symlink_metadata().is_ok() {
@@ -534,7 +533,7 @@ mod platform {
                     // We may not even try to connect → a live instance owned
                     // by another account. Never delete it.
                     Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                        return Err(BindError::AlreadyRunning)
+                        return Err(BindError::AlreadyRunning);
                     }
                     // Refused / not a socket → leftover from a crash; make
                     // sure before removing anything.
@@ -561,9 +560,7 @@ mod platform {
     fn tighten(dir: &Path, mode: u32) {
         let already =
             std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o7777 == mode);
-        if !already
-            && let Err(e) = Endpoint::chmod_mode(dir, mode)
-        {
+        if !already && let Err(e) = Endpoint::chmod_mode(dir, mode) {
             log::warn!("{e}");
         }
     }
@@ -632,11 +629,11 @@ mod platform {
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, SECURITY_ATTRIBUTES, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
@@ -719,9 +716,7 @@ mod platform {
                 return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
             }
             if raw == ERROR_FILE_NOT_FOUND {
-                return Err(io::Error::from_raw_os_error(
-                    ERROR_FILE_NOT_FOUND as i32,
-                ));
+                return Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32));
             }
             Err(err)
         }
@@ -736,7 +731,7 @@ mod platform {
             match self.connect() {
                 Ok(_) => return Err(BindError::AlreadyRunning),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(BindError::AlreadyRunning)
+                    return Err(BindError::AlreadyRunning);
                 }
                 Err(_) => {}
             }
@@ -782,7 +777,8 @@ mod platform {
             }
             let mut needed: u32 = 0;
             let mut buf: Vec<u8> = Vec::new();
-            let probed = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            let probed =
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
             let ok = if probed == 0 && needed > 0 {
                 buf.resize(needed as usize, 0);
                 GetTokenInformation(
@@ -1106,13 +1102,13 @@ mod platform {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ak-test-transport-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("ak-test-transport-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1133,7 +1129,10 @@ mod tests {
             let name = ep.display();
             assert!(name.starts_with(r"\\.\pipe\ak-"), "{name}");
             assert!(name.ends_with(".sock"), "{name}");
-            assert!(name.contains(&current_user()), "{name} carries the user name");
+            assert!(
+                name.contains(&current_user()),
+                "{name} carries the user name"
+            );
         }
     }
 
@@ -1402,7 +1401,10 @@ mod tests {
         // Exactly three allow ACEs, each granting generic-all (GA).
         assert_eq!(sddl, format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})"));
         // The owner set: SYSTEM, Administrators, running account.
-        assert!(sddl.contains("(A;;GA;;;SY)"), "SYSTEM must be granted: {sddl}");
+        assert!(
+            sddl.contains("(A;;GA;;;SY)"),
+            "SYSTEM must be granted: {sddl}"
+        );
         assert!(
             sddl.contains("(A;;GA;;;BA)"),
             "Administrators must be granted: {sddl}"
@@ -1456,7 +1458,10 @@ mod tests {
         // The defaults remain the IPC shape (缺省推导不变).
         let def = Endpoint::default_endpoint();
         assert!(!def.is_tcp());
-        assert_eq!(def.display(), Endpoint::default_path().display().to_string());
+        assert_eq!(
+            def.display(),
+            Endpoint::default_path().display().to_string()
+        );
     }
 
     /// Task 1.1: malformed `tcp://` values are rejected with a readable
@@ -1513,7 +1518,8 @@ mod tests {
         });
         let mut conn = ep.connect().unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        conn.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         conn.write_all(b"hello").unwrap();
         conn.flush().unwrap();
         let mut buf = [0u8; 5];

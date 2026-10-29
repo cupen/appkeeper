@@ -9,9 +9,9 @@
 //!   A. detect does not touch processes (periodic + reload preview),
 //!   B. scoped apply leaves other apps untouched,
 //!   C. --restart restarts unchanged programs but never a user-stopped one,
-//!   D. online `add` enters pending and starts on apply,
+//!   D. online `compose` enters pending and starts on apply,
 //!   E. no-change apply is idempotent,
-//!   G. add-process scaffold: offline `--apply` fails loudly (exit 3) and
+//!   G. compose-process scaffold: offline `--apply` pulls the daemon up and
 //!      `--env` parse errors exit 2 (G0, daemon not yet running) → generate →
 //!      apply → no-change re-add → changed re-add + `apply all` → `--apply`
 //!      one-step (app-scoped) → reserved `all` rejected → remove deletes the
@@ -59,13 +59,13 @@
 //!   (app-scope) confirms and applies, the result text renders, and a second
 //!   app's pending is untouched by the scoped apply.
 //! - windows service pass (Windows + admin only, add-windows-service-registration):
-//!   `service install --name ak-xtask-e2e-<pid> --desc e2e --now` against a throwaway
+//!   `daemon install --name ak-xtask-e2e-<pid> --desc e2e --now` against a throwaway
 //!   config, read the registration back through the windows-service crate
-//!   (binpath/AutoStart/failure actions/description), watch the service reach
-//!   RUNNING and supervise the test app via the control plane, then uninstall
-//!   and confirm an idempotent second uninstall. A non-admin shell warns and
-//!   skips; an sc.exe stop+delete scrub guard guarantees no `ak-xtask-e2e-*` service
-//!   is left behind on failure.
+//!   (binpath/`daemon start --service`/AutoStart/failure actions/description),
+//!   watch the service reach RUNNING and supervise the test app via the control
+//!   plane, then `daemon uninstall` and confirm an idempotent second uninstall.
+//!   A non-admin shell warns and skips; an sc.exe stop+delete scrub guard
+//!   guarantees no `ak-xtask-e2e-*` service is left behind on failure.
 //!
 //! Fast correctness tests stay in `cargo test` + `pnpm test`; this harness
 //! exists because these paths span process boundaries (child processes, HTTP,
@@ -140,7 +140,7 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     )?;
     std::fs::write(
         root.join("app-beta/appkeeper.toml"),
-        "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
+        "[app]\ndescription = \"beta app\"\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\n",
     )?;
     link_registration(
         &root.join("app-alpha/appkeeper.toml"),
@@ -386,7 +386,7 @@ fn spawn_daemon(bin: &Path, ws: &Workspace) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(ws.root.join("daemon.toml"))
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -542,8 +542,7 @@ fn find_sleep() -> Result<PathBuf> {
             }
         }
     }
-    let src = found
-        .context("no `sleep` executable found — needed by the scaffold e2e scenario")?;
+    let src = found.context("no `sleep` executable found — needed by the scaffold e2e scenario")?;
     // A space-bearing path ("C:\Program Files\Git\...") makes the scaffold
     // render one quoted command line and drop the `args` key; copy it (plus
     // its MSYS runtime) to a space-free path so both keys stay in play.
@@ -575,10 +574,7 @@ fn api(ws: &Workspace, path: &str) -> Result<String> {
 
 /// pid of a program via the control plane (None = not running or unknown).
 fn pid_of(ws: &Workspace, program: &str) -> Result<Option<u32>> {
-    let (code, body) = socket_get(
-        &ws.control_socket,
-        &format!("/v1/programs/{program}"),
-    )?;
+    let (code, body) = socket_get(&ws.control_socket, &format!("/v1/programs/{program}"))?;
     if code == 404 {
         return Ok(None);
     }
@@ -633,9 +629,27 @@ fn expect(cond: bool, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Blank the fields that legitimately differ between two successive status
+/// reads (uptime advances, and the host metrics sampler may tick) so the
+/// `ps --out json` / `GET /v1/status` parity check compares the contract.
+fn normalize_volatile(v: &mut serde_json::Value) {
+    if let Some(d) = v.get_mut("daemon") {
+        d["uptime_secs"] = serde_json::json!(0);
+        d["system"] = serde_json::Value::Null;
+    }
+    if let Some(programs) = v.get_mut("programs").and_then(|p| p.as_array_mut()) {
+        for p in programs {
+            p["uptime_secs"] = serde_json::json!(0);
+            p["cpu_percent"] = serde_json::Value::Null;
+            p["mem_bytes"] = serde_json::Value::Null;
+            p["log_rate"] = serde_json::Value::Null;
+        }
+    }
+}
+
 // -- offline pass ----------------------------------------------------------------
 
-/// Runs BEFORE the daemon exists. The "take effect now" entries (`add --apply`
+/// Runs BEFORE the daemon exists. The "take effect now" entries (`compose --apply`
 /// and the run ad-hoc form) auto-pull the daemon up in the background instead
 /// of failing (background-daemon spec); the pulled-up daemon is shut down
 /// again so the later offline scenarios still see a dead control plane.
@@ -643,12 +657,12 @@ fn expect(cond: bool, what: &str) -> Result<()> {
 fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let sleep = find_sleep()?;
 
-    step("G0. offline `add --apply` auto-pulls the daemon up (background-daemon)");
+    step("G0. offline `compose --apply` auto-pulls the daemon up (background-daemon)");
     let (ok, code, combined) = cli_try(
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "offline-demo",
@@ -658,7 +672,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(
         ok,
         &format!(
-            "offline add --apply now succeeds by pulling the daemon up, got code {code}: {combined}"
+            "offline compose --apply now succeeds by pulling the daemon up, got code {code}: {combined}"
         ),
     )?;
     expect(
@@ -681,7 +695,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // The daemon is now serving; shut it down so the offline scenarios below
     // (and the explicit daemon spawn) see a clean, offline control plane.
-    cli(bin, ws, &["shutdown"])?;
+    cli(bin, ws, &["daemon", "shutdown"])?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let up = socket_health_ok(&ws.control_socket);
@@ -699,7 +713,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "env-bad",
@@ -720,7 +734,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "env-bad",
@@ -741,7 +755,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "env-bad",
@@ -758,15 +772,124 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "empty --env key registers nothing",
     )?;
 
-    step("G0c. `ak status` with no daemon is unreachable (exit 3)");
-    let (ok, code, combined) = cli_try(bin, ws, &["status"])?;
+    step("G0c. `ak ps` with no daemon is unreachable (exit 3)");
+    let (ok, code, combined) = cli_try(bin, ws, &["ps"])?;
     expect(
         !ok && code == 3,
-        &format!("status without a daemon exits 3, got {code}"),
+        &format!("ps without a daemon exits 3, got {code}"),
     )?;
     expect(
         combined.contains("unreachable"),
         "the error says the daemon is unreachable",
+    )?;
+
+    step("G0c1. five removed verbs and bare `daemon` are usage errors (exit 2)");
+    // control-plane spec: `ak status|list|shutdown|add|service ...` report an
+    // unknown subcommand — no alias, no migration hint — and bare `ak daemon`
+    // reports the four-subcommand usage error.
+    for bad in [
+        &["status"][..],
+        &["list"][..],
+        &["shutdown"][..],
+        &["add", "."][..],
+        &["service", "install"][..],
+        &["service", "uninstall"][..],
+    ] {
+        let (ok, code, combined) = cli_try(bin, ws, bad)?;
+        expect(
+            !ok && code == 2,
+            &format!("{bad:?} is an unknown subcommand with exit 2, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("unrecognized subcommand"),
+            &format!("{bad:?} reports `unrecognized subcommand`: {combined:?}"),
+        )?;
+    }
+    // Raw argv: `cli_try` would prepend the global `--config`, which is the
+    // old unit signature (`ak --config <p> daemon`) and takes the upgrade
+    // branch instead of the plain bare-daemon usage error.
+    let (ok, code, combined) = cli_try_raw(bin, &["daemon"])?;
+    expect(
+        !ok && code == 2,
+        &format!("bare `ak daemon` exits 2, got {code}: {combined:?}"),
+    )?;
+    for sub in ["start", "install", "uninstall", "shutdown"] {
+        expect(
+            combined.contains(sub),
+            &format!("the bare-daemon usage error lists {sub}: {combined:?}"),
+        )?;
+    }
+
+    step("G0c1b. offline `ps --all` degrades to the registry listing (exit 0)");
+    // control-plane spec: no `--all` stays exit 3; `--all` prints the local
+    // registry with a daemon-offline note and exits 0; `--all --out json`
+    // prints only the registry array.
+    let (ok, code, combined) = cli_try(bin, ws, &["ps", "--all"])?;
+    expect(
+        ok && code == 0,
+        &format!("offline `ps --all` exits 0, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("daemon offline") && combined.contains("local registry"),
+        &format!("the degradation is labelled as a daemon-offline registry view: {combined:?}"),
+    )?;
+    // The workspace registered alpha/beta before the pass; the two offline
+    // apps from G0 were removed at the end of this pass.
+    for name in ["alpha", "beta"] {
+        expect(
+            combined.contains(name),
+            &format!("the offline listing names the registered app {name}: {combined:?}"),
+        )?;
+    }
+    let alpha_body = ws.root.join("app-alpha/appkeeper.toml");
+    expect(
+        combined.contains(&alpha_body.display().to_string()),
+        "the listing shows each app's config-body path",
+    )?;
+    // The listing carries the third documented column: the description
+    // (beta declares one in the workspace fixture).
+    expect(
+        combined.contains("beta app"),
+        &format!("the listing shows each app's description: {combined:?}"),
+    )?;
+    // Plain `ps` (no `--all`) must NOT degrade, whatever the output format.
+    let (ok, code, combined) = cli_try(bin, ws, &["ps", "--out", "json"])?;
+    expect(
+        !ok && code == 3,
+        &format!("offline `ps --out json` stays exit 3, got {code}: {combined:?}"),
+    )?;
+    // stdout only: the offline note rides stderr (cli() bails on non-zero).
+    let combined = cli(bin, ws, &["ps", "--all", "--out", "json"])?;
+    let registry: serde_json::Value =
+        serde_json::from_str(&combined).context("the offline --all JSON array parses")?;
+    expect(
+        registry.is_array(),
+        &format!("the offline degradation prints the registry array alone: {combined:?}"),
+    )?;
+    let names: Vec<&str> = registry
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r["name"].as_str()).collect())
+        .unwrap_or_default();
+    expect(
+        names.contains(&"alpha") && names.contains(&"beta"),
+        &format!("the JSON array carries the registered apps: {names:?}"),
+    )?;
+    expect(
+        registry
+            .as_array()
+            .map(|a| a.iter().all(|r| r["config_path"].is_string()))
+            .unwrap_or(false),
+        "each JSON entry carries its config_path",
+    )?;
+    expect(
+        registry
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|r| r["name"] == "beta" && r["description"] == "beta app")
+            })
+            .unwrap_or(false),
+        &format!("each JSON entry carries its description: {registry:?}"),
     )?;
 
     step("G0c2. removed webui/system subcommands stay removed (BREAKING, config-driven-webui)");
@@ -793,15 +916,15 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // The interception reads argv before clap, so the config path is never
     // resolved — the exact spec command lines can be run against a dead daemon.
     let cfg = ws.root.join("daemon-run-form.toml"); // never read, never created
-    // `run --detach` → exit 2, hint points at `ak daemon --detach`.
+    // `run --detach` → exit 2, hint points at `ak daemon start`.
     let (ok, code, combined) = cli_try_raw(bin, &["run", "--detach"])?;
     expect(
         !ok && code == 2,
         &format!("`run --detach` is intercepted with exit 2, got {code}: {combined:?}"),
     )?;
     expect(
-        combined.contains("daemon --detach"),
-        "the detach-form hint names `ak daemon --detach`",
+        combined.contains("ak daemon start") && !combined.contains("--detach"),
+        "the detach-form hint names `ak daemon start` and no removed flag",
     )?;
     // Config-only forms (the old systemd ExecStart signature) → exit 2 and the
     // extra unit-regeneration hint, with `--config` in either position.
@@ -816,8 +939,9 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("{args:?} is intercepted with exit 2, got {code}: {combined:?}"),
         )?;
         expect(
-            combined.contains("ak daemon") && combined.contains("service install --force --now"),
-            &format!("{args:?} hint names `ak daemon` and the unit regeneration command"),
+            combined.contains("ak daemon start --foreground")
+                && combined.contains("ak daemon install --force --now"),
+            &format!("{args:?} hint names the foreground form and the unit regeneration command"),
         )?;
     }
     // Bare `run` carries no daemon marker: it reaches dispatch and reports the
@@ -858,6 +982,129 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         combined.contains("unreachable") && !combined.contains("daemon form of `run`"),
         "`run <name>` is not caught by the daemon-form guard",
     )?;
+    // control-plane spec「daemon shutdown 停机」: with the daemon down the
+    // client contract is exit 3 (never a silent success).
+    let (ok, code, combined) = cli_try(bin, ws, &["daemon", "shutdown"])?;
+    expect(
+        !ok && code == 3,
+        &format!("offline `daemon shutdown` exits 3, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("unreachable"),
+        "offline `daemon shutdown` reports the daemon unreachable",
+    )?;
+
+    step("G0c4b. the old `daemon --config <path>` ExecStart is intercepted with the unit hint");
+    // service-registration spec「旧 unit 升级后拉起失败并给自救提示」: the
+    // pre-change systemd ExecStart / Windows binPath signature must fail with
+    // exit 2 AND name `ak daemon install --force --now`. Raw argv (the unit
+    // line verbatim), both flag positions plus the old `--service` binPath.
+    for args in [
+        &["daemon", "--config", cfg.to_str().unwrap()][..],
+        &["daemon", "-c", cfg.to_str().unwrap()][..],
+        &["-c", cfg.to_str().unwrap(), "daemon"][..],
+        &[
+            "daemon",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--service",
+            "ak",
+        ][..],
+    ] {
+        let (ok, code, combined) = cli_try_raw(bin, args)?;
+        expect(
+            !ok && code == 2,
+            &format!("{args:?} exits 2, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("ak daemon install --force --now"),
+            &format!("{args:?} names the unit regeneration command: {combined:?}"),
+        )?;
+        for sub in ["start", "install", "uninstall", "shutdown"] {
+            expect(
+                combined.contains(sub),
+                &format!("{args:?} still lists the {sub} subcommand: {combined:?}"),
+            )?;
+        }
+    }
+
+    step("G0c5. `daemon install`/`uninstall` refuse non-root and touch no unit file");
+    // service-registration spec「安装需要 root 权限」: non-root fails, names
+    // root, and produces no file / systemd change. Root cannot exercise the
+    // refusal branch, so the check skips there (CI/dev may run either way).
+    if cfg!(unix) && current_uid_e2e() != 0 {
+        let unit = ws
+            .root
+            .join(format!("ak-review-{}.service", std::process::id()));
+        let unit_s = unit.to_str().unwrap().to_string();
+        for verb in ["install", "uninstall"] {
+            let (ok, code, combined) =
+                cli_try(bin, ws, &["daemon", verb, "--unit-file", unit_s.as_str()])?;
+            expect(
+                !ok && code != 0,
+                &format!("non-root `daemon {verb}` fails, got {code}: {combined:?}"),
+            )?;
+            expect(
+                combined.contains("root"),
+                &format!("the {verb} refusal says root is required: {combined:?}"),
+            )?;
+            expect(
+                !unit.exists(),
+                &format!("non-root `daemon {verb}` wrote no unit file"),
+            )?;
+        }
+        // A name that is not a legal systemd unit file fails BEFORE the root
+        // check and before any write (same requirement).
+        let bad = ws.root.join("ak-review-bad.txt");
+        let (ok, _code, combined) = cli_try(
+            bin,
+            ws,
+            &["daemon", "install", "--unit-file", bad.to_str().unwrap()],
+        )?;
+        expect(
+            !ok && combined.contains("invalid unit file"),
+            &format!("an illegal unit file name is refused: {combined:?}"),
+        )?;
+        expect(!bad.exists(), "the illegal unit file was not created")?;
+        // Platform misuse: `--name` is Windows-only (Linux names units with
+        // --unit-file) and must fail without side effects.
+        let (ok, _code, combined) = cli_try(bin, ws, &["daemon", "install", "--name", "ak"])?;
+        expect(
+            !ok && combined.contains("only supported on Windows"),
+            &format!("`--name` on Linux is refused with the platform note: {combined:?}"),
+        )?;
+    } else {
+        println!("    skip: root (or non-unix) — the non-root refusal is unreachable");
+    }
+
+    step("G0c6. bare `ak` prints the full help and exits 0 without starting a daemon");
+    // control-plane spec「裸 ak 输出 help」+ the five removed verbs stay gone.
+    let (ok, code, combined) = cli_try_raw(bin, &[])?;
+    expect(
+        ok && code == 0,
+        &format!("bare `ak` exits 0, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("Usage: ak"),
+        &format!("bare `ak` prints the usage line: {combined:?}"),
+    )?;
+    for sub in ["daemon", "run", "ps", "compose"] {
+        expect(
+            combined.contains(&format!("\n  {sub} ")),
+            &format!("the help lists the {sub} subcommand: {combined:?}"),
+        )?;
+    }
+    // The removed verbs must not appear as subcommand lines (design D7).
+    for gone in ["status", "list", "shutdown", "add", "service"] {
+        expect(
+            !combined.contains(&format!("\n  {gone} ")),
+            &format!("the help no longer lists the removed `{gone}` verb: {combined:?}"),
+        )?;
+    }
+    expect(
+        !socket_health_ok(&ws.control_socket),
+        "bare `ak` did not start a daemon",
+    )?;
 
     step("G0d. a relative daemon.log_dir fails validate AND refuses daemon startup");
     let bad_cfg = ws.root.join("daemon-bad.toml");
@@ -874,7 +1121,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&bad_cfg)
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -997,7 +1244,11 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         default_socket_matches(&out),
         &format!("a single key prints the bare platform default: {out:?}"),
     )?;
-    let out = cli_cfg(bin, &cfg, &["config", "--get", "socket", "--get", "log_level"])?;
+    let out = cli_cfg(
+        bin,
+        &cfg,
+        &["config", "--get", "socket", "--get", "log_level"],
+    )?;
     expect(
         out.contains("socket=/run/appkeeper/") && out.contains("log_level=info")
             || (cfg!(windows) && out.contains(r"socket=\\.\pipe\ak-")),
@@ -1038,9 +1289,18 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli_cfg(
         bin,
         &cfg,
-        &["config", "--set", "monitor_interval=2.5", "--set", "log_level=debug"],
+        &[
+            "config",
+            "--set",
+            "monitor_interval=2.5",
+            "--set",
+            "log_level=debug",
+        ],
     )?;
-    expect(out.contains("monitor_interval"), "set reports the written keys: {out}")?;
+    expect(
+        out.contains("monitor_interval"),
+        "set reports the written keys: {out}",
+    )?;
     expect(
         out.contains("offline"),
         "the offline note says the change takes effect at next start",
@@ -1128,7 +1388,8 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // path-form socket the write parses, but whole-config validation refuses
     // the combination — exit 2, the fix named, file unchanged.
     {
-        let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["config", "--set", "auth_token=legacy"])?;
+        let (ok, code, combined) =
+            cli_try_cfg(bin, &cfg, &["config", "--set", "auth_token=legacy"])?;
         expect(
             !ok && code == 2,
             &format!("--set auth_token on a path-form socket exits 2, got {code}"),
@@ -1144,7 +1405,10 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     }
     // A config file that still carries the dead keys fails validate outright.
     let legacy = ws.root.join("cfgcmd-legacy.toml");
-    std::fs::write(&legacy, "[daemon]\nhost = \"127.0.0.1\"\nport = 7310\nauth_token = \"x\"\n")?;
+    std::fs::write(
+        &legacy,
+        "[daemon]\nhost = \"127.0.0.1\"\nport = 7310\nauth_token = \"x\"\n",
+    )?;
     let (ok, _code, combined) = cli_try_cfg(bin, &legacy, &["validate"])?;
     expect(
         !ok && combined.contains("removed"),
@@ -1306,9 +1570,9 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     println!("    (windows: the fake-EDITOR edit scenario requires unix; skipping)");
 
     step("K12. example.toml.sample is not scanned as an app");
-    let out = cli_cfg(bin, &cfg, &["list"])?;
+    let out = cli_cfg(bin, &cfg, &["ps", "--all"])?;
     expect(
-        out.contains("no apps registered"),
+        out.contains("no programs"),
         "the init-produced app_dir lists no apps (.sample ignored)",
     )?;
 
@@ -1371,9 +1635,7 @@ fn config_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         let out = cli_cfg(bin, &cfg, &["config", "--get", "socket"])?;
         expect(
             out.trim() == "/tmp/ak-xtask-visual.sock",
-            &format!(
-                "$VISUAL won over $EDITOR (visual.sock, not editor.sock): {out:?}"
-            ),
+            &format!("$VISUAL won over $EDITOR (visual.sock, not editor.sock): {out:?}"),
         )?;
     }
     #[cfg(not(unix))]
@@ -1426,10 +1688,11 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("B. scoped apply leaves other apps untouched");
-    // Give beta a pending change too.
+    // Give beta a pending change too (the description stays so the later
+    // `ps` DESCRIPTION assertion has a registry value to read).
     std::fs::write(
         ws.root.join("app-beta/appkeeper.toml"),
-        "[app]\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+        "[app]\ndescription = \"beta app\"\nrestart = \"always\"\n\n[program.job]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
     )?;
     let job_pid = pid_of(ws, "job")?.expect("job running");
     std::thread::sleep(Duration::from_secs(2));
@@ -1491,7 +1754,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "job was restarted by --restart",
     )?;
 
-    step("D. online add enters pending and starts on apply");
+    step("D. online compose enters pending and starts on apply");
     let gamma = ws.root.join("app-gamma");
     std::fs::create_dir_all(&gamma)?;
     std::fs::write(
@@ -1501,15 +1764,44 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli(
         bin,
         ws,
-        &["add", gamma.to_str().unwrap(), "--name", "gamma"],
+        &["compose", gamma.to_str().unwrap(), "--name", "gamma"],
     )?;
     expect(
         out.contains("registration is pending"),
-        "add sync reports pending (not immediate start)",
+        "compose sync reports pending (not immediate start)",
     )?;
     expect(
         pid_of(ws, "gamma")?.is_none(),
         "gamma not started before apply",
+    )?;
+    // control-plane spec: online `ps` is the projection only; `ps --all` adds
+    // the registered-but-not-applied app to the full view; `--out json`
+    // carries the same registry array under `registry`.
+    let plain = cli(bin, ws, &["ps"])?;
+    expect(
+        !plain.contains("gamma"),
+        &format!("plain `ps` shows only loaded programs: {plain:?}"),
+    )?;
+    let full = cli(bin, ws, &["ps", "--all"])?;
+    expect(
+        full.contains("gamma") && full.contains("not-applied"),
+        &format!("`ps --all` lists the pending app as not-applied: {full:?}"),
+    )?;
+    expect(
+        full.contains(&gamma.join("appkeeper.toml").display().to_string()),
+        "the full view carries the app's config-body path",
+    )?;
+    let all_json = cli(bin, ws, &["ps", "--all", "--out", "json"])?;
+    let all_v: serde_json::Value = serde_json::from_str(&all_json)?;
+    expect(
+        all_v["registry"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|r| r["name"] == "gamma" && r["state"] == "not-applied")
+            })
+            .unwrap_or(false),
+        &format!("`ps --all --out json` carries gamma under registry: {all_json:?}"),
     )?;
     let out = cli(bin, ws, &["apply"])?;
     expect(out.contains("gamma"), "apply picked the new app up")?;
@@ -1535,18 +1827,18 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     wait_pending_empty(ws)
 }
 
-/// Scenario G (add-process-scaffold): generate from an executable, apply,
+/// Scenario G (compose-process-scaffold): generate from an executable, apply,
 /// regenerate, `--apply`, the `all` reserved word, and remove-file semantics.
 fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let sleep = find_sleep()?;
     let apps = ws.root.join("apps");
 
-    step("G1. add scaffold generates a real config with absolute paths");
+    step("G1. compose scaffold generates a real config with absolute paths");
     let out = cli(
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "abc",
@@ -1556,7 +1848,10 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             "AK_E2E=1",
         ],
     )?;
-    expect(out.contains("generated"), "add prints the generated file")?;
+    expect(
+        out.contains("generated"),
+        "compose prints the generated file",
+    )?;
     expect(
         out.contains("pending"),
         "online sync reports the pending registration",
@@ -1617,12 +1912,15 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "validated command is the absolute executable path",
     )?;
     expect(pid_of(ws, "abc")?.is_none(), "abc not started before apply")?;
-    // list scans app_dir and shows the scaffolded record like any other.
-    let out = cli(bin, ws, &["list"])?;
-    expect(out.contains("abc"), "list shows the scaffolded app name")?;
+    // `ps --all` scans app_dir and shows the scaffolded record like any other.
+    let out = cli(bin, ws, &["ps", "--all"])?;
+    expect(
+        out.contains("abc"),
+        "ps --all shows the scaffolded app name",
+    )?;
     expect(
         out.contains("abc.toml"),
-        "list shows the scaffolded record path",
+        "ps --all shows the scaffolded record path",
     )?;
 
     step("G2. apply abc starts the scaffolded program");
@@ -1630,12 +1928,12 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(out.contains("abc"), "scoped apply picked up abc")?;
     let abc_pid = wait_running(ws, "abc")?;
 
-    step("G3. identical re-add reports no change");
+    step("G3. identical re-compose reports no change");
     let out = cli(
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "abc",
@@ -1648,15 +1946,15 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(out.contains("no change"), "identical re-add is a no change")?;
     expect(
         pid_of(ws, "abc")? == Some(abc_pid),
-        "no-change re-add does not touch the running program",
+        "no-change re-compose does not touch the running program",
     )?;
 
-    step("G4. changed re-add, a second pending app, then `apply all` takes both");
+    step("G4. changed re-compose, a second pending app, then `apply all` takes both");
     let out = cli(
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "abc",
@@ -1666,13 +1964,13 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     expect(
         out.contains("changed") && out.contains("ak apply abc"),
-        "changed re-add points at the remedy",
+        "changed re-compose points at the remedy",
     )?;
     let out = cli(
         bin,
         ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "fox",
@@ -1691,7 +1989,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(abc_pid2 != abc_pid, "abc restarted with the new args")?;
     wait_running(ws, "fox")?;
 
-    step("G5. add --apply is one step and app-scoped (other pending survives)");
+    step("G5. compose --apply is one step and app-scoped (other pending survives)");
     // Give alpha a pending change; delta's app-scoped --apply must not touch it.
     let worker_before = pid_of(ws, "worker")?;
     std::fs::write(
@@ -1702,7 +2000,13 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let out = cli(
         bin,
         ws,
-        &["add", sleep.to_str().unwrap(), "--name", "delta", "--apply"],
+        &[
+            "compose",
+            sleep.to_str().unwrap(),
+            "--name",
+            "delta",
+            "--apply",
+        ],
     )?;
     expect(out.contains("generated"), "delta scaffold generated")?;
     expect(out.contains("-> start"), "apply result shows delta started")?;
@@ -1732,9 +2036,12 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     wait_pending_empty(ws)?;
 
     step("G6. `--name all` is rejected (reserved apply-all keyword)");
-    let (ok, _code, combined) =
-        cli_try(bin, ws, &["add", sleep.to_str().unwrap(), "--name", "all"])?;
-    expect(!ok, "add --name all fails")?;
+    let (ok, _code, combined) = cli_try(
+        bin,
+        ws,
+        &["compose", sleep.to_str().unwrap(), "--name", "all"],
+    )?;
+    expect(!ok, "compose --name all fails")?;
     expect(
         combined.contains("reserved"),
         "error explains the reserved word",
@@ -1778,7 +2085,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 // -- cli-revamp scenario group -------------------------------------------------
 
 /// cli-revamp acceptance: the unified `run` verb (start / ad-hoc), `log`
-/// multi-program aggregation, `status` table vs `--json`, the four `restart`
+/// multi-program aggregation, `ps` table vs `--out json`, the four `restart`
 /// policies with the persisted user-stop record, and the legacy-alias rules.
 /// Self-contained: it runs in its own workspace with its own daemon (restarting
 /// it mid-pass is part of the restart-policy scenarios).
@@ -1834,7 +2141,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
     let sleep = find_sleep()?;
     let sleep_s = sleep.to_string_lossy().replace('\\', "/");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--name", "adhoc-a"])?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
+    )?;
     expect(
         out.contains("started") && out.contains("config:") && out.contains("pid:"),
         &format!("run -- registers and reports {{program, config, pid}}: {out:?}"),
@@ -1876,7 +2187,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     // this command line. Identical content is an idempotent success returning
     // the existing pid with no restart.
     let pid_before = pid_of(ws, "adhoc-a")?.expect("adhoc-a is running");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--name", "adhoc-a"])?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
+    )?;
     expect(
         out.contains("started") && out.contains(&pid_before.to_string()),
         &format!("identical re-run is idempotent (same pid {pid_before}): {out:?}"),
@@ -1886,7 +2201,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "the identical re-run did not restart the process",
     )?;
     // Changed args → regenerated and restarted (new pid).
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "456", "--name", "adhoc-a"])?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "456", "--name", "adhoc-a"],
+    )?;
     expect(
         out.contains("started"),
         &format!("the changed re-run succeeds: {out:?}"),
@@ -2019,26 +2338,60 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         &format!("the error explains the mixing: {combined:?}"),
     )?;
 
-    step("R7. status table by default; --json keeps the projection");
-    let table = cli(bin, ws, &["status"])?;
+    step("R7. ps table by default; --out json keeps the projection");
+    let table = cli(bin, ws, &["ps"])?;
     expect(
         ["NAME", "APP", "STATE", "PID", "RESTARTS", "UNHEALTHY"]
             .iter()
             .all(|h| table.contains(h)),
-        &format!("status default prints the table header: {table:?}"),
+        &format!("ps default prints the table header: {table:?}"),
+    )?;
+    // control-plane spec: the table adds the registry information — the
+    // config-object path (per program) and the app description.
+    expect(
+        table.contains("CONFIG") && table.contains("DESCRIPTION"),
+        &format!("ps adds the CONFIG / DESCRIPTION columns: {table:?}"),
+    )?;
+    expect(
+        table.contains(
+            &ws.root
+                .join("app-alpha/appkeeper.toml")
+                .display()
+                .to_string(),
+        ) || table.contains(
+            &ws.root
+                .join("app-beta/appkeeper.toml")
+                .display()
+                .to_string(),
+        ),
+        &format!("the CONFIG column carries the config-body path: {table:?}"),
+    )?;
+    expect(
+        table.contains("beta app"),
+        &format!("the DESCRIPTION column carries the app description: {table:?}"),
     )?;
     expect(
         !table.contains('{') && !table.contains('}'),
         "the default output is not JSON",
     )?;
-    let json = cli(bin, ws, &["status", "--json"])?;
+    let json = cli(bin, ws, &["ps", "--out", "json"])?;
     expect(
         json.trim_start().starts_with('{'),
-        "status --json is pretty JSON",
+        "ps --out json is pretty JSON",
     )?;
     expect(
         json.contains("\"programs\"") && json.contains("\"daemon\""),
         "the JSON carries the daemon + programs projection",
+    )?;
+    // control-plane spec: `ps --out json` equals GET /v1/status. Only the
+    // volatile clock fields are normalized away; everything else must match.
+    let mut cli_v: serde_json::Value = serde_json::from_str(&json)?;
+    let mut api_v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/status")?)?;
+    normalize_volatile(&mut cli_v);
+    normalize_volatile(&mut api_v);
+    expect(
+        cli_v == api_v,
+        &format!("`ps --out json` equals GET /v1/status: cli={cli_v} api={api_v}"),
     )?;
 
     step("R8. log multi-program aggregation: prefixes, both streams, 404 exit 1");
@@ -2055,7 +2408,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         cli(
             bin,
             ws,
-            &["add", echo_file.to_str().unwrap(), "--name", "echo"],
+            &["compose", echo_file.to_str().unwrap(), "--name", "echo"],
         )?;
         cli(bin, ws, &["apply", "echo"])?;
         wait_running(ws, "echo-a")?;
@@ -2174,11 +2527,7 @@ fn post_ndjson(ws: &Workspace, path: &str, body: &serde_json::Value) -> Result<(
 }
 
 /// [`post_ndjson`] against an explicit endpoint (secondary workspaces).
-fn post_ndjson_at(
-    endpoint: &Path,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<(u16, String)> {
+fn post_ndjson_at(endpoint: &Path, path: &str, body: &serde_json::Value) -> Result<(u16, String)> {
     control_http(endpoint, "POST", path, Some(&body.to_string()))
 }
 
@@ -2190,7 +2539,7 @@ fn spawn_daemon_at(bin: &Path, cfg: &Path, endpoint: &Path) -> Result<Daemon> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(cfg)
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -2385,7 +2734,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "add",
+            "compose",
             ws.root.join("fan-app").to_str().unwrap(),
             "--name",
             "fan",
@@ -2442,7 +2791,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "add",
+            "compose",
             ws.root.join("mixed-app").to_str().unwrap(),
             "--name",
             "mixed",
@@ -2474,7 +2823,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "add",
+            "compose",
             ws.root.join("slow-app").to_str().unwrap(),
             "--name",
             "slow",
@@ -2534,14 +2883,15 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "add",
+            "compose",
             ws.root.join("owner-app").to_str().unwrap(),
             "--name",
             "owner",
         ],
     )?;
     cli(bin, ws, &["apply", "owner"])?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--name", "clash"])?;
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--name", "clash"])?;
     expect(
         !ok && code != 0,
         &format!("cross-app colliding --name is refused, got {code}: {combined:?}"),
@@ -2607,10 +2957,25 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         apps.join("atomic.toml.pending").is_file(),
         "the placeholder exists mid-flight (a scanner cannot see it as a record)",
     )?;
-    let listed = cli(bin, ws, &["list"])?;
+    // The registry half of `ps --all` must not see the placeholder: the app
+    // only appears in the live projection (staged programs are deliberately
+    // visible there for the startup wait), never as a `not-applied` registry
+    // entry — a scanner of `app_dir` sees no record.
+    let listed = cli(bin, ws, &["ps", "--all"])?;
     expect(
-        !listed.contains("atomic"),
-        &format!("`ak list` excludes the in-flight app: {listed:?}"),
+        !listed
+            .lines()
+            .any(|l| l.starts_with("atomic ") && l.contains("not-applied")),
+        &format!("`ps --all` has no registry entry for the in-flight app: {listed:?}"),
+    )?;
+    let listed_json: serde_json::Value =
+        serde_json::from_str(&cli(bin, ws, &["ps", "--all", "--out", "json"])?)?;
+    expect(
+        listed_json["registry"]
+            .as_array()
+            .map(|a| !a.iter().any(|r| r["name"] == "atomic"))
+            .unwrap_or(true),
+        &format!("the registry array excludes the in-flight app: {listed_json}"),
     )?;
     let pending: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
     expect(
@@ -2751,10 +3116,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let ro_endpoint = if cfg!(unix) {
         ws.root.join("daemon-ro.sock")
     } else {
-        PathBuf::from(format!(
-            r"\\.\pipe\ak-e2e-ro-{}.sock",
-            std::process::id()
-        ))
+        PathBuf::from(format!(r"\\.\pipe\ak-e2e-ro-{}.sock", std::process::id()))
     };
     let ro_logs = ws.root.join("logs").to_string_lossy().replace('\\', "/");
     std::fs::write(
@@ -2907,7 +3269,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
 /// Ask the daemon to shut down and wait for the endpoint to go quiet.
 fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
-    cli(bin, ws, &["shutdown"])?;
+    cli(bin, ws, &["daemon", "shutdown"])?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if !socket_health_ok(&ws.control_socket) {
@@ -2920,11 +3282,12 @@ fn shutdown_and_wait(bin: &Path, ws: &Workspace) -> Result<()> {
     }
 }
 
-/// `daemon --detach` in its own isolated workspace: cold start becomes ready,
-/// prints the address + log path, and a second detach reports the
-/// already-running instance (no second process).
+/// `daemon start` (background) in its own isolated workspace: cold start
+/// becomes ready, prints the address + log path, and a second start is
+/// refused as a bind conflict (non-zero, names the live instance) without
+/// starting a second process.
 fn detach_pass(bin: &Path) -> Result<()> {
-    step("R9. `daemon --detach` cold start + second instance reports already-running");
+    step("R9. `daemon start` cold start + second instance is refused as already-running");
     let root = std::env::temp_dir().join(format!("ak-xtask-detach-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("logs"))?;
@@ -2938,11 +3301,8 @@ fn detach_pass(bin: &Path) -> Result<()> {
         ),
     )?;
     let cfg = root.join("daemon.toml");
-    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "--detach"])?;
-    expect(
-        ok,
-        &format!("daemon --detach exits 0, got {code}: {combined}"),
-    )?;
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "start"])?;
+    expect(ok, &format!("daemon start exits 0, got {code}: {combined}"))?;
     expect(
         combined.contains(endpoint.display().to_string().as_str()),
         &format!("the ready message prints the control endpoint: {combined:?}"),
@@ -2955,21 +3315,33 @@ fn detach_pass(bin: &Path) -> Result<()> {
         root.join("logs/daemon.out.log").is_file(),
         "the background log file exists",
     )?;
-    // A second detach sees the healthy instance and does not fail.
-    let (ok, _code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "--detach"])?;
+    // A second background start is a bind conflict: background-daemon spec
+    //「端口已占用时报错」— non-zero exit, the message names the live instance,
+    // and no second process is started.
+    let (ok, code, combined) = cli_try_cfg(bin, &cfg, &["daemon", "start"])?;
     expect(
-        ok,
-        "a second daemon --detach succeeds against the live instance",
+        !ok && code != 0,
+        &format!("a second daemon start fails on the live instance, got {code}: {combined:?}"),
     )?;
     expect(
         combined.contains("already running"),
         &format!("it reports the already-running daemon: {combined:?}"),
     )?;
-    // Shut the background daemon down through the control plane.
-    let (ok, code, c) = cli_try_cfg(bin, &cfg, &["shutdown"])?;
+    expect(
+        combined.contains(endpoint.display().to_string().as_str()),
+        &format!("the conflict message names the endpoint: {combined:?}"),
+    )?;
+    // The first instance is untouched by the refused start.
+    let (ok, code, c) = cli_try_cfg(bin, &cfg, &["ps"])?;
     expect(
         ok,
-        &format!("the detached daemon shuts down via the CLI (code {code}): {c:?}"),
+        &format!("the live daemon still answers ps (code {code}): {c:?}"),
+    )?;
+    // Shut the background daemon down through the control plane.
+    let (ok, code, c) = cli_try_cfg(bin, &cfg, &["daemon", "shutdown"])?;
+    expect(
+        ok,
+        &format!("the background daemon shuts down via the CLI (code {code}): {c:?}"),
     )?;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -3100,20 +3472,25 @@ fn actions_offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let (ok, _code, combined) = cli_try(
         bin,
         ws,
-        &["add", &acts_file.to_string_lossy(), "--name", "my.app"],
+        &["compose", &acts_file.to_string_lossy(), "--name", "my.app"],
     )?;
     expect(
         !ok && combined.contains("[A-Za-z0-9_-]"),
-        "`add --name my.app` is refused (dots are not identifiers)",
+        "`compose --name my.app` is refused (dots are not identifiers)",
     )?;
     let (ok, _code, combined) = cli_try(
         bin,
         ws,
-        &["add", &acts_file.to_string_lossy(), "--name", "bad name"],
+        &[
+            "compose",
+            &acts_file.to_string_lossy(),
+            "--name",
+            "bad name",
+        ],
     )?;
     expect(
         !ok && combined.contains("[A-Za-z0-9_-]"),
-        "`add --name \"bad name\"` is refused (spaces are not identifiers)",
+        "`compose --name \"bad name\"` is refused (spaces are not identifiers)",
     )?;
 
     step("H2. unknown action variables are refused at validate time");
@@ -3215,10 +3592,7 @@ fn chmod_exec(_p: &Path) -> std::io::Result<()> {
 }
 
 fn state_of(ws: &Workspace, program: &str) -> Result<String> {
-    let (_code, body) = socket_get(
-        &ws.control_socket,
-        &format!("/v1/programs/{program}"),
-    )?;
+    let (_code, body) = socket_get(&ws.control_socket, &format!("/v1/programs/{program}"))?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     Ok(v.get("state")
         .and_then(|s| s.as_str())
@@ -3847,7 +4221,7 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             let mut child = Command::new(bin)
                 .arg("--config")
                 .arg(&cfg2)
-                .arg("daemon")
+                .args(["daemon", "start", "--foreground"])
                 .stdout(Stdio::from(out))
                 .stderr(Stdio::from(err))
                 .spawn()?;
@@ -4091,12 +4465,12 @@ fn tcp_health_ok(ws: &TcpWs) -> bool {
 }
 
 /// Wait until the program's state is `running` (the built-in startsecs window
-/// keeps it in `starting` first) and return its live pid. `status --json` is
+/// keeps it in `starting` first) and return its live pid. `ps --out json` is
 /// the machine-readable projection, so the judgment is per-program exact.
 fn tcp_wait_running(bin: &Path, ws: &TcpWs, program: &str) -> Result<u32> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let out = tcp_cli(bin, ws, &["status", "--json"])?;
+        let out = tcp_cli(bin, ws, &["ps", "--out", "json"])?;
         let v: serde_json::Value = serde_json::from_str(out.trim())
             .with_context(|| format!("status --json parses: {out:?}"))?;
         let prog = v["programs"]
@@ -4133,7 +4507,7 @@ fn tcp_wait_dead(ws: &TcpWs) -> Result<()> {
 /// every CLI subcommand speak the SAME protocol over `tcp://` as over the
 /// local IPC path, admission rides `auth_token`, and both rejection paths
 /// (401 with a wrong token, no-token startup) refuse loudly. The implicit
-/// pull-up (`add --apply`, background-daemon spec) is included: the probe
+/// pull-up (`compose --apply`, background-daemon spec) is included: the probe
 /// must dial the TCP endpoint from a cold start.
 fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     step("T. tcp:// control endpoint: same protocol, Bearer admission, full CLI");
@@ -4195,7 +4569,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&no_token_cfg)
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::from(out_f))
         .stderr(Stdio::from(err_f))
         .spawn()
@@ -4214,7 +4588,10 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    expect(refused, "the daemon exits non-zero on a tokenless tcp:// config")?;
+    expect(
+        refused,
+        "the daemon exits non-zero on a tokenless tcp:// config",
+    )?;
     expect(
         std::fs::read_to_string(&no_token_log)?.contains("auth_token"),
         "the startup refusal names auth_token",
@@ -4225,16 +4602,16 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // (background-daemon spec: the readiness probe dials the configured
     // endpoint whatever shape it is).
     let sleep = find_sleep()?;
-    let (ok, code, combined) = tcp_cli_try(bin, &ws, &["status"]);
+    let (ok, code, combined) = tcp_cli_try(bin, &ws, &["ps"]);
     expect(
         !ok && code == 3 && combined.contains("unreachable"),
-        &format!("offline tcp:// status is exit-3 unreachable, got {code}: {combined:?}"),
+        &format!("offline tcp:// ps is exit-3 unreachable, got {code}: {combined:?}"),
     )?;
     let out = tcp_cli(
         bin,
         &ws,
         &[
-            "add",
+            "compose",
             sleep.to_str().unwrap(),
             "--name",
             "tcpdemo",
@@ -4245,7 +4622,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     )?;
     expect(
         out.contains("tcpdemo"),
-        &format!("offline add --apply succeeds over tcp://: {out:?}"),
+        &format!("offline compose --apply succeeds over tcp://: {out:?}"),
     )?;
     expect(
         root.join("apps/tcpdemo.toml").is_file(),
@@ -4260,10 +4637,10 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // verbs, same outputs as the IPC form (control-plane spec: TCP 形态提供
     // 同一套端点).
     let pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
-    let out = tcp_cli(bin, &ws, &["status"])?;
+    let out = tcp_cli(bin, &ws, &["ps"])?;
     expect(
         out.contains("tcpdemo") && out.contains("running") && !out.contains("starting"),
-        &format!("status lists the program over tcp://: {out:?}"),
+        &format!("ps lists the program over tcp://: {out:?}"),
     )?;
     expect(
         tcp_cli(bin, &ws, &["pid", "tcpdemo"])?.trim() == pid.to_string(),
@@ -4272,7 +4649,18 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // `log` rides the token'd endpoint too; the sleeper is silent, so the
     // assertion is the exit-0 round trip itself.
     tcp_cli(bin, &ws, &["log", "tcpdemo", "--tail", "5"])?;
-    let out = tcp_cli(bin, &ws, &["run", "--", sleep.to_str().unwrap(), "100000", "--name", "tcpadhoc"])?;
+    let out = tcp_cli(
+        bin,
+        &ws,
+        &[
+            "run",
+            "--",
+            sleep.to_str().unwrap(),
+            "100000",
+            "--name",
+            "tcpadhoc",
+        ],
+    )?;
     expect(
         out.contains("tcpadhoc") && out.contains("pid"),
         &format!("ad-hoc run registers over tcp://: {out:?}"),
@@ -4282,7 +4670,10 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // pending, reload previews it, apply lands it).
     std::fs::write(
         root.join("apps/tcpdemo.toml"),
-        format!("[app]\nrestart = \"always\"\n\n[program.tcpdemo]\ncommand = {:?}\nargs = [\"200000\"]\nstartsecs = 0.2\n", sleep.display().to_string()),
+        format!(
+            "[app]\nrestart = \"always\"\n\n[program.tcpdemo]\ncommand = {:?}\nargs = [\"200000\"]\nstartsecs = 0.2\n",
+            sleep.display().to_string()
+        ),
     )?;
     let out = tcp_cli(bin, &ws, &["reload"])?;
     expect(
@@ -4295,18 +4686,24 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
         &format!("apply lands the change over tcp://: {out:?}"),
     )?;
     let new_pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
-    expect(new_pid != pid, "the changed program was restarted (pid changed)")?;
+    expect(
+        new_pid != pid,
+        "the changed program was restarted (pid changed)",
+    )?;
     // stop + start round the gate as well.
     tcp_cli(bin, &ws, &["stop", "tcpadhoc"])?;
     let (ok, _code, combined) = {
         // start-or-hint on a registered program goes through `run <name>`.
         tcp_cli_try(bin, &ws, &["run", "tcpadhoc"])
     };
-    expect(ok, &format!("run <name> restarts the stopped program: {combined:?}"))?;
+    expect(
+        ok,
+        &format!("run <name> restarts the stopped program: {combined:?}"),
+    )?;
     tcp_wait_running(bin, &ws, "tcpadhoc")?;
     expect(
-        tcp_cli(bin, &ws, &["list"])?.contains("tcpdemo"),
-        "list works over tcp://",
+        tcp_cli(bin, &ws, &["ps", "--all"])?.contains("tcpdemo"),
+        "ps --all works over tcp://",
     )?;
 
     // T3. Wire contract: /v1/health is credential-free, /v1/status is not
@@ -4314,7 +4711,10 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     let (code, _) = tcp_get(&ws.addr, "/v1/health", None)?;
     expect(code == 200, "health over tcp:// needs no credential")?;
     let (code, body) = tcp_get(&ws.addr, "/v1/status", None)?;
-    expect(code == 401, &format!("anonymous /v1/status is 401, got {code}"))?;
+    expect(
+        code == 401,
+        &format!("anonymous /v1/status is 401, got {code}"),
+    )?;
     expect(
         !body.contains("programs") && !body.contains("tcpdemo"),
         "the 401 leaks no program state",
@@ -4322,7 +4722,10 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     let (code, _) = tcp_get(&ws.addr, "/v1/status", Some("wrong-token"))?;
     expect(code == 401, "a wrong token is 401 too")?;
     let (code, body) = tcp_get(&ws.addr, "/v1/status", Some(ws.token))?;
-    expect(code == 200 && body.contains("tcpdemo"), "the right token passes")?;
+    expect(
+        code == 200 && body.contains("tcpdemo"),
+        "the right token passes",
+    )?;
 
     // T4. A caller config with the WRONG token: 401 is a business answer —
     // exit 3, the message names auth_token, and it is NOT "unreachable"
@@ -4338,7 +4741,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     let out = Command::new(bin)
         .arg("--config")
         .arg(&wrong_cfg)
-        .args(["status"])
+        .args(["ps"])
         .output()
         .context("status with a wrong token")?;
     let combined = format!(
@@ -4360,7 +4763,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     )?;
 
     // T5. Shutdown through the token'd endpoint; the daemon goes away.
-    tcp_cli(bin, &ws, &["shutdown"])?;
+    tcp_cli(bin, &ws, &["daemon", "shutdown"])?;
     tcp_wait_dead(&ws)?;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -4736,7 +5139,7 @@ mod win_service {
             bin,
             &ws,
             &[
-                "service", "install", "--name", &name, "--desc", "e2e", "--now",
+                "daemon", "install", "--name", &name, "--desc", "e2e", "--now",
             ],
         )?;
         expect(
@@ -4761,13 +5164,13 @@ mod win_service {
         let exe = bin.canonicalize().context("resolve the daemon exe path")?;
         let conf = std::path::absolute(ws.config_arg())?;
         let expected_binpath = format!(
-            "\"{}\" run --config \"{}\" --service {name}",
+            "\"{}\" daemon start --service {name} --config \"{}\"",
             exe.display(),
             conf.display()
         );
         expect(
             normalize_ws(&cfg.executable_path.to_string_lossy()) == normalize_ws(&expected_binpath),
-            "binpath reads back exactly as rendered (exe + run --config + --service)",
+            "binpath reads back exactly as rendered (exe + daemon start --service + --config)",
         )?;
         expect(
             cfg.start_type == ServiceStartType::AutoStart,
@@ -4858,7 +5261,7 @@ mod win_service {
         )?;
 
         step("M4. uninstall removes it; a second uninstall is a no-op");
-        let out = cli(bin, &ws, &["service", "uninstall", "--name", &name])?;
+        let out = cli(bin, &ws, &["daemon", "uninstall", "--name", &name])?;
         expect(
             out.contains(&format!("service {name} uninstalled")),
             "uninstall reports the removed service",
@@ -4872,7 +5275,7 @@ mod win_service {
             Ok(_) => bail!("service {name} still exists after uninstall"),
             Err(e) => return Err(e).context("cannot re-open service after uninstall"),
         }
-        let out = cli(bin, &ws, &["service", "uninstall", "--name", &name])?;
+        let out = cli(bin, &ws, &["daemon", "uninstall", "--name", &name])?;
         expect(
             out.contains(&format!("service {name} is not installed")),
             "the second uninstall is an idempotent no-op",

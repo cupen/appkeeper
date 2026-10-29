@@ -697,7 +697,11 @@ mod tests {
         let mut p = make(
             &format!(
                 "[program.t]\ncommand = \"{}\"\nstartsecs = 0.05\nhealth_check = \"true\"\nhealth_interval = 0.1\nhealth_retries = 1\n",
-                if cfg!(windows) { "cmd /c ping -n 30 127.0.0.1" } else { "sleep 30" }
+                if cfg!(windows) {
+                    "cmd /c ping -n 30 127.0.0.1"
+                } else {
+                    "sleep 30"
+                }
             ),
             "hc-check",
         );

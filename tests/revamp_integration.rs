@@ -11,8 +11,8 @@
 //! Coverage targets the cli-revamp BREAKING/high-risk surfaces not pinned by
 //! the unit tests: the shutdown-does-not-write-a-record contract, the
 //! `unless-stopped` record across repeated daemon restarts, `always` pull-up
-//! after a manual stop, the offline `run --` cold start, `daemon --detach`
-//! timeout against an occupied endpoint, and `log` dual-stream / multi-program
+//! after a manual stop, the offline `run --` cold start, `daemon start`
+//! against an occupied endpoint, and `log` dual-stream / multi-program
 //! follow aggregation — plus the unix-socket-control-plane acceptance
 //! scenarios (section 8 of its tasks.md): stale-endpoint recovery, non-endpoint
 //! occupation, `curl --unix-socket` interoperability and the multi-user
@@ -129,7 +129,8 @@ impl Ws {
     }
 
     fn new(tag: &str) -> Ws {
-        let root = std::env::temp_dir().join(format!("ak-test-revamp-it-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("ak-test-revamp-it-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("apps")).unwrap();
         std::fs::create_dir_all(root.join("logs")).unwrap();
@@ -210,7 +211,7 @@ impl Ws {
         let child = Command::new(bin())
             .arg("--config")
             .arg(self.cfg())
-            .arg("daemon")
+            .args(["daemon", "start", "--foreground"])
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -242,13 +243,29 @@ impl Ws {
         out.trim().parse::<u32>().ok()
     }
 
+    /// Raw control-plane GET; returns (status, body).
+    fn get(&self, path: &str) -> (u16, String) {
+        let text = sockio::get(&self.endpoint, path).expect("connect the control plane");
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let payload = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        (status, payload)
+    }
+
     /// Raw control-plane POST with a JSON body; returns (status, body). The
     /// response is read to EOF (the endpoints under test answer with a
     /// Content-Length or a chunked stream).
     fn post_json(&self, path: &str, body: &serde_json::Value) -> (u16, String) {
         let body = body.to_string();
-        let text = sockio::post_json(&self.endpoint, path, &body)
-            .expect("connect the control plane");
+        let text =
+            sockio::post_json(&self.endpoint, path, &body).expect("connect the control plane");
         let status = text
             .lines()
             .next()
@@ -286,7 +303,7 @@ impl Ws {
 
     /// Ask the daemon to exit and wait for the control port to close.
     fn shutdown(&self) {
-        let _ = self.cli(&["shutdown"]);
+        let _ = self.cli(&["daemon", "shutdown"]);
         self.wait_health(false);
     }
 }
@@ -377,7 +394,10 @@ fn unless_stopped_record_survives_repeated_restarts() {
     ws.cli_ok(&["stop", "us"]);
     ws.wait_stopped("us");
     let text = std::fs::read_to_string(ws.state_file()).unwrap_or_default();
-    assert!(text.contains("\"us\""), "stop persisted the record: {text:?}");
+    assert!(
+        text.contains("\"us\""),
+        "stop persisted the record: {text:?}"
+    );
     ws.shutdown();
     drop(d);
 
@@ -596,7 +616,7 @@ fn run_daemon_first_failures_leave_no_residue() {
         format!("[program.clash]\ncommand = \"{sleep}\"\nargs = [\"300\"]\nstartsecs = 0.2\n"),
     )
     .unwrap();
-    ws.cli_ok(&["add", owner.to_str().unwrap(), "--name", "owner"]);
+    ws.cli_ok(&["compose", owner.to_str().unwrap(), "--name", "owner"]);
     ws.cli_ok(&["apply", "owner"]);
     let (ok, code, out) = ws.cli(&["run", "--", &sleep, "301", "--name", "clash"]);
     assert!(!ok && code != 0, "cross-app collision must fail: {out}");
@@ -620,7 +640,10 @@ fn run_daemon_first_failures_leave_no_residue() {
     let (ok, _code, out) = ws.cli(&["run", "--", &sleep, "301", "--name", "web"]);
     assert!(ok, "changed same-name re-run succeeds: {out}");
     let web_text = std::fs::read_to_string(ws.root.join("apps/web.toml")).unwrap();
-    assert!(web_text.contains("301"), "the record was regenerated: {web_text:?}");
+    assert!(
+        web_text.contains("301"),
+        "the record was regenerated: {web_text:?}"
+    );
     assert_ne!(ws.pid_of("web"), Some(web_pid), "the process restarted");
     assert!(
         !ws.root.join("apps/web.toml.pending").exists(),
@@ -641,7 +664,7 @@ fn run_daemon_first_failures_leave_no_residue() {
 }
 
 /// app-registry (D2): while the startup judgement is pending only the
-/// non-`.toml` placeholder exists — `ak list` and the pending projection never
+/// non-`.toml` placeholder exists — `ak ps --all` and the pending projection never
 /// see a half-written registration.
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
@@ -673,10 +696,24 @@ fn run_daemon_first_staging_is_invisible_to_scanners() {
         "the placeholder exists mid-flight: {:?}",
         app_dir_entries(&ws)
     );
-    let listed = ws.cli_ok(&["list"]);
+    // The registry half of `ps --all` must not see the placeholder: the app
+    // is only visible through the live projection (staged programs serve the
+    // startup wait), never as a `not-applied` registry entry.
+    let listed = ws.cli_ok(&["ps", "--all"]);
     assert!(
-        !listed.contains("atomic"),
-        "`ak list` excludes the in-flight app: {listed:?}"
+        !listed
+            .lines()
+            .any(|l| l.starts_with("atomic ") && l.contains("not-applied")),
+        "`ps --all` has no registry entry for the in-flight app: {listed:?}"
+    );
+    let listed_json: serde_json::Value =
+        serde_json::from_str(&ws.cli_ok(&["ps", "--all", "--out", "json"])).unwrap();
+    assert!(
+        listed_json["registry"]
+            .as_array()
+            .map(|a| !a.iter().any(|r| r["name"] == "atomic"))
+            .unwrap_or(true),
+        "the registry array excludes the in-flight app: {listed_json}"
     );
 
     // A reload mid-flight must not disturb the staging.
@@ -805,11 +842,17 @@ fn defaults_are_app_d_and_startsecs_three() {
     drop(d);
 }
 
-// -- daemon --detach --------------------------------------------------------
+// -- daemon start (background) ----------------------------------------------
 
-/// background-daemon: two concurrent implicit pull-ups end with exactly one
-/// daemon serving, and both callers succeed (the loser self-terminates on the
-/// port race; the health-only check makes it a success).
+/// background-daemon: two concurrent **explicit** `daemon start` calls end
+/// with exactly one daemon serving. `daemon start` is not the idempotent pull-up
+/// entry: whoever observes the winner already online exits non-zero with the
+/// already-running message (spec「端口已占用时报错」), so at least one caller
+/// succeeds and every caller either succeeds or names the live instance.
+///
+/// The spec's「并发拉起只有一个守护进程存活」scenario is about the *implicit*
+/// pull-up and requires BOTH calls to succeed — that anchor is
+/// `concurrent_compose_apply_both_succeed` below.
 #[test]
 #[ignore = "spawns a real daemon; run with --ignored"]
 fn concurrent_pull_up_yields_one_daemon() {
@@ -822,11 +865,11 @@ fn concurrent_pull_up_yields_one_daemon() {
             let out = Command::new(bin())
                 .arg("--config")
                 .arg(&cfg)
-                .args(["daemon", "--detach"])
+                .args(["daemon", "start"])
                 .output()
-                .expect("spawn daemon --detach");
+                .expect("spawn daemon start");
             (
-                out.status.success(),
+                out.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&out.stdout).to_string()
                     + &String::from_utf8_lossy(&out.stderr),
             )
@@ -834,15 +877,26 @@ fn concurrent_pull_up_yields_one_daemon() {
     };
     let a = spawn();
     let b = spawn();
-    let (ok_a, out_a) = a.join().unwrap();
-    let (ok_b, out_b) = b.join().unwrap();
-    assert!(ok_a, "first pull-up succeeds: {out_a}");
-    assert!(ok_b, "second pull-up succeeds: {out_b}");
+    let (code_a, out_a) = a.join().unwrap();
+    let (code_b, out_b) = b.join().unwrap();
+    // The only admissible failure is the bind conflict: exit 1 plus the
+    // already-running message. Anything else (unreachable, timeout, config)
+    // is a real regression and must not be swallowed by `ok || contains`.
+    for (who, code, out) in [("first", code_a, &out_a), ("second", code_b, &out_b)] {
+        assert!(
+            code == 0 || (code == 1 && out.contains("already running")),
+            "the {who} daemon start exits 0 or fails as a bind conflict (code 1): {code}: {out}"
+        );
+    }
+    assert!(
+        code_a == 0 || code_b == 0,
+        "at least one caller brings the daemon up: a={out_a:?} b={out_b:?}"
+    );
     ws.wait_health(true);
 
     // Exactly one daemon owns the endpoint: a second foreground instance
     // loses the bind race and exits with the already-running explanation.
-    let (ok, _code, out) = ws.cli(&["daemon"]);
+    let (ok, _code, out) = ws.cli(&["daemon", "start", "--foreground"]);
     assert!(
         !ok && out.contains("already running"),
         "the second foreground instance is refused with the live-instance message: {out:?}"
@@ -850,8 +904,86 @@ fn concurrent_pull_up_yields_one_daemon() {
     ws.shutdown();
 }
 
+/// background-daemon spec「并发拉起只有一个守护进程存活」: two `compose
+/// --apply` calls racing on a cold workspace each go through
+/// `daemonize::ensure_daemon`, whose `Ready { already_online }` outcome is
+/// success by definition — so BOTH calls MUST exit 0 (the spec says
+/// 「两个调用均成功完成」) and exactly one daemon must serve them.
+///
+/// This is the anchor for the implicit pull-up path specifically: the
+/// neighbouring `concurrent_pull_up_yields_one_daemon` drives two explicit
+/// `daemon start` processes, which is a bind conflict for the second (the
+/// 「端口已占用时报错」scenario), not the pull-up scenario.
+///
+/// Both apps are registered (without `--apply`) first, so the race under test
+/// is the pull-up itself, not concurrent writes into `app_dir`.
+#[test]
+#[ignore = "spawns a real daemon; run with --ignored"]
+fn concurrent_compose_apply_both_succeed() {
+    let ws = Ws::new("concurrent-compose");
+    assert!(!ws.health(), "the daemon must start offline");
+    let exe = sleep_bin();
+    for name in ["racea", "raceb"] {
+        ws.cli_ok(&["compose", &exe, "--name", name]);
+    }
+    assert!(
+        !ws.health(),
+        "registration alone must not pull the daemon up"
+    );
+    let cfg = ws.cfg();
+    let spawn = |name: &'static str| {
+        let cfg = cfg.clone();
+        let exe = exe.clone();
+        std::thread::spawn(move || {
+            let out = Command::new(bin())
+                .arg("--config")
+                .arg(&cfg)
+                .args(["compose", &exe, "--name", name, "--apply"])
+                .output()
+                .expect("spawn compose --apply");
+            (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stdout).to_string()
+                    + &String::from_utf8_lossy(&out.stderr),
+            )
+        })
+    };
+    let a = spawn("racea");
+    let b = spawn("raceb");
+    let (code_a, out_a) = a.join().unwrap();
+    let (code_b, out_b) = b.join().unwrap();
+    assert_eq!(
+        code_a, 0,
+        "the first compose --apply succeeds (implicit pull-up is not an error): {out_a:?}"
+    );
+    assert_eq!(
+        code_b, 0,
+        "the second compose --apply succeeds too (it observes the winner online): {out_b:?}"
+    );
+    assert!(
+        !out_a.contains("control endpoint already in use")
+            && !out_b.contains("control endpoint already in use"),
+        "neither pull-up reports a bind conflict: a={out_a:?} b={out_b:?}"
+    );
+    ws.wait_health(true);
+
+    // Exactly one daemon owns the endpoint, and it serves both apps.
+    let (status, body) = ws.get("/v1/status");
+    assert_eq!(status, 200, "the single daemon answers status: {body}");
+    assert!(
+        body.contains("racea") && body.contains("raceb"),
+        "one daemon serves both pull-up callers: {body}"
+    );
+    let (ok, _code, out) = ws.cli(&["daemon", "start", "--foreground"]);
+    assert!(
+        !ok && out.contains("already running"),
+        "only one instance can bind: the extra foreground start is refused: {out:?}"
+    );
+    ws.shutdown();
+}
+
 /// background-daemon: when the control endpoint is occupied by a foreign
-/// process the background daemon cannot bind, so `daemon --detach` exits
+/// process the background daemon cannot bind, so `daemon start` exits
 /// non-zero and names the background log — no silent success.
 ///
 /// The holder answers HTTP with 500 (so the health probe fails fast) yet keeps
@@ -874,8 +1006,8 @@ fn daemon_detach_times_out_when_endpoint_is_occupied() {
             );
         }
     });
-    let (ok, code, out) = ws.cli(&["daemon", "--detach"]);
-    assert!(!ok, "daemon --detach must fail on an occupied endpoint: {out}");
+    let (ok, code, out) = ws.cli(&["daemon", "start"]);
+    assert!(!ok, "daemon start must fail on an occupied endpoint: {out}");
     assert_ne!(code, 0, "non-zero exit, got {code}");
     assert!(
         out.contains("daemon.out.log"),
@@ -902,7 +1034,7 @@ fn detach_readiness_is_bounded() {
         }
     });
     let t0 = Instant::now();
-    let (_ok, _code, _out) = ws.cli(&["daemon", "--detach"]);
+    let (_ok, _code, _out) = ws.cli(&["daemon", "start"]);
     let elapsed = t0.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),
@@ -964,8 +1096,14 @@ fn log_multi_follow_prefixes_each_line() {
     let _ = child.kill();
     let out = child.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(text.contains("[echo-a] a-line"), "echo-a prefixed: {text:?}");
-    assert!(text.contains("[echo-b] b-line"), "echo-b prefixed: {text:?}");
+    assert!(
+        text.contains("[echo-a] a-line"),
+        "echo-a prefixed: {text:?}"
+    );
+    assert!(
+        text.contains("[echo-b] b-line"),
+        "echo-b prefixed: {text:?}"
+    );
 
     // A single program has no prefix.
     let single = ws.cli_ok(&["log", "echo-a", "--tail", "1"]);
@@ -1010,7 +1148,10 @@ fn run_unknown_program_exits_one() {
     let d = ws.spawn_daemon();
     ws.wait_health(true);
     let (ok, code, out) = ws.cli(&["run", "nosuch"]);
-    assert!(!ok && code == 1, "unknown program exits 1, got {code}: {out}");
+    assert!(
+        !ok && code == 1,
+        "unknown program exits 1, got {code}: {out}"
+    );
     assert!(
         out.contains("404") || out.contains("unknown program"),
         "the error carries the 404/unknown-program message: {out:?}"
@@ -1019,7 +1160,7 @@ fn run_unknown_program_exits_one() {
     drop(d);
 }
 
-// -- add --restart over a legacy [app] table --------------------------------
+// -- compose --restart over a legacy [app] table ----------------------------
 
 /// configuration spec: every write path writes only the new `restart` field.
 /// Registering with `--restart` over a pre-revamp deployment whose `[app]`
@@ -1041,21 +1182,21 @@ fn add_restart_over_legacy_app_table_stays_valid() {
     .unwrap();
 
     let (ok, code, out) = ws.cli(&[
-        "add",
+        "compose",
         deploy.to_str().unwrap(),
         "--name",
         "legacy",
         "--restart",
         "on-failure",
     ]);
-    assert!(ok, "add must succeed (exit {code}): {out}");
+    assert!(ok, "compose must succeed (exit {code}): {out}");
 
     // The written file must not mix the new and deprecated fields in one layer.
     let text = std::fs::read_to_string(deploy.join("appkeeper.toml")).unwrap();
     assert!(
         !(text.contains("restart =")
             && (text.contains("autorestart") || text.contains("autostart"))),
-        "add must migrate the legacy fields, not mix them: {text}"
+        "compose must migrate the legacy fields, not mix them: {text}"
     );
     let (ok, _code, out) = ws.cli(&["validate", deploy.join("appkeeper.toml").to_str().unwrap()]);
     assert!(ok, "the migrated app must still validate: {out}");
@@ -1117,9 +1258,14 @@ impl Sudoer {
         let setpriv = ["/usr/bin/setpriv", "/bin/setpriv"]
             .into_iter()
             .find(|p| Path::new(p).is_file());
-        let runuser = ["/usr/sbin/runuser", "/sbin/runuser", "/usr/bin/runuser", "/bin/runuser"]
-            .into_iter()
-            .find(|p| Path::new(p).is_file());
+        let runuser = [
+            "/usr/sbin/runuser",
+            "/sbin/runuser",
+            "/usr/bin/runuser",
+            "/bin/runuser",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file());
         if setpriv.is_none() && runuser.is_none() {
             return None;
         }
@@ -1185,7 +1331,9 @@ fn non_owner_status_gets_the_permission_error() {
     let ws = Ws::new("perm-denied");
     ws.write_app(
         "demo",
-        &format!("[program.secret-worker]\ncommand = \"{SLEEP}\"\nstartsecs = 0.2\nrestart = \"no\"\n"),
+        &format!(
+            "[program.secret-worker]\ncommand = \"{SLEEP}\"\nstartsecs = 0.2\nrestart = \"no\"\n"
+        ),
     );
     let d = ws.spawn_daemon();
     ws.wait_health(true);
@@ -1194,11 +1342,11 @@ fn non_owner_status_gets_the_permission_error() {
         bin().as_os_str(),
         std::ffi::OsStr::new("--config"),
         ws.cfg().as_os_str(),
-        std::ffi::OsStr::new("status"),
+        std::ffi::OsStr::new("ps"),
     ]);
-    let res = out.output().expect("run ak status as the non-owner");
-    let combined = String::from_utf8_lossy(&res.stdout).to_string()
-        + &String::from_utf8_lossy(&res.stderr);
+    let res = out.output().expect("run ak ps as the non-owner");
+    let combined =
+        String::from_utf8_lossy(&res.stdout).to_string() + &String::from_utf8_lossy(&res.stderr);
     assert_eq!(
         res.status.code(),
         Some(3),
@@ -1217,7 +1365,7 @@ fn non_owner_status_gets_the_permission_error() {
         "no program state leaks to a non-owner: {combined:?}"
     );
     // Control: the owner's own CLI answers normally.
-    let (ok, _, own) = ws.cli(&["status"]);
+    let (ok, _, own) = ws.cli(&["ps"]);
     assert!(ok, "the owner still queries the endpoint: {own:?}");
 
     ws.shutdown();
@@ -1287,10 +1435,7 @@ fn two_accounts_run_two_daemons_without_conflict() {
         .expect("spawn the user daemon");
     let deadline = Instant::now() + Duration::from_secs(20);
     let user_healthy = loop {
-        if matches!(
-            d_user.try_wait(),
-            Ok(Some(_))
-        ) {
+        if matches!(d_user.try_wait(), Ok(Some(_))) {
             break false;
         }
         if matches!(
@@ -1299,10 +1444,16 @@ fn two_accounts_run_two_daemons_without_conflict() {
         ) {
             break true;
         }
-        assert!(Instant::now() < deadline, "the user daemon never became healthy");
+        assert!(
+            Instant::now() < deadline,
+            "the user daemon never became healthy"
+        );
         std::thread::sleep(Duration::from_millis(150));
     };
-    assert!(user_healthy, "the unprivileged daemon serves its own endpoint");
+    assert!(
+        user_healthy,
+        "the unprivileged daemon serves its own endpoint"
+    );
 
     // Distinct endpoints — the default derivation is what keeps them apart.
     assert_ne!(ws_root.endpoint, ws_user.endpoint);
@@ -1325,12 +1476,12 @@ fn two_accounts_run_two_daemons_without_conflict() {
             bin().as_os_str(),
             std::ffi::OsStr::new("--config"),
             ws_root.cfg().as_os_str(),
-            std::ffi::OsStr::new("status"),
+            std::ffi::OsStr::new("ps"),
         ])
         .output()
-        .expect("run ak status against the root-owned endpoint");
-    let combined = String::from_utf8_lossy(&res.stdout).to_string()
-        + &String::from_utf8_lossy(&res.stderr);
+        .expect("run ak ps against the root-owned endpoint");
+    let combined =
+        String::from_utf8_lossy(&res.stdout).to_string() + &String::from_utf8_lossy(&res.stderr);
     assert_eq!(res.status.code(), Some(3), "{combined:?}");
     assert!(combined.contains("access denied"), "{combined:?}");
     assert!(!combined.contains("root-prog"), "{combined:?}");
@@ -1341,13 +1492,12 @@ fn two_accounts_run_two_daemons_without_conflict() {
             bin().as_os_str(),
             std::ffi::OsStr::new("--config"),
             ws_user.cfg().as_os_str(),
-            std::ffi::OsStr::new("status"),
+            std::ffi::OsStr::new("ps"),
         ])
         .output()
-        .expect("run ak status against the user-owned endpoint");
+        .expect("run ak ps against the user-owned endpoint");
     assert!(
-        res.status.success()
-            && String::from_utf8_lossy(&res.stdout).contains("user-prog"),
+        res.status.success() && String::from_utf8_lossy(&res.stdout).contains("user-prog"),
         "the user serves itself: {:?}",
         String::from_utf8_lossy(&res.stdout)
     );
@@ -1421,7 +1571,10 @@ fn stale_endpoint_is_cleared_and_the_daemon_serves() {
     // A crash residue: a bound socket whose listener died. std does not
     // unlink the file on drop — exactly what a SIGKILLed daemon leaves.
     UnixListener::bind(&ws.endpoint).unwrap();
-    assert!(Path::new(&ws.endpoint).exists(), "the stale endpoint exists");
+    assert!(
+        Path::new(&ws.endpoint).exists(),
+        "the stale endpoint exists"
+    );
     let d = ws.spawn_daemon();
     ws.wait_health(true);
     // The rebuilt endpoint is a live control plane, not the dead file.
@@ -1442,7 +1595,7 @@ fn non_endpoint_file_blocks_startup_and_survives() {
     let mut child = Command::new(bin())
         .arg("--config")
         .arg(ws.cfg())
-        .arg("daemon")
+        .args(["daemon", "start", "--foreground"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1461,8 +1614,8 @@ fn non_endpoint_file_blocks_startup_and_survives() {
         }
     };
     let out = child.wait_with_output().unwrap();
-    let combined = String::from_utf8_lossy(&out.stdout).to_string()
-        + &String::from_utf8_lossy(&out.stderr);
+    let combined =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(!status.success(), "startup is refused: {combined:?}");
     assert!(
         combined.contains("occupied") || combined.contains("not a socket"),
@@ -1533,7 +1686,10 @@ fn curl_unix_socket_queries_the_control_plane() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(text.trim_end().ends_with("200"), "health over curl: {text:?}");
+    assert!(
+        text.trim_end().ends_with("200"),
+        "health over curl: {text:?}"
+    );
 
     ws.shutdown();
     drop(d);

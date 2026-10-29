@@ -120,10 +120,7 @@ impl Client {
         if !self.endpoint.is_tcp() {
             return None;
         }
-        Some(format!(
-            "Bearer {}",
-            self.token.as_deref().unwrap_or("")
-        ))
+        Some(format!("Bearer {}", self.token.as_deref().unwrap_or("")))
     }
 
     /// The endpoint this client talks to (for error messages and reports).
@@ -132,7 +129,10 @@ impl Client {
     }
 
     fn connect(&self, timeout: Duration) -> Result<Box<dyn Conn>> {
-        let conn = self.endpoint.connect().map_err(|e| connect_error(&self.endpoint, e))?;
+        let conn = self
+            .endpoint
+            .connect()
+            .map_err(|e| connect_error(&self.endpoint, e))?;
         // Connect is instant on a local endpoint; the deadline that matters is
         // the per-read one.
         let _ = conn.set_write_timeout(Some(timeout));
@@ -192,7 +192,11 @@ impl Client {
     ) -> Result<Response> {
         let mut conn = self.connect(timeout)?;
         let has_body = body.as_object().map(|o| !o.is_empty()).unwrap_or(false);
-        let payload = if has_body { body.to_string() } else { String::new() };
+        let payload = if has_body {
+            body.to_string()
+        } else {
+            String::new()
+        };
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
         if let Some(auth) = self.auth_header() {
             head.push_str(&format!("Authorization: {auth}\r\n"));
@@ -390,7 +394,13 @@ impl Client {
         mut on_line: impl FnMut(&str) -> bool,
     ) -> Result<()> {
         let path = format!("/v1/programs/{name}/logs?stream={stream}&tail=20&follow=1");
-        let mut resp = self.request("GET", &path, &serde_json::json!({}), STREAM_TIMEOUT, Some("text/plain"))?;
+        let mut resp = self.request(
+            "GET",
+            &path,
+            &serde_json::json!({}),
+            STREAM_TIMEOUT,
+            Some("text/plain"),
+        )?;
         if resp.status != 200 {
             let status = resp.status;
             let text = resp.read_body().unwrap_or_default();
@@ -592,7 +602,6 @@ fn read_chunk_size(r: &mut dyn Read) -> Result<usize> {
     usize::from_str_radix(hex, 16).with_context(|| format!("malformed chunk size {text:?}"))
 }
 
-
 /// A failed `connect()`: the two causes the spec separates — "no daemon
 /// there" and "not your endpoint" — get different words.
 fn connect_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
@@ -601,7 +610,10 @@ fn connect_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
         ErrorKind::PermissionDenied => {
             let owner = match ep.owner_uid() {
                 Some(uid) => format!("endpoint {} is owned by uid {uid}", ep.display()),
-                None => format!("endpoint {} is not accessible to this account", ep.display()),
+                None => format!(
+                    "endpoint {} is not accessible to this account",
+                    ep.display()
+                ),
             };
             let me = match transport::current_uid() {
                 Some(uid) => format!("uid {uid}"),
@@ -613,7 +625,10 @@ fn connect_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
             )
         }
         ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
-            anyhow::anyhow!("{UNREACHABLE} (is `ak daemon` active? endpoint {}): {e}", ep.display())
+            anyhow::anyhow!(
+                "{UNREACHABLE} (is `ak daemon` active? endpoint {}): {e}",
+                ep.display()
+            )
         }
         _ => anyhow::anyhow!("{UNREACHABLE} (endpoint {}): {e}", ep.display()),
     }
@@ -651,6 +666,19 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     } else {
         1
     }
+}
+
+/// Whether the error means "no daemon is serving this endpoint".
+///
+/// This is strictly narrower than the exit-3 class in [`exit_code_of`]: a
+/// permission-denied endpoint (someone else's daemon) and a rejected TCP
+/// credential both exit 3 but prove a daemon IS there, and they carry their
+/// own marker (`DENIED` / `TOKEN_REJECTED`) instead of `UNREACHABLE`. Callers
+/// that answer "daemon offline" (the `ps --all` degradation) must use this
+/// predicate — the control-plane spec forbids reporting the other two as
+/// "not running".
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(UNREACHABLE)
 }
 
 /// Load the daemon config for client commands (defaults when absent).
@@ -793,7 +821,11 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("404"), "{text}");
         assert!(text.contains("unknown program"), "{text}");
-        assert_eq!(exit_code_of(&err), 1, "a control-plane answer is not unreachable");
+        assert_eq!(
+            exit_code_of(&err),
+            1,
+            "a control-plane answer is not unreachable"
+        );
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -810,6 +842,10 @@ mod tests {
         assert!(text.contains(UNREACHABLE), "{text}");
         assert!(text.contains(&sock.display().to_string()), "{text}");
         assert_eq!(exit_code_of(&err), 3);
+        assert!(
+            is_unreachable(&err),
+            "a missing listener is offline: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -827,6 +863,12 @@ mod tests {
         assert!(!text.starts_with(UNREACHABLE), "{text}");
         // Still exit class 3: the operator cannot act on it here.
         assert_eq!(exit_code_of(&denied), 3);
+        // But it is NOT the "no daemon there" case: a daemon owns that
+        // endpoint and answered our connect attempt with a refusal.
+        assert!(
+            !is_unreachable(&denied),
+            "a permission refusal is not an offline daemon: {text}"
+        );
     }
 
     /// Task 3.2: chunked frames are reassembled into whole lines (a line
@@ -902,7 +944,9 @@ mod tests {
             http_response("HTTP/1.1 404 Not Found", r#"{"error":"unknown program"}"#),
         );
         let c = Client::from_config(&config_with_socket(&sock));
-        let err = c.follow_lines("ghost", "out", |_| true).expect_err("404 must error");
+        let err = c
+            .follow_lines("ghost", "out", |_| true)
+            .expect_err("404 must error");
         assert!(err.to_string().contains("404"), "{err:#}");
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -980,7 +1024,7 @@ mod tests {
             let dir = tmp_dir("commit");
             let sock = dir.join("ak.sock");
             let (_, listener) = bound(&sock);
-        let server = fake_server(listener, ok_response("{\"result\":\"ok\"}"));
+            let server = fake_server(listener, ok_response("{\"result\":\"ok\"}"));
             let c = Client::from_config(&config_with_socket(&sock));
             let v = if commit {
                 c.adhoc_commit("web").unwrap()
@@ -1120,7 +1164,10 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("401"), "{text}");
         assert!(text.contains("auth_token"), "names the fix: {text}");
-        assert!(text.contains("unauthorized"), "keeps the daemon's words: {text}");
+        assert!(
+            text.contains("unauthorized"),
+            "keeps the daemon's words: {text}"
+        );
         assert_eq!(exit_code_of(&err), 3);
         server.join().unwrap();
     }
