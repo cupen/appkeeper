@@ -23,9 +23,7 @@
 
 应用名 `all` 为保留字（见 apply-workflow），compose 与 run ad-hoc MUST 拒绝以 `all` 注册（含 `--name all` 与文件名/命令名 stem 推导出的 `all`）。
 
-重复执行：目录/`.toml` 来源的同名 compose 保持既有 upsert 语义（更新链接与 flag，不产生重复）；可执行程序与 run ad-hoc 命令行来源的同名注册 SHALL **全量再生**——以本次给定参数重写整个生成文件（未给 flag 的字段回到缺省，文件上手工编辑的内容会被覆盖），再生前 MUST 校验通过才落盘。再生后 SHALL 将新内容与磁盘旧内容比对：有差异时打印变更提示并明确指出需执行 `ak apply <app>`（或全量 `ak apply`）方可生效（run ad-hoc 因立即生效而当场应用）；无差异时打印「无变更」类提示。
-
-同名 ad-hoc 注册且该程序**已在运行**时：定义无变化 SHALL 幂等成功并返回现有 PID；定义有变化 SHALL 重启并返回新 PID。
+重复执行：目录/`.toml` 来源的同名 compose 保持既有 upsert 语义（更新链接与 flag，不产生重复）；可执行程序来源的同名 compose SHALL **全量再生**——以本次给定参数重写整个生成文件（未给 flag 的字段回到缺省，文件上手工编辑的内容会被覆盖），再生前 MUST 校验通过才落盘。再生后 SHALL 将新内容与磁盘旧内容比对：有差异时打印变更提示并明确指出需执行 `ak apply <app>`（或全量 `ak apply`）方可生效；无差异时打印「无变更」类提示。run ad-hoc 命令行的同名重复提交**不**走隐式再生：未带 `--force` 时 MUST 按「run ad-hoc 同名应用拦截」要求拒绝，带 `--force` 时 MUST 按「run ad-hoc --force 强制覆盖」要求处理。
 
 `compose --apply` SHALL 在注册/再生成功后立即对该 app 执行一次 apply（仅本 app 范围，MUST NOT 波及其他 app 的 pending）。守护进程离线时，`compose --apply` SHALL 自动后台拉起守护进程后继续应用（拉起协议、竞态容忍与超时语义详见 `background-daemon` 能力规范），MUST NOT 以「守护进程离线」报错退出；run 的 ad-hoc 形态**不再**享有该隐式拉起（见 `background-daemon`）。
 
@@ -69,7 +67,7 @@
 #### Scenario: 命令行形态只注册不启动
 
 - **WHEN** 执行 `ak run --cmd "python -m http.server 8000" --name web --restart=no`
-- **THEN** `web` 注册落地（生成配置含 `restart = "no"`）但不被拉起，后续 `ak run web` 可启动它
+- **THEN** `web` 注册落地（生成配置含 `restart = "no"`）但不被拉起，后续 `ak start web` 可启动它
 
 #### Scenario: --cmd 字符串形态与 -- 等价
 
@@ -83,13 +81,15 @@
 
 #### Scenario: 命令行形态重复执行全量再生
 
+> 标题为既有场景锚点，现行行为以下文为准：ad-hoc 同名重复提交不再隐式再生；未带 `--force` 时拒绝，带 `--force` 时按差异覆盖或空操作。
+
 - **WHEN** 对已由命令行注册的 `web` 再次执行 `ak run -- python -m http.server 9000 --name web`
-- **THEN** 生成文件按本次命令行全量重写并立即生效（端口变更当场应用），行为与可执行程序来源的全量再生一致
+- **THEN** 注册被拒绝，`app_dir/web.toml` 保持原内容，既有 `web` 进程不被停止或重启
 
 #### Scenario: 同名已在运行时按差异处理
 
 - **WHEN** 对已注册且正在运行的 `web` 再次执行 `ak run -- python -m http.server 8000 --name web`（参数相同）
-- **THEN** 幂等成功，返回现有 PID，不重启进程
+- **THEN** 注册被拒绝，既有 `web` 进程 PID 保持不变；不存在「幂等成功返回现有 PID」的放行路径
 
 #### Scenario: 未指定 --name 时取可执行文件名
 
@@ -137,6 +137,7 @@
 
 - **WHEN** 对同名应用（目录或 `.toml` 来源）再次 compose 并修改 flag
 - **THEN** 链接与 `[app]` 表字段被更新，不产生重复注册
+
 ### Requirement: 移除与查看
 
 `ak remove <app>` SHALL 删除 `app_dir` 中该应用的注册记录并注销；守护进程运行中时其程序 SHALL 被停止并清理。注册记录为链接（外部部署目录注册）时，部署目录中的配置本体 MUST NOT 被删除；注册记录为位于 `app_dir` 内的真实文件（脚手架生成）时，SHALL 连带删除该文件并打印被删除的路径。注册表查看 SHALL 由 `ak ps` 承接（原顶层 `list` 动词移除）：`ak ps --all` 在线时展示含未运行 app 的全量视图，离线时降级输出全部已注册应用（名称、配置本体路径、描述，见 `control-plane` 能力规范）。
@@ -157,6 +158,7 @@
 
 - **WHEN** 守护进程未运行时执行 `ak ps --all`
 - **THEN** 输出注明 daemon offline 的清单，含每个已注册应用的名称、配置本体路径与描述
+
 ### Requirement: 离线可用
 
 compose / remove MUST NOT 依赖守护进程运行：守护进程离线时 SHALL 直接维护 `app_dir` 链接完成操作（离线时 MUST NOT 因无法同步而报错）；守护进程在线时 SHALL 在持久化后通过控制 API 触发同步（重扫检出），使注册变化进入待应用（pending）状态，由 `ak apply` 落地生效。在线同步失败 SHALL 视为本次命令失败：错误信息 MUST 说明注册已持久化但守护进程未同步及补救方式（`ak reload` 重扫后 `ak apply`），并以非零码退出，MUST NOT 仅以警告带过。
@@ -182,6 +184,7 @@ compose / remove MUST NOT 依赖守护进程运行：守护进程离线时 SHALL
 
 - **WHEN** 守护进程未运行时执行 `ak run -- ./server --name web`
 - **THEN** 以退出码 3 报守护进程不可达，`app_dir` 不变，守护进程未被拉起
+
 ### Requirement: 启动成功后再落盘的注册契约
 
 ad-hoc 注册（run 的 `--`/`--cmd` 形态）的落盘 SHALL 遵循「先确认启动成功、后写入注册记录」的顺序，且写入 SHALL 具备原子性与失败无残留保证：
@@ -221,6 +224,7 @@ ad-hoc 注册（run 的 `--`/`--cmd` 形态）的落盘 SHALL 遵循「先确认
 
 - **WHEN** 对已注册且内容一致的 `web` 再次执行相同的 ad-hoc 注册
 - **THEN** 不重复写盘、不重启进程，幂等成功并返回现有 PID
+
 ### Requirement: 残留态的提示与确认
 
 对上次「启动成功但落盘失败」而留下的进程（未注册但同名程序在运行），再次以相同参数执行 ad-hoc 注册时，守护进程 SHALL 回传该残留状况，CLI SHALL 提示当前状况并询问用户是否重新落盘；用户确认后 SHALL 仅完成落盘（复用已在运行的进程，MUST NOT 重复启动或重启）；用户拒绝时 SHALL 以非零码退出且不写盘。
@@ -239,3 +243,87 @@ ad-hoc 注册（run 的 `--`/`--cmd` 形态）的落盘 SHALL 遵循「先确认
 
 - **WHEN** 用户对上述提示选择不重新落盘
 - **THEN** 命令以非零码退出，`app_dir` 不变，进程保持运行
+
+### Requirement: run ad-hoc 同名应用拦截
+
+`ak run` 的 ad-hoc 两种形态（`--` trailing 与 `--cmd`）SHALL 把同名判定交给守护进程；当应用名对应的注册记录已存在，或内存中已有同名应用（含已注册但未运行的程序），且**未指定 `--force`** 时，守护进程 SHALL 拒绝本次注册并回传结构化冲突错误，MUST NOT 写盘、MUST NOT 启动新进程、MUST NOT 停止或重启既有进程。
+
+拒绝信息 SHALL 明确指出该应用名已存在并给出可操作指引（改用其他 `--app` 名称，或显式加 `--force` 覆盖）。CLI SHALL 以非零退出码退出。
+
+「已启动但未落盘」的残留态不属本要求：该场景仍按 `app-registry` 的残留确认流程处理，且 MUST NOT 重启既有进程。
+
+#### Scenario: 同名已注册且运行中被拒绝
+
+- **WHEN** 对已由 `ak run` 注册且正在运行的 `web` 再次执行 `ak run -- python -m http.server 9000 --app web`
+- **THEN** 守护进程回传冲突错误，既有 `web` 进程的 PID 与 `app_dir/web.toml` 内容均保持不变，CLI 以非零退出码退出
+
+#### Scenario: 同名已注册但未运行也被拒绝
+
+- **WHEN** 对已注册但当前未运行的 `web` 再次执行 `ak run -- python -m http.server 9000 --app web`
+- **THEN** 注册被拒绝，`app_dir/web.toml` 不被改写，不产生新进程
+
+#### Scenario: --restart=no 同样受拦截
+
+- **WHEN** 对已存在的 `web` 执行 `ak run --cmd "python -m http.server 9000" --app web --restart=no`
+- **THEN** 注册被拒绝，不写盘；`--restart=no` 不构成覆盖既有应用的例外
+
+#### Scenario: 参数完全相同也不再生
+
+- **WHEN** 对已注册的 `web` 以完全相同的命令行与参数再次执行 `ak run`
+- **THEN** 仍以冲突错误拒绝，MUST NOT 返回「幂等成功」或现有 PID
+
+#### Scenario: 残留态仍走确认流程
+
+- **WHEN** 上一次 run 已启动同名程序但落盘失败，且注册记录不存在
+- **THEN** 守护进程回传残留态而非冲突错误，CLI 询问用户是否仅补落盘；确认后复用已在运行的进程，MUST NOT 重启
+
+### Requirement: run ad-hoc --force 强制覆盖
+
+`ak run --force` SHALL 允许覆盖同名已注册应用。覆盖判定 SHALL 在守护进程内完成：把本次命令行渲染出的完整配置文本与磁盘现有注册记录逐字节比较。
+
+- **有差异**：SHALL 在通过全部校验后原子重写注册记录（占位 + rename），随后停止旧的同名程序并按新定义重新拉起；`--restart=no` 时只重写记录、不拉起（旧进程 SHALL 被停止，避免旧定义继续运行）。返回新 PID（`--restart=no` 时为 `null`）。
+- **无差异**：MUST NOT 写盘、MUST NOT 停止或重启进程、MUST NOT 拉起新进程；CLI SHALL 仅提示「配置无修改，不做任何动作」并以退出码 0 退出；`--json` 结果 SHALL 标记 `unchanged: true` 并回传现有 PID（若有）。
+
+`--force` SHALL NOT 绕过其他既有关卡：与**其他应用**的程序名冲突仍被拒绝；目标记录不是本工具生成的脚手架文件（如指向外部部署配置的链接或手工文件）时仍被拒绝覆盖。
+
+「已启动但未落盘」的残留态 SHALL NOT 被 `--force` 改写：仍按残留确认流程处理。
+
+#### Scenario: 有差异时覆盖并重启
+
+- **WHEN** 对正在运行且已注册的 `web` 执行 `ak run --force -- python -m http.server 9000 --app web`
+- **THEN** `app_dir/web.toml` 被原子重写为新命令行，旧进程被停止，新进程启动并通过启动判定，CLI 回传新 PID
+
+#### Scenario: 无差异时不做任何动作
+
+- **WHEN** 对正在运行且已注册的 `web` 以完全相同的新旧配置执行 `ak run --force -- python -m http.server 8000 --app web`
+- **THEN** `app_dir/web.toml` 字节不变、进程 PID 不变、不发生 stop/spawn，CLI 仅提示「配置无修改，不做任何动作」并以 0 退出
+
+#### Scenario: 已注册未运行时有差异
+
+- **WHEN** 对已注册但当前未运行的 `web` 执行带不同参数的 `ak run --force`
+- **THEN** 记录被重写并拉起新进程
+
+#### Scenario: 已注册未运行且无差异
+
+- **WHEN** 对已注册但当前未运行的 `web` 以相同配置执行 `ak run --force`
+- **THEN** 不写盘、不拉起进程，仅提示「配置无修改，不做任何动作」并以 0 退出
+
+#### Scenario: --restart=no 强制覆盖
+
+- **WHEN** 对正在运行的 `web` 执行带不同参数的 `ak run --force --restart=no`
+- **THEN** 记录被重写，旧进程被停止，新定义不被拉起
+
+#### Scenario: 跨应用程序名冲突不因 --force 放行
+
+- **WHEN** `--force` 的目标应用名与**其他应用**已注册的程序名冲突
+- **THEN** 注册仍被拒绝，不写盘、不启动进程
+
+#### Scenario: 外部部署配置不被 --force 覆盖
+
+- **WHEN** 同名注册记录是指向外部部署配置的链接或非脚手架生成文件
+- **THEN** `--force` 覆盖被拒绝并说明原因，目标文件不变
+
+#### Scenario: 强制覆盖失败时的处置
+
+- **WHEN** `--force` 的新定义校验失败，或新进程未通过启动判定
+- **THEN** 校验失败时目标文件保持原样且无占位残留；启动判定失败时新进程被停止并以结构化错误回传，已原子落盘的新记录保留（覆盖已生效，不回滚旧记录）

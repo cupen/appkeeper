@@ -103,6 +103,7 @@
 
 - **WHEN** 配置 `socket = "tcp://127.0.0.1:7310"` 且携带正确 token 请求 `GET /v1/status`
 - **THEN** 返回与本地 IPC 形态字节等价的 JSON；端点集合、状态码与错误语义不因形态改变
+
 ### Requirement: CLI 控制命令
 
 单二进制 SHALL 同时承担守护进程与客户端两种角色。守护进程 SHALL 由 `ak daemon`
@@ -291,6 +292,7 @@
 
 - **WHEN** 执行 `ak run nosuch`（不带 `--`）
 - **THEN** 返回 404 的控制面错误信息并以退出码 1 退出，提示新命令应使用 `run --` 形态
+
 ### Requirement: shell 子命令
 
 单二进制 SHALL 另提供客户端入口 `appkeeper shell`：交互式 REPL（详见
@@ -303,15 +305,18 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 守护进程未启动时执行 `appkeeper shell -e "status"`
 - **THEN** 输出守护进程不可达提示，退出码为 3
+
 ### Requirement: 注册并启动端点
 
-守护进程 SHALL 提供「注册并启动」端点（ad-hoc `run` 的服务端实现），接受一个尚未注册的临时应用定义（命令、参数、环境变量、工作目录、名称、restart/backoff 等微调 flag），并 SHALL 按以下顺序处理：
+守护进程 SHALL 提供「注册并启动」端点（ad-hoc `run` 的服务端实现），接受一个临时应用定义（命令、参数、环境变量、工作目录、名称、`force`、restart/backoff 等微调 flag），并 SHALL 按以下顺序处理：
 
-1. 校验定义（名称合法且非保留字 `all`、命令可解析为绝对路径、程序名不与**其他应用**的已注册程序冲突）；同名应用自身的重复提交不属冲突——它是全量再生/upsert，语义见 `app-registry` 能力规范；
-2. 启动该程序并等待判定「启动成功」——进程存活超过 `startsecs`，且该程序若配置了健康探测，则其首轮探测通过；
-3. 判定成功后，将定义写入 `app_dir` 完成注册（落盘契约见 `app-registry` 能力规范）。
+1. 校验定义：名称合法且非保留字 `all`、命令可解析为绝对路径、应用名尚未注册（未带 `force` 时同名一律拒绝；带 `force` 时按 `app-registry` 的「run ad-hoc --force 强制覆盖」语义处理）、程序名不与**其他应用**的已注册程序冲突；
+2. 启动该程序并等待判定「启动成功」——进程存活超过 `startsecs`，且该程序若配置了健康探测，则其首轮探测通过。`force` 且新旧配置逐字节相同的情况下 SHALL 跳过本步，不启动任何进程；
+3. 判定成功后，将定义写入 `app_dir` 完成注册（落盘契约见 `app-registry` 能力规范）。`force` 且配置有差异时，记录在启动判定前即原子落盘；配置无差异时不写盘。
 
-任一步骤失败时，守护进程 SHALL 回传结构化错误（失败阶段 + 可读原因），且 MUST NOT 在 `app_dir` 留下注册文件或占位残留；已启动但判定失败的进程 SHALL 被停止并清理。
+同名判定 SHALL 在守护进程的命令处理路径中完成（注册表记录与内存中的同名应用同源判定），MUST NOT 仅由客户端预检，以免与巡检/apply 竞态后仍覆盖既有应用。
+
+任一步骤失败时，守护进程 SHALL 回传结构化错误（失败阶段 + 可读原因），且 MUST NOT 在 `app_dir` 留下注册文件或占位残留；已启动但判定失败的进程 SHALL 被停止并清理。同名冲突 SHALL 以状态冲突类错误回传，且 MUST NOT 写盘、MUST NOT 启动新进程、MUST NOT 停止或重启既有进程。
 
 端点 SHALL 回传成功结果，含 `{程序名, 配置路径, PID}`；对扇出（app 级）请求 SHALL 回传逐程序结果数组。
 
@@ -332,13 +337,26 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 #### Scenario: 同名重复提交走再生
 
-- **WHEN** 对已由 ad-hoc 注册的同名应用再次提交定义
-- **THEN** 按 `app-registry` 的全量再生/upsert 语义处理（无变化幂等返回现有 PID、有变化重启返回新 PID），MUST NOT 以「已注册」为由拒绝
+> 标题为既有场景锚点，现行行为以下文为准：未带 `force` 时同名重复提交被拒绝；带 `force` 时按差异覆盖、无差异空操作。
+
+- **WHEN** 对已注册的同名应用（无论其程序当前是否在运行）再次提交定义且未带 `force`
+- **THEN** 守护进程以状态冲突错误回传，不写盘、不启动新进程、不停止或重启既有进程，MUST NOT 以「幂等成功」放行
+
+#### Scenario: force 且配置有差异
+
+- **WHEN** 对已注册的同名应用提交带 `force` 且渲染结果与磁盘记录不同的定义
+- **THEN** 守护进程原子重写记录，停止旧程序并按新定义启动，回传新 PID
+
+#### Scenario: force 且配置无差异
+
+- **WHEN** 对已注册的同名应用提交带 `force` 且渲染结果与磁盘记录逐字节相同的定义
+- **THEN** 守护进程不写盘、不停止/重启进程、不启动新进程，回传成功结果并标记 `unchanged`
 
 #### Scenario: 保留字 all 被拒绝
 
 - **WHEN** 提交的定义应用名为 `all`
 - **THEN** 守护进程以校验错误回传，不启动进程、不写盘
+
 ### Requirement: 启动进度流式反馈
 
 「注册并启动」端点 SHALL 在程序配置了健康探测时向客户端流式回传进度：至少包含开始阶段（含预估等待上限）与最终结果帧；无健康探测时 SHALL 直接回传最终结果，无需中间帧。进度信息 SHALL 至少说明当前所处阶段（spawn 后等待 `startsecs` / 等待健康探测）与预估等待上限，使客户端可据此向用户展示等待进度。
@@ -354,6 +372,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 提交的定义其程序未配置健康探测
 - **THEN** 端点回传最终结果（成功含 PID 或失败原因），不产生中间进度帧
+
 ### Requirement: API 准入控制
 
 控制端点的准入 SHALL 由端点形态唯一决定，两种形态的准入机制 SHALL NOT 混合：
@@ -396,6 +415,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 配置 `socket = "tcp://127.0.0.1:7310"` 但未配置 `auth_token`，执行 `ak validate` 或 `ak daemon start`
 - **THEN** 校验失败并说明 tcp:// 形态必须配置 auth_token，守护进程不启动
+
 ### Requirement: 控制 socket 端点
 
 守护进程 SHALL 通过 `[daemon] socket` 配置的单一控制端点对外服务。该值 SHALL 为 URL 形态自识别的字符串：`tcp://host:port` 前缀声明 TCP 形态（host 与端口 SHALL 可解析，端口 1–65535），其它非空值 SHALL 视为本地 IPC 路径。缺省值为 `/run/appkeeper/<uid>/ak.sock`（unix）与 `\\.\pipe\<用户名>.sock`（Windows），两者均把当前 uid / 用户名纳入路径以支持同机多用户并存。unix 上 `/run/appkeeper` 父目录 SHALL 为 `0755`、其下 uid 子目录 SHALL 为 `0700`，守护进程 SHALL 在缺失时创建这些目录。空值 SHALL 被校验拒绝；`tcp://` 值无法解析 SHALL 被校验拒绝。
@@ -431,6 +451,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 另一台机器的配置文件写 `socket = "tcp://<host>:7310"` 与对应 `auth_token`，执行 `ak -c <该配置> ps`
 - **THEN** CLI 经 TCP 端点操作远端守护进程；无需任何额外机制
+
 ### Requirement: 启动冲突与陈旧端点处理
 
 守护进程启动时若控制端点路径已被占用，SHALL 先尝试连接该端点以判定占用性质：连接成功说明已有实例在运行，SHALL 以明确的错误信息退出（非零码）并提示可能已有实例在运行；连接被拒（无监听者）说明是上次异常退出留下的陈旧端点，SHALL 删除该端点后重建并正常启动。删除前 SHALL 校验该路径确为 socket/管道端点而非任意文件，MUST NOT 删除非端点路径。同机重复启动 SHALL NOT 静默成功。
@@ -449,6 +470,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 目标路径存在但不是 socket/管道端点
 - **THEN** 启动失败并明确报告该路径被非端点文件占用，MUST NOT 删除该文件
+
 ### Requirement: 控制面连接失败的错误区分
 
 客户端连接控制端点失败时 SHALL 区分失败原因并给出对应提示，退出码均为 3：
