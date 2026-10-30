@@ -10,6 +10,7 @@ import { customElement, property, state } from 'lit/decorators.js'
 import { apiFetch } from '../lib/api.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import { formatBytes, formatPercent, formatUptime, stateGlyph } from '../lib/format.js'
+import '../components/log-viewer.js'
 
 type PendingAction = 'stop' | 'restart' | null
 

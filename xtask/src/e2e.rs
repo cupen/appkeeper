@@ -5544,6 +5544,224 @@ fn bench_workspaces() -> Vec<PathBuf> {
 /// Bench smoke: a short firehose run of the real `appkeeper-bench` binary
 /// (spawning its own isolated daemon on a random port) — verifies the bench
 /// wiring, the JSON report contract and the cleanup guarantee.
+/// appkeeper-bench reentry used by the webui-driven pass below: 1000 rows at
+/// 100 rows/sec (~10s) through the daemon's own pump, then exit.
+const BENCH_WEBUI_APP: &str = "benchweb";
+const BENCH_WEBUI_ROWS: u64 = 1000;
+
+/// The bench program registered for the webui pass is produced by the real
+/// `compose` scaffold (`--args`/`--restart no`), so the generated TOML is the
+/// canonical rendering rather than a hand-written template. `__generate`
+/// requires `--row-size`; 128 matches the bench's own default.
+const BENCH_WEBUI_ARGS: &str = "__generate --row-size 128 --rows 1000 --rate 100";
+
+/// bench-webui-integration: register a real workload through the CLI, start
+/// it from the webui (a real browser), watch lines stream into the log panel,
+/// then reconcile the disk log against the generator's line contract.
+fn bench_webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
+    step("L0. bench bridge: CLI registration → webui start → dual log verification");
+    let bench = build_bench()?;
+    let apps = ws.root.join("apps");
+    let cfg = apps.join(format!("{BENCH_WEBUI_APP}.toml"));
+
+    // Register through the CLI exactly as a user would: `compose` scaffolds
+    // the config from the executable, with the generator args and `restart =
+    // "no"` (so `apply` registers it without pulling it up — the webui starts
+    // it, which is the whole point of this pass).
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "compose",
+            bench.to_str().unwrap(),
+            "--name",
+            BENCH_WEBUI_APP,
+            "--args",
+            BENCH_WEBUI_ARGS,
+            "--restart",
+            "no",
+        ],
+    )?;
+    expect(
+        out.contains("generated") || cfg.is_file(),
+        "compose scaffolds the bench app config",
+    )?;
+    let generated = std::fs::read_to_string(&cfg)?;
+    expect(
+        generated.contains("__generate") && generated.contains("restart"),
+        "the generated config carries the generator args and restart policy",
+    )?;
+    let validated = cli(bin, ws, &["validate", &cfg.to_string_lossy()])?;
+    expect(
+        validated.contains(BENCH_WEBUI_APP),
+        "the bench app config validates",
+    )?;
+
+    // Apply registers it; `restart = "no"` keeps it stopped so the webui is
+    // the only thing that starts it.
+    cli(bin, ws, &["apply", BENCH_WEBUI_APP])?;
+    expect(
+        pid_of(ws, BENCH_WEBUI_APP)?.is_none(),
+        "the bench program is registered but not started",
+    )?;
+
+    // Drive the real browser: start from the program view, then read the log
+    // panel's own line count as the workload produces.
+    run_playwright_script(ws, "e2e-bench-webui.mjs", bench_webui_script(ws))?;
+
+    // Disk side: the pump appends every generated row to `<name>.out.log`.
+    let log = ws
+        .root
+        .join("logs")
+        .join(format!("{BENCH_WEBUI_APP}.out.log"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if log.is_file() {
+            let rows = std::fs::read_to_string(&log)?;
+            let counted = rows.lines().filter(|l| l.starts_with("[out] ")).count();
+            if counted as u64 >= BENCH_WEBUI_ROWS {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "bench log never reached {BENCH_WEBUI_ROWS} rows at {}",
+                log.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let disk = std::fs::read_to_string(&log)?;
+    let lines: Vec<&str> = disk.lines().filter(|l| l.starts_with("[out] ")).collect();
+    expect(
+        lines.len() as u64 == BENCH_WEBUI_ROWS,
+        &format!("disk log holds exactly {BENCH_WEBUI_ROWS} rows"),
+    )?;
+    // Line contract (D6): `[out] <seq> <ts> <fill>`, seq 0..rows, strictly
+    // increasing — the same reconciliation the bench itself does.
+    let mut last: Option<u64> = None;
+    let mut ordered = true;
+    for line in &lines {
+        let seq = line
+            .strip_prefix("[out] ")
+            .and_then(|r| r.split(' ').next())
+            .and_then(|s| s.parse::<u64>().ok());
+        match seq {
+            Some(s) => {
+                if last.is_some_and(|prev| s <= prev) {
+                    ordered = false;
+                    break;
+                }
+                last = Some(s);
+            }
+            None => {
+                ordered = false;
+                break;
+            }
+        }
+    }
+    expect(ordered, "disk rows carry strictly increasing seq numbers")?;
+    expect(
+        last == Some(BENCH_WEBUI_ROWS - 1),
+        "the last disk row is the final sequence number",
+    )?;
+
+    // Cleanup: the guard-remove contract requires stop before remove.
+    cli_try(bin, ws, &["stop", BENCH_WEBUI_APP])?;
+    let out = cli(bin, ws, &["remove", BENCH_WEBUI_APP])?;
+    expect(
+        out.contains("removed") || out.contains(BENCH_WEBUI_APP),
+        "remove reports the app",
+    )?;
+    expect(!cfg.exists(), "the generated config is gone after remove")?;
+    expect(
+        pid_of(ws, BENCH_WEBUI_APP)?.is_none(),
+        "no bench process survives the cleanup",
+    )?;
+    Ok(())
+}
+
+/// The webui script for the bench pass: click start in the program view, wait
+/// for the state to turn running, then watch the log panel accumulate lines.
+fn bench_webui_script(ws: &Workspace) -> String {
+    format!(
+        r###"// Generated by xtask e2e — bench started from the console UI.
+import {{ createRequire }} from 'node:module';
+const require = createRequire(import.meta.url);
+const {{ chromium }} = require(process.argv[2] + '/index.js');
+
+const URL = 'http://127.0.0.1:{webui}/';
+const PROGRAM_PATH = '/app/{app}/program/{app}';
+const ok = (m) => console.log('    ok: ' + m);
+
+const browser = await chromium.launch({{ headless: true }});
+const page = await browser.newPage();
+page.setDefaultTimeout(15_000);
+try {{
+  await page.goto(URL);
+  // The console boots on the dashboard; the router is a History-API SPA, so
+  // drive it with pushState (a `#/...` hash would not match any route).
+  await page.waitForFunction(() => !!document.querySelector('ak-app'));
+  await page.evaluate((path) => {{
+    history.pushState({{}}, '', path);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  }}, PROGRAM_PATH);
+
+  // The program view renders once the projection knows the app.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot?.querySelector('button[data-kind="start"]');
+  }});
+  ok('program view shows the start button');
+
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot?.querySelector('button[data-kind="start"]')?.click();
+  }});
+
+  // Running state comes from the WS snapshot/deltas.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return [...(view?.shadowRoot?.querySelectorAll('.card') ?? [])].some(
+      (c) => c.textContent.includes('PID') && !c.textContent.includes('—'),
+    );
+  }});
+  ok('the console started the bench program');
+
+  // Log panel: rows stream in through the same ring the CLI follows.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    const viewer = view?.shadowRoot?.querySelector('ak-log-viewer');
+    const scroller = viewer?.shadowRoot?.querySelector('.scroller');
+    return (scroller?.querySelectorAll('.row')?.length ?? 0) > 0;
+  }});
+  ok('log lines stream into the console panel');
+
+  const lines = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    const viewer = view?.shadowRoot?.querySelector('ak-log-viewer');
+    const scroller = viewer?.shadowRoot?.querySelector('.scroller');
+    return scroller?.textContent ?? '';
+  }});
+  if (!lines.includes('[out]')) {{
+    throw new Error('console log panel should carry the generator lines');
+  }}
+  ok('console log rows match the generator line contract');
+}} finally {{
+  await browser.close();
+}}
+console.log('BENCH WEBUI PASS OK');
+"###,
+        webui = ws.webui_port,
+        app = BENCH_WEBUI_APP,
+    )
+}
+
 fn bench_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("L. bench smoke: appkeeper-bench firehose cycles its own isolated daemon");
     let bench = build_bench()?;
@@ -6010,11 +6228,17 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
 /// module). Kept as a subprocess so xtask carries no node dependency.
 fn browser_pass(ws: &Workspace) -> Result<()> {
     step("F. browser: badge appears, app-scoped apply works, result renders");
-    let script = browser_script(ws);
-    let script_path = ws.root.join("e2e-browser.mjs");
+    run_playwright_script(ws, "e2e-browser.mjs", browser_script(ws))?;
+    Ok(())
+}
+
+/// Resolve playwright from the npx cache (no fresh install) and run one
+/// generated script against the workspace webui. Shared by every browser
+/// pass; node-side asserts print `ok:` lines and failures throw.
+fn run_playwright_script(ws: &Workspace, name: &str, script: String) -> Result<()> {
+    let script_path = ws.root.join(name);
     std::fs::write(&script_path, script)?;
 
-    // Resolve playwright from the npx cache (no fresh install), then run.
     let resolve = r#"
 let candidates = [];
 const envDir = process.env.HOME + '/.npm/_npx';
@@ -6053,7 +6277,7 @@ console.error('playwright not found'); process.exit(3);
         .status()
         .context("run browser e2e script")?;
     if !status.success() {
-        bail!("browser pass failed with {status}");
+        bail!("browser pass {name} failed with {status}");
     }
     Ok(())
 }
@@ -6574,8 +6798,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
         webui_pass(&bin, &ws)?;
         if args.no_browser {
             println!("\n(--no-browser: skipping browser pass)");
+            println!("(--no-browser: skipping bench webui pass)");
         } else {
             browser_pass(&ws)?;
+            bench_webui_pass(&bin, &ws)?;
         }
         bench_pass(&bin, &ws)?;
         tcp_control_endpoint_pass(&bin)?;
