@@ -334,6 +334,14 @@ impl Client {
         self.call("POST", "/v1/reload")
     }
 
+    /// `remove <app>`: the daemon-executed atomic removal (guard-remove-until-
+    /// stopped). A conflict (409) or unknown app (404) is an API answer, not a
+    /// transport failure; an unreachable daemon surfaces as exit 3 via
+    /// [`exit_code_of`]. The client never deletes registration files itself.
+    pub fn remove_app(&self, app: &str) -> Result<serde_json::Value> {
+        self.call("POST", &format!("/v1/apps/{app}/remove"))
+    }
+
     pub fn pending(&self) -> Result<serde_json::Value> {
         self.call("GET", "/v1/pending")
     }
@@ -1037,6 +1045,102 @@ mod tests {
             assert!(req.contains("\"name\":\"web\""), "name in body: {req}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// guard-remove-until-stopped 2.2: `remove <app>` is one POST to the
+    /// daemon-owned endpoint — the client never deletes a registration record
+    /// itself and sends no empty body.
+    #[test]
+    fn remove_app_posts_the_app_scoped_endpoint() {
+        let dir = tmp_dir("remove-ok");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            ok_response(concat!(
+                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"#,
+                r#""kept_config":null,"programs":["api"],"applied":true,"#,
+                r#""result":"app[web] removed; no apply needed"}"#
+            )),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
+        let v = c.remove_app("web").unwrap();
+        assert_eq!(v["app"], "web");
+        assert_eq!(v["applied"], true);
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
+            "the removal is one app-scoped POST: {req}"
+        );
+        assert!(!req.contains("Authorization"), "path endpoint: {req}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 409 from the removal guard is an ANSWER (the daemon is reachable):
+    /// exit class 1, the daemon's blocking-program message preserved verbatim.
+    #[test]
+    fn remove_conflict_keeps_the_daemons_message_and_exits_1() {
+        let dir = tmp_dir("remove-409");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            http_response(
+                "HTTP/1.1 409 Conflict",
+                concat!(
+                    r#"{"error":"app \"web\" still has live program(s): api (running); "#,
+                    r#"run `ak stop web` first, then remove"}"#
+                ),
+            ),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.remove_app("web").expect_err("409 must error");
+        let text = format!("{err:#}");
+        assert!(text.contains("409"), "{text}");
+        assert!(text.contains("api (running)"), "blockers survive: {text}");
+        assert!(text.contains("ak stop web"), "the remedy survives: {text}");
+        assert_eq!(
+            exit_code_of(&err),
+            1,
+            "a conflict is an answer, not offline: {text}"
+        );
+        assert!(!is_unreachable(&err), "a conflict is not offline: {text}");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown app → 404 → exit 1 (an answer, not a transport failure).
+    #[test]
+    fn remove_unknown_app_is_an_api_error_with_exit_1() {
+        let dir = tmp_dir("remove-404");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let server = fake_server(
+            listener,
+            http_response(
+                "HTTP/1.1 404 Not Found",
+                r#"{"error":"unknown app \"ghost\""}"#,
+            ),
+        );
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.remove_app("ghost").expect_err("404 must error");
+        assert!(err.to_string().contains("unknown app"), "{err:#}");
+        assert_eq!(exit_code_of(&err), 1);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An offline daemon is the unreachable class (exit 3): removal never
+    /// falls back to touching the registry locally.
+    #[test]
+    fn remove_offline_daemon_exits_3() {
+        let dir = tmp_dir("remove-offline");
+        let sock = dir.join("ak.sock");
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.remove_app("web").expect_err("nothing is listening");
+        assert!(format!("{err:#}").contains(UNREACHABLE), "{err:#}");
+        assert_eq!(exit_code_of(&err), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 3.4: a listener that accepts but never answers must not eat the

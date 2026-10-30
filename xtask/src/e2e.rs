@@ -14,8 +14,10 @@
 //!   G. compose-process scaffold: offline `--apply` pulls the daemon up and
 //!      `--env` parse errors exit 2 (G0, daemon not yet running) → generate →
 //!      apply → no-change re-add → changed re-add + `apply all` → `--apply`
-//!      one-step (app-scoped) → reserved `all` rejected → remove deletes the
-//!      generated file and stops the program.
+//!      one-step (app-scoped) → reserved `all` rejected → remove refuses a
+//!      live app, and stop-then-remove deletes the generated file in one step.
+//!   RG. remove guard: live app 409, stop-then-remove one step, apply batch
+//!   refusal (`remove_guard_pass`).
 //!   H. actions (actions/glossary change): offline declaration + rejection
 //!      cases (charset / unknown variable / reserved word / timeout range),
 //!      then online: `--app` fan-out order + user_stopped coverage, custom
@@ -1220,12 +1222,36 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "the error names the unknown field: {combined:?}",
     )?;
 
-    // Clean the offline registration so the daemon pass starts clean.
-    let out = cli(bin, ws, &["remove", "offline-demo"])?;
+    // guard-remove-until-stopped: removal is a daemon-executed action, so with
+    // the control plane down it exits 3 and touches nothing — no implicit
+    // daemon pull-up, no local registry deletion (the old offline direct
+    // delete is gone). The record is then cleared by the harness itself so
+    // the daemon pass starts clean.
+    step("G0d3. offline `remove` exits 3 and leaves the registration untouched");
+    let record = ws.root.join("apps/offline-demo.toml");
     expect(
-        out.contains("generated config file removed"),
-        "offline remove deletes the generated file",
+        record.is_file(),
+        "the offline registration exists before the attempt",
     )?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "offline-demo"])?;
+    expect(
+        !ok && code == 3,
+        &format!("offline remove exits 3, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("unreachable"),
+        &format!("the failure names the unreachable daemon: {combined:?}"),
+    )?;
+    expect(
+        record.is_file(),
+        "the offline remove did not delete the registration locally",
+    )?;
+    expect(
+        !socket_health_ok(&ws.control_socket),
+        "no daemon was implicitly pulled up by the remove attempt",
+    )?;
+    // Harness cleanup (not a product assertion): drop the record on disk.
+    std::fs::remove_file(&record)?;
     Ok(())
 }
 
@@ -2196,37 +2222,536 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "error explains the reserved word",
     )?;
 
-    step("G7. remove deletes the generated file, keeps external bodies");
+    step("G7. remove is daemon-executed: live app refused, stop-then-remove is one step");
+    // guard-remove-until-stopped: a live app may not be removed. abc is still
+    // running here, so the guard answers 409 and NOTHING changes (no stop, no
+    // file deletion, no apply).
+    let abc_pid_before = pid_of(ws, "abc")?.expect("abc is running before the refusal");
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "abc"])?;
+    expect(!ok, &format!("remove of a live app fails, got {code}"))?;
+    expect(
+        combined.contains("still has live program(s)") && combined.contains("ak stop abc"),
+        &format!("the conflict names the blockers and the remedy: {combined:?}"),
+    )?;
+    expect(abc_file.is_file(), "the refused removal kept the record")?;
+    expect(
+        pid_of(ws, "abc")? == Some(abc_pid_before),
+        "the refused removal did not stop or restart the program",
+    )?;
+
+    // stop → remove: the daemon deletes the generated file and drops the
+    // programs in the same turn — no apply, no pending unregistration.
+    let out = cli(bin, ws, &["stop", "abc"])?;
+    expect(out.contains("abc"), "abc stopped before removal")?;
     let out = cli(bin, ws, &["remove", "abc"])?;
     expect(
-        out.contains("generated config file removed"),
-        "remove announces the deleted file",
+        out.contains("generated config file removed") && out.contains("no apply needed"),
+        &format!("remove reports the deleted file and no apply: {out:?}"),
     )?;
     expect(!abc_file.exists(), "apps/abc.toml is gone")?;
+    expect(
+        pid_of(ws, "abc")?.is_none(),
+        "abc's program is gone from the projection",
+    )?;
+
+    let out = cli(bin, ws, &["stop", "fox"])?;
+    expect(out.contains("fox"), "fox stopped before removal")?;
     let out = cli(bin, ws, &["remove", "fox"])?;
     expect(
         out.contains("generated config file removed"),
         "fox's generated file is deleted too",
     )?;
     expect(!apps.join("fox.toml").exists(), "apps/fox.toml is gone")?;
+
     // A link registration (gamma) is removed without touching the external
-    // deployment file — whatever the message says, the body must survive
-    // (on Windows the record is a hard link, so the message differs).
+    // deployment file; the message names the kept body.
+    let out = cli(bin, ws, &["stop", "gamma"])?;
+    expect(out.contains("gamma"), "gamma stopped before removal")?;
     let out = cli(bin, ws, &["remove", "gamma"])?;
-    expect(out.contains("unregistered"), "gamma unregistered")?;
+    expect(
+        out.contains("deployment config kept at") && out.contains("no apply needed"),
+        &format!("gamma's removal names the kept deployment config: {out:?}"),
+    )?;
     expect(
         ws.root.join("app-gamma/appkeeper.toml").is_file(),
         "gamma's appkeeper.toml still exists",
     )?;
-    // Apply the removals: the stopped programs disappear from the status.
-    cli(bin, ws, &["apply"])?;
     expect(
-        pid_of(ws, "abc")?.is_none(),
-        "abc's program stopped and gone",
+        pid_of(ws, "gamma")?.is_none(),
+        "gamma's program is gone from the projection",
+    )?;
+
+    // The success left no pending unregistration behind and needs no apply.
+    let pending: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
+    let removed_pending = pending
+        .get("apps_removed")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+    expect(
+        removed_pending.is_empty(),
+        &format!("no pending注销 entry after remove: {pending}"),
+    )?;
+    let status: serde_json::Value = serde_json::from_str(&api(ws, "/v1/status")?)?;
+    let apps: Vec<&str> = status
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|p| p.get("app").and_then(|a| a.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for gone in ["abc", "fox", "gamma"] {
+        expect(
+            !apps.contains(&gone),
+            &format!("{gone} is absent from the status projection: {apps:?}"),
+        )?;
+    }
+    Ok(())
+}
+
+// -- remove guard scenario group (guard-remove-until-stopped) ----------------
+
+/// guard-remove-until-stopped acceptance, in its own workspace + daemon so the
+/// main workspace's apps stay untouched for the later passes.
+///
+/// RG1: a live app refuses removal on `/v1` AND on `/api` (409, blocker list,
+/// nothing changes). RG2: a hand-deleted *program* whose definition is gone but
+/// whose process runs refuses the whole apply batch (the other in-scope change
+/// is not applied, `--restart` does not exempt it, an out-of-scope apply and a
+/// program-scoped apply still proceed), then a stop lets the apply remove it.
+/// RG3: the same for a whole hand-deleted *app*. RG4: stop → `/api` remove is
+/// one daemon action — external deployment body kept, no apply, no pending
+/// unregistration, `/api/overview` no longer lists the app. RG5: a program in
+/// `backoff` blocks removal as well; after a stop, `/v1` removal succeeds.
+fn remove_guard_pass(bin: &Path) -> Result<()> {
+    let ws = setup_workspace("guard")?;
+    let mut daemon = spawn_daemon(bin, &ws)?;
+    let result = remove_guard_scenarios(bin, &ws);
+    shutdown_daemon(&ws, &mut daemon);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
+    let apps = ws.root.join("apps");
+    let alpha_body = ws.root.join("app-alpha/appkeeper.toml");
+    // spawn_daemon waits on the control endpoint; wait for the console too.
+    let health = format!("http://127.0.0.1:{}/api/health", ws.webui_port);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !http_ok(&health) {
+        if Instant::now() > deadline {
+            bail!("the console never answered on {}", ws.webui_port);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // registry::remove reports the canonicalized link target.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let web_pid = wait_running(ws, "web")?;
+    // Removal reports the blocker's state; wait past the startsecs judgement
+    // so the conflict names `running` rather than the transient `starting`.
+    wait_state(ws, "web", "running")?;
+    wait_state(ws, "worker", "running")?;
+    wait_state(ws, "job", "running")?;
+    let pending_apps_removed = |ws: &Workspace| -> Result<Vec<String>> {
+        let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
+        Ok(v.get("apps_removed")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    };
+
+    step("RG1. a live app is refused by /v1 and /api and nothing changes");
+    let (code, body) = api_checked(ws, "POST", "/v1/apps/alpha/remove", "")?;
+    expect(
+        code == 409,
+        &format!("/v1 removal of a live app is 409, got {code}: {body}"),
+    )?;
+    for needle in [
+        "still has live program(s)",
+        "web (running)",
+        "worker (running)",
+        "ak stop alpha",
+    ] {
+        expect(
+            body.contains(needle),
+            &format!("the /v1 conflict names {needle:?}: {body}"),
+        )?;
+    }
+    let (code, body) = web_http(ws, "POST", "/api/apps/alpha/remove", None)?;
+    expect(
+        code == 409,
+        &format!("/api removal of a live app is 409, got {code}: {body}"),
     )?;
     expect(
-        pid_of(ws, "fox")?.is_none(),
-        "fox's program stopped and gone",
+        body.contains("still has live program(s)") && body.contains("ak stop alpha"),
+        &format!("the /api conflict carries the same message: {body}"),
+    )?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "alpha"])?;
+    expect(
+        !ok && code == 1,
+        &format!("CLI removal of a live app exits 1, got {code}: {combined}"),
+    )?;
+    expect(
+        combined.contains("still has live program(s)"),
+        &format!("the CLI surfaces the daemon's conflict: {combined}"),
+    )?;
+    expect(
+        apps.join("alpha.toml").is_file(),
+        "the refused removal kept the record",
+    )?;
+    expect(
+        pid_of(ws, "web")? == Some(web_pid) && pid_of(ws, "worker")?.is_some(),
+        "the refused removal neither stopped nor restarted alpha's programs",
+    )?;
+
+    step("RG2. a hand-deleted running program refuses the whole apply batch");
+    // Drop `worker` from alpha's definition and change `web` in the same edit.
+    std::fs::write(
+        &alpha_body,
+        "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+    )?;
+    std::thread::sleep(Duration::from_secs(2)); // periodic detect window
+    for restart in [false, true] {
+        let args: Vec<&str> = if restart {
+            vec!["apply", "--restart"]
+        } else {
+            vec!["apply"]
+        };
+        let (ok, code, combined) = cli_try(bin, ws, &args)?;
+        expect(
+            !ok && code == 1,
+            &format!("apply {args:?} refuses the batch, got {code}: {combined}"),
+        )?;
+        expect(
+            combined.contains("apply refused, nothing was stopped or restarted"),
+            &format!("the refusal says nothing ran: {combined}"),
+        )?;
+        expect(
+            combined.contains("alpha.worker (running)") && combined.contains("ak stop"),
+            &format!("the refusal lists the blocker and the remedy: {combined}"),
+        )?;
+        expect(
+            pid_of(ws, "web")? == Some(web_pid),
+            "the in-scope web change was NOT applied by the refused batch",
+        )?;
+        expect(
+            pid_of(ws, "worker")?.is_some(),
+            "the deleted-but-running worker was not dropped",
+        )?;
+        expect(
+            alpha_body.is_file(),
+            "the on-disk edit is not undone by the refusal",
+        )?;
+    }
+    let pending: serde_json::Value = serde_json::from_str(&api(ws, "/v1/pending")?)?;
+    let pending_programs: Vec<String> = pending
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("program").and_then(|x| x.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    for want in ["web", "worker"] {
+        expect(
+            pending_programs.iter().any(|p| p == want),
+            &format!("{want} stays pending after the refusal: {pending}"),
+        )?;
+    }
+    // Out of scope: an apply scoped to another app is not blocked.
+    let out = cli(bin, ws, &["apply", "beta"])?;
+    expect(
+        out.contains("no changes"),
+        &format!("beta-scoped apply proceeds: {out}"),
+    )?;
+    // Program scope: the surviving program's change applies on its own.
+    let out = cli(bin, ws, &["apply", "alpha", "web"])?;
+    expect(
+        out.contains("update-and-restart"),
+        &format!("the program-scoped apply is not blocked: {out}"),
+    )?;
+    let web_pid2 = wait_running(ws, "web")?;
+    expect(web_pid2 != web_pid, "web restarted with the new definition")?;
+    expect(
+        pid_of(ws, "worker")?.is_some(),
+        "worker survived the program-scoped apply (deletion out of scope)",
+    )?;
+    // Stop the program, then the apply performs the removal.
+    let out = cli(bin, ws, &["stop", "alpha", "worker"])?;
+    expect(out.contains("worker"), &format!("worker stopped: {out}"))?;
+    let out = cli(bin, ws, &["apply"])?;
+    expect(
+        out.contains("removed:") && out.contains("alpha.worker"),
+        &format!("apply removes the stopped program: {out}"),
+    )?;
+    expect(
+        pid_of(ws, "worker")?.is_none(),
+        "worker is gone from the projection",
+    )?;
+
+    step("RG3. a hand-deleted running app refuses the whole apply batch");
+    let beta_pid = pid_of(ws, "job")?.expect("job running");
+    std::fs::remove_file(apps.join("beta.toml"))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let (ok, code, combined) = cli_try(bin, ws, &["apply", "--restart"])?;
+    expect(
+        !ok && code == 1,
+        &format!("apply --restart refuses the deleted app, got {code}: {combined}"),
+    )?;
+    expect(
+        combined.contains("beta.job (running)"),
+        &format!("the refusal names the deleted app's live program: {combined}"),
+    )?;
+    expect(
+        !apps.join("beta.toml").exists(),
+        "the on-disk deletion is not rolled back",
+    )?;
+    expect(
+        pid_of(ws, "job")? == Some(beta_pid),
+        "--restart does not sneak the deletion through (job untouched)",
+    )?;
+    expect(
+        pending_apps_removed(ws)?.contains(&"beta".to_string()),
+        "the unregistration stays pending while it is refused",
+    )?;
+    let out = cli(bin, ws, &["stop", "beta", "job"])?;
+    expect(out.contains("job"), &format!("job stopped: {out}"))?;
+    let out = cli(bin, ws, &["apply"])?;
+    expect(
+        out.contains("app[beta] removed") && out.contains("removed:") && out.contains("beta.job"),
+        &format!("apply performs the app removal after the stop: {out}"),
+    )?;
+    expect(
+        pid_of(ws, "job")?.is_none(),
+        "job is gone from the projection",
+    )?;
+    expect(
+        pending_apps_removed(ws)?.is_empty(),
+        "no pending unregistration left",
+    )?;
+
+    step("RG4. stop → /api remove is one daemon action (external body kept)");
+    let out = cli(bin, ws, &["stop", "alpha"])?;
+    expect(out.contains("web"), &format!("alpha stopped: {out}"))?;
+    let (code, body) = web_http(ws, "POST", "/api/apps/alpha/remove", None)?;
+    expect(
+        code == 200,
+        &format!("/api remove succeeds, got {code}: {body}"),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    expect(
+        v["app"] == "alpha",
+        &format!("the result names the app: {body}"),
+    )?;
+    expect(
+        v["applied"] == true,
+        &format!("the result reports an immediate daemon-side removal: {body}"),
+    )?;
+    expect(
+        v["deleted_file"] == false,
+        &format!("a link registration is not a generated file: {body}"),
+    )?;
+    expect(
+        v["kept_config"] == canon(&alpha_body).display().to_string(),
+        &format!("the kept deployment body path is reported: {body}"),
+    )?;
+    expect(
+        v["result"]
+            .as_str()
+            .map(|r| r.contains("deployment config kept at") && r.contains("no apply needed"))
+            .unwrap_or(false),
+        &format!("the message says kept + no apply: {body}"),
+    )?;
+    expect(
+        alpha_body.is_file(),
+        "the external deployment config survives",
+    )?;
+    expect(
+        !apps.join("alpha.toml").exists(),
+        "the registration record is gone",
+    )?;
+    expect(
+        pid_of(ws, "web")?.is_none(),
+        "alpha's program left the projection",
+    )?;
+    let overview: serde_json::Value = serde_json::from_str(&web_get(ws, "/api/overview")?)?;
+    let overview_apps: Vec<&str> = overview
+        .get("programs")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.get("app").and_then(|x| x.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    expect(
+        !overview_apps.contains(&"alpha"),
+        &format!("the console projection dropped alpha too: {overview_apps:?}"),
+    )?;
+    expect(
+        pending_apps_removed(ws)?.is_empty(),
+        "the removal left no pending unregistration",
+    )?;
+
+    step("RG5. a program in backoff blocks removal; stop then /v1 remove works");
+    let flaky = ws.root.join("app-flaky");
+    std::fs::create_dir_all(&flaky)?;
+    let flaky_body = flaky.join("appkeeper.toml");
+    std::fs::write(
+        &flaky_body,
+        "[app]\nrestart = \"always\"\n\n[program.slow]\ncommand = \"sleep 0.5\"\nstartsecs = 0.2\nrestart_backoff = 30\nmax_restart_backoff = 30\n",
+    )?;
+    link_registration(&flaky_body, &apps.join("flaky.toml"))?;
+    std::thread::sleep(Duration::from_secs(2)); // periodic detect window
+    let out = cli(bin, ws, &["apply", "flaky"])?;
+    expect(out.contains("flaky.slow"), &format!("flaky applied: {out}"))?;
+    wait_state(ws, "slow", "backoff")?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "flaky"])?;
+    expect(
+        !ok && code == 1,
+        &format!("removal with a backoff program exits 1, got {code}: {combined}"),
+    )?;
+    expect(
+        combined.contains("slow (backoff)"),
+        &format!("backoff is not exempt from the guard: {combined}"),
+    )?;
+    expect(
+        apps.join("flaky.toml").is_file(),
+        "the refused removal keeps the record",
+    )?;
+    let out = cli(bin, ws, &["stop", "flaky"])?;
+    expect(out.contains("slow"), &format!("flaky stopped: {out}"))?;
+    let (code, body) = api_checked(ws, "POST", "/v1/apps/flaky/remove", "")?;
+    expect(
+        code == 200,
+        &format!("/v1 remove succeeds after the stop, got {code}: {body}"),
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    expect(
+        v["kept_config"] == canon(&flaky_body).display().to_string(),
+        &format!("the link target is reported as kept: {body}"),
+    )?;
+    expect(!apps.join("flaky.toml").exists(), "flaky's record is gone")?;
+    expect(pid_of(ws, "slow")?.is_none(), "flaky's program is gone")?;
+
+    step("RG6. shell `remove` is the same daemon action (conflict → stop → one-step)");
+    // A fresh app so the shell contract is exercised on its own target.
+    let shellapp = ws.root.join("app-shellrm");
+    std::fs::create_dir_all(&shellapp)?;
+    let shellapp_body = shellapp.join("appkeeper.toml");
+    std::fs::write(
+        &shellapp_body,
+        "[app]\nrestart = \"always\"\n\n[program.svc2]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+    )?;
+    link_registration(&shellapp_body, &apps.join("shellrm.toml"))?;
+    std::thread::sleep(Duration::from_secs(2)); // periodic detect window
+    let out = cli(bin, ws, &["apply", "shellrm"])?;
+    expect(
+        out.contains("shellrm.svc2"),
+        &format!("shellrm applied: {out}"),
+    )?;
+    wait_state(ws, "svc2", "running")?;
+    // `shell -e` maps the control-plane 409 to exit 1 and prints the daemon's
+    // blocker list (shell-client: 拒绝时显示阻塞程序与先 stop 的提示).
+    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "remove shellrm"])?;
+    expect(
+        !ok && code == 1,
+        &format!("shell remove of a live app exits 1, got {code}: {combined}"),
+    )?;
+    expect(
+        combined.contains("svc2 (running)") && combined.contains("stop shellrm"),
+        &format!("the shell shows the blockers and the remedy: {combined}"),
+    )?;
+    expect(
+        apps.join("shellrm.toml").is_file(),
+        "the refused shell removal kept the record",
+    )?;
+    expect(
+        pid_of(ws, "svc2")?.is_some(),
+        "the refused shell removal did not stop the program",
+    )?;
+    // stop → remove in one shell command: no apply, record and projection gone.
+    let out = cli(bin, ws, &["shell", "-e", "stop shellrm"])?;
+    expect(out.contains("svc2"), &format!("shell stop reported: {out}"))?;
+    let out = cli(bin, ws, &["shell", "-e", "remove shellrm"])?;
+    expect(
+        out.contains("deployment config kept at") && out.contains("no apply needed"),
+        &format!("shell remove reports kept config and no apply: {out}"),
+    )?;
+    expect(!apps.join("shellrm.toml").exists(), "the record is gone")?;
+    expect(
+        pid_of(ws, "svc2")?.is_none(),
+        "the program left the projection",
+    )?;
+    expect(
+        pending_apps_removed(ws)?.is_empty(),
+        "the shell removal left no pending unregistration",
+    )?;
+
+    step("RG7. /api/apply refuses the live deletion with the /v1 409 semantics");
+    let batchy = ws.root.join("app-batchy");
+    std::fs::create_dir_all(&batchy)?;
+    let batchy_body = batchy.join("appkeeper.toml");
+    std::fs::write(
+        &batchy_body,
+        "[app]\nrestart = \"always\"\n\n[program.b2]\ncommand = \"sleep 300000\"\nstartsecs = 0.2\n",
+    )?;
+    link_registration(&batchy_body, &apps.join("batchy.toml"))?;
+    std::thread::sleep(Duration::from_secs(2)); // periodic detect window
+    let out = cli(bin, ws, &["apply", "batchy"])?;
+    expect(out.contains("batchy.b2"), &format!("batchy applied: {out}"))?;
+    wait_state(ws, "b2", "running")?;
+    let pid = pid_of(ws, "b2")?.expect("b2 running before the refusal");
+    std::fs::remove_file(apps.join("batchy.toml"))?;
+    std::thread::sleep(Duration::from_secs(2)); // periodic detect window
+    let (v1_code, v1_body) = api_checked(ws, "POST", "/v1/apply", "{}")?;
+    let (web_code, web_body) = web_http(ws, "POST", "/api/apply", Some("{}"))?;
+    expect(
+        v1_code == 409 && web_code == 409,
+        &format!(
+            "/v1 and /api both refuse with 409, got {v1_code}/{web_code}: {v1_body} {web_body}"
+        ),
+    )?;
+    for needle in [
+        "apply refused, nothing was stopped or restarted",
+        "batchy.b2 (running)",
+        "ak stop",
+    ] {
+        expect(
+            v1_body.contains(needle),
+            &format!("the /v1 409 names {needle:?}: {v1_body}"),
+        )?;
+    }
+    expect(
+        web_body.contains("batchy.b2 (running)"),
+        &format!("the /api 409 carries the same blocker list: {web_body}"),
+    )?;
+    expect(
+        !apps.join("batchy.toml").exists(),
+        "the on-disk deletion is not rolled back",
+    )?;
+    expect(
+        pid_of(ws, "b2")? == Some(pid),
+        "the refused /api apply did not stop or restart b2",
+    )?;
+    expect(
+        pending_apps_removed(ws)?.contains(&"batchy".to_string()),
+        "the unregistration stays pending after the refused /api apply",
+    )?;
+    // Cleaning up: stop then let apply finish the removal.
+    let out = cli(bin, ws, &["stop", "batchy"])?;
+    expect(out.contains("b2"), &format!("b2 stopped: {out}"))?;
+    let out = cli(bin, ws, &["apply"])?;
+    expect(
+        out.contains("app[batchy] removed"),
+        &format!("apply performs the pending removal: {out}"),
     )?;
     Ok(())
 }
@@ -4691,6 +5216,41 @@ fn http_ok(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One console API call against the workspace's `[webui] listen`; returns the
+/// status code and body. The e2e workspace enables no console auth token, so
+/// no session cookie is needed.
+fn web_http(ws: &Workspace, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-m",
+        "10",
+        "-o",
+        "-",
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        method,
+    ]);
+    if let Some(b) = body {
+        cmd.args(["-H", "content-type: application/json", "-d", b]);
+    }
+    cmd.arg(format!("http://127.0.0.1:{}{path}", ws.webui_port));
+    let out = cmd.output().context("curl the console API")?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (resp, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok((code.trim().parse().unwrap_or(0), resp.to_string()))
+}
+
+/// Console `GET`; a non-2xx status is an error.
+fn web_get(ws: &Workspace, path: &str) -> Result<String> {
+    let (code, body) = web_http(ws, "GET", path, None)?;
+    if !(200..300).contains(&code) {
+        bail!("GET {path} -> {code}: {body}");
+    }
+    Ok(body)
+}
+
 /// The console is config-driven: `config --delete webui` + `reload` turns it
 /// off, `config --set webui.listen=...` + `reload` turns it on or rebinds it
 /// (config-driven-webui acceptance scenarios). Restores the setup listen so
@@ -6007,6 +6567,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         cli_pass(&bin, &ws)?;
         actions_online_pass(&bin, &ws)?;
         revamp_pass(&bin)?;
+        remove_guard_pass(&bin)?;
         run_daemon_first_pass(&bin)?;
         detach_pass(&bin)?;
         stop_signal_pass(&bin)?;

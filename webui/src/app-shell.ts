@@ -39,6 +39,8 @@ export class AkApp extends LitElement {
   @state() private routeId: string = 'dashboard'
 
   private params: Record<string, string> = {}
+  /** Set while a removal-driven redirect is queued (one shot). */
+  private redirecting = false
   private onNavigateBound: () => void = () => {}
   private onClick: (e: MouseEvent) => void = () => {}
 
@@ -210,6 +212,39 @@ export class AkApp extends LitElement {
       this.routeId = match.id
       this.params = match.params
     }
+    // `params` is not reactive and `routeId` may be unchanged (app → another
+    // app): a same-route navigation must still re-render the outlet.
+    this.redirecting = false
+    this.requestUpdate()
+  }
+
+  /**
+   * guard-remove-until-stopped 4.3: navigation fallback after a removal. If
+   * the app (or program) behind the current URL vanished from the projection —
+   * the remove landed through another client (CLI, another tab) — move to a
+   * still-resolving view instead of leaving a dead page with stale controls.
+   * Only an established projection is authoritative: a null/empty doc (initial
+   * load, daemon offline) must not trigger a redirect.
+   */
+  protected updated(): void {
+    if (this.redirecting) return
+    const doc = this.console.snapshot.doc
+    if (!doc) return
+    if (this.routeId !== 'app' && this.routeId !== 'program') return
+    const app = decodeURIComponent(this.params['app'] ?? '')
+    const programs = this.programsOf(app)
+    const apps = new Set(doc.programs.map((p) => p.app))
+    // Leave when the app record was removed or the projection knows it is
+    // gone. An app with no programs but a live record keeps its overview
+    // (which renders its own empty state); an unestablished projection must
+    // never redirect.
+    const gone = consoleStore.wasAppRemoved(app) || (apps.size > 0 && !apps.has(app))
+    if (programs.length > 0 || !gone) return
+    // Defer: navigating from inside `updated` would schedule another update
+    // in the same cycle (and `navigate` dispatches popstate synchronously).
+    const next = [...apps].sort()[0]
+    this.redirecting = true
+    queueMicrotask(() => navigate(next ? `/app/${encodeURIComponent(next)}` : '/'))
   }
 
   private programsOf(app: string): ProgramInfo[] {

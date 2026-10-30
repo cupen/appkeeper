@@ -18,6 +18,9 @@ use crate::registry;
 
 pub type Reply = std::sync::mpsc::Sender<Result<String>>;
 
+/// Reply channel for the structured removal result (guard-remove-until-stopped).
+pub type RemoveReply = std::sync::mpsc::Sender<std::result::Result<RemoveOutcome, RemoveError>>;
+
 /// Reply channel for the structured ad-hoc results (run-daemon-first D3/D5).
 pub type AdhocUpReply = std::sync::mpsc::Sender<std::result::Result<AdhocUpResult, AdhocUpError>>;
 pub type AdhocCommitReply = std::sync::mpsc::Sender<Result<AdhocCommitResult>>;
@@ -212,6 +215,14 @@ pub enum Command {
         name: String,
         reply: AdhocAbortReply,
     },
+    /// guard-remove-until-stopped D1: unregister one app atomically — the
+    /// liveness guard, the registration deletion and the state cleanup all run
+    /// in this one serialized turn. Every entry point (CLI, shell, `/v1`,
+    /// `/api`) enqueues this command; none of them deletes files itself.
+    Remove {
+        app: String,
+        reply: RemoveReply,
+    },
 }
 
 /// Which per-program action an app fan-out runs (actions spec: 动作层级矩阵).
@@ -264,6 +275,115 @@ pub fn render_fanout(r: &FanoutResult) -> String {
     }
     out.join("\n")
 }
+
+/// The structured result of one app removal (guard-remove-until-stopped).
+///
+/// Shared verbatim by `POST /v1/apps/<app>/remove` and
+/// `POST /api/apps/<app>/remove`; the CLI and shell render it, the console
+/// shows the same fields. Field names are wire-stable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoveOutcome {
+    pub app: String,
+    /// The registration record path that was removed
+    /// (`app_dir/<app>.toml`).
+    pub config_path: String,
+    /// True when the record was a real file inside `app_dir`
+    /// (scaffold-generated) and was deleted together with the registration.
+    pub deleted_file: bool,
+    /// The deployment config body kept on disk (link registrations); `None`
+    /// for a generated file that was deleted.
+    pub kept_config: Option<String>,
+    /// True when there was no registration record left to delete (removed by
+    /// hand beforehand): the runtime state and pending entries were still
+    /// cleaned up, so the removal is satisfied even though nothing was
+    /// deleted. No error: `apply` is not needed to finish anything.
+    pub already_unregistered: bool,
+    /// The programs whose entries were dropped from the runtime projection.
+    pub programs: Vec<String>,
+    /// Always true: removal is immediate, no `apply` is needed.
+    pub applied: bool,
+}
+
+impl RemoveOutcome {
+    /// One-line summary for the CLI/shell (no `apply` hint: removal already
+    /// took effect).
+    pub fn render(&self) -> String {
+        if self.already_unregistered {
+            format!(
+                "app[{}] removed (the registration record was already gone; \
+                 runtime state cleaned up); no apply needed",
+                self.app
+            )
+        } else if self.deleted_file {
+            format!(
+                "app[{}] removed (generated config file removed: {}); no apply needed",
+                self.app, self.config_path
+            )
+        } else {
+            format!(
+                "app[{}] removed (deployment config kept at {}); no apply needed",
+                self.app,
+                self.kept_config
+                    .clone()
+                    .unwrap_or_else(|| self.config_path.clone())
+            )
+        }
+    }
+}
+
+/// Why a `Remove` command was refused. The HTTP status each variant maps to
+/// is fixed here so `/v1` and `/api` cannot drift apart.
+#[derive(Debug)]
+pub enum RemoveError {
+    /// No such app is loaded or registered.
+    UnknownApp(String),
+    /// At least one program is running/starting/stopping/backoff; the payload
+    /// carries `(program, state)` pairs sorted by name.
+    Busy {
+        app: String,
+        blockers: Vec<(String, ProgramState)>,
+    },
+    /// The registration record could not be deleted; nothing was cleaned up.
+    Delete(String),
+}
+
+impl RemoveError {
+    pub fn http_status(&self) -> u16 {
+        match self {
+            RemoveError::UnknownApp(_) => 404,
+            RemoveError::Busy { .. } => 409,
+            RemoveError::Delete(_) => 500,
+        }
+    }
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveError::UnknownApp(app) => write!(f, "unknown app {app:?}"),
+            RemoveError::Busy { app, blockers } => {
+                let list = blockers
+                    .iter()
+                    .map(|(name, state)| format!("{name} ({state})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "app {app:?} still has live program(s): {list}; \
+                     run `ak stop {app}` first, then remove"
+                )
+            }
+            RemoveError::Delete(msg) => write!(
+                f,
+                "failed to remove the registration record: {msg}; \
+                 the app's runtime state was not cleaned up — check the record path \
+                 and GET /v1/status before retrying (an apply will not fix this)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoveError {}
 
 /// Why a `signal` request failed; carries the HTTP status for the API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -898,6 +1018,9 @@ impl Supervisor {
                 let _ = reply.send(self.cmd_adhoc_abort(&name));
             }
             Command::Reload { reply } => answer(reply, self.cmd_reload()),
+            Command::Remove { app, reply } => {
+                let _ = reply.send(self.cmd_remove(&app));
+            }
             Command::Apply {
                 scope,
                 restart,
@@ -1098,6 +1221,125 @@ impl Supervisor {
             programs: steps,
         };
         serde_json::to_string(&fr).context("failed to serialize fan-out result")
+    }
+
+    // -- app removal (guard-remove-until-stopped D1–D3) ----------------------
+
+    /// The single online removal path. Runs entirely inside one command turn,
+    /// so start/restart/apply cannot interleave between the liveness check and
+    /// the registration deletion (design D1).
+    ///
+    /// Order: resolve members → liveness guard → delete the registration
+    /// record → only then mutate runtime state. A deletion failure therefore
+    /// leaves the app and its programs untouched (D3).
+    fn cmd_remove(&self, app: &str) -> std::result::Result<RemoveOutcome, RemoveError> {
+        let (config, config_dir, members, blockers, known) = {
+            let st = self.state.lock().unwrap();
+            let mut members: Vec<String> = st
+                .programs
+                .values()
+                .filter(|p| p.def.app == app)
+                .map(|p| p.def.name.clone())
+                .collect();
+            members.sort();
+            let mut blockers: Vec<(String, ProgramState)> = st
+                .programs
+                .values()
+                .filter(|p| p.def.app == app && !p.state().removable())
+                .map(|p| (p.def.name.clone(), p.state()))
+                .collect();
+            blockers.sort_by(|a, b| a.0.cmp(&b.0));
+            // Loaded apps and freshly-registered (pending) apps are valid
+            // targets; anything else is a 404. A record whose TOML fails to
+            // parse is included on purpose: such an app is not in `st.apps`
+            // and `registry::list` flags it `broken`, so filtering it here
+            // would strand the operator — the old local-delete CLI could
+            // still remove it, and that is the only cleanup path. The
+            // liveness guard needs no change: a broken app has no running
+            // program, so it is removable by construction.
+            let known = st.apps.iter().any(|a| a.name == app)
+                || registry::list(&st.config, &st.config_dir)
+                    .map(|l| l.iter().any(|r| r.name == app))
+                    .unwrap_or(false);
+            (
+                st.config.clone(),
+                st.config_dir.clone(),
+                members,
+                blockers,
+                known,
+            )
+        };
+        if !known {
+            return Err(RemoveError::UnknownApp(app.to_string()));
+        }
+        if !blockers.is_empty() {
+            return Err(RemoveError::Busy {
+                app: app.to_string(),
+                blockers,
+            });
+        }
+        // Registration deletion first (D3): a failure must not clean up state.
+        //
+        // A record that is already gone is NOT a failure: the operator may
+        // have deleted it by hand, and the app is still loaded here (that is
+        // why the request resolved at all). The removal goal — app gone from
+        // the runtime projection and no pending unregistration left — is
+        // still reachable in this turn, so cleanup runs and the result says
+        // the record was already absent. Reporting `Delete`/500 here would be
+        // both wrong (nothing failed) and misleading (apply is not the fix:
+        // the cleanup below is).
+        let (deleted_file, already_unregistered, kept_config) =
+            if registry::is_registered(&config, &config_dir, app) {
+                let removed = registry::remove(&config, &config_dir, app)
+                    .map_err(|e| RemoveError::Delete(format!("{e:#}")))?;
+                let kept = if removed.deleted_file {
+                    None
+                } else {
+                    Some(removed.path.display().to_string())
+                };
+                (removed.deleted_file, false, kept)
+            } else {
+                (false, true, None)
+            };
+        let mut dropped: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            for name in &members {
+                if st.programs.remove(name).is_some() {
+                    dropped.push(name.clone());
+                }
+            }
+            st.apps.retain(|a| a.name != app);
+            // The app's user-stop records die with it; other apps' records
+            // stay untouched.
+            let mut changed = false;
+            for name in &members {
+                changed |= st.user_stopped.remove(name);
+            }
+            if changed {
+                let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+                save_user_stopped(&log_dir, &st.user_stopped);
+            }
+            // The removal itself must never surface as a pending注销项.
+            st.pending.programs.retain(|p| p.app != app);
+            st.pending.apps_added.retain(|a| a != app);
+            st.pending.apps_removed.retain(|a| a != app);
+        }
+        self.sync_health_tasks();
+        // Republish the pending projection against the post-removal disk.
+        if let Err(e) = self.detect(true) {
+            warn!("app[{app}]: removal succeeded but the pending rescan failed: {e:#}");
+        }
+        let record = registry::link_path(&config, &config_dir, app);
+        Ok(RemoveOutcome {
+            app: app.to_string(),
+            config_path: record.display().to_string(),
+            deleted_file,
+            kept_config,
+            already_unregistered,
+            programs: dropped,
+            applied: true,
+        })
     }
 
     // -- reload / apply -----------------------------------------------------
@@ -1816,6 +2058,59 @@ impl Supervisor {
         })
     }
 
+    /// guard-remove-until-stopped D4: find the hand-deleted apps/programs the
+    /// detection pass implies within `scope` and refuse the whole apply when
+    /// any of them is still live (`running`/`starting`/`stopping`/`backoff`,
+    /// the shared predicate from [`ProgramState::removable`]).
+    ///
+    /// A conflict aborts before any `stop` / `programs.remove` / rebuild, so
+    /// no in-scope change (including `--restart`) takes effect. Disk deletions
+    /// are not undone and the pending entry survives: a later apply after a
+    /// stop performs them normally. Deletions outside `scope` never block.
+    fn check_removable_deletions(&self, det: &Detection, scope: &ApplyScope) -> Result<()> {
+        let st = self.state.lock().unwrap();
+        let keep_apps: HashSet<&str> = det.records.iter().map(|r| r.name.as_str()).collect();
+        let new_programs: HashMap<&str, HashSet<&str>> = det
+            .resolved
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.programs.iter().map(|p| p.name.as_str()).collect(),
+                )
+            })
+            .collect();
+        let mut blockers: Vec<String> = Vec::new();
+        for p in st.programs.values() {
+            // A program is deleted when its whole app registration is gone, or
+            // when the app survives but no longer defines it.
+            let deleted = match new_programs.get(p.def.app.as_str()) {
+                Some(names) => !names.contains(p.def.name.as_str()),
+                None => !keep_apps.contains(p.def.app.as_str()),
+            };
+            if !deleted {
+                continue;
+            }
+            if !scope.matches(&p.def.app, &p.def.name) {
+                continue;
+            }
+            let state = p.state();
+            if !state.removable() {
+                blockers.push(format!("{}.{} ({state})", p.def.app, p.def.name));
+            }
+        }
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        blockers.sort();
+        bail!(
+            "apply refused, nothing was stopped or restarted: the deleted app/program(s) are \
+             still live: {}; run `ak stop <app>` (or stop the program) first, then apply again \
+             — the on-disk deletion is kept and stays pending meanwhile",
+            blockers.join(", ")
+        )
+    }
+
     /// Mutate the running state per the detection and scope. Reuses the
     /// reload rules: changed programs are stopped, redefined and — when
     /// they were alive (running/starting) or waiting out a crash backoff —
@@ -1829,6 +2124,10 @@ impl Supervisor {
         let new_config = &det.config;
         let resolved = &det.resolved;
         let new_records = &det.records;
+        // guard-remove-until-stopped D4: refuse the WHOLE batch before any
+        // in-scope state change when a hand-deleted app/program still has a
+        // live lifecycle. `--restart` does not exempt this check.
+        self.check_removable_deletions(det, scope)?;
         let mut result = ApplyResult {
             errors: det.failed.clone(),
             ..ApplyResult::default()
@@ -2784,6 +3083,43 @@ mod tests {
         panic!("program {name} never reached {want:?}, got {got:?}");
     }
 
+    /// Multi-app harness: one temp root with `app.d`, each app linked into it.
+    /// Returns the supervisor plus `(name -> deployment config file)`.
+    fn setup_apps(
+        tag: &str,
+        apps: &[(&str, &str)],
+    ) -> (
+        Arc<Supervisor>,
+        PathBuf,
+        std::collections::HashMap<String, PathBuf>,
+    ) {
+        let dir = std::env::temp_dir().join(format!("ak-test-apps-{tag}-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut files = std::collections::HashMap::new();
+        for (name, toml_text) in apps {
+            let f = dir.join(format!("{name}-appkeeper.toml"));
+            std::fs::write(&f, toml_text).unwrap();
+            link_for_test(&f, &dir.join("app.d").join(format!("{name}.toml")));
+            files.insert(name.to_string(), f);
+        }
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        (sup, dir, files)
+    }
+
     /// configuration: reload only detects — a modified file shows up in the
     /// pending preview while the program's state and pid are untouched.
     #[test]
@@ -3104,7 +3440,9 @@ mod tests {
         let _ = sup.shutdown_all();
     }
 
-    /// apply-workflow: removing a program from the file stops and drops it.
+    /// apply-workflow: removing a program from the file stops and drops it —
+    /// after the guard-remove-until-stopped precheck, the apply is refused
+    /// while that program is still live, so the drop needs a stop first.
     #[test]
     fn apply_removes_dropped_program() {
         let (sup, app_file) = setup(
@@ -3117,13 +3455,462 @@ mod tests {
             "[app]\nautostart = true\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
         )
         .unwrap();
+        let err = sup.cmd_apply(&ApplyScope::All, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("demo.q (running)"),
+            "the live deletion refuses the batch: {err:#}"
+        );
+        let _ = sup.cmd_stop("q");
         let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
         assert!(out.contains("removed"), "{out}");
         {
             let st = sup.state.lock().unwrap();
             assert!(!st.programs.contains_key("q"));
         }
-        let _ = sup.shutdown_all();
+        sup.shutdown_all();
+    }
+
+    /// guard-remove-until-stopped 1.2: the Remove command clears the loaded
+    /// app, its programs and its registration record, and leaves no pending
+    ///注销项 behind — while other apps' pending stays untouched.
+    #[test]
+    fn remove_app_is_atomic_and_leaves_no_pending() {
+        let (sup, dir, files) = setup_apps(
+            "remove-ok",
+            &[
+                (
+                    "web",
+                    "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+                ),
+                (
+                    "other",
+                    "[app]\nrestart = \"always\"\n\n[program.other]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+                ),
+            ],
+        );
+        wait_state(&sup, "web", ProgramState::Running);
+        wait_state(&sup, "other", ProgramState::Running);
+        // Give "other" a pending change so the removal must not swallow it.
+        std::fs::write(
+            &files["other"],
+            "[app]\nrestart = \"always\"\n\n[program.other]\ncommand = 'sleep 45'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        sup.detect(true).unwrap();
+        let other_pending = sup.state.lock().unwrap().pending.programs.len();
+        assert_eq!(other_pending, 1);
+
+        // stopping is not removable — stop web first (its record goes).
+        let out = sup.cmd_app_fanout(FanoutKind::Stop, "web").unwrap();
+        assert!(out.contains("web"), "{out}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.programs["web"].state().removable());
+        }
+        let outcome = sup.cmd_remove("web").unwrap();
+        assert_eq!(outcome.app, "web");
+        assert!(outcome.applied, "removal needs no apply");
+        assert!(!outcome.deleted_file, "web is a link registration");
+        assert_eq!(
+            outcome.kept_config.as_deref(),
+            Some(files["web"].to_string_lossy().as_ref()),
+            "the external deployment body is reported as kept"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.apps.iter().any(|a| a.name == "web"));
+            assert!(!st.programs.contains_key("web"), "web's program is gone");
+            assert!(st.programs.contains_key("other"), "other stays loaded");
+            assert!(
+                st.pending.programs.iter().all(|p| p.app != "web"),
+                "no removal pending项: {:?}",
+                st.pending.programs
+            );
+            assert!(
+                st.pending.programs.iter().any(|p| p.app == "other"),
+                "other's pending survives: {:?}",
+                st.pending.programs
+            );
+            assert!(!st.user_stopped.contains("web"), "user-stop record cleared");
+        }
+        // The link record is gone, the deployment body is still there.
+        assert!(!dir.join("app.d/web.toml").exists());
+        assert!(files["web"].is_file());
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.2: a refusal leaves the running projection and the record intact.
+    #[test]
+    fn remove_app_refuses_a_running_program() {
+        let (sup, dir, _files) = setup_apps(
+            "remove-busy",
+            &[(
+                "web",
+                "[app]\nrestart = \"always\"\n\n[program.web]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+            )],
+        );
+        wait_state(&sup, "web", ProgramState::Running);
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+        let err = sup.cmd_remove("web").unwrap_err();
+        match &err {
+            RemoveError::Busy { app, blockers } => {
+                assert_eq!(app, "web");
+                assert_eq!(blockers.len(), 1);
+                assert_eq!(blockers[0].0, "web");
+                assert_eq!(blockers[0].1, ProgramState::Running);
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert_eq!(err.http_status(), 409);
+        assert!(err.to_string().contains("ak stop web"), "{err}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["web"].pid(), pid, "program untouched");
+            assert!(st.apps.iter().any(|a| a.name == "web"), "still loaded");
+        }
+        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.2: an unknown app is a 404-class refusal, not a deletion.
+    #[test]
+    fn remove_unknown_app_is_not_found() {
+        let (sup, dir, _files) = setup_apps(
+            "remove-unknown",
+            &[(
+                "web",
+                "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'true'\nstartsecs = 0.0\n",
+            )],
+        );
+        let err = sup.cmd_remove("ghost").unwrap_err();
+        assert!(matches!(err, RemoveError::UnknownApp(_)));
+        assert_eq!(err.http_status(), 404);
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.2/1.3: a scaffold-generated record is deleted with the registration
+    /// and `deleted_file` says so; exited/fatal programs are removable.
+    #[test]
+    fn remove_app_deletes_generated_record_and_allows_fatal() {
+        let (sup, dir, _files) = setup_apps(
+            "remove-generated",
+            &[(
+                "abc",
+                "[app]\nrestart = \"always\"\n\n[program.abc]\ncommand = 'false'\nstartsecs = 0.5\nstartretries = 0\n",
+            )],
+        );
+        // Make the program a generated file inside app_dir: replace the link
+        // with a real file of the same content.
+        let record = dir.join("app.d/abc.toml");
+        let body = std::fs::read_to_string(&record).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::write(&record, &body).unwrap();
+        // The command dies before startsecs with no retry budget → fatal.
+        wait_state(&sup, "abc", ProgramState::Fatal);
+        let outcome = sup.cmd_remove("abc").unwrap();
+        assert!(outcome.deleted_file, "the generated record was deleted");
+        assert!(outcome.kept_config.is_none(), "nothing external is kept");
+        assert_eq!(outcome.config_path, record.display().to_string());
+        assert!(!record.exists(), "generated record gone");
+        assert!(
+            !sup.state.lock().unwrap().programs.contains_key("abc"),
+            "fatal program dropped"
+        );
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.2/D3: when the registration record cannot be deleted, the failure is
+    /// a server error (500), the runtime projection is left untouched, and the
+    /// message never offers an apply as the remedy.
+    #[test]
+    fn remove_delete_failure_keeps_runtime_state() {
+        let (sup, dir, _files) = setup_apps(
+            "remove-delete-fail",
+            &[(
+                "web",
+                "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'true'\nstartsecs = 0.0\n",
+            )],
+        );
+        // Replace the record with a directory: `remove_file` fails while the
+        // path still exists, so the failure is deterministic (and needs no
+        // permission tricks, which are meaningless when running as root).
+        let record = dir.join("app.d/web.toml");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(&record).unwrap();
+        let before = {
+            let st = sup.state.lock().unwrap();
+            (st.programs.len(), st.apps.len())
+        };
+        let err = sup.cmd_remove("web").unwrap_err();
+        assert_eq!(err.http_status(), 500, "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to remove the registration record"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("an apply will not fix this"),
+            "no apply-as-remedy hint: {msg}"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(
+                (st.programs.len(), st.apps.len()),
+                before,
+                "no runtime state was cleaned up"
+            );
+            assert!(st.programs.contains_key("web"));
+            assert!(st.apps.iter().any(|a| a.name == "web"));
+        }
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// guard-remove-until-stopped (review): a registration whose body fails to
+    /// parse is still removable. It is never loaded into `st.apps` (bootstrap
+    /// and detection isolate it) and `registry::list` flags it `broken`, so a
+    /// `broken.is_none()` filter on the target check would answer 404 and leave
+    /// the operator without the one cleanup path the old local-delete CLI
+    /// provided.
+    #[test]
+    fn remove_accepts_a_broken_registration_record() {
+        let (sup, dir, files) = setup_apps(
+            "remove-broken",
+            &[(
+                "other",
+                "[app]\nrestart = \"no\"\n\n[program.other]\ncommand = 'true'\nstartsecs = 0.0\n",
+            )],
+        );
+        // Register a second app whose body does not parse: link intact, TOML
+        // broken. It is therefore neither loaded nor pending — only the
+        // registry knows about it.
+        let body = dir.join("web-appkeeper.toml");
+        std::fs::write(&body, "not [ valid toml").unwrap();
+        let record = dir.join("app.d/web.toml");
+        link_for_test(&body, &record);
+        sup.detect(true).unwrap();
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.apps.iter().any(|a| a.name == "web"),
+                "a broken app is not loaded"
+            );
+            let listed = registry::list(&st.config, &st.config_dir).unwrap();
+            let entry = listed.iter().find(|a| a.name == "web").expect("listed");
+            assert!(entry.broken.is_some(), "the record is broken: {entry:?}");
+        }
+
+        let outcome = sup
+            .cmd_remove("web")
+            .expect("a broken record must remain removable");
+        assert_eq!(outcome.app, "web");
+        assert!(!outcome.deleted_file, "web is a link registration");
+        assert!(
+            !outcome.already_unregistered,
+            "the record existed and was deleted"
+        );
+        assert_eq!(
+            outcome.kept_config.as_deref(),
+            Some(body.to_string_lossy().as_ref()),
+            "the (broken) external body is reported as kept"
+        );
+        assert!(!record.exists(), "the broken registration link is gone");
+        assert!(body.is_file(), "the external body is never deleted");
+        assert!(files["other"].is_file(), "other apps are untouched");
+        assert!(sup.state.lock().unwrap().programs.contains_key("other"));
+        // A second removal is now unknown — the record is really gone.
+        assert!(matches!(
+            sup.cmd_remove("web").unwrap_err(),
+            RemoveError::UnknownApp(_)
+        ));
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// guard-remove-until-stopped (review): a record deleted by hand must not
+    /// turn removal into a 500. The app is still loaded (that is why the
+    /// request resolved), so cleaning the runtime state and pending entries
+    /// satisfies the removal — success, with `already_unregistered` telling the
+    /// truth, and no claim that an apply is needed.
+    #[test]
+    fn remove_after_a_hand_deleted_record_succeeds() {
+        let (sup, dir, files) = setup_apps(
+            "remove-record-gone",
+            &[
+                (
+                    "web",
+                    "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'true'\nstartsecs = 0.0\n",
+                ),
+                (
+                    "other",
+                    "[app]\nrestart = \"no\"\n\n[program.other]\ncommand = 'true'\nstartsecs = 0.0\n",
+                ),
+            ],
+        );
+        let record = dir.join("app.d/web.toml");
+        std::fs::remove_file(&record).unwrap();
+        // The detection pass now sees web as unregistered → pending注销项.
+        sup.detect(true).unwrap();
+        assert!(
+            sup.state
+                .lock()
+                .unwrap()
+                .pending
+                .apps_removed
+                .contains(&"web".to_string()),
+            "the hand deletion is pending"
+        );
+
+        let outcome = sup.cmd_remove("web").expect("removal must not fail");
+        assert_eq!(outcome.app, "web");
+        assert!(
+            outcome.already_unregistered,
+            "the outcome reports the record was already gone"
+        );
+        assert!(!outcome.deleted_file);
+        assert!(outcome.applied);
+        let rendered = outcome.render();
+        assert!(rendered.contains("already gone"), "{rendered}");
+        assert!(rendered.contains("no apply needed"), "{rendered}");
+        assert!(
+            !rendered.contains("failed") && !rendered.contains("will not fix this"),
+            "no failure/apply-as-remedy wording: {rendered}"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.apps.iter().any(|a| a.name == "web"), "web dropped");
+            assert!(!st.programs.contains_key("web"), "web's program dropped");
+            assert!(st.programs.contains_key("other"), "other stays loaded");
+            assert!(
+                !st.pending.apps_removed.contains(&"web".to_string()),
+                "the removal is not left pending: {:?}",
+                st.pending.apps_removed
+            );
+        }
+        assert!(!record.exists());
+        assert!(files["web"].is_file(), "the external body is untouched");
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1/3.2: a hand-deleted app whose programs are still running refuses
+    /// the whole apply — no in-scope change (including other apps' changes and
+    /// `--restart`) is applied, the disk deletion stays, pending is kept.
+    #[test]
+    fn apply_refuses_batch_when_deleted_app_still_runs() {
+        let (sup, dir, files) = setup_apps(
+            "apply-guard",
+            &[
+                (
+                    "a",
+                    "[app]\nrestart = \"always\"\n\n[program.a]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+                ),
+                (
+                    "b",
+                    "[app]\nrestart = \"always\"\n\n[program.b]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+                ),
+            ],
+        );
+        wait_state(&sup, "a", ProgramState::Running);
+        wait_state(&sup, "b", ProgramState::Running);
+        let a_pid = sup.state.lock().unwrap().programs["a"].pid();
+        let b_pid = sup.state.lock().unwrap().programs["b"].pid();
+        // Hand-delete app a's registration and change b's definition.
+        std::fs::remove_file(dir.join("app.d/a.toml")).unwrap();
+        std::fs::write(
+            &files["b"],
+            "[app]\nrestart = \"always\"\n\n[program.b]\ncommand = 'sleep 90'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        // The periodic detection would have published these; publish now.
+        sup.detect(true).unwrap();
+        for restart in [false, true] {
+            let err = sup.cmd_apply(&ApplyScope::All, restart).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("still live") && msg.contains("a.a (running)"),
+                "conflict lists the blocker: {msg}"
+            );
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["a"].pid(), a_pid, "a untouched");
+            assert_eq!(st.programs["b"].pid(), b_pid, "b's change not applied");
+            assert_eq!(
+                st.programs["b"].def.args,
+                vec!["30".to_string()],
+                "b keeps its old definition"
+            );
+            assert!(
+                st.pending.programs.iter().any(|p| p.program == "b"),
+                "b's pending survives refused apply: {:?}",
+                st.pending.programs
+            );
+            drop(st);
+            assert!(
+                !dir.join("app.d/a.toml").exists(),
+                "the on-disk deletion is not undone"
+            );
+        }
+        // Out-of-scope apply does not block on a's deletion.
+        let out = sup.cmd_apply(&ApplyScope::App("b".into()), false).unwrap();
+        assert!(out.contains("update-and-restart"), "{out}");
+        // After a stop, the full apply performs the removal. (The scoped apply
+        // of b already dropped app a's record from the loaded set, so stop the
+        // program by name.)
+        let _ = sup.cmd_stop("a");
+        let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
+        assert!(out.contains("removed"), "{out}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.programs.contains_key("a"));
+            assert!(!st.apps.iter().any(|x| x.name == "a"));
+        }
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1/3.2: a hand-deleted program inside a surviving app is refused
+    /// while it is starting/backoff, and allowed once it is stopped.
+    #[test]
+    fn apply_refuses_deleted_program_that_is_live() {
+        let (sup, dir, files) = setup_apps(
+            "apply-prog-guard",
+            &[(
+                "demo",
+                "[app]\nrestart = \"always\"\n\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n\n[program.q]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+            )],
+        );
+        wait_state(&sup, "p", ProgramState::Running);
+        wait_state(&sup, "q", ProgramState::Running);
+        // Drop program q from the definition while it still runs.
+        std::fs::write(
+            &files["demo"],
+            "[app]\nrestart = \"always\"\n\n[program.p]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        sup.detect(true).unwrap();
+        let err = sup.cmd_apply(&ApplyScope::All, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("demo.q (running)"), "{msg}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.programs.contains_key("q"), "q not dropped");
+            assert!(
+                st.pending.programs.iter().any(|p| p.program == "q"),
+                "deletion stays pending: {:?}",
+                st.pending.programs
+            );
+        }
+        // Stop q, then apply removes it.
+        let _ = sup.cmd_stop("q");
+        let out = sup.cmd_apply(&ApplyScope::All, false).unwrap();
+        assert!(out.contains("removed") && out.contains("demo.q"), "{out}");
+        assert!(!sup.state.lock().unwrap().programs.contains_key("q"));
+        sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// apply-workflow: cross-app validation failure aborts with no pending.

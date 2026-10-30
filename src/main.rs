@@ -252,8 +252,13 @@ enum Cmd {
         #[arg(long = "apply")]
         apply: bool,
     },
-    /// Unregister an app (deployment configs are kept)
-    Remove { name: String },
+    /// Unregister an app: only when it has no running/starting/stopping/
+    /// backoff program; the daemon removes it immediately (no apply needed)
+    Remove {
+        /// App name
+        #[arg(value_name = "APP")]
+        name: String,
+    },
     /// Interactive shell client (supervisorctl style)
     Shell {
         /// Execute one command and exit
@@ -842,24 +847,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Remove { name }) => {
-            let config = client::load_config(&config_path)?;
-            let config_dir = config_dir_of(&config_path);
-            let removed = registry::remove(&config, &config_dir, name)?;
-            if removed.deleted_file {
-                println!(
-                    "app[{name}] unregistered (generated config file removed: {})",
-                    removed.path.display()
-                );
-            } else {
-                println!(
-                    "app[{name}] unregistered (deployment config kept at {})",
-                    removed.path.display()
-                );
-            }
-            sync_if_online(&config)?;
-            Ok(())
-        }
+        Some(Cmd::Remove { name }) => remove_cmd(&config_path, name),
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
     }
 }
@@ -1828,6 +1816,27 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
     }
 }
 
+/// `ak remove <app>`: the daemon-executed atomic removal (guard-remove-until-
+/// stopped). The CLI no longer deletes registration records or triggers a
+/// reload/apply afterwards — the daemon performs the liveness guard, the
+/// record deletion and the state cleanup in one turn and the result already
+/// says the removal is in effect.
+///
+/// Exit codes follow the client contract: an unreachable daemon is 3 (via
+/// [`client::exit_code_of`]), a 409 conflict / 404 unknown app is 1.
+fn remove_cmd(config_path: &Path, app: &str) -> Result<()> {
+    client_cmd(config_path, |c| {
+        let v = c.remove_app(app)?;
+        println!(
+            "{}",
+            v.get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("removed")
+        );
+        Ok(())
+    })
+}
+
 /// `ak start|stop|restart <app>`: app-level fan-out; the server expands it in
 /// the established order and reports per-program results. For `start` the
 /// per-program `{name, config_path, pid, status}` is rendered and any failure
@@ -2667,6 +2676,74 @@ mod sync_tests {
             "error must explain the sync failure: {err:#}"
         );
         server.join().unwrap();
+    }
+
+    /// guard-remove-until-stopped 2.2: `ak remove` is a single online call to
+    /// the daemon-owned endpoint. It never probes/pulls up a daemon first, and
+    /// it never deletes the registration record or asks for a reload/apply
+    /// itself — the daemon owns all of that.
+    #[test]
+    fn remove_cli_is_one_online_call_and_touches_no_files() {
+        let (socket, mut listener) = mock_socket("remove-cli");
+        let server = std::thread::spawn(move || {
+            let mut sock = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            while !raw.ends_with(b"\r\n\r\n") {
+                if std::io::Read::read(&mut sock, &mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                raw.push(byte[0]);
+            }
+            let req = String::from_utf8_lossy(&raw).to_string();
+            let body = concat!(
+                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"#,
+                r#""kept_config":null,"programs":["api"],"applied":true,"#,
+                r#""result":"app[web] removed; no apply needed"}"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
+            req
+        });
+
+        let dir = std::env::temp_dir().join(format!("ak-test-remove-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("daemon.toml");
+        // The record exists on disk; the client must leave it alone.
+        let record = dir.join("web.toml");
+        std::fs::write(&record, "[program.api]\ncommand = \"sleep\"\n").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\nsocket = {:?}\napp_dir = {:?}\n",
+                socket.to_string_lossy(),
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        remove_cmd(&config_path, "web").expect("the daemon answered 200");
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
+            "one targeted call, no preflight: {req}"
+        );
+        assert!(
+            !req.contains("/v1/health")
+                && !req.contains("/v1/apply")
+                && !req.contains("/v1/reload"),
+            "no implicit pull-up / follow-up sync: {req}"
+        );
+        assert!(
+            record.exists(),
+            "the CLI never deletes registration files itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Offline: registry ops are offline-first; unreachable daemon means

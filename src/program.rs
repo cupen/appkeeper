@@ -46,6 +46,28 @@ impl fmt::Display for ProgramState {
     }
 }
 
+impl ProgramState {
+    /// May an app/program in this state be removed (guard-remove-until-stopped
+    /// D2)? `running`, `starting` and `stopping` mean a live child or a stop
+    /// that has not converged; `backoff` means an automatic restart is already
+    /// scheduled. All four block removal — `backoff` is deliberately NOT
+    /// exempt, or the removed definition could be resurrected mid-removal.
+    /// `stopped`, `exited` and `fatal` allow removal regardless of whether the
+    /// user ever ran an explicit stop.
+    ///
+    /// This is the single predicate shared by the Supervisor `Remove` command
+    /// and the apply deletion precheck; no entry point may re-implement it.
+    pub fn removable(self) -> bool {
+        !matches!(
+            self,
+            ProgramState::Running
+                | ProgramState::Starting
+                | ProgramState::Stopping
+                | ProgramState::Backoff
+        )
+    }
+}
+
 pub struct ManagedProgram {
     pub def: ResolvedProgram,
     pub log_dir: PathBuf,
@@ -714,6 +736,59 @@ mod tests {
         p.record_health(true, Instant::now());
         assert!(p.health_confirmed(), "first success confirms health");
         p.stop();
+        let _ = std::fs::remove_dir_all(p.log_dir.clone());
+    }
+
+    /// guard-remove-until-stopped task 1.1: the shared removal predicate
+    /// covers all seven states — running/starting/stopping/backoff refuse,
+    /// stopped/exited/fatal allow.
+    #[test]
+    fn removable_covers_all_seven_states() {
+        let cases = [
+            (ProgramState::Running, false),
+            (ProgramState::Starting, false),
+            (ProgramState::Stopping, false),
+            (ProgramState::Backoff, false),
+            (ProgramState::Stopped, true),
+            (ProgramState::Exited, true),
+            (ProgramState::Fatal, true),
+        ];
+        for (state, want) in cases {
+            assert_eq!(
+                state.removable(),
+                want,
+                "state {state} must {}be removable",
+                if want { "" } else { "not " }
+            );
+        }
+    }
+
+    /// Backoff is deliberately not exempt: no child process exists, but an
+    /// automatic restart is scheduled and removing the definition now would
+    /// resurrect it (design D2).
+    #[test]
+    fn backoff_is_not_exempt_from_removal_guard() {
+        let mut p = make(&fast_exit("max_restarts = 5"), "rm-backoff");
+        p.spawn();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            p.tick(Instant::now());
+            if p.state() == ProgramState::Backoff {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(p.state(), ProgramState::Backoff);
+        assert!(p.pid().is_none(), "backoff has no live child");
+        assert!(
+            !p.state().removable(),
+            "backoff blocks removal even without a child process"
+        );
+        p.stop();
+        assert!(
+            p.state().removable(),
+            "an explicit stop converges to a removable state"
+        );
         let _ = std::fs::remove_dir_all(p.log_dir.clone());
     }
 }

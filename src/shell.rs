@@ -54,6 +54,9 @@ pub(crate) enum ShellCmd {
         program: Option<String>,
         restart: bool,
     },
+    /// `remove <app>`: the daemon-executed atomic removal
+    /// (guard-remove-until-stopped); never touches the registry locally.
+    Remove(String),
     Shutdown,
     Open,
     Help,
@@ -79,6 +82,7 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         "log" => parse_log(args)?,
         "pending" => ShellCmd::Pending,
         "apply" => parse_apply(args)?,
+        "remove" => ShellCmd::Remove(one_arg(head, args)?),
         "shutdown" => ShellCmd::Shutdown,
         "open" => ShellCmd::Open,
         "help" | "?" => ShellCmd::Help,
@@ -237,9 +241,9 @@ fn parse_log(args: &[String]) -> Result<ShellCmd> {
 /// Naive "did you mean" for the unknown-command hint. The word list mirrors
 /// the CLI vocabulary (`start|stop|restart|ps`, no `reload`, no `status`).
 fn similar_hint(input: &str) -> String {
-    const COMMANDS: [&str; 13] = [
+    const COMMANDS: [&str; 14] = [
         "ps", "start", "stop", "restart", "action", "signal", "pid", "log", "pending", "apply",
-        "shutdown", "open", "help",
+        "remove", "shutdown", "open", "help",
     ];
     let input = input.to_lowercase();
     let mut words: Vec<&'static str> = Vec::new();
@@ -306,6 +310,10 @@ Built-in commands:
                                       reserved — no app can be named `all`;
                                       --restart restarts unchanged programs too
                                       (user-stopped ones stay stopped)
+  remove <app>                        unregister an app immediately (no apply
+                                      needed); refused while any of its programs
+                                      is running/starting/stopping/backoff —
+                                      run `stop <app>` first
   shutdown                            stop all programs and exit the daemon
   open                                open the web console in the system browser
   help (or ?)                         show this help
@@ -326,6 +334,7 @@ impl std::fmt::Display for ActionExit {
 impl std::error::Error for ActionExit {}
 
 /// Outcome of one executed command: keep looping or leave the shell.
+#[derive(Debug, PartialEq)]
 enum Outcome {
     Continue,
     Exit,
@@ -491,6 +500,18 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
                 v.get("result")
                     .and_then(|r| r.as_str())
                     .unwrap_or("applied")
+            );
+            Ok(Outcome::Continue)
+        }
+        ShellCmd::Remove(app) => {
+            // The control plane owns the guard and the message (it names the
+            // blocking programs and the `stop <app>` remedy on 409).
+            let v = c.remove_app(app)?;
+            println!(
+                "{}",
+                v.get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("removed")
             );
             Ok(Outcome::Continue)
         }
@@ -1106,6 +1127,152 @@ mod tests {
         assert!(parse_line("log").is_err());
         assert!(parse_line("log web --tail").is_err());
         assert!(parse_line("log web --stream both").is_err());
+    }
+
+    /// guard-remove-until-stopped 2.3: `remove <app>` is a first-class verb
+    /// that takes exactly one app name and routes to the control plane.
+    #[test]
+    fn remove_parsing() {
+        assert_eq!(parse("remove web"), Some(ShellCmd::Remove("web".into())));
+        assert!(parse_line("remove").is_err(), "remove needs an app name");
+        assert!(
+            parse_line("remove a b").is_err(),
+            "remove takes exactly one app"
+        );
+        // The help text documents the verb and the stop-first contract.
+        assert!(HELP_TEXT.contains("remove <app>"));
+        assert!(HELP_TEXT.contains("stop <app>"));
+    }
+
+    // -- `remove <app>` against a fake control plane (task 2.3) --------------
+
+    #[cfg(unix)]
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[cfg(unix)]
+    fn http_status(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Bind a private unix socket and answer one request with `response`.
+    /// Returns (config, request handle).
+    #[cfg(unix)]
+    fn fake_daemon(
+        tag: &str,
+        response: String,
+    ) -> (crate::config::DaemonConfig, std::thread::JoinHandle<String>) {
+        let dir =
+            std::env::temp_dir().join(format!("ak-test-shell-remove-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ak.sock");
+        let ep = crate::transport::Endpoint::parse(&sock.display().to_string()).unwrap();
+        let mut listener = ep.bind().unwrap();
+        let req = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            while !raw.ends_with(b"\r\n\r\n") {
+                if std::io::Read::read(&mut conn, &mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                raw.push(byte[0]);
+            }
+            std::io::Write::write_all(&mut conn, response.as_bytes()).unwrap();
+            let req = String::from_utf8_lossy(&raw).into_owned();
+            let _ = std::fs::remove_dir_all(&dir);
+            req
+        });
+        let cfg = toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            sock.to_string_lossy()
+        ))
+        .unwrap();
+        (cfg, req)
+    }
+
+    /// A successful remove routes to the shared endpoint and keeps the shell
+    /// alive (REPL contract).
+    #[cfg(unix)]
+    #[test]
+    fn remove_success_keeps_the_session() {
+        let (cfg, req) = fake_daemon(
+            "ok",
+            http_ok(
+                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"kept_config":null,"programs":["api"],"applied":true,"result":"app[web] removed; no apply needed"}"#,
+            ),
+        );
+        let c = Client::from_config(&cfg);
+        let outcome = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost").unwrap();
+        assert!(matches!(outcome, Outcome::Continue), "the shell stays up");
+        let req = req.join().unwrap();
+        assert!(
+            req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
+            "the shell reuses the control-plane client: {req}"
+        );
+    }
+
+    /// A 409 surfaces the backend's blocking-program message with the
+    /// stop-first remedy; `-e` maps it to exit 1 while the REPL stays alive.
+    #[cfg(unix)]
+    #[test]
+    fn remove_conflict_reports_blockers_and_keeps_the_session() {
+        let (cfg, req) = fake_daemon(
+            "409",
+            http_status(
+                "409 Conflict",
+                r#"{"error":"app \"web\" still has live program(s): api (running); run `ak stop web` first, then remove"}"#,
+            ),
+        );
+        let c = Client::from_config(&cfg);
+        let err = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost")
+            .expect_err("a conflict is an error");
+        let text = format!("{err:#}");
+        assert!(text.contains("api (running)"), "blockers survive: {text}");
+        assert!(text.contains("ak stop web"), "remedy survives: {text}");
+        assert_eq!(
+            client::exit_code_of(&err),
+            1,
+            "`-e` maps a conflict to exit 1: {text}"
+        );
+        req.join().unwrap();
+    }
+
+    /// Offline and unknown-app removals use the shared exit classes (3 and 1).
+    #[cfg(unix)]
+    #[test]
+    fn remove_offline_and_unknown_app_exit_classes() {
+        let dir = std::env::temp_dir().join(format!("ak-test-shell-off-{}", std::process::id()));
+        let cfg: crate::config::DaemonConfig = toml::from_str(&format!(
+            "[daemon]\nsocket = {:?}\n",
+            dir.join("ak.sock").to_string_lossy()
+        ))
+        .unwrap();
+        let c = Client::from_config(&cfg);
+        let err = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost")
+            .expect_err("no daemon");
+        assert_eq!(client::exit_code_of(&err), 3);
+
+        let (cfg, req) = fake_daemon(
+            "404",
+            http_status("404 Not Found", r#"{"error":"unknown app \"ghost\""}"#),
+        );
+        let c = Client::from_config(&cfg);
+        let err = execute(&c, &ShellCmd::Remove("ghost".into()), "http://localhost")
+            .expect_err("unknown app");
+        assert!(format!("{err:#}").contains("unknown app"), "{err:#}");
+        assert_eq!(client::exit_code_of(&err), 1);
+        req.join().unwrap();
     }
 
     /// actions: start/stop/restart take `<app> [<program>]` (the CLI range

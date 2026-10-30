@@ -34,12 +34,22 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `compose/remove` 管理 app 注册表
   （compose 按路径形态分派：目录/`.toml` → 既有注册；其他普通文件 → 脚手架生成
   `app_dir/<name>.toml`，`apply all` 中 `all` 为全量保留字，不可作应用名；
-  `compose --apply` 保留离线隐式拉起）。顶层 `reload` 已删（`ak reload` 为未知子命令）。
+  `compose --apply` 保留离线隐式拉起；`remove` 是纯在线调用
+  `POST /v1/apps/<app>/remove`，**不做本地直删**，守护离线退出 3，成功即由
+  守护进程清理注册与内存状态、无需 apply）。顶层 `reload` 已删（`ak reload` 为未知子命令）。
 - `src/supervisor.rs` — 守护循环（7 态状态机 × 程序），命令队列唯一写者；
   新增「暂存应用」`staged`（已启动未落盘的 ad-hoc app，检测合并使巡检不清理）与
   `AdhocUp/AdhocCommit/AdhocAbort` 命令；启动判定等待（`wait_startup`）跑在 HTTP
-  连接线程而非命令处理器；`src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件
-  + 占位 `*.toml.pending` 与原子 rename 落盘引擎）；`src/config.rs` — 分层配置
+  连接线程而非命令处理器；
+  `Command::Remove` 是移除的唯一入口：先按 `ProgramState::removable()`
+  （`running/starting/stopping/backoff` 拒绝，`stopped/exited/fatal` 接受）查活态，
+  再删注册记录、清内存/pending/用户停止记录、同步健康任务并重扫 pending，
+  返回 `RemoveOutcome`（`deleted_file`/`kept_config`/`programs`/`applied`）与
+  `RemoveError`（404/409/500 映射）；`apply_detection` 在改动任何状态前用同一
+  判定做整批预检（`check_removable_deletions`，`--restart` 不豁免、范围外不阻塞）；
+  `src/registry.rs` — app 注册表（app_dir 链接 + 脚手架生成文件
+  + 占位 `*.toml.pending` 与原子 rename 落盘引擎；`remove` 只删记录，生成文件随
+  记录删除、外部部署本体与日志保留）；`src/config.rs` — 分层配置
   （daemon + app 部署文件）；`src/pump.rs` — 输出接管/轮转/环形缓冲；
   `src/health.rs` — 健康探测（`ureq` 仅供它探测用户程序 URL，不得接回控制面）；
   `src/client.rs` — CLI HTTP/1.1 客户端（自建传输层，含 ad-hoc NDJSON 流式读取）。
@@ -51,7 +61,9 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   准入按端点形态：IPC 形态即 socket 属主、忽略 Authorization 头，TCP 形态
   Bearer 门——除 `/v1/health` 免凭据外 401），状态投影（`StatusDoc`/`ProgramInfo`，
   含 `config_path`/`health_confirmed`）由此导出；
-  `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册。
+  `POST /v1/run`（chunked NDJSON 进度流）、`/v1/run/commit|abort` 承载 ad-hoc 注册；
+  `POST /v1/apps/<app>/remove` 复用 `Command::Remove`，`/v1/apply` 对活态删除目标
+  回 409（与 `/api/apply` 同一消息）。
 - `appkeeper-bench/` — 独立基准测量二进制（workspace 成员）：日志生成器 =
   bench 二进制自我重入（隐藏 `__generate`），指标全部从 `/v1` 投影与磁盘日志
   外部采集（daemon 侧零改动）；轮转对账/清理契约见 benchmark 规范
@@ -60,14 +72,17 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
   SPA + `/api/*`（复用控制面投影；可选 `webui.auth_token` → `/api/auth` 换票
   cookie 会话）+ `/ws` 推送（快照/增量/日志/心跳，MessagePack 二进制帧）；
-  与控制面共享 `Supervisor` 与环形缓冲。
+  `POST /api/apps/<app>/remove` 与 `/v1` 同构（同一 `Command::Remove` 与结果类型，
+  `/ws` 增量帧新增 `removed`（程序名）与 `apps_gone`（app 名）让前端收敛）。
 - `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
 - `webui/` — Web 控制台前端（pnpm + Vite + TypeScript + Lit），release 构建
   后 `dist/` 经 rust-embed 嵌入二进制；dist 不提交。build.rs 在 release（或
   `AK_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
   运行时读盘，无 Node 时回退占位页）。`lib/api.ts`（统一 fetch 封装 +
   401 换票重放）与 `lib/credentials.ts`（凭据状态机）+ `components/credential-gate.ts`
-  构成可选 token 的前端配合。
+  构成可选 token 的前端配合；App 概况页的「移除应用」走 `lib/api.ts` 的
+  `removeApp`，确认框说明删除边界且不自动 stop，成功后 `store` 记录
+  `removedApps`/`flash` 并由 app-shell 收敛导航。
 
 ## Build & Run
 
@@ -80,6 +95,8 @@ pnpm exec tsc --noEmit && pnpm test && pnpm build   # 类型检查 + 测试 + �
 pnpm dev                               # HMR dev server（:5273），代理 /api /health /ws → 后端（:9877）
 
 cargo run -p xtask -- e2e             # 验收 e2e：CLI 检出/apply/范围/--restart/compose 场景
+                                       #   + remove 守卫（活态拒绝、backoff 拒绝、stop→remove 一步、
+                                       #     离线退出 3、手工删除的 apply 整批拒绝、/api 与 /v1 同构）
                                        #   + playwright 驱动真实浏览器的 webui 交互（--no-browser 跳过浏览器段）
                                        #   + appkeeper-bench firehose 冒烟（JSON 报告 + 清理断言）
 cargo run -- validate                  # 校验 daemon 配置 + 全部注册应用

@@ -11,7 +11,7 @@
  * - WS back   → stop polling; the fresh snapshot clears staleness.
  */
 
-import { apiFetch, apiJson } from './api.js'
+import { apiFetch, apiJson, removeApp, type RemoveAppResult } from './api.js'
 import { loadRefreshMs, saveRefreshMs, type RefreshMs } from './prefs.js'
 import type { PendingDoc, ProgramInfo, StatusDoc, StreamId } from './types.js'
 import { WsClient, type WsState } from './ws-client.js'
@@ -42,6 +42,9 @@ export class ConsoleStore {
   private refreshMs: RefreshMs = loadRefreshMs()
   private logFrames: { program: string; stream: StreamId; text: string }[] = []
   private flushScheduled = false
+  private flashNotice: { ok: boolean; text: string } | null = null
+  /** Apps removed since the last snapshot (STATUS `apps_gone`). */
+  private removedApps = new Set<string>()
 
   /** Log subscriptions survive reconnects: WS resubscribes on snapshot. */
   private subscriptions = new Set<string>() // `${program}\u0000${stream}`
@@ -50,6 +53,7 @@ export class ConsoleStore {
     if (this.client) return
     this.client = new WsClient(wsUrl(), {
       snapshot: (doc) => {
+        this.removedApps.clear()
         this.doc = {
           daemon: doc.daemon,
           programs: [...doc.programs].sort(byAppThenName),
@@ -64,9 +68,15 @@ export class ConsoleStore {
         }
         this.emit()
       },
-      delta: (programs, pending) => {
+      delta: (programs, pending, removed, appsGone) => {
         if (!this.doc) return
-        this.mergeDelta(programs)
+        this.mergeDelta(programs, removed)
+        if (appsGone?.length) {
+          // A removed app record is authoritative even when it declared no
+          // programs (nothing to drop from the projection) — remember it so
+          // the views can converge and navigate away.
+          for (const a of appsGone) this.removedApps.add(a)
+        }
         if (pending !== undefined) this.doc = { ...this.doc, pending }
         this.emit()
       },
@@ -144,6 +154,35 @@ export class ConsoleStore {
   }
 
   /**
+   * A one-shot console notice that survives navigation (e.g. "app removed; no
+   * apply needed" after the overview falls back to the dashboard). Rendered by
+   * the overview bar until dismissed.
+   */
+  get flash(): { ok: boolean; text: string } | null {
+    return this.flashNotice
+  }
+
+  setFlash(text: string, ok = true): void {
+    this.flashNotice = { ok, text }
+    this.emit()
+  }
+
+  clearFlash(): void {
+    if (!this.flashNotice) return
+    this.flashNotice = null
+    this.emit()
+  }
+
+  /**
+   * Whether [`app`] was removed since the last snapshot (STATUS `apps_gone`).
+   * The shell uses it to leave a page whose app no longer exists, including
+   * one that declared no programs at all.
+   */
+  wasAppRemoved(app: string): boolean {
+    return this.removedApps.has(app)
+  }
+
+  /**
    * Apply pending changes via the control-plane API. Scope mirrors the CLI:
    * app + optional program restrict the blast radius; restart also restarts
    * unchanged programs (user-stopped ones stay stopped — server semantics).
@@ -167,6 +206,31 @@ export class ConsoleStore {
   private async pollOnceIfNotLive(): Promise<void> {
     if (this.transport === 'live' && this.client) return
     await this.pollOnce()
+  }
+
+  /**
+   * Remove one whole app through the Web endpoint
+   * (guard-remove-until-stopped). The daemon owns the guard and the result;
+   * this never stops anything and never applies afterwards. A 409/404 throws
+   * an `ApiError` carrying the daemon's message, and the caller keeps the
+   * page as-is.
+   *
+   * Live WS sessions receive the removal as a STATUS delta with `removed`;
+   * degraded (polling) sessions are refreshed here so the removed app cannot
+   * linger.
+   */
+  async removeApp(app: string): Promise<RemoveAppResult> {
+    const result = await removeApp(app)
+    // The server already dropped the record and these programs; apply the
+    // same removal locally so the sidebar/overview converge immediately even
+    // before the next WS delta (a 2xx answer is authoritative).
+    this.removedApps.add(app)
+    if (result.programs?.length) {
+      this.mergeDelta([], result.programs)
+    }
+    this.emit()
+    await this.pollOnceIfNotLive()
+    return result
   }
 
   // --ak- log subscriptions --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-
@@ -208,9 +272,16 @@ export class ConsoleStore {
 
   // --ak- internals --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak--
 
-  private mergeDelta(programs: ProgramInfo[]): void {
+  /**
+   * Merge one STATUS delta. `removed` carries program names the server dropped
+   * (a whole app was removed); they must be deleted from the projection — an
+   * additive merge would leave stale, still-clickable rows behind
+   * (guard-remove-until-stopped 4.3).
+   */
+  private mergeDelta(programs: ProgramInfo[], removed?: string[]): void {
     if (!this.doc) return
     const byName = new Map(this.doc.programs.map((p) => [p.name, p]))
+    for (const name of removed ?? []) byName.delete(name)
     for (const p of programs) byName.set(p.name, p)
     this.doc = {
       daemon: this.doc.daemon,
@@ -224,6 +295,9 @@ export class ConsoleStore {
       const res = await apiFetch('/api/overview')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const doc = (await res.json()) as StatusDoc
+      // A poll returns a whole document, so it supersedes the incremental
+      // removal bookkeeping (absent apps are simply absent).
+      this.removedApps.clear()
       this.doc = {
         daemon: doc.daemon,
         programs: [...doc.programs].sort(byAppThenName),

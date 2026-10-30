@@ -175,6 +175,31 @@ async fn pending(State(sup): State<Arc<Supervisor>>) -> Json<crate::supervisor::
     Json(doc)
 }
 
+/// `POST /api/apps/{name}/remove` — the console's removal entry
+/// (guard-remove-until-stopped). Enqueues the same Supervisor command as
+/// `/v1/apps/{name}/remove` and returns the same outcome shape; the status
+/// mapping is the error's own (404 unknown, 409 conflict, 500 delete failure).
+/// The console never stops programs or deletes files itself.
+async fn app_remove(State(sup): State<Arc<Supervisor>>, Path(name): Path<String>) -> Response {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    sup.enqueue(Command::Remove {
+        app: name,
+        reply: tx,
+    });
+    match rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(Ok(outcome)) => Json(crate::server::remove_json(&outcome)).into_response(),
+        Ok(Err(e)) => api_error(
+            StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &e.to_string(),
+        ),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "supervisor did not answer in time",
+        ),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct ApplyQuery {
     app: Option<String>,
@@ -264,6 +289,7 @@ pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>, auth_token:
         .route("/api/programs/{name}/{action}", post(program_action))
         .route("/api/pending", get(pending))
         .route("/api/apply", post(apply))
+        .route("/api/apps/{name}/remove", post(app_remove))
         .route("/ws", get(ws_upgrade))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&auth),
@@ -624,6 +650,40 @@ fn status_delta(prev: &[ProgramInfo], cur: &[ProgramInfo]) -> Vec<ProgramInfo> {
         .collect()
 }
 
+/// Program names that existed in `prev` and are gone from `cur` — the removal
+/// signal of a STATUS frame (guard-remove-until-stopped 4.3). Without it a
+/// shrinking projection would leave the console with stale, still-clickable
+/// rows for a removed app.
+fn status_removed(prev: &[ProgramInfo], cur: &[ProgramInfo]) -> Vec<String> {
+    let present: std::collections::HashSet<&str> = cur.iter().map(|p| p.name.as_str()).collect();
+    let mut gone: Vec<String> = prev
+        .iter()
+        .filter(|p| !present.contains(p.name.as_str()))
+        .map(|p| p.name.clone())
+        .collect();
+    gone.sort();
+    gone
+}
+
+/// App record names in the live state. App removal drops a record, so the
+/// difference between two ticks is exactly "these apps were removed" — unlike
+/// the program diff it cannot be confused with an app whose programs were all
+/// deleted by an apply (that keeps the record and its now-empty overview).
+fn app_names(sup: &Arc<Supervisor>) -> Vec<String> {
+    let st = sup.state.lock().unwrap();
+    let mut names: Vec<String> = st.apps.iter().map(|a| a.name.clone()).collect();
+    names.sort();
+    names
+}
+
+/// Apps present in `prev` and gone from `cur` (sorted).
+fn status_removed_apps(prev: &[String], cur: &[String]) -> Vec<String> {
+    let present: std::collections::HashSet<&str> = cur.iter().map(String::as_str).collect();
+    prev.iter()
+        .filter(|a| !present.contains(a.as_str()))
+        .cloned()
+        .collect()
+}
 async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>) {
     stop.enter_session();
     let (mut sink, mut source) = socket.split();
@@ -651,6 +711,7 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>, stop: Arc<WebuiLife
     // webui-api spec: the first message is always a full snapshot.
     let snap = status_doc(&sup);
     let mut last: Vec<ProgramInfo> = snap.programs.clone();
+    let mut last_apps = app_names(&sup);
     let mut last_pending = snap.pending.clone();
     // Named (map) encoding: the browser's msgpack decoder produces JS
     // objects; compact array encoding yields a tuple, which the client's
@@ -735,12 +796,34 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>, stop: Arc<WebuiLife
                 // (apply-workflow: pending appears in snapshot + deltas).
                 let doc = status_doc(&sup);
                 let cur = doc.programs.clone();
+                let cur_apps = app_names(&sup);
                 let pending_changed = doc.pending != last_pending;
                 let delta = status_delta(&last, &cur);
+                let removed = status_removed(&last, &cur);
+                let apps_removed = status_removed_apps(&last_apps, &cur_apps);
                 last = cur;
-                if !delta.is_empty() || pending_changed {
+                last_apps = cur_apps;
+                if !delta.is_empty()
+                    || !removed.is_empty()
+                    || !apps_removed.is_empty()
+                    || pending_changed
+                {
                     last_pending = doc.pending.clone();
                     let mut payload = serde_json::json!({ "programs": delta });
+                    // Removal is explicit: the client drops these entries
+                    // instead of keeping a stale, clickable row for an app
+                    // that is already gone (guard-remove-until-stopped 4.3).
+                    if !removed.is_empty() {
+                        payload["removed"] = serde_json::json!(removed);
+                    }
+                    // App-level removal is the authoritative signal (the
+                    // record is gone); the program list alone cannot tell a
+                    // removed app from an app whose definitions were all
+                    // deleted by an apply. Named `apps_gone` so it cannot be
+                    // confused with the pending projection's `apps_removed`.
+                    if !apps_removed.is_empty() {
+                        payload["apps_gone"] = serde_json::json!(apps_removed);
+                    }
                     if pending_changed {
                         payload["pending"] =
                             serde_json::to_value(&doc.pending).unwrap_or_default();
@@ -1206,12 +1289,240 @@ mod tests {
         assert_eq!(delta, vec![b]);
     }
 
+    /// guard-remove-until-stopped 4.3: a shrinking projection names exactly
+    /// the programs that disappeared, so the console can drop them instead of
+    /// keeping a stale row; nothing else is reported.
+    #[test]
+    fn status_removed_names_dropped_programs_only() {
+        let mk = |app: &str, name: &str| ProgramInfo {
+            app: app.into(),
+            name: name.into(),
+            state: "stopped".into(),
+            pid: None,
+            unhealthy: false,
+            uptime_secs: 0.0,
+            total_exits: 0,
+            restart_backoff: 1.0,
+            last_exit: None,
+            fatal_reason: None,
+            wait_reason: None,
+            cpu_percent: None,
+            mem_bytes: None,
+            log_rate: crate::metrics::LogRates::default(),
+            command: String::new(),
+            args: Vec::new(),
+            work_dir: String::new(),
+            config_path: None,
+            health_confirmed: true,
+        };
+        let before = vec![mk("web", "api"), mk("web", "web"), mk("other", "job")];
+        // `web` (a whole app) went away; `other.job` stays.
+        let after = vec![mk("other", "job")];
+        assert_eq!(
+            status_removed(&before, &after),
+            vec!["api".to_string(), "web".to_string()],
+            "only the removed app's programs, sorted"
+        );
+        assert!(status_removed(&after, &after).is_empty());
+        // No removal when the projection only changed (same length/set).
+        let mut changed = after.clone();
+        changed[0].state = "running".into();
+        assert!(status_removed(&after, &changed).is_empty());
+    }
+
     // -- metrics contract tests (webui-api: 投影携带指标) --------------------
 
     use crate::config::{AppRaw, resolve_app};
     use crate::metrics::{ProgramMetrics, SystemMetrics};
     use crate::program::ManagedProgram;
     use std::path::Path;
+
+    /// guard-remove-until-stopped 4.1: a supervisor with one registered app
+    /// (`web`, restart = "no") whose removal can be driven through `/api`.
+    /// Spawns the real command loop so the endpoint's enqueue/wait completes.
+    fn sup_with_registered_app(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ak-test-web-rm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let body = dir.join("web-appkeeper.toml");
+        std::fs::write(
+            &body,
+            "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&body, dir.join("app.d/web.toml")).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&body, dir.join("app.d/web.toml")).is_err() {
+                std::fs::hard_link(&body, dir.join("app.d/web.toml")).unwrap();
+            }
+        }
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        let sup2 = sup.clone();
+        std::thread::spawn(move || sup2.run());
+        (sup, dir)
+    }
+
+    /// 4.1: a stopped app is removed via `/api`, returning the same outcome
+    /// shape as `/v1` and clearing the app from the projection.
+    #[tokio::test]
+    async fn api_remove_succeeds_and_projection_drops_the_app() {
+        let (sup, dir) = sup_with_registered_app("ok");
+        let app = build_router(sup.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/apps/web/remove", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["app"], "web");
+        assert_eq!(v["deleted_file"], false);
+        assert_eq!(v["applied"], true);
+        assert!(
+            v["kept_config"]
+                .as_str()
+                .unwrap()
+                .ends_with("web-appkeeper.toml")
+        );
+        assert!(!dir.join("app.d/web.toml").exists(), "record deleted");
+        // The projection no longer lists the app.
+        let app2 = build_router(sup.clone(), test_stop(), "");
+        let (status, body) = get(app2, "/api/overview").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !doc["programs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["app"] == "web"),
+            "{doc}"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.1: an unknown app is a 404 error object; nothing changes.
+    #[tokio::test]
+    async fn api_remove_unknown_app_is_404() {
+        let (sup, dir) = sup_with_registered_app("404");
+        let app = build_router(sup.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/apps/ghost/remove", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("unknown app"), "{v}");
+        assert!(dir.join("app.d/web.toml").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.1/webui-api: a registration-deletion failure is a server error on
+    /// `/api`, and the app/program stay in the projection (the `/v1` and
+    /// `/api` mapping cannot drift — both read `RemoveError::http_status`).
+    #[tokio::test]
+    async fn api_remove_delete_failure_is_500_and_keeps_the_projection() {
+        let (sup, dir) = sup_with_registered_app("delete-fail");
+        // Replace the record with a directory: deletion fails deterministically
+        // (no permission tricks, which do nothing when running as root).
+        let record = dir.join("app.d/web.toml");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(&record).unwrap();
+        let app = build_router(sup.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/apps/web/remove", None, None).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = v["error"].as_str().unwrap();
+        assert!(
+            msg.contains("failed to remove the registration record"),
+            "{v}"
+        );
+        assert!(
+            !msg.contains("ak apply") || msg.contains("will not fix this"),
+            "no apply-as-remedy suggestion: {v}"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.programs.contains_key("web"), "program kept");
+            assert!(
+                st.apps.iter().any(|a| a.name == "web"),
+                "app record kept in the projection"
+            );
+        }
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.1: a live program blocks `/api` removal with a 409 carrying the
+    /// daemon's blocker list; the app keeps running, the record survives, and
+    /// no stop/apply is triggered.
+    #[tokio::test]
+    async fn api_remove_conflict_for_a_running_app() {
+        let (sup, dir) = sup_with_registered_app("busy");
+        // Start the program: `starting` and `running` both block.
+        let started = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            sup.enqueue(Command::Start {
+                name: "web".into(),
+                reply: Some(tx),
+            });
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("start answered")
+                .expect("start ok")
+        };
+        assert!(started.contains("web"), "{started}");
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+        let app = build_router(sup.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/apps/web/remove", None, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            msg.contains("web (running)") || msg.contains("web (starting)"),
+            "{msg}"
+        );
+        assert!(msg.contains("ak stop web"), "the remedy is named: {msg}");
+        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].pid(),
+            pid,
+            "nothing was stopped"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.1: with a console token configured, the removal endpoint requires a
+    /// session exactly like the other `/api` writes.
+    #[tokio::test]
+    async fn api_remove_requires_a_session() {
+        let (sup, dir) = sup_with_registered_app("auth");
+        let app = build_router(sup.clone(), test_stop(), "s3cr3t");
+        let (status, _, _) = call(app, "POST", "/api/apps/web/remove", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A supervisor with one declared program "m" and metric values injected
     /// into the shared sampler table.
@@ -1752,5 +2063,101 @@ mod pending_ws_tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["programs"][0]["app"], "demo");
+    }
+
+    /// guard-remove-until-stopped 4.3: a removal that lands through the
+    /// command queue (CLI, `/v1`, another tab) reaches an open console as a
+    /// STATUS delta naming the dropped program (`removed`) and the removed app
+    /// record (`apps_gone`) — the signal the sidebar/overview converge on.
+    #[tokio::test]
+    async fn ws_status_delta_reports_removed_programs_and_apps_gone() {
+        let dir = std::env::temp_dir().join(format!("ak-test-web-wsrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let body = dir.join("web-appkeeper.toml");
+        std::fs::write(
+            &body,
+            "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'sleep 30'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&body, dir.join("app.d/web.toml")).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(&body, dir.join("app.d/web.toml")).is_err() {
+                std::fs::hard_link(&body, dir.join("app.d/web.toml")).unwrap();
+            }
+        }
+        let (config, _) = crate::config::DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        // The command-queue driver: removal is executed by the supervisor loop.
+        let runner = sup.clone();
+        std::thread::spawn(move || runner.run());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(sup2, test_stop(), "")).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let msg = ws.next().await.unwrap().unwrap();
+        let (t, _payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+        assert_eq!(t, msg_type::SNAPSHOT, "the first frame is the snapshot");
+
+        // Remove out-of-band, exactly like `ak remove` / another console tab.
+        let (tx, rx) = std::sync::mpsc::channel();
+        sup.enqueue(Command::Remove {
+            app: "web".into(),
+            reply: tx,
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("remove answered")
+            .expect("remove succeeded");
+
+        // The next STATUS frame must carry both removal signals.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let payload = loop {
+            assert!(tokio::time::Instant::now() < deadline, "no STATUS frame");
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a frame arrives")
+                .expect("the stream stays open")
+                .unwrap();
+            let Ok((t, payload)) = api::decode_ws_message(&msg.into_data()) else {
+                continue;
+            };
+            if t == msg_type::STATUS {
+                break payload;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            v["removed"],
+            serde_json::json!(["web"]),
+            "the dropped program is named: {v}"
+        );
+        assert_eq!(
+            v["apps_gone"],
+            serde_json::json!(["web"]),
+            "the removed app record is named: {v}"
+        );
+        assert!(!dir.join("app.d/web.toml").exists(), "record deleted");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

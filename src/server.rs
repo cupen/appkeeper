@@ -548,6 +548,10 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
                 .any(|kv| kv == "wait=1" || kv == "wait=true");
             post_app_fanout(sup, name, verb, wait)
         }
+        // guard-remove-until-stopped D1: the one online removal path — the
+        // Supervisor command owns the liveness guard, the record deletion and
+        // the state cleanup (this thread never touches files or processes).
+        ("POST", ["v1", "apps", name, "remove"]) => post_app_remove(sup, name),
         ("GET", ["v1", "programs", name, "logs"]) => {
             // Streaming response: owns the connection until the client leaves.
             respond_logs(sup, name, &query, Box::new(writer));
@@ -860,6 +864,40 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
         Ok(Err(e)) => err_bytes(404, &format!("{e:#}")),
         Err(_) => err_bytes(500, "supervisor did not answer in time"),
     }
+}
+
+/// `POST /v1/apps/{name}/remove` — the one online removal path
+/// (guard-remove-until-stopped). Admission, status mapping and the result
+/// shape are the Supervisor's; this function only marshals the command and
+/// renders the shared outcome, so the `/api` endpoint stays isomorphic.
+///
+/// Status mapping: unknown app → 404, a live/backoff program → 409,
+/// a registration-deletion failure → 500 (nothing was cleaned up).
+fn post_app_remove(sup: &Arc<Supervisor>, app: &str) -> Vec<u8> {
+    let (tx, rx) = mpsc::channel();
+    sup.enqueue(Command::Remove {
+        app: app.to_string(),
+        reply: tx,
+    });
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(outcome)) => json_bytes(200, remove_json(&outcome)),
+        Ok(Err(e)) => err_bytes(e.http_status(), &e.to_string()),
+        Err(_) => err_bytes(500, "supervisor did not answer in time"),
+    }
+}
+
+/// The wire shape of one successful removal, shared by `/v1` and `/api`.
+pub(crate) fn remove_json(o: &crate::supervisor::RemoveOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "app": o.app,
+        "config_path": o.config_path,
+        "deleted_file": o.deleted_file,
+        "kept_config": o.kept_config,
+        "already_unregistered": o.already_unregistered,
+        "programs": o.programs,
+        "applied": o.applied,
+        "result": o.render(),
+    })
 }
 
 // -- ad-hoc register-and-start (run-daemon-first) ---------------------------
@@ -1967,6 +2005,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- app removal endpoint (guard-remove-until-stopped 2.1) ---------------
+
+    /// Register a `restart = "no"` app through the ad-hoc endpoint and return
+    /// its registration record path. `register_only` means it is never started.
+    fn register_only_app(ep: &TestEndpoint, dir: &Path, name: &str) -> std::path::PathBuf {
+        let (cmd, args) = sleep_cmd();
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": name, "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        dir.join("app.d").join(format!("{name}.toml"))
+    }
+
+    /// 2.1: a stopped app is removed immediately with the structured result;
+    /// the status projection no longer contains it.
+    #[test]
+    fn remove_endpoint_succeeds_for_a_stopped_app() {
+        let (sup, dir, ep) = serve_harness("remove-ok");
+        let record = register_only_app(&ep, &dir, "web");
+        assert!(record.exists());
+        let resp = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        assert_eq!(v["app"], "web");
+        assert_eq!(v["deleted_file"], true, "generated record deleted: {v}");
+        assert_eq!(v["applied"], true);
+        assert!(v["programs"].as_array().is_some());
+        assert!(
+            v["result"].as_str().unwrap().contains("no apply needed"),
+            "{v}"
+        );
+        assert!(!record.exists(), "registration record deleted");
+        let status = ep.get("/v1/status");
+        let sv: serde_json::Value =
+            serde_json::from_str(status.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        assert!(
+            !sv["programs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["app"] == "web"),
+            "web's program projection is gone: {sv}"
+        );
+        // A second removal is a 404 (nothing is registered any more).
+        let again = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        assert!(again.starts_with("HTTP/1.1 404"), "{again}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.1: a running program is a 409; nothing changes.
+    #[test]
+    fn remove_endpoint_conflict_for_a_running_app() {
+        let (sup, dir, ep) = serve_harness("remove-busy");
+        let _record = register_only_app(&ep, &dir, "web");
+        // Start it (register=false, restart=no means it stays stopped until a
+        // start command).
+        let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
+        assert!(start.starts_with("HTTP/1.1 200"), "{start}");
+        let resp = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        // The program is either still starting or already running — both block.
+        assert!(
+            resp.contains("web (running)") || resp.contains("web (starting)"),
+            "{resp}"
+        );
+        assert!(resp.contains("ak stop web"), "{resp}");
+        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+        let status = ep.get("/v1/status");
+        assert!(status.contains("\"web\""), "program still projected");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.1: an unknown app is a 404.
+    #[test]
+    fn remove_endpoint_unknown_app_is_404() {
+        let (sup, dir, ep) = serve_harness("remove-404");
+        let resp = ep.post("/v1/apps/not-registered/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        assert!(resp.contains("unknown app"), "{resp}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.1: the TCP form serves the same endpoint under the Bearer gate.
+    #[test]
+    fn remove_endpoint_works_over_the_tcp_form() {
+        let (sup, dir, ep) = serve_harness_tcp("remove-tcp", "secret-1");
+        let (cmd, args) = sleep_cmd();
+        let resp = ep.post_auth(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+            Some("secret-1"),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        // No token → 401, and the record survives.
+        let denied = ep.post_auth("/v1/apps/web/remove", &serde_json::json!({}), None);
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        assert!(dir.join("app.d/web.toml").exists());
+        let ok = ep.post_auth(
+            "/v1/apps/web/remove",
+            &serde_json::json!({}),
+            Some("secret-1"),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(!dir.join("app.d/web.toml").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2: `POST /v1/apply` maps the batch refusal for a live hand-deleted
+    /// app/program to 409 with the blocker list — the same message `/api/apply`
+    /// serves (both ride `Command::Apply`).
+    #[test]
+    fn apply_endpoint_maps_a_live_deletion_to_409() {
+        let (sup, dir, ep) = serve_harness("apply-guard");
+        let record = register_only_app(&ep, &dir, "web");
+        let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
+        assert!(start.starts_with("HTTP/1.1 200"), "{start}");
+        // Hand-delete the registration while the program still runs.
+        std::fs::remove_file(&record).unwrap();
+        let resp = ep.post("/v1/apply", &serde_json::json!({}));
+        assert!(
+            resp.starts_with("HTTP/1.1 409"),
+            "a live deleted app refuses the whole apply: {resp}"
+        );
+        for needle in ["apply refused, nothing was stopped or restarted", "ak stop"] {
+            assert!(resp.contains(needle), "the 409 names {needle:?}: {resp}");
+        }
+        // The blocker is reported with its live state (`starting` until
+        // startsecs elapses, `running` after — both are guard states).
+        assert!(
+            resp.contains("web.web (starting)") || resp.contains("web.web (running)"),
+            "the 409 names the blocker program and state: {resp}"
+        );
+        assert!(!record.exists(), "the on-disk deletion is not rolled back");
+        assert!(
+            sup.state.lock().unwrap().programs.contains_key("web"),
+            "the live program was not dropped by the refused apply"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -- TCP form + Bearer admission (tcp-control-endpoint tasks 2.1–2.4) ----
 
     /// An ephemeral free localhost TCP port (bind :0, read, drop — the
@@ -2024,6 +2215,27 @@ mod tests {
                 req.push_str(&format!("Authorization: Bearer {t}\r\n"));
             }
             req.push_str("Connection: close\r\n\r\n");
+            conn.write_all(req.as_bytes()).unwrap();
+            conn.flush().unwrap();
+            let mut out = String::new();
+            conn.read_to_string(&mut out).unwrap();
+            out
+        }
+
+        /// POST JSON with an optional Bearer token (the tcp:// form gate).
+        fn post_auth(&self, path: &str, body: &serde_json::Value, token: Option<&str>) -> String {
+            let mut conn = self.0.connect().expect("connect to the control endpoint");
+            let payload = body.to_string();
+            let mut req = format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            );
+            if let Some(t) = token {
+                req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+            }
+            req.push_str(&format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            ));
             conn.write_all(req.as_bytes()).unwrap();
             conn.flush().unwrap();
             let mut out = String::new();

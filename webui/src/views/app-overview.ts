@@ -9,6 +9,7 @@
 import { LitElement, css, html } from 'lit'
 import { customElement, property, state } from 'lit/decorators.js'
 import { nothing } from 'lit'
+import { ApiError } from '../lib/api.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import type { ProgramInfo } from '../lib/types.js'
 import {
@@ -44,6 +45,8 @@ export class AkAppOverview extends LitElement {
   @state() private rateWindow: RateWindowS = loadRateWindowS()
   @state() private applying = false
   @state() private applyFeedback: { ok: boolean; text: string } | null = null
+  @state() private removing = false
+  @state() private removeFeedback: { ok: boolean; text: string } | null = null
 
   static styles = css`
     :host {
@@ -85,6 +88,50 @@ export class AkAppOverview extends LitElement {
       border-radius: var(--ak-radius-sm, 6px);
       font: inherit;
       padding: 3px 6px;
+    }
+    .remove {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--ak-space-2);
+    }
+    .remove button {
+      font: inherit;
+      font-size: 0.8rem;
+      padding: 4px 12px;
+      border-radius: var(--ak-radius-sm, 6px);
+      border: 1px solid var(--ak-status-failed-border, #b91c1c);
+      background: transparent;
+      color: var(--ak-status-failed, #ef4444);
+      cursor: pointer;
+    }
+    .remove button:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--ak-status-failed, #ef4444) 12%, transparent);
+    }
+    .remove button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .remove-strip {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--ak-space-2);
+      padding: var(--ak-space-2) var(--ak-space-4);
+      border-radius: var(--ak-radius-lg, 10px);
+      border: 1px solid var(--ak-border);
+      background: var(--ak-surface);
+      font-size: 0.82rem;
+      color: var(--ak-text-dim);
+      white-space: pre-wrap;
+    }
+    .remove-strip[data-error='true'] {
+      border-color: var(--ak-status-failed, #ef4444);
+      background: var(--ak-status-failed-bg);
+      color: var(--ak-text);
+    }
+    .remove-strip[data-ok='true'] {
+      border-color: var(--ak-status-done-border, #15803d);
+      background: var(--ak-status-done-bg);
+      color: var(--ak-status-done, #22c55e);
     }
     table {
       width: 100%;
@@ -256,6 +303,70 @@ export class AkAppOverview extends LitElement {
     saveRateWindowS(this.rateWindow)
   }
 
+  /**
+   * Remove the whole app (guard-remove-until-stopped). Confirmation states
+   * the deletion boundary honestly: the registration goes away, an
+   * `app_dir`-generated config file is deleted with it, an external
+   * deployment config body is kept — and nothing is stopped for the user.
+   * On success the app is gone immediately (no apply); a 409 keeps the page
+   * and shows the daemon's blocking programs + the stop-first remedy.
+   */
+  private async onRemove(): Promise<void> {
+    if (this.removing) return
+    const programs = this.programsOf(this.app)
+    const live = programs.filter(
+      (p) => p.state === 'running' || p.state === 'starting' || p.state === 'backoff',
+    )
+    const liveNote = live.length
+      ? `\n注意：当前仍有 ${live.length} 个程序未停止（${live
+          .map((p) => `${p.name} ${p.state}`)
+          .join(', ')}），移除会被拒绝；请先执行停止。`
+      : ''
+    if (
+      !window.confirm(
+        `移除 app「${this.app}」？\n` +
+          '将删除其注册记录；若配置位于 app_dir 内且由脚手架生成，该配置文件会一并删除；\n' +
+          '外部部署配置本体保留，日志文件不受影响。\n' +
+          '移除不会自动停止任何程序，也不影响其他应用。' +
+          liveNote,
+      )
+    ) {
+      return
+    }
+    this.removing = true
+    this.removeFeedback = null
+    try {
+      const r = await this.store.removeApp(this.app)
+      const text = r.result
+      this.removeFeedback = { ok: true, text }
+      // The app no longer exists and this view is about to unmount, so carry
+      // the success message across the navigation (the localized notice said
+      // "no apply needed") and land on a still-resolving overview.
+      this.store.setFlash(text, true)
+      navigate(this.fallbackPath())
+    } catch (e) {
+      const msg = e instanceof ApiError || e instanceof Error ? e.message : String(e)
+      // The daemon's own words already name the blockers and `ak stop <app>`;
+      // the page (and its navigation entry) stays.
+      this.removeFeedback = { ok: false, text: msg }
+    } finally {
+      this.removing = false
+    }
+  }
+
+  /** Where to go once this app is gone: another app's overview, else the dashboard. */
+  private fallbackPath(): string {
+    const others = [
+      ...new Set(
+        (this.console?.snapshot.doc?.programs ?? [])
+          .map((p) => p.app)
+          .filter((a) => a !== this.app),
+      ),
+    ].sort()
+    const next = others[0]
+    return next ? `/app/${encodeURIComponent(next)}` : '/'
+  }
+
   private openDetail(program: string): void {
     navigate(`/app/${encodeURIComponent(this.app)}/program/${encodeURIComponent(program)}`)
   }
@@ -275,7 +386,28 @@ export class AkAppOverview extends LitElement {
             )}
           </select>
         </label>
+        <span class="remove">
+          <button
+            data-kind="remove"
+            ?disabled=${this.removing}
+            @click=${() => void this.onRemove()}
+            title="移除整个应用（不会自动停止程序；运行中的程序会阻止移除）"
+          >
+            ${this.removing ? '移除中…' : '移除应用'}
+          </button>
+        </span>
       </header>
+      ${this.removeFeedback
+        ? html`<div
+            class="remove-strip"
+            data-ok=${this.removeFeedback.ok}
+            data-error=${!this.removeFeedback.ok}
+            role=${this.removeFeedback.ok ? 'status' : 'alert'}
+            aria-label="移除结果"
+          >
+            ${this.removeFeedback.text}
+          </div>`
+        : nothing}
       ${pendingSet.size > 0 || this.applyFeedback
         ? html`<div class="apply-strip" role="alert">
             <span><span class="count">${pendingSet.size}</span> 个程序配置有变化（待应用）</span>

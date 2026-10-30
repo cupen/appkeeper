@@ -54,3 +54,41 @@ export function apiPostJson<T>(path: string, payload: unknown): Promise<T> {
     body: JSON.stringify(payload),
   })
 }
+
+/**
+ * Remove a whole app: `POST /api/apps/<app>/remove` (guard-remove-until-stopped).
+ *
+ * The daemon owns the guard — a live program yields a 409 `ApiError` carrying
+ * the blocking programs and the stop-first remedy, an unknown app a 404. The
+ * console never sends stop+remove and never calls apply afterwards: a 2xx
+ * means the removal already took effect.
+ */
+export function removeApp<T = RemoveAppResult>(app: string): Promise<T> {
+  return apiJson<T>(`/api/apps/${encodeURIComponent(app)}/remove`, { method: 'POST' })
+}
+
+/**
+ * The removal result shared with `POST /v1/apps/<app>/remove`
+ * (supervisor::RemoveOutcome). Field names are the wire contract.
+ */
+export interface RemoveAppResult {
+  app: string
+  /** The registration record path that was removed (`app_dir/<app>.toml`). */
+  config_path: string
+  /** True when a scaffold-generated real file was deleted with it. */
+  deleted_file: boolean
+  /** Deployment config body kept on disk (link registrations), else null. */
+  kept_config: string | null
+  /**
+   * True when there was no record left to delete (removed by hand): the
+   * runtime state was still cleaned up, so the removal is satisfied and no
+   * apply is needed.
+   */
+  already_unregistered: boolean
+  /** Programs dropped from the runtime projection. */
+  programs: string[]
+  /** Always true: the removal is immediate, no apply is needed. */
+  applied: boolean
+  /** One-line summary rendered by the daemon. */
+  result: string
+}

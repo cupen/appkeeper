@@ -270,7 +270,20 @@ export class AkOverviewBar extends LitElement {
       (pending?.apps_added.length ?? 0) +
       (pending?.apps_removed.length ?? 0) +
       (pending?.daemon_hints.length ?? 0)
+    const flash = this.store.flash
     return html`
+      ${flash
+        ? html`<div
+            class="pending"
+            role=${flash.ok ? 'status' : 'alert'}
+            aria-label="操作结果"
+          >
+            <span class="detail">${flash.text}</span>
+            <span class="actions">
+              <button @click=${() => this.store.clearFlash()} title="关闭提示">关闭</button>
+            </span>
+          </div>`
+        : nothing}
       ${pendingCount > 0
         ? html`<div class="pending" role="alert" aria-label="待应用变更">
             <span class="badge">待应用变更 <span class="count">${pendingCount}</span></span>

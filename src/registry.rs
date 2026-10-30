@@ -867,6 +867,16 @@ pub struct RemovedApp {
     pub deleted_file: bool,
 }
 
+/// True when a registration record exists at `app_dir/<name>.toml`.
+///
+/// Uses the same existence probe as [`remove`], so the two cannot drift: a
+/// caller that needs "nothing left to delete" (the daemon Remove command, whose
+/// record may have been removed by hand) checks this instead of parsing
+/// [`remove`]'s error text.
+pub fn is_registered(config: &DaemonConfig, config_dir: &Path, name: &str) -> bool {
+    link_path(config, config_dir, name).exists()
+}
+
 /// Remove an app registration: delete the `app_dir` record. A link record
 /// is removed while the external deployment file is kept; a record that is
 /// a real file inside `app_dir` (scaffold-generated) is deleted with the
@@ -1384,6 +1394,45 @@ mod tests {
         }
         assert!(body.exists(), "deployment config untouched");
         assert!(!tmp.join("app.d").join("myapp.toml").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// guard-remove-until-stopped 1.3: the registration removal touches only
+    /// the record — log files survive, an unknown app is an error, and the
+    /// reported paths distinguish the deleted record from the kept body.
+    #[test]
+    fn remove_leaves_logs_alone_and_reports_paths() {
+        let tmp = tmp_dir("remove-boundary");
+        let config = DaemonConfig::default();
+        let logs = tmp.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log_file = logs.join("abc-out.log");
+        std::fs::write(&log_file, "line\n").unwrap();
+
+        // Generated record: path reported = the deleted record itself.
+        let exe = make_exe(&tmp, "proc");
+        let r = add(&config, &tmp, &exe, &opts("abc")).unwrap();
+        let removed = remove(&config, &tmp, "abc").unwrap();
+        assert!(removed.deleted_file);
+        assert_eq!(removed.path, r.file, "the deleted record path is reported");
+        assert!(
+            log_file.is_file(),
+            "log files are never removed with an app"
+        );
+
+        // External record: path reported = the kept deployment body.
+        let deploy = tmp.join("ext");
+        std::fs::create_dir_all(&deploy).unwrap();
+        let body = deploy.join("appkeeper.toml");
+        std::fs::write(&body, "[program.b]\ncommand = \"true\"\n").unwrap();
+        add(&config, &tmp, &deploy, &opts("ext")).unwrap();
+        let removed = remove(&config, &tmp, "ext").unwrap();
+        assert_eq!(removed.path, body, "the kept config body path is reported");
+        assert!(body.is_file());
+
+        // Unknown app: rejected, nothing to report.
+        let err = remove(&config, &tmp, "nope").unwrap_err();
+        assert!(format!("{err:#}").contains("not registered"), "{err:#}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

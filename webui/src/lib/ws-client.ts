@@ -30,7 +30,13 @@ export type WsState = 'connecting' | 'open' | 'closed'
 
 export interface WsClientHandlers {
   snapshot(doc: StatusDoc): void
-  delta(programs: ProgramInfo[], pending?: PendingDoc): void
+  /**
+   * Incremental update. `removed` names programs that disappeared from the
+   * projection and `appsGone` the app records that were removed
+   * (guard-remove-until-stopped); the store MUST drop those entries rather
+   * than keeping stale, clickable rows.
+   */
+  delta(programs: ProgramInfo[], pending?: PendingDoc, removed?: string[], appsGone?: string[]): void
   log(program: string, stream: 0 | 1, text: string): void
   gap(program: string, stream: 0 | 1, skipped: number): void
   error(message: string): void
@@ -161,16 +167,18 @@ export class WsClient {
         this.handlers.snapshot(decodeDoc<StatusDoc>(payload))
         return
       case MSG.STATUS: {
-        // The payload is a JSON object {programs, pending?} since the
-        // apply-workflow change; decode defensively (old servers sent a
-        // bare program array).
+        // The payload is a JSON object {programs, pending?, removed?} since the
+        // apply-workflow / guard-remove changes; decode defensively (old
+        // servers sent a bare program array).
         const text = new TextDecoder().decode(payload)
         try {
           const parsed = JSON.parse(text) as {
             programs?: ProgramInfo[]
             pending?: PendingDoc
+            removed?: string[]
+            apps_gone?: string[]
           }
-          this.handlers.delta(parsed.programs ?? [], parsed.pending)
+          this.handlers.delta(parsed.programs ?? [], parsed.pending, parsed.removed, parsed.apps_gone)
         } catch {
           const programs = decodeDoc<ProgramInfo[]>(payload)
           this.handlers.delta(programs)

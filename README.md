@@ -75,7 +75,7 @@ ak start web                                          # 5. 再启动
 | --- | --- |
 | `ak compose <目录\|.toml\|可执行>` | 注册 app：目录/配置→`app_dir` 链接；可执行→脚手架生成配置 |
 | `ak compose … --apply` | 注册后立即生效（守护离线时自动后台拉起） |
-| `ak remove <app>` | 注销（脚手架生成的文件连带删除，部署目录文件不动） |
+| `ak remove <app>` | 注销：守护进程一次完成，立即清除注册与内存投影，**无需 apply**；要求该 app 无 `running/starting/stopping/backoff` 程序，否则 409 列出阻塞项并提示先 `ak stop <app>`（守护离线退出 3，不做本地直删） |
 | `ak config --reload` | 立即重扫配置，检出待应用变更（pending），**不触碰任何进程** |
 | `ak apply [<app> [<程序>]] [--restart]` | 应用待应用变更（见下「两阶段」） |
 | `ak validate [路径]` | 校验 daemon 配置 + 全部注册应用（或单个文件） |
@@ -92,9 +92,16 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置/用法错误、`3` �
 - **两层模型**：daemon 全局唯一，持有注册目录 `app_dir`；**app** 是部署单元
   （部署目录里的 `appkeeper.toml`）；**program** 是被守护的子进程，名字跨全部
   应用全局唯一——任何面板直接用程序名寻址。
-- **配置变更两阶段**：磁盘配置被修改（手改 / compose / remove）→ 守护进程
+- **配置变更两阶段**：磁盘配置被修改（手改 / compose）→ 守护进程
   周期重扫，差异只记为 **pending**（绝不碰进程）→ `ak apply` 显式生效。
   `ak config --reload` 只是「立即重扫一次」。
+- **移除是命令式的一步**：`ak remove <app>` 由守护进程原子执行——校验活态、
+  删除注册记录、清理内存状态，当场收敛，不进入 pending、不需要 apply、
+  也不停止任何程序（存在活态程序时直接拒绝）。手工删除注册文件或 app 内的
+  程序定义则走两阶段，且 apply 会整批拒绝仍在运行/启动/停止中/退避的删除目标：
+  先 `ak stop`，再 `ak apply`。
+- **删除边界**：移除只动注册记录——脚手架生成在 `app_dir` 内的配置随记录删除；
+  外部部署目录里的 `appkeeper.toml` 本体保留；日志文件一律不动。
 - **restart 策略**（docker 字面量）：`no` / `on-failure` / `always` /
   `unless-stopped`。优先级 `[program.*]` > `[app]` > daemon `[app-default]` >
   内置默认 `no`。
@@ -175,6 +182,10 @@ ak config --delete webui                              # 删段 = 关闭
 未配 token 时 `/api/*` 完全开放（socket 属主隔离不覆盖控制台），`ak validate`
 会对该组合告警。
 
+控制台的 App 概况页提供「移除应用」操作（需确认）：与 `ak remove` 走同一个
+`POST /api/apps/<app>/remove`，活态冲突时页面保留并展示阻塞原因，成功后提示
+无需 apply，侧栏与当前视图随 `/ws` 推送自动收敛。
+
 ## 控制面与远程管理
 
 控制面是控制端点上的标准 HTTP/1.1 JSON API（`/v1/*`），端点两种形态同一时刻
@@ -185,6 +196,13 @@ ak config --delete webui                              # 删段 = 关闭
 
 远程机器操作只需一份指向 `tcp://` 的配置：`ak -c <配置> ps`。排障可直接
 `curl --unix-socket /run/appkeeper/$(id -u)/ak.sock http://localhost/v1/status`。
+
+移除应用由 `POST /v1/apps/<app>/remove`（控制台用同构的
+`POST /api/apps/<app>/remove`）承载：`200` 返回
+`{app, config_path, deleted_file, kept_config, programs, applied, result}`；
+未知 app 为 `404`，存在活态程序为 `409`（消息列出 `program (state)` 与
+`ak stop <app>` 提示），注册记录删除失败为 `500`。手工删除注册文件后
+`POST /v1/apply` 在范围内存在活态删除目标时同样返回 `409`，且整批不执行。
 
 ## 升级速览（历史 BREAKING 摘要）
 
@@ -205,6 +223,9 @@ ak config --delete webui                              # 删段 = 关闭
 - `run` ad-hoc 全形态 daemon-first：离线退出 3；先启动成功再落盘（失败不留残留）。
 - v0.1 单文件配置：`ak compose <旧文件>` 自动识别转换。
 - 标识符（app/程序/动作名）仅允许 `[A-Za-z0-9_-]`。
+- `ak remove <app>` 不再是本地直删 + 事后 sync：改为守护进程执行的原子动作
+  （活态程序拒绝、成功即收敛、不产生 pending）；守护离线退出 3，不做本地删除。
+  旧流程「`ak remove` 后 `ak apply`」不再需要。
 
 ## 开发
 
