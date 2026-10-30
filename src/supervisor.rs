@@ -1782,12 +1782,17 @@ impl Supervisor {
     /// "On disk" is an lstat, not a stat: a dangling symlink record still IS a
     /// registration (the same predicate [`registry::guard_scaffold_overwrite`]
     /// uses), so it must be a conflict rather than a free path to rename over.
+    /// Only a regular file or a symlink counts — a DIRECTORY at the record path
+    /// is not a registration record; it is left to the landing stage, which
+    /// fails its rename and reports the partial failure (residual).
     fn adhoc_exists(&self, name: &str) -> bool {
         let (config, config_dir) = {
             let st = self.state.lock().unwrap();
             (st.config.clone(), st.config_dir.clone())
         };
-        if std::fs::symlink_metadata(registry::link_path(&config, &config_dir, name)).is_ok() {
+        if let Ok(md) = std::fs::symlink_metadata(registry::link_path(&config, &config_dir, name))
+            && (md.is_file() || md.file_type().is_symlink())
+        {
             return true;
         }
         let st = self.state.lock().unwrap();
