@@ -44,6 +44,11 @@ const EXIT_CONFIG: i32 = 2;
 /// Client contract: 3 = daemon unreachable (mapped by `client::exit_code_of`).
 const EXIT_UNREACHABLE: i32 = 3;
 
+/// The fixed human hint for a `--force` run whose rendered config is
+/// byte-identical to the record on disk: nothing was done, exit 0
+/// (refuse-run-existing-app D6).
+const UNCHANGED_HINT: &str = "配置无修改，不做任何动作";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ak",
@@ -82,7 +87,9 @@ enum Cmd {
         #[arg(long = "json")]
         json: bool,
     },
-    /// Register and start a new command line (ad-hoc; daemon required)
+    /// Register and start a new command line (ad-hoc; daemon required).
+    /// A same-name app is refused by default; `--force` overwrites it
+    /// (identical config is a no-op)
     Run {
         /// The command line: everything after `--`
         #[arg(
@@ -114,6 +121,9 @@ enum Cmd {
         /// Ad-hoc working directory (default: current directory)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
+        /// Overwrite an existing same-name app (default: a same-name run is refused)
+        #[arg(long = "force")]
+        force: bool,
         /// Machine-readable JSON output
         #[arg(long = "json")]
         json: bool,
@@ -656,6 +666,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             restart_backoff,
             envs,
             workdir,
+            force,
             json,
         }) => {
             let adhoc = !cmd.is_empty() || cmd_str.is_some();
@@ -679,6 +690,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 *restart_backoff,
                 envs,
                 workdir.as_deref(),
+                *force,
                 *json,
             )
         }
@@ -1181,21 +1193,25 @@ struct AdhocFlags {
     restart_backoff: Option<f64>,
     envs: Vec<String>,
     workdir: Option<PathBuf>,
+    /// `--force`: overwrite an existing same-name app (a value-less flag).
+    force: bool,
 }
 
 /// Split the trailing region into `(argv, flags)`: argv is everything up to
 /// the first recognized scaffold flag; the rest is parsed as scaffold flags
-/// (supporting both `--flag value` and `--flag=value`).
+/// (supporting both `--flag value` and `--flag=value`; `--force` takes no
+/// value and rejects `--force=...`).
 fn split_adhoc_trailing(
     trailing: &[String],
 ) -> std::result::Result<(Vec<String>, AdhocFlags), String> {
-    const FLAGS: [&str; 6] = [
+    const FLAGS: [&str; 7] = [
         "--app",
         "--description",
         "--restart",
         "--restart-backoff",
         "--env",
         "--workdir",
+        "--force",
     ];
     let is_flag = |t: &str| {
         FLAGS
@@ -1237,6 +1253,12 @@ fn split_adhoc_trailing(
             }
             "--env" => flags.envs.push(take_value(&mut i)?),
             "--workdir" => flags.workdir = Some(PathBuf::from(take_value(&mut i)?)),
+            "--force" => {
+                if inline.is_some() {
+                    return Err("--force takes no value".to_string());
+                }
+                flags.force = true;
+            }
             other => return Err(format!("unknown flag {other:?} in the run command form")),
         }
         i += 1;
@@ -1259,6 +1281,7 @@ fn run_adhoc(
     restart_backoff: Option<f64>,
     envs: &[String],
     workdir: Option<&Path>,
+    force: bool,
     json: bool,
 ) -> Result<()> {
     // For the `--` form the scaffold flags may ride after the command line
@@ -1280,6 +1303,9 @@ fn run_adhoc(
     let restart = flags.restart.as_deref().or(restart);
     let restart_backoff = flags.restart_backoff.or(restart_backoff);
     let workdir = flags.workdir.as_deref().or(workdir);
+    // `--force` is accepted in both positions (`ak run --force -- <cmd>` and
+    // `ak run -- <cmd> --force`) and has no value.
+    let force = force || flags.force;
     let envs: Vec<String> = if flags.envs.is_empty() {
         envs.to_vec()
     } else {
@@ -1331,6 +1357,7 @@ fn run_adhoc(
         "restart": restart,
         "restart_backoff": restart_backoff,
         "register_only": register_only,
+        "force": force,
     });
     let mut residual: Option<serde_json::Value> = None;
     let frames = c.adhoc_run(&body, |frame| {
@@ -1494,6 +1521,10 @@ fn render_run_terminal(frame: &serde_json::Value, json: bool) -> Result<()> {
 /// (task 6.4/6.8) so the branches are unit-testable.
 fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<String>, Vec<String>) {
     let ok = frame.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+    // `--force` + byte-identical config: nothing was written and nothing was
+    // started or stopped. A fixed human hint, exit 0; `--json` carries the
+    // structured object (refuse-run-existing-app D6).
+    let unchanged = frame.get("unchanged").and_then(|u| u.as_bool()) == Some(true);
     if json {
         // Machine-readable shape (task 6.4): name / config_path / pid / status.
         // The full frame (error, partial, config_text) rides along so a
@@ -1508,8 +1539,15 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
             "name": program,
             "config_path": config_path,
             "pid": pid,
-            "status": if ok { "started" } else { "failed" },
+            "status": match (ok, unchanged) {
+                (_, true) => "unchanged",
+                (true, false) => "started",
+                (false, false) => "failed",
+            },
         });
+        if unchanged {
+            obj["unchanged"] = serde_json::Value::Bool(true);
+        }
         if !ok {
             if let Some(e) = frame.get("error") {
                 obj["error"] = e.clone();
@@ -1527,6 +1565,9 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
         let text = serde_json::to_string_pretty(&obj).unwrap_or_default();
         let code = if ok { EXIT_OK } else { EXIT_ERROR };
         return (code, vec![text], Vec::new());
+    }
+    if unchanged && ok {
+        return (EXIT_OK, vec![UNCHANGED_HINT.to_string()], Vec::new());
     }
     if !ok {
         let phase = frame
@@ -3548,6 +3589,135 @@ mod cli_verb_tests {
         assert!(parse_err(&["run", "--cmd", "x", "--name", "web"]).contains("unexpected argument"));
         // The two entry forms are mutually exclusive.
         assert!(parse_err(&["run", "--cmd", "x", "--", "y"]).contains("cannot be used with"));
+    }
+
+    /// refuse-run-existing-app 1.2: `--force` is recognized in both positions
+    /// (`ak run --force -- <cmd>` and `ak run -- <cmd> --force`) and takes no
+    /// value; `--force=...` is rejected.
+    #[test]
+    fn run_adhoc_force_flag_in_both_positions() {
+        // clap position (before `--`).
+        match parse(&["run", "--force", "--", "python", "-m", "http.server"]).cmd {
+            Some(Cmd::Run { cmd, force, .. }) => {
+                assert!(force, "--force before `--`");
+                let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
+                assert_eq!(argv, vec!["python", "-m", "http.server"]);
+                assert!(!flags.force, "nothing to split out");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // Trailing position: once the flag region starts (the first recognized
+        // flag), `--force` may sit at any point inside it — same as `--app`.
+        for trailing in [
+            vec!["python", "-m", "http.server", "--force"],
+            vec!["python", "-m", "http.server", "--app", "web", "--force"],
+            vec!["python", "-m", "http.server", "--force", "--app", "web"],
+            vec!["python", "-m", "http.server", "--restart", "no", "--force"],
+        ] {
+            let owned: Vec<String> = trailing.iter().map(|s| s.to_string()).collect();
+            let (argv, flags) = split_adhoc_trailing(&owned).unwrap();
+            assert_eq!(
+                argv,
+                vec!["python", "-m", "http.server"],
+                "command split before the flag region in {trailing:?}"
+            );
+            assert!(flags.force, "recognized in {trailing:?}");
+        }
+        // The flag region starts at the first recognized flag, `--force`
+        // included; the trailing tokens from there on must be scaffold flags.
+        let (argv, flags) =
+            split_adhoc_trailing(&["python".into(), "-c".into(), "x".into(), "--force".into()])
+                .unwrap();
+        assert_eq!(argv, vec!["python", "-c", "x"]);
+        assert!(flags.force);
+        // A command token after `--force` is an error, exactly like after
+        // `--app` (the region is flags-only).
+        assert!(split_adhoc_trailing(&["python".into(), "--force".into(), "-m".into()]).is_err());
+
+        // `--force` takes no value.
+        assert!(split_adhoc_trailing(&["x".into(), "--force=yes".into()]).is_err());
+        // And the `--force` spelling is legal at the clap level too.
+        parse(&["run", "--force", "--cmd", "python -c x"]);
+    }
+
+    /// refuse-run-existing-app 1.4: `unchanged:true` prints the fixed hint and
+    /// exits 0; `--json` carries the structured `unchanged` marker.
+    #[test]
+    fn run_terminal_unchanged_is_a_noop() {
+        let frame = serde_json::json!({
+            "ok": true, "program": "web", "config_path": "/d/web.toml",
+            "pid": 42, "unchanged": true,
+        });
+        let (code, out, err) = run_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty(), "{err:?}");
+        assert_eq!(out, vec![UNCHANGED_HINT.to_string()]);
+        // The human hint carries no pid/config noise: it is the fixed sentence.
+        let joined = out.join("\n");
+        assert!(joined.contains("配置无修改，不做任何动作"), "{joined}");
+        assert!(!joined.contains("42"), "{joined}");
+
+        let (code, out, _) = run_terminal_render(&frame, true);
+        assert_eq!(code, EXIT_OK);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["unchanged"], true);
+        assert_eq!(v["status"], "unchanged");
+        assert_eq!(v["pid"], 42);
+        assert_eq!(v["name"], "web");
+        assert_eq!(v["config_path"], "/d/web.toml");
+
+        // Not running: pid is null, still unchanged and exit 0.
+        let stopped = serde_json::json!({
+            "ok": true, "program": "web", "config_path": "/d/web.toml",
+            "pid": serde_json::Value::Null, "unchanged": true,
+        });
+        let (code, out, _) = run_terminal_render(&stopped, false);
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, vec![UNCHANGED_HINT.to_string()]);
+        let (_, out, _) = run_terminal_render(&stopped, true);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert!(v["pid"].is_null());
+        assert_eq!(v["unchanged"], true);
+
+        // A started frame is untouched by the new branch.
+        let (code, out, _) = run_terminal_render(
+            &serde_json::json!({
+                "ok": true, "program": "web", "config_path": "/d/web.toml", "pid": 7,
+            }),
+            false,
+        );
+        assert_eq!(code, EXIT_OK);
+        assert!(out.join("\n").contains("started"), "{out:?}");
+    }
+
+    /// refuse-run-existing-app 1.2: `--force` also reaches the request body —
+    /// the CLI folds the clap flag and the trailing flag into one boolean. The
+    /// body shape itself is asserted where the daemon parses it (`server.rs`).
+    #[test]
+    fn run_adhoc_force_positions_fold_into_one_flag() {
+        // Effective force = clap flag OR trailing flag, in either position.
+        // `ak run --force -- <cmd...>`: only the clap flag is set.
+        match parse(&["run", "--force", "--", "python", "-m", "http.server"]).cmd {
+            Some(Cmd::Run { cmd, force, .. }) => {
+                assert!(force, "clap flag is set");
+                let (_, flags) = split_adhoc_trailing(&cmd).unwrap();
+                assert!(!flags.force, "the trailing region carries no --force");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // `ak run -- <cmd...> --force`: only the trailing flag is set.
+        match parse(&["run", "--", "python", "-m", "http.server", "--force"]).cmd {
+            Some(Cmd::Run { cmd, force, .. }) => {
+                assert!(!force, "clap flag is not set");
+                let (_, flags) = split_adhoc_trailing(&cmd).unwrap();
+                assert!(flags.force, "the trailing region carries --force");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse(&["run", "--force", "--", "python"]).cmd {
+            Some(Cmd::Run { force, .. }) => assert!(force),
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 
     /// An invalid `--restart` literal is rejected — at clap parse time for the

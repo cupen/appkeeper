@@ -2850,7 +2850,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         &format!("the error carries the 409/already-running message: {combined:?}"),
     )?;
 
-    step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + regenerate");
+    step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + default refusal");
     let sleep = find_sleep()?;
     let sleep_s = sleep.to_string_lossy().replace('\\', "/");
     let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--app", "adhoc-a"])?;
@@ -2890,36 +2890,87 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         a_text.replace("adhoc-a", "adhoc-X") == b_text.replace("adhoc-b", "adhoc-X"),
         "`--` and `--cmd` produce the same registration modulo the name",
     )?;
-    // Re-running the SAME name is a full regeneration (app-registry: 同名
-    // ad-hoc 全量再生, immediate effect): the whole file is rewritten from
-    // this command line. Identical content is an idempotent success returning
-    // the existing pid with no restart.
+    // Refuse-run-existing-app 4.1/4.3: a same-name re-submission WITHOUT
+    // `--force` is refused with zero side effects — the record bytes and mtime
+    // stay put, the running PID is neither stopped nor replaced, and the error
+    // names the app plus the `--force` escape. There is no implicit
+    // regeneration anymore (app-registry: 同名 ad-hoc 提交默认拒绝).
+    step("R3b. a same-name re-submission is refused by default (no --force)");
     let pid_before = pid_of(ws, "adhoc-a")?.expect("adhoc-a is running");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--app", "adhoc-a"])?;
-    expect(
-        out.contains("started") && out.contains(&pid_before.to_string()),
-        &format!("identical re-run is idempotent (same pid {pid_before}): {out:?}"),
-    )?;
-    expect(
-        pid_of(ws, "adhoc-a")? == Some(pid_before),
-        "the identical re-run did not restart the process",
-    )?;
-    // Changed args → regenerated and restarted (new pid).
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "456", "--app", "adhoc-a"])?;
-    expect(
-        out.contains("started"),
-        &format!("the changed re-run succeeds: {out:?}"),
-    )?;
-    let a_text2 = std::fs::read_to_string(&a_cfg)?;
-    expect(
-        a_text2.contains("456") && !a_text2.contains("123"),
-        "re-running regenerates the whole file from the new command line",
-    )?;
-    let pid_after = pid_of(ws, "adhoc-a")?.expect("adhoc-a still running");
-    expect(
-        pid_after != pid_before,
-        "the changed definition restarted the process (new pid)",
-    )?;
+    let a_text_before = std::fs::read_to_string(&a_cfg)?;
+    let a_mtime_before = std::fs::metadata(&a_cfg)?.modified()?;
+    let files_before = app_dir_files(ws);
+    let changed_cmd = format!("{sleep_s} 456");
+    let attempts: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "changed args",
+            vec!["run", "--", &sleep_s, "456", "--app", "adhoc-a"],
+        ),
+        (
+            "identical args",
+            vec!["run", "--", &sleep_s, "123", "--app", "adhoc-a"],
+        ),
+        (
+            "--restart=no",
+            vec![
+                "run",
+                "--",
+                &sleep_s,
+                "456",
+                "--app",
+                "adhoc-a",
+                "--restart=no",
+            ],
+        ),
+        (
+            "--cmd form",
+            vec!["run", "--cmd", &changed_cmd, "--app", "adhoc-a"],
+        ),
+    ];
+    for (label, args) in attempts {
+        let (ok, code, combined) = cli_try(bin, ws, &args)?;
+        expect(
+            !ok && code != 0,
+            &format!("a same-name re-run ({label}) is refused, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("adhoc-a"),
+            &format!("the refusal ({label}) names the app: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("--force"),
+            &format!("the refusal ({label}) points at --force: {combined:?}"),
+        )?;
+        expect(
+            std::fs::read_to_string(&a_cfg)? == a_text_before,
+            &format!("the refusal ({label}) left the record bytes unchanged"),
+        )?;
+        expect(
+            std::fs::metadata(&a_cfg)?.modified()? == a_mtime_before,
+            &format!("the refusal ({label}) left the record mtime unchanged"),
+        )?;
+        expect(
+            pid_of(ws, "adhoc-a")? == Some(pid_before),
+            &format!("the refusal ({label}) did not restart the process"),
+        )?;
+        if cfg!(unix) {
+            expect(
+                pid_alive(pid_before),
+                &format!("the existing process ({pid_before}) is still alive after {label}"),
+            )?;
+        }
+        expect(
+            !ws.root.join("apps/adhoc-a.toml.pending").exists(),
+            &format!("the refusal ({label}) left no placeholder"),
+        )?;
+        expect(
+            app_dir_files(ws) == files_before,
+            &format!(
+                "the refusal ({label}) left app_dir untouched: {:?}",
+                app_dir_files(ws)
+            ),
+        )?;
+    }
     // Command resolution failure exits 2 with no artifact.
     let (ok, code, combined) =
         cli_try(bin, ws, &["run", "--", "definitely-not-a-real-cmd", "--x"])?;
@@ -2953,6 +3004,35 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     expect(
         pid_of(ws, "adhoc-quiet")?.is_none(),
         "--restart=no registers but does not start",
+    )?;
+    // Refuse-run-existing-app 4.2: a registered-but-NOT-running app is refused
+    // too — the record is not rewritten and no process is created.
+    let quiet_cfg = ws.root.join("apps/adhoc-quiet.toml");
+    let quiet_before = std::fs::read_to_string(&quiet_cfg)?;
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "789", "--app", "adhoc-quiet"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("re-running a stopped registration is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("adhoc-quiet") && combined.contains("--force"),
+        &format!("the refusal names the app and --force: {combined:?}"),
+    )?;
+    expect(
+        std::fs::read_to_string(&quiet_cfg)? == quiet_before,
+        "the stopped registration's record is unchanged",
+    )?;
+    expect(
+        pid_of(ws, "adhoc-quiet")?.is_none(),
+        "the refused re-run started no process",
+    )?;
+    expect(
+        !ws.root.join("apps/adhoc-quiet.toml.pending").exists(),
+        "the refused re-run left no placeholder",
     )?;
     // Reserved `all` is refused.
     let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--app", "all"])?;
@@ -3606,23 +3686,405 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     )?;
     expect_no_residue(ws, "clash")?;
 
-    step("RDF9b. a same-name ad-hoc re-submission regenerates (not refused)");
-    // `web` was ad-hoc registered in RDF1; re-submitting it is a full
-    // regeneration (app-registry: 同名全量再生), immediate effect.
+    step("RDF9b. a same-name ad-hoc re-submission is refused by default (no --force)");
+    // `web` was ad-hoc registered in RDF1 and is running. Re-submitting it
+    // without `--force` is a conflict with zero side effects
+    // (app-registry: run ad-hoc 同名应用拦截; task 4.2).
     let web_pid = pid_of(ws, "web")?.expect("web is running");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "303", "--app", "web"])?;
+    let web_before = std::fs::read_to_string(apps.join("web.toml"))?;
+    let web_mtime = std::fs::metadata(apps.join("web.toml"))?.modified()?;
+    let files_before = app_dir_files(ws);
+    for (label, args) in [
+        (
+            "changed args",
+            vec!["run", "--", &sleep_s, "303", "--app", "web"],
+        ),
+        (
+            "identical args",
+            vec!["run", "--", &sleep_s, "300", "--app", "web"],
+        ),
+        (
+            "--restart=no",
+            vec!["run", "--", &sleep_s, "303", "--app", "web", "--restart=no"],
+        ),
+        (
+            "--cmd form",
+            vec!["run", "--cmd", &format!("{sleep_s} 303"), "--app", "web"],
+        ),
+    ] {
+        let (ok, code, combined) = cli_try(bin, ws, &args)?;
+        expect(
+            !ok && code != 0,
+            &format!("a same-name re-run ({label}) is refused, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("web") && combined.contains("--force"),
+            &format!("the refusal ({label}) names the app and --force: {combined:?}"),
+        )?;
+        expect(
+            std::fs::read_to_string(apps.join("web.toml"))? == web_before,
+            &format!("the refusal ({label}) left the record bytes unchanged"),
+        )?;
+        expect(
+            std::fs::metadata(apps.join("web.toml"))?.modified()? == web_mtime,
+            &format!("the refusal ({label}) left the record mtime unchanged"),
+        )?;
+        expect(
+            pid_of(ws, "web")? == Some(web_pid),
+            &format!("the refusal ({label}) did not restart the process"),
+        )?;
+        if cfg!(unix) {
+            expect(
+                pid_alive(web_pid),
+                &format!("the running process ({web_pid}) is alive after {label}"),
+            )?;
+        }
+    }
     expect(
-        out.contains("started"),
-        &format!("a same-name re-submission succeeds: {out:?}"),
+        app_dir_files(ws) == files_before,
+        &format!("refusals left app_dir untouched: {:?}", app_dir_files(ws)),
+    )?;
+    expect(
+        apps.join("web.toml").is_file() && !apps.join("web.toml.pending").exists(),
+        "the refusals left the record in place and no placeholder",
+    )?;
+
+    step("RDF9c. --force with different content on a running app rewrites and restarts");
+    // 5.1: the record is fully rewritten, the old pid disappears (or is
+    // replaced) and `ps` reflects the new definition.
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "303", "--app", "web"],
+    )?;
+    expect(
+        out.contains("started") && out.contains("pid:"),
+        &format!("a forced overwrite reports the new pid: {out:?}"),
     )?;
     let web_text = std::fs::read_to_string(apps.join("web.toml"))?;
     expect(
-        web_text.contains("303"),
-        "the record was regenerated from the new command line",
+        web_text.contains("303") && web_text.contains("args"),
+        &format!("the record was rewritten from the new command line: {web_text:?}"),
+    )?;
+    let new_pid = wait_running(ws, "web")?;
+    expect(
+        new_pid != web_pid,
+        "the forced overwrite replaced the process (new pid)",
+    )?;
+    if cfg!(unix) {
+        expect(
+            !pid_alive(web_pid),
+            &format!("the previous process ({web_pid}) was stopped"),
+        )?;
+    }
+    let table = cli(bin, ws, &["ps"])?;
+    let web_row = table
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("web"))
+        .unwrap_or("");
+    expect(
+        web_row.contains(&new_pid.to_string()),
+        &format!("`ps` shows the new pid: {web_row:?}"),
     )?;
     expect(
-        pid_of(ws, "web")? != Some(web_pid),
-        "the changed definition restarted the process",
+        !apps.join("web.toml.pending").exists(),
+        "the forced overwrite left no placeholder",
+    )?;
+
+    step("RDF9d. --force with identical content does nothing at all");
+    // 5.2 / D6: bytes, mtime and pid are untouched, no stop/spawn happens,
+    // and the CLI prints the fixed hint with exit 0.
+    let text_now = std::fs::read_to_string(apps.join("web.toml"))?;
+    let mtime_now = std::fs::metadata(apps.join("web.toml"))?.modified()?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "303", "--app", "web"],
+    )?;
+    expect(
+        out.contains("配置无修改，不做任何动作"),
+        &format!("the unchanged force run prints the fixed hint: {out:?}"),
+    )?;
+    expect(
+        !out.contains("started"),
+        &format!("the unchanged force run reports no start: {out:?}"),
+    )?;
+    expect(
+        std::fs::read_to_string(apps.join("web.toml"))? == text_now,
+        "the unchanged force run left the record bytes unchanged",
+    )?;
+    expect(
+        std::fs::metadata(apps.join("web.toml"))?.modified()? == mtime_now,
+        "the unchanged force run left the record mtime unchanged",
+    )?;
+    expect(
+        pid_of(ws, "web")? == Some(new_pid),
+        "the unchanged force run left the pid unchanged",
+    )?;
+    if cfg!(unix) {
+        expect(
+            pid_alive(new_pid),
+            &format!("the running process ({new_pid}) is still alive"),
+        )?;
+    }
+    expect(
+        !apps.join("web.toml.pending").exists(),
+        "the unchanged force run wrote no placeholder",
+    )?;
+
+    step("RDF9e. --force --restart=no with different content stops without starting");
+    // 5.5: the record is rewritten, the old process stops, the new definition
+    // is not pulled up.
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--force",
+            "--",
+            &sleep_s,
+            "304",
+            "--app",
+            "web",
+            "--restart=no",
+        ],
+    )?;
+    expect(
+        !out.contains("配置无修改"),
+        &format!("a changed force --restart=no is not a no-op: {out:?}"),
+    )?;
+    let text_no = std::fs::read_to_string(apps.join("web.toml"))?;
+    expect(
+        text_no.contains("304") && text_no.contains("restart = \"no\""),
+        &format!("the record was rewritten with restart = no: {text_no:?}"),
+    )?;
+    expect(
+        pid_of(ws, "web")?.is_none(),
+        "force --restart=no stops the old process and starts nothing",
+    )?;
+    wait_state_in(ws, "web", &["stopped"])?;
+    expect(
+        !apps.join("web.toml.pending").exists(),
+        "force --restart=no left no placeholder",
+    )?;
+    // Same definition again: no-op, still stopped.
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--force",
+            "--",
+            &sleep_s,
+            "304",
+            "--app",
+            "web",
+            "--restart=no",
+        ],
+    )?;
+    expect(
+        out.contains("配置无修改，不做任何动作"),
+        &format!("the unchanged force --restart=no prints the hint: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "web")?.is_none(),
+        "an unchanged force run never pulls a stopped app up",
+    )?;
+
+    step("RDF9f. --force on a registered-but-stopped app with a difference starts it");
+    // 5.3: registered with --restart=no, then forced with different content:
+    // the record is rewritten and the program is pulled up.
+    cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--",
+            &sleep_s,
+            "305",
+            "--app",
+            "idle",
+            "--restart=no",
+        ],
+    )?;
+    expect(pid_of(ws, "idle")?.is_none(), "idle starts stopped")?;
+    let idle_cfg = apps.join("idle.toml");
+    let idle_before = std::fs::read_to_string(&idle_cfg)?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "306", "--app", "idle"],
+    )?;
+    expect(
+        out.contains("started"),
+        &format!("the forced overwrite starts the stopped app: {out:?}"),
+    )?;
+    let idle_text = std::fs::read_to_string(&idle_cfg)?;
+    expect(
+        idle_text != idle_before && idle_text.contains("306"),
+        "the record was rewritten from the new command line",
+    )?;
+    let idle_pid = wait_running(ws, "idle")?;
+    expect(
+        out.contains(&idle_pid.to_string()),
+        &format!("the reported pid is the live one ({idle_pid})"),
+    )?;
+
+    step("RDF9g. --force on a registered-but-stopped app with no difference is a no-op");
+    // 5.4: nothing is written and the program stays stopped.
+    cli(bin, ws, &["stop", "idle"])?;
+    wait_state_in(ws, "idle", &["stopped"])?;
+    let idle_text_now = std::fs::read_to_string(&idle_cfg)?;
+    let idle_mtime = std::fs::metadata(&idle_cfg)?.modified()?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "306", "--app", "idle"],
+    )?;
+    expect(
+        out.contains("配置无修改，不做任何动作"),
+        &format!("the unchanged force run prints the hint: {out:?}"),
+    )?;
+    expect(
+        std::fs::read_to_string(&idle_cfg)? == idle_text_now,
+        "the unchanged force run left the record unchanged",
+    )?;
+    expect(
+        std::fs::metadata(&idle_cfg)?.modified()? == idle_mtime,
+        "the unchanged force run left the record mtime unchanged",
+    )?;
+    expect(
+        pid_of(ws, "idle")?.is_none(),
+        "the unchanged force run did not pull the stopped app up",
+    )?;
+    expect(
+        idle_cfg.is_file() && !apps.join("idle.toml.pending").exists(),
+        "the unchanged force run left the record in place and no placeholder",
+    )?;
+
+    step("RDF9h. --force does not bypass a cross-app program-name collision");
+    // 5.6a: `clash` belongs to app `owner`; --force must still be refused and
+    // must not write anything.
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "302", "--app", "clash"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("--force on a cross-app collision is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("owner") || combined.contains("already registered"),
+        &format!("the error explains the collision: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "clash")?;
+
+    step("RDF9j. a --force overwrite whose new process fails startup keeps the new record");
+    // 5.7 / D7: structured error, the failed new process is stopped, no
+    // `.pending` residue, and the landed record stays (no rollback).
+    cli(
+        bin,
+        ws,
+        &[
+            "run",
+            "--",
+            &sleep_s,
+            "308",
+            "--app",
+            "doomed",
+            "--restart=no",
+        ],
+    )?;
+    let doomed_cfg = apps.join("doomed.toml");
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "0.05", "--app", "doomed"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("the failing forced start exits non-zero, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("startsecs") || combined.contains("startup"),
+        &format!("the error names the startup failure: {combined:?}"),
+    )?;
+    let doomed_text = std::fs::read_to_string(&doomed_cfg)?;
+    expect(
+        doomed_text.contains("0.05"),
+        "the new record was landed before the startup judgement (no rollback)",
+    )?;
+    expect(
+        pid_of(ws, "doomed")?.is_none(),
+        "the failed new process was stopped",
+    )?;
+    expect(
+        !apps.join("doomed.toml.pending").exists(),
+        "the failed forced start left no placeholder",
+    )?;
+
+    step("RDF9k. --json carries `unchanged` and the pid for both force outcomes");
+    // 5.8: a changed overwrite reports status started + the new pid; an
+    // identical overwrite reports unchanged:true and the existing pid.
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--json", "--", &sleep_s, "310", "--app", "jf"],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf json parses")?;
+    let jf_pid = v["pid"].as_u64().context("jf initial pid")? as u32;
+    expect(
+        v["status"] == "started",
+        &format!("the initial run is started: {out:?}"),
+    )?;
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run", "--json", "--force", "--", &sleep_s, "311", "--app", "jf",
+        ],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf changed json")?;
+    expect(
+        v["status"] == "started",
+        &format!("the changed forced run reports started: {out:?}"),
+    )?;
+    expect(
+        v.get("unchanged").is_none(),
+        &format!("a changed forced run is not marked unchanged: {out:?}"),
+    )?;
+    let jf_pid2 = v["pid"].as_u64().context("jf new pid")? as u32;
+    expect(
+        jf_pid2 != jf_pid,
+        &format!("the changed forced run reports the new pid ({jf_pid2}): {out:?}"),
+    )?;
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run", "--json", "--force", "--", &sleep_s, "311", "--app", "jf",
+        ],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf unchanged json")?;
+    expect(
+        v["unchanged"] == true && v["status"] == "unchanged",
+        &format!("the identical forced run is marked unchanged: {out:?}"),
+    )?;
+    expect(
+        v["pid"].as_u64() == Some(u64::from(jf_pid2)),
+        &format!("the unchanged run reports the existing pid ({jf_pid2}): {out:?}"),
+    )?;
+    expect(
+        v["name"] == "jf"
+            && v["config_path"]
+                .as_str()
+                .is_some_and(|c| c.ends_with("jf.toml")),
+        &format!("the unchanged json carries name/config_path: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "jf")? == Some(jf_pid2),
+        "the unchanged forced run left the process alone",
     )?;
 
     step("RDF10. the reserved `all` name is refused with no residue");
@@ -3850,6 +4312,45 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         "no process was started when the placeholder could not be written",
     )?;
     shutdown_daemon_at(&ro_endpoint, &mut ro_daemon);
+
+    step("RDF13d. --force refuses to overwrite an external deployment config");
+    // 5.6b: `ext.toml` is a link to a config OUTSIDE app_dir; --force must
+    // refuse and leave the target byte-identical. This runs after the
+    // pending-sensitive scenarios (a not-applied app would show up as new).
+    let ext_target = ws.root.join("external-web.toml");
+    let ext_text =
+        format!("[program.ext]\ncommand = \"{sleep_s}\"\nargs = [\"300\"]\nstartsecs = 0.2\n");
+    std::fs::write(&ext_target, &ext_text)?;
+    link_registration(&ext_target, &apps.join("ext.toml"))?;
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "307", "--app", "ext"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("--force on an external registration is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("ext"),
+        &format!("the refusal names the app: {combined:?}"),
+    )?;
+    expect(
+        std::fs::read_to_string(&ext_target)? == ext_text,
+        "the external config is untouched",
+    )?;
+    expect(
+        apps.join("ext.toml").is_file(),
+        "the registration link is still in place",
+    )?;
+    expect(
+        !apps.join("ext.toml.pending").exists(),
+        "the refused overwrite left no placeholder",
+    )?;
+    // Remove the registration again: the scenarios below (residual state)
+    // assert on the live registry and must not see a new app.
+    std::fs::remove_file(apps.join("ext.toml"))?;
+    std::fs::remove_file(&ext_target)?;
 
     // -- 8.6: partial failure + residual state ------------------------------
 

@@ -20,7 +20,12 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `run`（**仅** ad-hoc 注册：`--`/`--cmd` 二选一，应用命名 `--app`，**daemon-first**：
   经控制面 API 由守护进程执行，返回同样的 `{程序名, 配置路径, PID}` 并支持 `--json`；
   「先启动成功、后落盘」，守护离线一律退出码 3 且不隐式拉起；裸 `run` 为退出码 2
-  的用法错误并列出 ad-hoc 两形态；守护形态的 `run` 在参数解析前拦截并给迁移提示）|
+  的用法错误并列出 ad-hoc 两形态；守护形态的 `run` 在参数解析前拦截并给迁移提示；
+  **同名默认拒绝**：应用名已注册（记录在盘 / 内存 app / 同名程序）时未带 `--force`
+  一律 409 冲突、零副作用（不写盘、不启停既有进程），`--force` 才覆盖；
+  `--force` 逐字节比较新旧配置，**无差异为空操作**（「配置无修改，不做任何动作」，
+  退出 0，不写盘/不重启/不拉起），有差异则原子重写后停旧启新；`--force` 不放行
+  跨应用程序名冲突与外部部署配置写保护）|
   `validate`（含 webui 无 token 的暴露警告）| `config`
   （daemon 配置动作：init/set/get/delete/edit/reload，白名单键表与读改写/
   原子落盘引擎在 `src/config.rs`；`--reload` 经 `/v1/reload` 触发在线重扫，

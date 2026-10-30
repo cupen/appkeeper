@@ -46,6 +46,9 @@ pub struct AdhocSpec {
     pub health_check: Option<String>,
     /// `--restart=no`: no startup judgement, register only (D8).
     pub register_only: bool,
+    /// `--force`: overwrite an existing same-name registration (refuse-run-
+    /// existing-app D4/D5). Without it a same-name submission is a 409 conflict.
+    pub force: bool,
 }
 
 /// A staged (started but not yet persisted) ad-hoc app (run-daemon-first D1).
@@ -75,6 +78,11 @@ pub enum AdhocUpError {
     /// The name (or program name) collides / is invalid / is the reserved
     /// `all` keyword.
     Validation(String),
+    /// A same-name app already exists (registered record on disk, in-memory
+    /// app or a program owned by that app) and `--force` was not given. Zero
+    /// side effects: nothing written, nothing started or stopped
+    /// (refuse-run-existing-app D3).
+    Conflict(String),
     /// The placeholder could not be established: nothing started (D2).
     Stage(String),
 }
@@ -82,7 +90,9 @@ pub enum AdhocUpError {
 impl std::fmt::Display for AdhocUpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AdhocUpError::Validation(m) | AdhocUpError::Stage(m) => f.write_str(m),
+            AdhocUpError::Validation(m) | AdhocUpError::Conflict(m) | AdhocUpError::Stage(m) => {
+                f.write_str(m)
+            }
         }
     }
 }
@@ -90,11 +100,13 @@ impl std::fmt::Display for AdhocUpError {
 impl std::error::Error for AdhocUpError {}
 
 impl AdhocUpError {
-    /// The HTTP status a validation failure maps to: a name collision or an
-    /// invalid name is a 400; everything else is a 409 (state conflict).
+    /// The HTTP status a validation failure maps to: an invalid definition or a
+    /// name owned by ANOTHER app is a 400; a same-name conflict and any other
+    /// state conflict is a 409 (refuse-run-existing-app D3).
     pub fn http_status(&self) -> u16 {
         match self {
             AdhocUpError::Validation(_) => 400,
+            AdhocUpError::Conflict(_) => 409,
             AdhocUpError::Stage(_) => 500,
         }
     }
@@ -103,6 +115,7 @@ impl AdhocUpError {
     pub fn phase(&self) -> &'static str {
         match self {
             AdhocUpError::Validation(_) => "validation",
+            AdhocUpError::Conflict(_) => "conflict",
             AdhocUpError::Stage(_) => "stage",
         }
     }
@@ -126,14 +139,16 @@ pub struct AdhocUpResult {
     /// True when the definition was already staged/started by an earlier run
     /// whose commit failed: the CLI must ask before re-committing (D4).
     pub residual: bool,
-    /// True when a same-name registration already held byte-identical content:
-    /// an idempotent upsert that neither wrote the record nor restarted the
-    /// process. `pid` is the existing one (control-plane spec: 同名重复提交走再生).
+    /// True when `--force` was given and the newly rendered config is
+    /// byte-identical to the record on disk: nothing was written, nothing was
+    /// started or stopped. `pid` is the existing one, if any
+    /// (refuse-run-existing-app D6).
     pub unchanged: bool,
-    /// True when the record is ALREADY on disk (a regeneration of a committed
-    /// same-name app): the caller waits for the startup judgement but MUST NOT
-    /// run the commit step again (there is no placeholder / staged entry).
-    pub committed: bool,
+    /// True when the record is ALREADY on disk by the time this result is
+    /// returned: the `--force` overwrite path landed it atomically before any
+    /// startup judgement, so the caller MUST NOT run the commit step again
+    /// (there is no placeholder / staged entry) (refuse-run-existing-app D7).
+    pub landed: bool,
 }
 
 /// Successful `AdhocCommit`: the record is on disk.
@@ -1530,10 +1545,10 @@ impl Supervisor {
     /// file stem) and validate it: identifier charset, not the reserved `all`
     /// keyword, and no collision with a program name owned by a DIFFERENT app.
     ///
-    /// A same-name app's own repeated submission is NOT a collision: per the
-    /// control-plane spec it is a full regeneration / upsert (see
-    /// [`Self::cmd_adhoc_up`]), so the program belonging to the same app name
-    /// is allowed through.
+    /// A same-name app's own repeated submission is not a collision here: the
+    /// same-name decision is `--force`'s job ([`Self::cmd_adhoc_up`]), and a
+    /// program owned by the SAME app name is allowed through. `--force` never
+    /// bypasses this check — a program owned by a DIFFERENT app stays refused.
     fn resolve_adhoc_name(&self, spec: &AdhocSpec) -> std::result::Result<String, AdhocUpError> {
         let name = match &spec.name {
             Some(n) => n.clone(),
@@ -1560,9 +1575,10 @@ impl Supervisor {
             )));
         }
         let st = self.state.lock().unwrap();
-        // Only a program owned by ANOTHER app is a genuine collision: a
-        // same-name app's own program is the upsert/regeneration target
-        // (control-plane spec: 同名应用自身的重复提交不属冲突).
+        // Only a program owned by ANOTHER app is a genuine collision here: a
+        // same-name app's own program is the `--force` overwrite target, while
+        // a program owned by a different app stays refused (`--force` never
+        // bypasses this check — refuse-run-existing-app D8).
         if let Some(p) = st.programs.get(&name)
             && p.def.app != name
         {
@@ -1644,16 +1660,19 @@ impl Supervisor {
     /// `AdhocUp`: validate → stage the placeholder → insert the staged record
     /// and `ManagedProgram` → spawn → reply. Never waits: the caller polls.
     ///
-    /// A same-name app that is ALREADY committed (its record is on disk) is an
-    /// upsert/regeneration (control-plane spec: 同名重复提交走再生): identical
-    /// content is an idempotent success returning the existing pid without
-    /// restarting; changed content stops the old process, writes the new
-    /// record and starts the new definition. A same-name app that is staged
-    /// but not yet committed is the residual (failed-commit) case (D4).
+    /// Refuse-run-existing-app: a same-name app is refused with `Conflict`
+    /// unless `--force` is given. With `--force` the overwrite path
+    /// ([`Self::adhoc_force`]) compares the rendered text with the record on
+    /// disk: identical content is a no-op (`unchanged`), different content is
+    /// atomically rewritten and the old process stopped before the new one is
+    /// started (`landed`). A same-name app that is staged but not yet committed
+    /// is the residual (failed-commit) case (D4) and `--force` does not take it
+    /// over.
     fn cmd_adhoc_up(&self, spec: &AdhocSpec) -> std::result::Result<AdhocUpResult, AdhocUpError> {
         let name = self.resolve_adhoc_name(spec)?;
         // Residual check (D4): a same-name staged app that already started but
-        // whose commit failed. Report it instead of restarting.
+        // whose commit failed. Report it instead of restarting; `--force` does
+        // not take over the residual (refuse-run-existing-app D8).
         {
             let st = self.state.lock().unwrap();
             if let Some(s) = st.staged.get(&name) {
@@ -1673,18 +1692,23 @@ impl Supervisor {
                     register_only: false,
                     residual: true,
                     unchanged: false,
-                    committed: false,
+                    landed: false,
                 });
             }
+        }
+        // Existence check before rendering (D1/D3): a default same-name
+        // submission is a conflict with zero side effects, no matter what the
+        // new definition looks like. With `--force` the overwrite path renders
+        // and validates first (D4).
+        if self.adhoc_exists(&name) {
+            if spec.force {
+                return self.adhoc_force(spec, &name);
+            }
+            return Err(AdhocUpError::Conflict(adhoc_conflict_message(&name)));
         }
         // Render + validate the NEW definition before touching anything: a
         // failure here must not disturb the existing record or process.
         let (target, text) = self.render_adhoc(spec, &name)?;
-        // Committed same-name app: upsert / full regeneration (no placeholder,
-        // no startup judgement — the record is already on disk).
-        if let Some(up) = self.adhoc_upsert(spec, &name, &target, &text)? {
-            return Ok(up);
-        }
         let (config, config_dir) = {
             let st = self.state.lock().unwrap();
             (st.config.clone(), st.config_dir.clone())
@@ -1745,98 +1769,122 @@ impl Supervisor {
             register_only: spec.register_only,
             residual: false,
             unchanged: false,
-            committed: false,
+            landed: false,
         })
     }
 
-    /// Upsert/regenerate an already-committed same-name app (control-plane
-    /// spec: 同名重复提交走再生). Returns `None` when `name` is not a
-    /// committed registration (the caller then stages a fresh one).
+    /// True when `name` already exists as an app (refuse-run-existing-app D2):
+    /// its registration record is on disk, it is in the in-memory `apps`
+    /// registry, or `st.programs` holds a same-name program owned by that app
+    /// (covers the window before a rescan). A staged-but-unlanded app is
+    /// handled as residual before this check is reached.
     ///
-    /// - identical content → idempotent: no write, no restart, existing pid;
-    /// - changed content → full regeneration: stop the old process, rewrite
-    ///   the record and start the new definition (`--restart=no` writes only).
-    fn adhoc_upsert(
-        &self,
-        spec: &AdhocSpec,
-        name: &str,
-        target: &Path,
-        text: &str,
-    ) -> std::result::Result<Option<AdhocUpResult>, AdhocUpError> {
-        // The app must be an already-committed registration (its record is a
-        // real generated file and the app is in `st.apps`). Anything else —
-        // not yet registered, or a link/hard-link record to an external file —
-        // is NOT an upsert target: the caller stages a fresh one (or the guard
-        // below refuses to clobber an external file).
-        if !target.is_file() {
-            return Ok(None);
-        }
+    /// "On disk" is an lstat, not a stat: a dangling symlink record still IS a
+    /// registration (the same predicate [`registry::guard_scaffold_overwrite`]
+    /// uses), so it must be a conflict rather than a free path to rename over.
+    fn adhoc_exists(&self, name: &str) -> bool {
         let (config, config_dir) = {
             let st = self.state.lock().unwrap();
             (st.config.clone(), st.config_dir.clone())
         };
-        {
+        if std::fs::symlink_metadata(registry::link_path(&config, &config_dir, name)).is_ok() {
+            return true;
+        }
+        let st = self.state.lock().unwrap();
+        st.apps.iter().any(|a| a.name == name)
+            || st.programs.get(name).is_some_and(|p| p.def.app == name)
+    }
+
+    /// The program in memory that belongs to app `name`, if any. A same-name
+    /// app's program is keyed by its reported program name, which need not be
+    /// the app name for a hand-written record.
+    fn adhoc_program<'a>(st: &'a SupervisorState, name: &str) -> Option<&'a ManagedProgram> {
+        st.programs
+            .get(name)
+            .or_else(|| st.programs.values().find(|p| p.def.app == name))
+    }
+
+    /// `--force` overwrite of an existing same-name app (refuse-run-existing-app
+    /// D4). Validation runs first (a failure touches nothing), the target must
+    /// be our own scaffold file (`--force` does not bypass the guard), and the
+    /// rendered text is compared with the record byte for byte:
+    ///
+    /// - identical → `unchanged`: no write, no stop, no spawn; existing pid;
+    /// - different → placeholder + atomic rename lands the new record, then the
+    ///   old program is stopped and the new definition started (`--restart=no`
+    ///   stops only, without spawning) → `landed`.
+    fn adhoc_force(
+        &self,
+        spec: &AdhocSpec,
+        name: &str,
+    ) -> std::result::Result<AdhocUpResult, AdhocUpError> {
+        let (target, text) = self.render_adhoc(spec, name)?;
+        let (config, config_dir) = {
             let st = self.state.lock().unwrap();
-            if !st.apps.iter().any(|a| a.name == name) {
-                return Ok(None);
-            }
-        }
-        let dir = registry::app_dir(&config, &config_dir);
-        if let Err(e) = registry::guard_scaffold_overwrite(target, &dir, name) {
-            return Err(AdhocUpError::Validation(format!("{e:#}")));
-        }
-        let old_text = match std::fs::read_to_string(target) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(AdhocUpError::Validation(format!(
-                    "cannot read the existing registration {}: {e}",
-                    target.display()
-                )));
-            }
+            (st.config.clone(), st.config_dir.clone())
         };
-        // Idempotent: identical content → reuse the running process.
-        if old_text == text {
+        // An external/hand-written record is never clobbered, `--force` or not.
+        let dir = registry::app_dir(&config, &config_dir);
+        registry::guard_scaffold_overwrite(&target, &dir, name)
+            .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
+        // Byte comparison against the record on disk (a missing or unreadable
+        // record counts as "different": there is nothing to preserve).
+        let old_text = std::fs::read_to_string(&target).ok();
+        if old_text.as_deref() == Some(text.as_str()) {
             let st = self.state.lock().unwrap();
-            let pid = st.programs.get(name).and_then(|p| p.pid());
-            return Ok(Some(AdhocUpResult {
+            let pid = Self::adhoc_program(&st, name).and_then(|p| p.pid());
+            let has_health = Self::adhoc_program(&st, name)
+                .map(|p| p.def.health.is_some())
+                .unwrap_or(false);
+            return Ok(AdhocUpResult {
                 app: name.to_string(),
                 program: name.to_string(),
                 config_path: target.display().to_string(),
                 pid,
                 estimate_secs: 0.0,
-                has_health: st
-                    .programs
-                    .get(name)
-                    .map(|p| p.def.health.is_some())
-                    .unwrap_or(false),
+                has_health,
                 register_only: spec.register_only,
                 residual: false,
                 unchanged: true,
-                committed: true,
-            }));
+                landed: false,
+            });
         }
-        // Changed: full regeneration. Write the record atomically (placeholder
-        // + rename), then rebuild the program; respawn per the new definition
-        // unless the caller asked for register-only.
-        let _placeholder = registry::stage_placeholder(&config, &config_dir, name, text)
+        // Different: land the new record atomically (placeholder + rename)
+        // before touching any process.
+        let _placeholder = registry::stage_placeholder(&config, &config_dir, name, &text)
             .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
-        let raw: crate::config::AppRaw = match toml::from_str(text) {
+        let raw: crate::config::AppRaw = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
                 registry::discard_placeholder(&config, &config_dir, name);
                 return Err(AdhocUpError::Validation(format!("{e}")));
             }
         };
-        let resolved = match config::resolve_app(name, target, &raw, config.app_default.as_ref()) {
+        let resolved = match config::resolve_app(name, &target, &raw, config.app_default.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 registry::discard_placeholder(&config, &config_dir, name);
                 return Err(AdhocUpError::Validation(format!("{e:#}")));
             }
         };
-        // Land the record (rename the placeholder); keep the process untouched
-        // until the new file is in place.
-        match registry::commit_staged(&config, &config_dir, name, text) {
+        match registry::commit_staged(&config, &config_dir, name, &text) {
+            // A racing writer landed identical content: treat as unchanged.
+            Ok(o) if o.unchanged() => {
+                let st = self.state.lock().unwrap();
+                let pid = Self::adhoc_program(&st, name).and_then(|p| p.pid());
+                return Ok(AdhocUpResult {
+                    app: name.to_string(),
+                    program: name.to_string(),
+                    config_path: target.display().to_string(),
+                    pid,
+                    estimate_secs: 0.0,
+                    has_health: resolved.programs[0].health.is_some(),
+                    register_only: spec.register_only,
+                    residual: false,
+                    unchanged: true,
+                    landed: false,
+                });
+            }
             Ok(_) => {}
             Err(e) => {
                 registry::discard_placeholder(&config, &config_dir, name);
@@ -1849,9 +1897,18 @@ impl Supervisor {
             let mut st = self.state.lock().unwrap();
             let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
             let ring_cap = st.config.daemon.log_buffer_lines;
-            // Stop and drop the old process, then install the new definition.
-            if let Some(mut old) = st.programs.remove(&program) {
-                old.stop();
+            // Stop and drop every process of the old definition (the record is
+            // already the new one), then install the new program.
+            let stale: Vec<String> = st
+                .programs
+                .iter()
+                .filter(|(k, p)| k.as_str() == name || p.def.app == name)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in stale {
+                if let Some(mut old) = st.programs.remove(&key) {
+                    old.stop();
+                }
             }
             let mut mp = ManagedProgram::new(resolved.programs[0].clone(), log_dir, ring_cap);
             if !spec.register_only {
@@ -1869,7 +1926,7 @@ impl Supervisor {
             pid
         };
         self.sync_health_tasks();
-        Ok(Some(AdhocUpResult {
+        Ok(AdhocUpResult {
             app: name.to_string(),
             program,
             config_path: target.display().to_string(),
@@ -1879,8 +1936,8 @@ impl Supervisor {
             register_only: spec.register_only,
             residual: false,
             unchanged: false,
-            committed: true,
-        }))
+            landed: true,
+        })
     }
 
     /// Upper bound (seconds) a caller should wait for the startup judgement
@@ -2803,6 +2860,16 @@ fn answer(reply: Option<Reply>, r: Result<String>) {
     if let Some(tx) = reply {
         let _ = tx.send(r);
     }
+}
+
+/// The refusal a same-name `ak run` gets without `--force`
+/// (refuse-run-existing-app D3/D8): names the app and points at the two
+/// escapes (a different `--app`, or an explicit overwrite).
+fn adhoc_conflict_message(name: &str) -> String {
+    format!(
+        "app {name:?} is already registered — `ak run` refuses to replace an existing app; \
+         choose another `--app` name or pass `--force` to overwrite it"
+    )
 }
 
 // -- startup judgement (run-daemon-first D3/D5) ------------------------------
@@ -4889,6 +4956,7 @@ mod tests {
             restart_backoff: None,
             health_check: None,
             register_only: false,
+            force: false,
         }
     }
 
@@ -5056,51 +5124,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// control-plane: a same-name app's repeated submission is NOT a
-    /// collision — identical content is an idempotent upsert returning the
-    /// existing pid without restarting (同名重复提交走再生, 无变化幂等).
+    /// refuse-run-existing-app 2.2: a same-name submission without `--force`
+    /// is a 409 conflict with zero side effects — whether the app is running
+    /// or registered-but-stopped.
     #[test]
-    fn adhoc_upsert_identical_is_idempotent() {
-        let (sup, dir, h) = adhoc_harness("upsert-idem");
+    fn adhoc_up_refuses_existing_app_without_force() {
+        let (sup, dir, h) = adhoc_harness("conflict");
         let spec = || AdhocSpec {
             name: Some("web".into()),
             ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
         };
+        // Registered AND running.
         let first = adhoc_up(&sup, spec()).unwrap();
+        let pid = first.pid.expect("spawned");
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+
+        let err = adhoc_up(&sup, spec()).unwrap_err();
+        assert!(matches!(err, AdhocUpError::Conflict(_)), "{err:?}");
+        assert_eq!(err.http_status(), 409);
+        assert_eq!(err.phase(), "conflict");
+        assert!(err.to_string().contains("web"), "names the app: {err}");
+        assert!(
+            err.to_string().contains("--force"),
+            "offers the escape: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "record untouched"
+        );
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].pid(),
+            Some(pid),
+            "running process untouched"
+        );
+
+        // Registered but not running: still a conflict, still no new process.
+        let _ = sup.cmd_stop("web");
+        assert!(sup.state.lock().unwrap().programs["web"].pid().is_none());
+        let err = adhoc_up(&sup, spec()).unwrap_err();
+        assert!(matches!(err, AdhocUpError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "record untouched"
+        );
+        assert!(
+            sup.state.lock().unwrap().programs["web"].pid().is_none(),
+            "no process is started"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.2: `--restart=no` does not exempt a same-name
+    /// submission from the refusal, and neither does an identical command line.
+    #[test]
+    fn adhoc_up_refuses_existing_app_register_only_and_identical() {
+        let (sup, dir, h) = adhoc_harness("conflict-no");
+        let register_only = AdhocSpec {
+            name: Some("web".into()),
+            restart: Some(crate::config::RestartPolicy::No),
+            register_only: true,
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        adhoc_up(&sup, register_only).unwrap();
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        // Same definition again: no "idempotent success with the old pid".
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                register_only: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Conflict(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.4/D6: `--force` with byte-identical content is
+    /// a true no-op — no write (bytes and mtime unchanged), no stop, no spawn,
+    /// same pid, `unchanged = true`.
+    #[test]
+    fn adhoc_force_identical_is_a_no_op() {
+        let (sup, dir, h) = adhoc_harness("force-idem");
+        let spec = |force: bool| AdhocSpec {
+            name: Some("web".into()),
+            force,
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        let first = adhoc_up(&sup, spec(false)).unwrap();
         assert!(!first.unchanged && !first.residual);
         let pid = first.pid.expect("spawned");
-        // Commit so the record is on disk (a committed same-name app).
         adhoc_commit(&sup, "web").unwrap();
-        assert!(dir.join("app.d").join("web.toml").exists());
+        let record = dir.join("app.d").join("web.toml");
+        assert!(record.exists());
+        let before_text = std::fs::read_to_string(&record).unwrap();
+        let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
 
-        let again = adhoc_up(&sup, spec()).unwrap();
-        assert!(
-            again.unchanged,
-            "identical content is idempotent: {again:?}"
-        );
+        let again = adhoc_up(&sup, spec(true)).unwrap();
+        assert!(again.unchanged, "identical content is a no-op: {again:?}");
+        assert!(!again.landed, "nothing landed: {again:?}");
         assert!(!again.residual, "not the residual path");
         assert_eq!(again.pid, Some(pid), "no restart, same pid");
         assert_eq!(again.app, "web");
-        // No placeholder was staged and the record is unchanged.
+        // Bytes, mtime, placeholder and process are all untouched.
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before_text);
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().modified().unwrap(),
+            before_mtime,
+            "mtime unchanged"
+        );
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
         {
             let st = sup.state.lock().unwrap();
             assert!(
                 !st.staged.contains_key("web"),
-                "no staged entry for a committed app"
+                "no staged entry for a landed app"
             );
             assert_eq!(st.programs["web"].pid(), Some(pid));
         }
+
+        // Not running + identical: still nothing is started.
+        let _ = sup.cmd_stop("web");
+        let stopped = adhoc_up(&sup, spec(true)).unwrap();
+        assert!(stopped.unchanged, "{stopped:?}");
+        assert_eq!(stopped.pid, None, "no process is started");
+        assert!(
+            sup.state.lock().unwrap().programs["web"].pid().is_none(),
+            "an unchanged force run never starts the app"
+        );
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// control-plane: a same-name app resubmitted with DIFFERENT content is
-    /// fully regenerated — the record is rewritten and the process restarted
-    /// with a new pid (同名重复提交走再生, 有变化重启).
+    /// refuse-run-existing-app 2.5/D7: `--force` with DIFFERENT content lands
+    /// the new record atomically, stops the old process and starts the new
+    /// definition (`landed = true`, new pid).
     #[test]
-    fn adhoc_upsert_changed_regenerates() {
-        let (sup, dir, h) = adhoc_harness("upsert-regen");
+    fn adhoc_force_changed_relaunches() {
+        let (sup, dir, h) = adhoc_harness("force-regen");
         let first = adhoc_up(
             &sup,
             AdhocSpec {
@@ -5119,11 +5290,13 @@ mod tests {
             &sup,
             AdhocSpec {
                 name: Some("web".into()),
+                force: true,
                 ..spec_for(sleep_bin().to_str().unwrap(), &["60"])
             },
         )
         .unwrap();
         assert!(!again.unchanged && !again.residual, "{again:?}");
+        assert!(again.landed, "the record is on disk: {again:?}");
         let pid2 = again.pid.expect("respawned");
         assert_ne!(pid2, pid1, "changed content restarts the process");
         // The record was rewritten in place; no placeholder residue.
@@ -5135,18 +5308,196 @@ mod tests {
             assert_eq!(st.programs["web"].pid(), Some(pid2));
             assert!(
                 !st.staged.contains_key("web"),
-                "regeneration stages nothing"
+                "the force path stages nothing"
             );
         }
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// control-plane: a validation failure of the NEW definition must not
-    /// disturb the existing record or the running process.
+    /// refuse-run-existing-app 2.5/D8: `--force --restart=no` with different
+    /// content rewrites the record, stops the old process and starts nothing.
     #[test]
-    fn adhoc_upsert_invalid_definition_keeps_existing() {
-        let (sup, dir, h) = adhoc_harness("upsert-invalid");
+    fn adhoc_force_restart_no_stops_without_spawning() {
+        let (sup, dir, h) = adhoc_harness("force-no");
+        let first = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = first.pid.expect("spawned");
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+
+        let again = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                restart: Some(crate::config::RestartPolicy::No),
+                register_only: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["60"])
+            },
+        )
+        .unwrap();
+        assert!(again.landed && !again.unchanged, "{again:?}");
+        assert_eq!(again.pid, None, "register-only spawns nothing");
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert!(text.contains("60"), "{text}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(
+                st.programs["web"].state(),
+                ProgramState::Stopped,
+                "the old process was stopped and no new one started"
+            );
+            assert!(st.programs["web"].pid().is_none(), "old pid released");
+        }
+        // The old process is really gone (its /proc entry disappears).
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "old process {pid} is stopped"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.6/D8: `--force` does not bypass a program name
+    /// owned by ANOTHER app — still a validation error, nothing written.
+    #[test]
+    fn adhoc_force_does_not_bypass_cross_app_collision() {
+        let (sup, dir, h) = adhoc_harness("force-collide");
+        let app_file = dir.join("existing.toml");
+        std::fs::write(&app_file, "[program.web]\ncommand = 'sleep 30'\n").unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        link_for_test(&app_file, &dir.join("app.d").join("existing.toml"));
+        sup.bootstrap().unwrap();
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("already registered"), "{err}");
+        assert!(
+            !dir.join("app.d").join("web.toml").exists(),
+            "nothing was written"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.3/D4: `--force` still refuses to clobber a
+    /// record that is a link to an external deployment config.
+    #[test]
+    fn adhoc_force_refuses_external_registration() {
+        let (sup, dir, h) = adhoc_harness("force-external");
+        let outside = dir.join("outside.toml");
+        let outside_text = "[program.web]\ncommand = 'sleep 5'\n";
+        std::fs::write(&outside, outside_text).unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        link_for_test(&outside, &dir.join("app.d").join("web.toml"));
+
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("web"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            outside_text,
+            "the external config is untouched"
+        );
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.2: a DANGLING symlink record still counts as
+    /// "registered" (lstat, not stat). Without `--force` it is a conflict and
+    /// the link survives; with `--force` the unguardable link is refused by
+    /// `guard_scaffold_overwrite` and stays untouched.
+    #[test]
+    #[cfg(unix)]
+    fn adhoc_up_treats_dangling_link_as_existing() {
+        let (sup, dir, h) = adhoc_harness("dangling");
+        let app_dir = dir.join("app.d");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let link = app_dir.join("web.toml");
+        let missing = dir.join("gone.toml");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        assert!(!link.exists(), "the link must dangle (target is missing)");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the record itself is present"
+        );
+
+        // Default path: a conflict, zero side effects, the dangling link stays.
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Conflict(_)), "{err:?}");
+        assert_eq!(err.http_status(), 409);
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the dangling link was not replaced"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+        assert!(!app_dir.join("web.toml.pending").exists());
+        assert!(
+            sup.state.lock().unwrap().programs.is_empty(),
+            "nothing spawned"
+        );
+
+        // `--force`: the link cannot be resolved, so the guard refuses it.
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("web"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the dangling link is untouched"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+        assert!(!app_dir.join("web.toml.pending").exists());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.3: a validation failure on the `--force` path
+    /// keeps the existing record and process exactly as they were.
+    #[test]
+    fn adhoc_force_invalid_definition_keeps_existing() {
+        let (sup, dir, h) = adhoc_harness("force-invalid");
         let first = adhoc_up(
             &sup,
             AdhocSpec {
@@ -5167,6 +5518,7 @@ mod tests {
             &sup,
             AdhocSpec {
                 name: Some("web".into()),
+                force: true,
                 restart_backoff: Some(-1.0),
                 ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
             },
@@ -5176,6 +5528,50 @@ mod tests {
             err.to_string().contains("restart_backoff"),
             "the validation error names the field: {err}"
         );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "record untouched"
+        );
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].pid(),
+            Some(pid),
+            "the running process is untouched"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 2.2: the existence check runs BEFORE rendering,
+    /// so a same-name submission is a conflict even when its definition would
+    /// fail validation — the existing record and process stay untouched.
+    #[test]
+    fn adhoc_up_conflict_precedes_definition_validation() {
+        let (sup, dir, h) = adhoc_harness("upsert-invalid");
+        let first = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        let pid = first.pid.expect("spawned");
+        adhoc_commit(&sup, "web").unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                restart_backoff: Some(-1.0),
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Conflict(_)), "{err:?}");
         assert_eq!(
             std::fs::read_to_string(&record).unwrap(),
             before,

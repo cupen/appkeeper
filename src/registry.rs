@@ -309,8 +309,8 @@ pub struct ScaffoldSpec {
 /// A plain single-link file inside `app_dir` is our own prior generation and
 /// is the intended regeneration target.
 ///
-/// Shared by [`add_scaffold`] and the daemon-side ad-hoc regeneration
-/// (run-daemon-first: same-name re-submission regenerates the record).
+/// Shared by [`add_scaffold`] and the daemon-side `ak run --force` overwrite
+/// (refuse-run-existing-app D8: `--force` never bypasses this guard).
 pub fn guard_scaffold_overwrite(target: &Path, app_dir: &Path, name: &str) -> Result<()> {
     let Ok(md) = std::fs::symlink_metadata(target) else {
         return Ok(()); // nothing there: a fresh generation

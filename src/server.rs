@@ -959,6 +959,7 @@ fn parse_adhoc_spec(body: &[u8]) -> std::result::Result<crate::supervisor::Adhoc
             .get("register_only")
             .and_then(|b| b.as_bool())
             .unwrap_or(false),
+        force: v.get("force").and_then(|b| b.as_bool()).unwrap_or(false),
     })
 }
 
@@ -1046,9 +1047,9 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
         return;
     }
 
-    // Idempotent upsert (control-plane spec: 同名重复提交走再生, 无变化幂等):
-    // the record already held identical content, so nothing was written and the
-    // process was not restarted. No staged entry exists — answer directly.
+    // `--force` + byte-identical record (refuse-run-existing-app D6): nothing
+    // was written and nothing was started or stopped. No staged entry exists
+    // and no startup judgement applies — answer the terminal frame directly.
     if up.unchanged {
         let _ = write_ndjson_chunk(
             &mut writer,
@@ -1067,11 +1068,11 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
         return;
     }
 
-    // `--restart=no` (D8): no startup judgement, commit directly.
+    // `--restart=no` (D8): no startup judgement. A `--force` overwrite landed
+    // the record before this point (D7), so there is no placeholder to commit;
+    // a fresh registration still commits here.
     if up.register_only {
-        // A regeneration already wrote the record; there is no placeholder to
-        // commit, so just answer.
-        if up.committed {
+        if up.landed {
             let _ = write_ndjson_chunk(
                 &mut writer,
                 &serde_json::json!({
@@ -1150,9 +1151,9 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
     let outcome = crate::supervisor::wait_startup(sup, &up.program, estimate);
     match outcome {
         crate::supervisor::StartupOutcome::Started { pid } => {
-            // A regenerated (already committed) app has no staged entry to
-            // commit — the new record is already on disk. Answer directly.
-            if up.committed {
+            // A `--force` overwrite already landed the record (D7): there is no
+            // staged entry to commit — answer directly with the judged pid.
+            if up.landed {
                 let _ = write_ndjson_chunk(
                     &mut writer,
                     &serde_json::json!({
@@ -1201,9 +1202,10 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
         crate::supervisor::StartupOutcome::Failed { phase, reason } => {
             // Startup judgement failed: abort (stop process, delete
             // placeholder, clear staged) and report the structured failure.
-            // A regenerated app has no staged entry: its record stays on disk
-            // and the (failed) process is simply stopped.
-            if up.committed {
+            // A `--force` overwrite has no staged entry: its new record stays
+            // on disk (the overwrite already took effect) and the failed
+            // process is simply stopped (refuse-run-existing-app D7).
+            if up.landed {
                 let _ = stop_via_command(sup, &up.app);
             } else {
                 let _ = abort_via_command(sup, &up.app);
@@ -1218,7 +1220,7 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
             );
         }
         crate::supervisor::StartupOutcome::TimedOut { waited_secs } => {
-            if up.committed {
+            if up.landed {
                 let _ = stop_via_command(sup, &up.app);
             } else {
                 let _ = abort_via_command(sup, &up.app);
@@ -1269,8 +1271,8 @@ fn abort_via_command(sup: &Arc<Supervisor>, name: &str) -> Result<String> {
 }
 
 /// Stop a program through the command queue; best-effort. Used when a
-/// REGENERATED (already committed) ad-hoc program fails its startup judgement:
-/// there is no staged entry to abort, so the record stays and only the failed
+/// `--force` overwritten ad-hoc program fails its startup judgement: there is
+/// no staged entry to abort, so the new record stays and only the failed
 /// process is stopped.
 fn stop_via_command(sup: &Arc<Supervisor>, name: &str) -> Result<String> {
     let (tx, rx) = mpsc::channel();
@@ -1673,6 +1675,40 @@ mod tests {
         }
     }
 
+    /// refuse-run-existing-app 1.3: `parse_adhoc_spec` lifts `force` from the
+    /// request body and defaults it to false when absent.
+    #[test]
+    fn parse_adhoc_spec_reads_force() {
+        let with = parse_adhoc_spec(
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "web", "command": "/bin/sleep", "args": ["30"], "force": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(with.force);
+        assert_eq!(with.name.as_deref(), Some("web"));
+
+        let without = parse_adhoc_spec(
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "web", "command": "/bin/sleep",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!without.force, "absent force defaults to false");
+        // A non-boolean `force` is ignored (defaults to false), like the other
+        // loosely-typed fields.
+        let bogus = parse_adhoc_spec(
+            &serde_json::to_vec(&serde_json::json!({
+                "name": "web", "command": "/bin/sleep", "force": "yes",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!bogus.force);
+    }
+
     /// 5.2/5.3: a successful ad-hoc run (no health check) streams only the
     /// terminal frame (control-plane spec: 无健康探测时无需中间帧), commits
     /// the record and returns {program, config_path, pid}.
@@ -1808,6 +1844,248 @@ mod tests {
         // Missing command → 400.
         let resp = ep.post("/v1/run", &serde_json::json!({ "name": "web" }));
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 3.1: without `force` a same-name submission is a
+    /// 409 state conflict answered before the stream starts — no record write,
+    /// no new process, and the existing PID is untouched.
+    #[test]
+    fn run_endpoint_refuses_same_name_without_force() {
+        let (sup, dir, ep) = serve_harness("run-conflict");
+        let (cmd, args) = sleep_cmd();
+        let first = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
+        assert!(start.starts_with("HTTP/1.1 200"), "{start}");
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+        assert!(pid.is_some());
+
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({ "name": "web", "command": cmd, "args": args }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        assert!(resp.contains("\"phase\":\"conflict\""), "{resp}");
+        assert!(resp.contains("web"), "{resp}");
+        assert!(resp.contains("--force"), "offers the escape: {resp}");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+        assert_eq!(
+            sup.state.lock().unwrap().programs["web"].pid(),
+            pid,
+            "the running process is untouched"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 3.1/D6: `force` + byte-identical config answers a
+    /// single terminal `unchanged` frame, never entering the startup judgement.
+    #[test]
+    fn run_endpoint_force_unchanged_answers_one_frame() {
+        let (sup, dir, ep) = serve_harness("run-unchanged");
+        let (cmd, args) = sleep_cmd();
+        let first = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
+
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "force": true, "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = dechunk(resp.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let frames: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            frames.len(),
+            1,
+            "unchanged → one terminal frame: {frames:?}"
+        );
+        assert_eq!(frames[0]["ok"], true, "{frames:?}");
+        assert_eq!(frames[0]["unchanged"], true, "{frames:?}");
+        assert!(
+            frames[0]["pid"].is_null(),
+            "no process is started: {frames:?}"
+        );
+        assert!(
+            frames[0]["config_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("web.toml")
+        );
+        // Byte and mtime identical: nothing was rewritten.
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 3.2/3.3: `force` with different content lands the
+    /// record before the startup judgement, then answers the terminal frame
+    /// without a second commit (`register_only` answers immediately, pid null).
+    #[test]
+    fn run_endpoint_force_landed_skips_commit() {
+        let (sup, dir, ep) = serve_harness("run-landed");
+        let (cmd, args) = sleep_cmd();
+        let first = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let record = dir.join("app.d").join("web.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        // Different args, register-only: the record is rewritten and nothing is
+        // started (pid null), no staged entry is left behind.
+        let mut new_args = args.clone();
+        new_args.push("extra".into());
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": new_args,
+                "force": true, "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = dechunk(resp.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let frames: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 1, "terminal frame only: {frames:?}");
+        assert_eq!(frames[0]["ok"], true, "{frames:?}");
+        assert_ne!(frames[0]["unchanged"], true, "{frames:?}");
+        assert!(frames[0]["pid"].is_null(), "register-only: {frames:?}");
+        let after = std::fs::read_to_string(&record).unwrap();
+        assert_ne!(after, before, "the record was rewritten");
+        assert!(after.contains("extra"), "{after}");
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !sup.state.lock().unwrap().staged.contains_key("web"),
+            "the force path never stages (no commit step)"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 3.2/D7: `force` with different content that then
+    /// FAILS its startup judgement gets a structured error and the new process
+    /// is stopped, while the landed record stays on disk.
+    #[test]
+    fn run_endpoint_force_failed_startup_stops_new_process() {
+        let (sup, dir, ep) = serve_harness("run-force-fail");
+        let record = register_only_app(&ep, &dir, "web");
+        assert!(record.exists());
+        // A definition that exits inside startsecs: the startup judgement fails.
+        #[cfg(unix)]
+        let (cmd, args) = ("/bin/sh", vec!["-c".to_string(), "exit 3".to_string()]);
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd", vec!["/c".to_string(), "exit 3".to_string()]);
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args, "force": true,
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = dechunk(resp.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let frames: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let last = frames.last().unwrap();
+        assert_eq!(last["ok"], false, "{frames:?}");
+        assert_eq!(last["phase"], "startup", "{frames:?}");
+        assert!(!last["error"].as_str().unwrap().is_empty(), "{frames:?}");
+        // The landed record stays (the overwrite took effect, no rollback) and
+        // the failed process is stopped.
+        assert!(record.exists(), "the new record is kept");
+        assert!(
+            sup.state.lock().unwrap().programs["web"].pid().is_none(),
+            "the failed new process was stopped"
+        );
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refuse-run-existing-app 3.2: `force` + different content that passes the
+    /// startup judgement answers the terminal frame with the new PID.
+    #[test]
+    fn run_endpoint_force_restarts_and_reports_new_pid() {
+        let (sup, dir, ep) = serve_harness("run-force-ok");
+        let (cmd, args) = sleep_cmd();
+        let first = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": args,
+                "register_only": true, "restart": "no",
+            }),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let pid1 = sup
+            .state
+            .lock()
+            .unwrap()
+            .programs
+            .get("web")
+            .and_then(|p| p.pid());
+        // Different content + spawn: the startup judgement runs (3s startsecs).
+        let mut new_args = args.clone();
+        new_args.push("60".into());
+        let resp = ep.post(
+            "/v1/run",
+            &serde_json::json!({
+                "name": "web", "command": cmd, "args": new_args, "force": true,
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let body = dechunk(resp.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let frames: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let last = frames.last().unwrap();
+        assert_eq!(last["ok"], true, "{frames:?}");
+        let pid2 = last["pid"].as_u64().expect("new pid");
+        if let Some(p1) = pid1 {
+            assert_ne!(pid2 as u32, p1, "restarted with a new pid");
+        }
+        assert!(dir.join("app.d").join("web.toml").exists());
+        assert!(!dir.join("app.d").join("web.toml.pending").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

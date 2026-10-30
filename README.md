@@ -45,12 +45,19 @@ ak start web                                          # 5. 再启动
 | --- | --- |
 | `ak run --cmd "python -m http.server 8000" --app web` | 注册一条命令行并立即启动（成功才落盘） |
 | `ak run -- python -m http.server 8000 --app web` | 等价的 `--` 写法（脚手架旗标放在命令之后） |
+| `ak run --force -- python -m http.server 9000 --app web` | 覆盖已注册的同名 app（有差异则重写并重启，无差异仅提示） |
 | `ak run … --json` | 机器可读输出：`name / config_path / pid / status` |
 
 `ak run` 只承载 ad-hoc 注册；启动/停止已注册的 app 或程序请用
 `ak start|stop|restart <app> [<program>]`。ad-hoc 形态可附加
 `--restart <no\|on-failure\|always\|unless-stopped>`、`--env K=V`、`--workdir`、
 `--description`。
+
+同名默认拒绝：应用名已注册（或在内存中）时，未带 `--force` 的 `ak run` 以
+冲突错误退出（守护进程 409，不写盘、不启停任何进程）。带 `--force` 时逐字节
+比较新旧配置：有差异则原子重写记录并停旧启新，无差异则输出「配置无修改，
+不做任何动作」并以 0 退出。`--force` 不放行跨应用程序名冲突，也不覆盖指向
+外部部署配置的注册记录。
 
 **日常控制**
 
@@ -221,6 +228,8 @@ ak config --delete webui                              # 删段 = 关闭
   `auth_token` 仅 `tcp://` 形态合法。
 - `app_dir` 默认名 `apps` → `app.d`；`startsecs` 默认 1.0s → 3.0s（可显式声明覆盖）。
 - `run` ad-hoc 全形态 daemon-first：离线退出 3；先启动成功再落盘（失败不留残留）。
+  同名重复提交改为默认拒绝（409，零副作用）；需显式 `--force` 覆盖，无差异时为空操作
+  （输出「配置无修改，不做任何动作」并以 0 退出，不再隐式再生/重启）。
 - v0.1 单文件配置：`ak compose <旧文件>` 自动识别转换。
 - 标识符（app/程序/动作名）仅允许 `[A-Za-z0-9_-]`。
 - `ak remove <app>` 不再是本地直删 + 事后 sync：改为守护进程执行的原子动作
