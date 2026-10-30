@@ -6397,6 +6397,147 @@ try {{
     return bar && !bar.shadowRoot.querySelector('.pending');
   }});
   ok('badge clears after the scoped apply');
+
+  // -- guard-remove-until-stopped: F1–F3 in the console -----------------
+  // beta carries one running program (`job`), which is exactly the state the
+  // remove guard must refuse. The scenarios run against it so alpha (used by
+  // the apply assertions above) stays untouched.
+  const openApp = async (name) => {{
+    await page.evaluate((app) => {{
+      history.pushState({{}}, '', '/app/' + app);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    }}, name);
+    await page.waitForFunction(() => {{
+      const app = document.querySelector('ak-app');
+      const view = app?.shadowRoot?.querySelector('ak-app-overview');
+      return !!view?.shadowRoot?.querySelector('button[data-kind="remove"]');
+    }});
+  }};
+
+  await openApp('beta');
+  ok('beta overview shows the remove button');
+
+  // F1: cancelling the confirm must not touch the daemon.
+  let removeRequests = 0;
+  page.on('request', (r) => {{
+    if (r.url().includes('/api/apps/beta/remove')) removeRequests++;
+  }});
+  page.removeAllListeners('dialog');
+  page.on('dialog', (d) => d.dismiss());
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    view?.shadowRoot?.querySelector('button[data-kind="remove"]')?.click();
+  }});
+  await new Promise((r) => setTimeout(r, 400));
+  if (removeRequests !== 0) {{
+    throw new Error('a cancelled remove must not POST, saw ' + removeRequests);
+  }}
+  const stillHere = await page.evaluate((app) => {{
+    const el = document.querySelector('ak-app');
+    return !!el?.shadowRoot?.querySelector('ak-app-overview');
+  }});
+  if (!stillHere) throw new Error('a cancelled remove must stay on the app view');
+  ok('F1 cancelled remove issues no request and stays on the page');
+
+  // F2: the running program blocks removal — the daemon's 409 is shown
+  // inline, the page and the navigation entry survive.
+  page.removeAllListeners('dialog');
+  page.on('dialog', (d) => d.accept());
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    view?.shadowRoot?.querySelector('button[data-kind="remove"]')?.click();
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    const strip = view?.shadowRoot?.querySelector('.remove-strip');
+    return strip && strip.dataset.error === 'true';
+  }});
+  const conflictText = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    return view?.shadowRoot?.querySelector('.remove-strip')?.textContent ?? '';
+  }});
+  if (!/stop|停止/i.test(conflictText)) {{
+    throw new Error('the 409 must name the stop-first remedy, got: ' + conflictText);
+  }}
+  const betaStillListed = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
+    return [...(tree?.shadowRoot?.querySelectorAll('a') ?? [])].some((a) =>
+      a.getAttribute('href')?.includes('/app/beta'),
+    );
+  }});
+  if (!betaStillListed) throw new Error('a 409 must not drop the app from the sidebar');
+  ok('F2 a live app is refused with the stop-first remedy and stays listed');
+
+  // Stop the blocking program from the UI, then remove succeeds in one step.
+  await page.evaluate(() => {{
+    history.pushState({{}}, '', '/app/beta/program/job');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot?.querySelector('button[data-kind="stop"]');
+  }});
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot?.querySelector('button[data-kind="stop"]')?.click();
+  }});
+  // The confirm step inside the detail view has its own accept button.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot?.querySelector('.confirm button');
+  }});
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot?.querySelector('.confirm button')?.click();
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot?.querySelector('button[data-kind="start"]');
+  }});
+  ok('beta job stopped from the console');
+
+  // F3: now the remove goes through, the app leaves the sidebar and the SPA
+  // navigates to a still-resolving view.
+  await openApp('beta');
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    view?.shadowRoot?.querySelector('button[data-kind="remove"]')?.click();
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
+    const links = [...(tree?.shadowRoot?.querySelectorAll('a') ?? [])];
+    return links.length > 0 && !links.some((a) => a.getAttribute('href')?.includes('/app/beta'));
+  }});
+  const alphaKept = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
+    return [...(tree?.shadowRoot?.querySelectorAll('a') ?? [])].some((a) =>
+      a.getAttribute('href')?.includes('/app/alpha'),
+    );
+  }});
+  if (!alphaKept) throw new Error('removing beta must not affect alpha');
+  // The success notice rides in the overview bar (`setFlash`), not the shell.
+  const flash = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
+    return bar?.shadowRoot?.textContent ?? '';
+  }});
+  if (!/无需|apply|移除/.test(flash)) {{
+    throw new Error('the success notice should confirm the removal: ' + flash.slice(0, 200));
+  }}
+  ok('F3 remove succeeds immediately, beta leaves the sidebar, alpha stays');
 }} finally {{
   await browser.close();
 }}
