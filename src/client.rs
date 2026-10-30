@@ -610,35 +610,66 @@ fn read_chunk_size(r: &mut dyn Read) -> Result<usize> {
     usize::from_str_radix(hex, 16).with_context(|| format!("malformed chunk size {text:?}"))
 }
 
+/// Build a connection-class error as a short headline plus aligned,
+/// indented `key: value` lines. An endpoint path, the OS error and the fix
+/// hint on one line run past a terminal's width, so each gets its own row.
+fn connection_error(headline: &str, details: &[(&str, String)]) -> anyhow::Error {
+    let width = details.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut msg = String::from(headline);
+    for (key, value) in details {
+        msg.push('\n');
+        msg.push_str("  ");
+        msg.push_str(key);
+        msg.push(':');
+        msg.push_str(&" ".repeat(width - key.len() + 1));
+        msg.push_str(value);
+    }
+    anyhow::anyhow!("{msg}")
+}
+
 /// A failed `connect()`: the two causes the spec separates — "no daemon
 /// there" and "not your endpoint" — get different words.
 fn connect_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::PermissionDenied => {
-            let owner = match ep.owner_uid() {
-                Some(uid) => format!("endpoint {} is owned by uid {uid}", ep.display()),
-                None => format!(
-                    "endpoint {} is not accessible to this account",
-                    ep.display()
-                ),
+            let endpoint = match ep.owner_uid() {
+                Some(uid) => format!("{} (owned by uid {uid})", ep.display()),
+                None => format!("{} (not accessible to this account)", ep.display()),
             };
             let me = match transport::current_uid() {
                 Some(uid) => format!("uid {uid}"),
                 None => format!("account {:?}", transport::current_user()),
             };
-            anyhow::anyhow!(
-                "{DENIED}: {owner}, the current user is {me} — run this command as the account \
-                 the daemon runs under, or with higher privileges"
+            connection_error(
+                DENIED,
+                &[
+                    ("endpoint", endpoint),
+                    ("current user", me),
+                    (
+                        "hint",
+                        "run as the daemon's account, or elevate".to_string(),
+                    ),
+                ],
             )
         }
         ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
-            anyhow::anyhow!(
-                "{UNREACHABLE} (is `ak daemon` active? endpoint {}): {e}",
-                ep.display()
+            connection_error(
+                UNREACHABLE,
+                &[
+                    ("endpoint", ep.display().to_string()),
+                    ("cause", e.to_string()),
+                    ("hint", "is `ak daemon` running?".to_string()),
+                ],
             )
         }
-        _ => anyhow::anyhow!("{UNREACHABLE} (endpoint {}): {e}", ep.display()),
+        _ => connection_error(
+            UNREACHABLE,
+            &[
+                ("endpoint", ep.display().to_string()),
+                ("cause", e.to_string()),
+            ],
+        ),
     }
 }
 
@@ -654,10 +685,16 @@ fn read_error(ep: &transport::Endpoint, e: std::io::Error) -> anyhow::Error {
 /// (control-plane spec: TCP 凭据被拒 → 专属提示 + 退出码 3).
 fn api_error(status: u16, msg: &str) -> anyhow::Error {
     if status == 401 {
-        anyhow::anyhow!(
-            "{TOKEN_REJECTED} (api error 401): {msg} — a tcp:// control endpoint requires the \
-             daemon's `[daemon] auth_token`, which the client sends as `Authorization: Bearer \
-             <token>`; check the auth_token in your config"
+        connection_error(
+            TOKEN_REJECTED,
+            &[
+                ("api error", "401".to_string()),
+                ("detail", msg.to_string()),
+                (
+                    "hint",
+                    "match the daemon's `[daemon] auth_token`".to_string(),
+                ),
+            ],
         )
     } else {
         anyhow::anyhow!("api error {status}: {msg}")
@@ -849,6 +886,11 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains(UNREACHABLE), "{text}");
         assert!(text.contains(&sock.display().to_string()), "{text}");
+        // The detail rows are on their own lines, not one long line.
+        assert!(
+            text.contains("\n  endpoint: ") && text.contains("\n  cause: "),
+            "details are wrapped: {text}"
+        );
         assert_eq!(exit_code_of(&err), 3);
         assert!(
             is_unreachable(&err),
@@ -868,6 +910,10 @@ mod tests {
         let text = format!("{denied:#}");
         assert!(text.contains(DENIED), "{text}");
         assert!(text.contains("uid"), "names the ids: {text}");
+        assert!(
+            text.contains("\n  endpoint: ") && text.contains("\n  hint: "),
+            "the long hint is on its own line: {text}"
+        );
         assert!(!text.starts_with(UNREACHABLE), "{text}");
         // Still exit class 3: the operator cannot act on it here.
         assert_eq!(exit_code_of(&denied), 3);
