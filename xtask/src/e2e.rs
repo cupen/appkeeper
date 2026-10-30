@@ -6418,7 +6418,8 @@ console.log('BROWSER PASS OK');
 
 /// Pure decision over the raw `CheckTokenMembership` outputs, kept separate
 /// from the unsafe SID plumbing so the elevation gate is unit-testable on
-/// every platform (6.1).
+/// every platform (6.1). Only the Windows roundtrip calls it outside tests.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn token_is_elevated(check_ok: i32, is_member: i32) -> bool {
     check_ok != 0 && is_member != 0
 }

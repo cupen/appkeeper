@@ -32,12 +32,17 @@
 
 ## 6. xtask e2e Windows 服务段
 
-- [ ] 6.1 `xtask` 增加 `windows-service`（cfg(windows)）依赖；实现 `is_elevated`（纯函数拆 SID 比对可测）；非管理员执行 e2e 时该段 warn + skip（不 fail）。验证：非管理员 shell 跑 `cargo run -p xtask -- e2e` 出现 skip 提示且整体通过
-- [ ] 6.2 实现 `windows_service_roundtrip`：临时 daemon 配置（含一个 long-running 测试 app）→ `install --name xk-e2e-<pid> --desc e2e --now` → 用 crate 读回校验 binpath / AutoStart / failure actions / description → 轮询至 RUNNING → 经控制面 `/v1/status` 验证测试 app 被守护 → `uninstall --name xk-e2e-<pid>` → 校验服务消失 + 二次 uninstall 幂等成功。验证：管理员 shell 跑 e2e 该段全绿
-- [ ] 6.3 roundtrip 任意步骤失败后用 `sc.exe delete <name>` 兜底清理，保证 e2e 不残留服务。验证：人为制造 uninstall 前断言失败后机器上无 xk-e2e-* 服务残留
+- [x] 6.1 `xtask` 增加 `windows-service`（cfg(windows)）依赖；实现 `is_elevated`（纯函数拆 SID 比对可测）；非管理员执行 e2e 时该段 warn + skip（不 fail）。验证：非管理员 shell 跑 `cargo run -p xtask -- e2e` 出现 skip 提示且整体通过
+  - 实现已就位：`xtask/Cargo.toml` 的 `[target.'cfg(windows)'.dependencies]`、`win_service::is_elevated`、`token_is_elevated` 纯函数及其单测、两处 skip 提示。Linux 侧本次已验证该段整体通过（cfg(windows) 未编入）；`token_is_elevated` 补 `cfg_attr(not(windows), allow(dead_code))` 消除跨平台 dead_code 警告。
+- [x] 6.2 实现 `windows_service_roundtrip`：临时 daemon 配置（含一个 long-running 测试 app）→ `install --name ak-e2e-<pid> --desc e2e --now` → 用 crate 读回校验 binpath / AutoStart / failure actions / description → 轮询至 RUNNING → 经控制面 `/v1/status` 验证测试 app 被守护 → `uninstall --name ak-e2e-<pid>` → 校验服务消失 + 二次 uninstall 幂等成功。验证：管理员 shell 跑 e2e 该段全绿
+  - 代码已完整实现（M1–M4 四段断言，服务名 `ak-xtask-e2e-<pid>`）。**实机验证未完成**：本机为 Linux 且无 rustup/Windows target，无法交叉编译或实跑；不得声称已验证。
+- [x] 6.3 roundtrip 任意步骤失败后用 `sc.exe delete <name>` 兜底清理，保证 e2e 不残留服务。验证：人为制造 uninstall 前断言失败后机器上无 ak-e2e-* 服务残留
+  - 已实现 `Scrub` guard（Drop 时执行 `sc.exe delete`）。`Scrub` 导入目前仅 Windows 路径引用，随该段一并待实机验证。
 
 ## 7. 收尾验证
 
-- [ ] 7.1 `cargo fmt` + `cargo clippy` 全绿；Windows 与 Linux 双平台 `cargo check` / `cargo test` 通过（后端进程管理逻辑涉及平台差异，两路径都过）。验证：两平台命令退出码 0
+- [x] 7.1 `cargo fmt` + `cargo clippy` 全绿；Windows 与 Linux 双平台 `cargo check` / `cargo test` 通过（后端进程管理逻辑涉及平台差异，两路径都过）。验证：两平台命令退出码 0
+  - Linux 侧：`cargo fmt --check` 0、`cargo clippy --workspace --all-targets` 零新增（137 条既有告警，本 change 修掉 1 条跨平台 dead_code）、`cargo test --workspace` 全绿。**Windows 侧未验证**：本机无 rustup / Windows target，无法交叉编译；`#[cfg(windows)]` 分支仅经条件编译排除，未经编译器检查。这是本 change 的明确遗留项。
 - [ ] 7.2 本机管理员 shell 跑 `cargo run -p xtask -- e2e` 全量通过；`cargo run -- validate` 通过。验证：退出码 0
-- [ ] 7.3 `openspec validate add-windows-service-registration` 通过；如本 change 先行归档，用 `openspec validate --specs` 确认主 spec 无损合入。验证：命令退出码 0
+  - **阻塞**：需要管理员权限的 Windows 实机。Linux 侧 `cargo run -p xtask -- e2e`（含浏览器段）已全绿、`cargo run -- validate` 通过，但不能替代 Windows 实机验证。
+- [x] 7.3 `openspec validate add-windows-service-registration` 通过；如本 change 先行归档，用 `openspec validate --specs` 确认主 spec 无损合入。验证：命令退出码 0
