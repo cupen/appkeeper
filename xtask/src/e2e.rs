@@ -6222,14 +6222,24 @@ try {{
     view?.shadowRoot?.querySelector('button[data-kind="start"]')?.click();
   }});
 
-  // Running state comes from the WS snapshot/deltas.
+  // Running state comes from the WS snapshot/deltas. The detail page is a
+  // single-column flow now: PID is the first metric cell's value, not a
+  // `.card` grid.
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    return [...(view?.shadowRoot?.querySelectorAll('.card') ?? [])].some(
-      (c) => c.textContent.includes('PID') && !c.textContent.includes('—'),
-    );
+    const metrics = view?.shadowRoot?.querySelector('.metrics');
+    const pid = metrics?.querySelector(':scope > li:first-child .v');
+    return !!pid && /^\d+$/.test(pid.textContent.trim());
   }});
+  const metricCells = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return view?.shadowRoot?.querySelectorAll('.metrics > li')?.length ?? 0;
+  }});
+  if (metricCells !== 6) {{
+    throw new Error('detail metric strip should hold 6 cells, got ' + metricCells);
+  }}
   ok('the console started the bench program');
 
   // Log panel: rows stream in through the same ring the CLI follows.
@@ -6809,6 +6819,7 @@ const pierce = (el, sel) => el.shadowRoot?.querySelector(sel);
 const browser = await chromium.launch({{ headless: true }});
 const page = await browser.newPage();
 page.setDefaultTimeout(10_000);
+await page.setViewportSize({{ width: 1440, height: 900 }});
 try {{
   await page.goto(URL);
   await page.waitForFunction(() => {{
@@ -6831,6 +6842,359 @@ try {{
   }});
   if (mark !== 'ak') throw new Error('brand mark should read ak, got ' + JSON.stringify(mark));
   ok('brand mark reads ak');
+
+  // -- webui-visual-system: one content column, overflow, status, long names --
+  const near = (a, b, label) => {{
+    if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 1) {{
+      throw new Error(label + ' differs by more than 1px: ' + a + ' vs ' + b);
+    }}
+  }};
+
+  // Wait for the global program table (the dashboard groups one per app).
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    const tables = [...(dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? [])];
+    return tables.length > 0 &&
+      tables.every((t) => (t.shadowRoot?.querySelectorAll('tbody tr[data-program]')?.length ?? 0) > 0);
+  }});
+
+  // 1440: the daemon bar and the routed content share the same content column.
+  const geom = await page.evaluate(() => {{
+    const b = (el) => {{
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {{ left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }};
+    }};
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    const table = dash?.shadowRoot?.querySelector('ak-program-table');
+    return {{
+      bar: b(app?.shadowRoot?.querySelector('ak-overview-bar')?.shadowRoot?.querySelector('.bar')),
+      title: b(dash?.shadowRoot?.querySelector('.page-title')),
+      panel: b(table?.shadowRoot?.querySelector('.panel')),
+      view: b(dash),
+      contentRight: dash ? dash.getBoundingClientRect().left + dash.clientWidth : null,
+      outlet: b(app?.shadowRoot?.querySelector('.outlet')),
+    }};
+  }});
+  if (!geom.bar || !geom.title || !geom.panel || !geom.outlet || geom.contentRight === null) {{
+    throw new Error('dashboard geometry hooks missing: ' + JSON.stringify(geom));
+  }}
+  near(geom.bar.left, geom.title.left, '1440 bar/dashboard title left edge');
+  near(geom.bar.left, geom.panel.left, '1440 bar/table left edge');
+  near(geom.bar.left, geom.view.left, '1440 bar/dashboard view left edge');
+  near(geom.bar.right, geom.contentRight, '1440 bar/dashboard content right edge');
+  near(geom.panel.right, geom.contentRight, '1440 table/content right edge');
+  if (geom.title.top <= geom.bar.bottom) {{
+    throw new Error('routed view must start below the overview bar');
+  }}
+  ok('1440: overview bar and content share one column (≤1px)');
+
+  // Every table row carries a real, visible Chinese status badge (the old
+  // blank/English status column is the regression this guards).
+  const statusRows = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    const out = [];
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const badge = tr.querySelector('td.status ak-status-badge');
+        const pill = badge?.shadowRoot?.querySelector('.badge');
+        const r = pill?.getBoundingClientRect();
+        out.push({{
+          app: tr.getAttribute('data-app'),
+          program: tr.getAttribute('data-program'),
+          state: tr.getAttribute('data-status'),
+          word: badge?.shadowRoot?.querySelector('.label')?.textContent?.trim() ?? '',
+          visible: !!r && r.width > 0 && r.height > 0,
+        }});
+      }}
+    }}
+    return out;
+  }});
+  const WORDS = {{
+    running: '运行中',
+    starting: '启动中',
+    stopping: '停止中',
+    backoff: '退避中',
+    exited: '已退出',
+    stopped: '已停止',
+    fatal: '故障',
+  }};
+  if (statusRows.length === 0) throw new Error('dashboard rendered no program rows');
+  for (const row of statusRows) {{
+    if (!row.visible || row.word === '') {{
+      throw new Error('blank status cell for ' + row.app + '.' + row.program + ' (' + row.state + ')');
+    }}
+    if (WORDS[row.state] && row.word !== WORDS[row.state]) {{
+      throw new Error(
+        'status word for ' + row.state + ' should be ' + WORDS[row.state] + ', got ' + row.word,
+      );
+    }}
+  }}
+  ok('status column renders a visible Chinese badge on every row (' + statusRows.length + ')');
+
+  // Sidebar: neutral program names, a 6px status dot and the state word in
+  // the accessible name (colour is never the only channel).
+  const tree = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
+    const nodes = [...(tree?.shadowRoot?.querySelectorAll('a.prog') ?? [])];
+    return nodes.map((a) => {{
+      const dot = a.querySelector('.dot');
+      const r = dot?.getBoundingClientRect();
+      return {{
+        state: a.getAttribute('data-state'),
+        color: getComputedStyle(a).color,
+        active: a.getAttribute('data-active') === 'true',
+        label: a.getAttribute('aria-label') ?? '',
+        dot: !!r && r.width >= 5 && r.width <= 7,
+      }};
+    }});
+  }});
+  if (tree.length === 0) throw new Error('sidebar tree lists no programs');
+  const neutral = [...new Set(tree.filter((n) => !n.active).map((n) => n.color))];
+  if (neutral.length > 1) {{
+    throw new Error('program names must stay neutral across states, saw ' + neutral.join(' / '));
+  }}
+  for (const node of tree) {{
+    if (!node.dot) throw new Error('tree row lost its 6px status dot: ' + node.label);
+    if (!node.label) throw new Error('tree row needs an accessible name carrying the state word');
+  }}
+  ok('sidebar: neutral names + 6px status dots + state words in accessible names');
+
+  // Long app names: same row height as a short one, ellipsized, count fixed.
+  const longName = await page.evaluate(() => {{
+    const b = (el) => {{
+      const r = el.getBoundingClientRect();
+      return {{ left: r.left, right: r.right, height: r.height, width: r.width }};
+    }};
+    const app = document.querySelector('ak-app');
+    const tree = app?.shadowRoot?.querySelector('ak-console-tree');
+    const links = [...(tree?.shadowRoot?.querySelectorAll('.app-link') ?? [])];
+    if (links.length === 0) throw new Error('no app link to measure');
+    const short = links[0];
+    const target = links[links.length - 1];
+    const shortHeight = b(short).height;
+    const name = target.querySelector('.name');
+    const count = target.querySelector('.count');
+    if (!name || !count) throw new Error('app link lost its .name/.count slots');
+    const original = name.textContent;
+    name.textContent = 'app-with-a-name-far-longer-than-the-sidebar-rail-allows-' + 'x'.repeat(40);
+    const longHeight = b(target).height;
+    const ellipsis = name.scrollWidth > name.clientWidth + 1;
+    const lineHeight = parseFloat(getComputedStyle(name).lineHeight);
+    const wrapped = !Number.isFinite(lineHeight) || b(name).height > lineHeight + 1;
+    const countStable = b(count).left >= b(name).right - 1;
+    name.textContent = original;
+    return {{ shortHeight, longHeight, ellipsis, wrapped, countStable, title: target.getAttribute('title') }};
+  }});
+  near(longName.shortHeight, longName.longHeight, 'long app name row height');
+  if (!longName.ellipsis) throw new Error('long app name must truncate with an ellipsis');
+  if (longName.wrapped) throw new Error('long app name wrapped onto a second line');
+  if (!longName.countStable) throw new Error('long app name pushed the program count out of its slot');
+  if (!longName.title) throw new Error('app link must keep the full name in title');
+  ok('long app name stays one line, ellipsized, row height unchanged');
+
+  // Row quick actions: hidden at rest, revealed by hover/focus, never shift
+  // another column, never navigate, and destructive actions confirm first.
+  const row = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        if (tr.getAttribute('data-status') !== 'running') continue;
+        const ops = tr.querySelector('td.ops .row-actions');
+        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        const restart = tr.querySelector('td.ops button[data-kind="restart"]');
+        const num = tr.querySelector('td.num');
+        if (!ops || !stop || !restart || !num) continue;
+        const r = tr.getBoundingClientRect();
+        return {{
+          x: r.left + r.width / 2,
+          y: r.top + r.height / 2,
+          app: tr.getAttribute('data-app'),
+          program: tr.getAttribute('data-program'),
+          opacity: getComputedStyle(ops).opacity,
+          numLeft: num.getBoundingClientRect().left,
+        }};
+      }}
+    }}
+    return null;
+  }});
+  if (!row) throw new Error('dashboard has no running row with stop/restart quick actions');
+  if (row.opacity !== '0') throw new Error('row actions must be hidden at rest, opacity ' + row.opacity);
+  await page.mouse.move(row.x, row.y);
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const ops = tr.querySelector('td.ops .row-actions');
+        if (ops && getComputedStyle(ops).opacity === '1') return true;
+      }}
+    }}
+    return false;
+  }});
+  const hovered = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const ops = tr.querySelector('td.ops .row-actions');
+        if (ops && getComputedStyle(ops).opacity === '1') {{
+          return {{ numLeft: tr.querySelector('td.num').getBoundingClientRect().left }};
+        }}
+      }}
+    }}
+    return null;
+  }});
+  if (!hovered) throw new Error('hover did not reveal the row actions');
+  near(row.numLeft, hovered.numLeft, 'hover must not move the numeric columns');
+  ok('hover reveals stop/restart without shifting other columns');
+
+  // Focus (keyboard path) reveals the same actions after the pointer leaves.
+  await page.mouse.move(1, 1);
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const ops = tr.querySelector('td.ops .row-actions');
+        if (ops && getComputedStyle(ops).opacity !== '0') return false;
+      }}
+    }}
+    return true;
+  }});
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        if (stop) {{
+          stop.focus();
+          return;
+        }}
+      }}
+    }}
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        const ops = tr.querySelector('td.ops .row-actions');
+        if (stop?.matches(':focus') && ops && getComputedStyle(ops).opacity === '1') return true;
+      }}
+    }}
+    return false;
+  }});
+  const focusReveal = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        if (!stop) continue;
+        const ops = tr.querySelector('td.ops .row-actions');
+        return {{
+          focused: stop.matches(':focus'),
+          opacity: getComputedStyle(ops).opacity,
+        }};
+      }}
+    }}
+    return null;
+  }});
+  if (!focusReveal || !focusReveal.focused || focusReveal.opacity !== '1') {{
+    throw new Error('keyboard focus must reveal the row actions: ' + JSON.stringify(focusReveal));
+  }}
+  ok('keyboard focus reveals the row actions (:focus-within)');
+
+  // Cancel the destructive confirm: nothing POSTs, the row never navigates.
+  let stopRequests = 0;
+  const countStop = (r) => {{
+    if (r.url().includes('/api/programs/') && r.url().endsWith('/stop')) stopRequests++;
+  }};
+  let confirmText = '';
+  const dismissConfirm = (d) => {{
+    confirmText = d.message();
+    d.dismiss();
+  }};
+  page.on('request', countStop);
+  page.on('dialog', dismissConfirm);
+  const beforeUrl = page.url();
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        if (stop) {{
+          stop.click();
+          return;
+        }}
+      }}
+    }}
+  }});
+  await new Promise((r) => setTimeout(r, 400));
+  page.removeListener('request', countStop);
+  page.removeListener('dialog', dismissConfirm);
+  if (!/停止/.test(confirmText)) {{
+    throw new Error('row stop must ask for confirmation, got: ' + JSON.stringify(confirmText));
+  }}
+  if (stopRequests !== 0) {{
+    throw new Error('a cancelled row stop must not POST, saw ' + stopRequests);
+  }}
+  if (page.url() !== beforeUrl) {{
+    throw new Error('a row quick action must not navigate');
+  }}
+  ok('row stop confirms first, then cancels without a request or navigation');
+
+  // 1024 / 820: the page itself never scrolls sideways; the wide table
+  // scrolls inside its own container.
+  const assertNoPageOverflow = async (label) => {{
+    const o = await page.evaluate(() => {{
+      const b = (el) => {{
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {{ left: r.left, right: r.right, width: r.width }};
+      }};
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      const table = dash?.shadowRoot?.querySelector('ak-program-table');
+      const scroller = table?.shadowRoot?.querySelector('.table-scroll');
+      return {{
+        docScroll: document.documentElement.scrollWidth,
+        docClient: document.documentElement.clientWidth,
+        bodyScroll: document.body.scrollWidth,
+        inner: window.innerWidth,
+        scroller: b(scroller),
+        scrollsInside: !!scroller && scroller.scrollWidth > scroller.clientWidth,
+      }};
+    }});
+    if (o.docScroll > o.docClient + 1 || o.bodyScroll > o.inner + 1) {{
+      throw new Error(label + ': page gained a horizontal scrollbar ' + JSON.stringify(o));
+    }}
+    if (o.scroller && (o.scroller.left < -1 || o.scroller.right > o.inner + 1)) {{
+      throw new Error(label + ': table container leaves the viewport ' + JSON.stringify(o));
+    }}
+    return o;
+  }};
+  for (const width of [1024, 820]) {{
+    await page.setViewportSize({{ width, height: 800 }});
+    await new Promise((r) => setTimeout(r, 150));
+    const o = await assertNoPageOverflow(width + 'px');
+    ok(
+      width +
+        'px: no page-level horizontal scroll (table scrolls inside its container: ' +
+        o.scrollsInside +
+        ')',
+    );
+  }}
+  await page.setViewportSize({{ width: 1440, height: 900 }});
 
   // Edit alpha's config on disk → badge with count 1.
   const fs = await import('node:fs');
@@ -6856,6 +7220,33 @@ try {{
   }});
   ok('pending badge appears after the disk edit');
 
+  // The pending badge is page-level: it lives in the overview bar, above the
+  // routed content and on the same left edge as the bar.
+  const pendingGeom = await page.evaluate(() => {{
+    const b = (el) => {{
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {{ left: r.left, right: r.right, top: r.top, bottom: r.bottom }};
+    }};
+    const app = document.querySelector('ak-app');
+    const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
+    const pending = bar?.shadowRoot?.querySelector('.pending');
+    return {{
+      inBar: !!pending,
+      pending: b(pending),
+      bar: b(bar?.shadowRoot?.querySelector('.bar')),
+      outlet: b(app?.shadowRoot?.querySelector('.outlet')),
+    }};
+  }});
+  if (!pendingGeom.inBar || !pendingGeom.pending || !pendingGeom.outlet || !pendingGeom.bar) {{
+    throw new Error('pending badge must live in the page-level overview bar: ' + JSON.stringify(pendingGeom));
+  }}
+  if (pendingGeom.pending.bottom > pendingGeom.outlet.top + 1) {{
+    throw new Error('pending badge must sit above the routed content: ' + JSON.stringify(pendingGeom));
+  }}
+  near(pendingGeom.pending.left, pendingGeom.bar.left, 'pending badge left edge');
+  ok('pending badge sits in the page-level bar, above the routed content');
+
   // Navigate to the alpha app view; the changed row carries the mark.
   await page.goto(URL + '#/app/alpha').catch(() => {{}});
   // SPA uses history routing; drive the tree link instead.
@@ -6873,6 +7264,57 @@ try {{
     return !!view?.shadowRoot?.querySelector('.apply-strip button');
   }});
   ok('alpha view shows the apply strip');
+
+  // App overview: the shared table, real badges, the rate switch in the
+  // table title bar, the row-level pending mark and the same content column.
+  const overview = await page.evaluate(() => {{
+    const b = (el) => {{
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {{ left: r.left, right: r.right, width: r.width }};
+    }};
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-app-overview');
+    const table = view?.shadowRoot?.querySelector('ak-program-table');
+    const rows = [...(table?.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? [])];
+    return {{
+      bar: b(app?.shadowRoot?.querySelector('ak-overview-bar')?.shadowRoot?.querySelector('.bar')),
+      title: b(view?.shadowRoot?.querySelector('.page-title')),
+      panel: b(table?.shadowRoot?.querySelector('.panel')),
+      view: b(view),
+      contentRight: view ? view.getBoundingClientRect().left + view.clientWidth : null,
+      rateInTableHead: !!table?.shadowRoot?.querySelector('.table-head select.rate-select'),
+      rows: rows.map((tr) => ({{
+        program: tr.getAttribute('data-program'),
+        word: tr.querySelector('td.status ak-status-badge')?.shadowRoot?.querySelector('.label')?.textContent?.trim() ?? '',
+        changed: tr.querySelector('.changed-mark')?.textContent?.trim() ?? '',
+      }})),
+    }};
+  }});
+  if (!overview.bar || !overview.title || !overview.panel || overview.contentRight === null) {{
+    throw new Error('app overview geometry hooks missing: ' + JSON.stringify(overview));
+  }}
+  near(overview.bar.left, overview.title.left, 'app overview bar/title left edge');
+  near(overview.bar.left, overview.panel.left, 'app overview bar/table left edge');
+  near(overview.bar.left, overview.view.left, 'app overview bar/view left edge');
+  near(overview.bar.right, overview.contentRight, 'app overview bar/content right edge');
+  near(overview.panel.right, overview.contentRight, 'app overview table/content right edge');
+  if (!overview.rateInTableHead) {{
+    throw new Error('the log-rate window switch must live in the table title bar');
+  }}
+  if (overview.rows.length === 0) throw new Error('app overview table rendered no rows');
+  let marked = 0;
+  for (const r of overview.rows) {{
+    if (!r.word) throw new Error('app overview has a blank status cell: ' + r.program);
+    if (r.changed) {{
+      if (r.changed !== '待应用') {{
+        throw new Error('row-level pending mark should read 待应用, got ' + r.changed);
+      }}
+      marked++;
+    }}
+  }}
+  if (marked === 0) throw new Error('the pending program must carry a row-level 待应用 mark');
+  ok('app overview: shared table, real badges, rate switch, pending marks, one column');
 
   // Confirm dialog: auto-accept.
   page.on('dialog', (d) => d.accept());
@@ -6984,6 +7426,56 @@ try {{
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
     return !!view?.shadowRoot?.querySelector('button[data-kind="stop"]');
   }});
+
+  // Detail page: one column — title row (with a real badge) → six-metric
+  // strip → mono command block → log viewer taking the remaining height.
+  const detail = await page.evaluate(() => {{
+    const b = (el) => (el ? el.getBoundingClientRect() : null);
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    const root = view?.shadowRoot;
+    const header = root?.querySelector('header');
+    const metrics = root?.querySelector('.metrics');
+    const command = root?.querySelector('.command');
+    const viewer = root?.querySelector('ak-log-viewer');
+    const cells = [...(metrics?.querySelectorAll(':scope > li') ?? [])];
+    const badge = header?.querySelector('ak-status-badge');
+    return {{
+      order: [header, metrics, command, viewer].map((el) => (el ? b(el).top : null)),
+      metricCount: cells.length,
+      pidLabel: cells[0]?.querySelector('.k')?.textContent?.trim() ?? '',
+      mono: command ? getComputedStyle(command.querySelector('code')).fontFamily : '',
+      word: badge?.shadowRoot?.querySelector('.label')?.textContent?.trim() ?? '',
+      viewerHeight: b(viewer)?.height ?? 0,
+      hostBottom: b(root?.host)?.bottom ?? null,
+      viewerBottom: b(viewer)?.bottom ?? null,
+    }};
+  }});
+  if (detail.order.some((t) => t === null)) {{
+    throw new Error('detail layout block missing: ' + JSON.stringify(detail));
+  }}
+  for (let i = 1; i < detail.order.length; i++) {{
+    if (!(detail.order[i] > detail.order[i - 1])) {{
+      throw new Error(
+        'detail must stack title → metrics → command → logs: ' + JSON.stringify(detail.order),
+      );
+    }}
+  }}
+  if (detail.metricCount !== 6 || detail.pidLabel !== 'PID') {{
+    throw new Error('detail metric strip should be 6 cells starting with PID: ' + JSON.stringify(detail));
+  }}
+  if (!/mono|monospace/i.test(detail.mono)) {{
+    throw new Error('the command block must use a monospace font, got ' + detail.mono);
+  }}
+  if (!detail.word) throw new Error('the detail header must render a status word');
+  if (detail.viewerHeight < 260) {{
+    throw new Error('the log viewer must take the remaining height, got ' + detail.viewerHeight);
+  }}
+  if (detail.hostBottom !== null && detail.viewerBottom !== null && detail.hostBottom - detail.viewerBottom > 32) {{
+    throw new Error('the log viewer must reach the bottom of the detail column');
+  }}
+  ok('detail: title → 6 metrics → mono command → log viewer fills the rest');
+
   await page.evaluate(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
