@@ -1,16 +1,36 @@
 /**
- * Dashboard (route `/`): daemon-level overview — system resources live in
- * the overview bar; this view lists every registered app with its program
- * states, so a fatal anywhere is visible without drilling in. Replaces the
- * earlier under-construction placeholder.
+ * Dashboard (route `/`): the global program table. Every registered app
+ * contributes a group whose title carries the app name and program count;
+ * apps that contain a fatal or backing-off program are listed first, and
+ * inside a group those rows lead, so "who is down" is visible without
+ * drilling in (webui-ui: 全局程序总览). The sidebar already is the app
+ * directory — this view intentionally has no app cards.
+ *
+ * Daemon system metrics live in the overview bar; the degraded-transport
+ * banners stay here because they qualify the data this table shows.
  */
 
 import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property } from 'lit/decorators.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import type { ProgramInfo } from '../lib/types.js'
-import { stateGlyph } from '../lib/format.js'
 import { navigate } from '../router.js'
+import { viewStyles } from '../styles/shared.js'
+import '../components/program-table.js'
+import type { ProgramSelectDetail } from '../components/program-table.js'
+
+/** Fatal first, then backing off, then everything else. */
+const STATE_RANK: Record<string, number> = { fatal: 0, backoff: 1 }
+
+function rank(state: string): number {
+  return STATE_RANK[state] ?? 2
+}
+
+interface AppGroup {
+  app: string
+  programs: ProgramInfo[]
+  worst: number
+}
 
 @customElement('ak-dashboard')
 export class AkDashboard extends LitElement {
@@ -19,96 +39,44 @@ export class AkDashboard extends LitElement {
 
   private console: ConsoleController | null = null
 
-  static styles = css`
-    :host {
-      flex: 1;
-      min-height: 0;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: var(--ak-space-4);
-      padding: var(--ak-space-4) var(--ak-space-5);
-      box-sizing: border-box;
-    }
-    h1 {
-      margin: 0;
-      font-size: 1.25rem;
-      color: var(--ak-text-bright);
-    }
-    .banner {
-      padding: var(--ak-space-2) var(--ak-space-3);
-      border-radius: var(--ak-radius-sm, 6px);
-      font-size: 0.85rem;
-    }
-    .banner[data-mode='poll'] {
-      background: color-mix(in srgb, var(--ak-status-working) 12%, transparent);
-      color: var(--ak-status-working);
-      border: 1px solid var(--ak-status-working-border, transparent);
-    }
-    .banner[data-mode='offline'] {
-      background: var(--ak-status-failed-bg);
-      color: var(--ak-status-failed);
-      border: 1px solid var(--ak-status-failed-border);
-    }
-    .app {
-      background: var(--ak-surface);
-      border: 1px solid var(--ak-border);
-      border-radius: var(--ak-radius-lg, 10px);
-      padding: var(--ak-space-3) var(--ak-space-4);
-    }
-    .app h2 {
-      margin: 0 0 var(--ak-space-2);
-      font-size: 1rem;
-      color: var(--ak-text-bright);
-    }
-    .app a {
-      color: inherit;
-      text-decoration: none;
-    }
-    .app a:hover h2 {
-      color: var(--ak-accent-hover);
-    }
-    ul {
-      list-style: none;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    li {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.88rem;
-      color: var(--ak-text-dim);
-      font-variant-numeric: tabular-nums;
-      cursor: pointer;
-    }
-    li[data-state='fatal'] {
-      color: var(--ak-status-failed);
-    }
-    li .glyph {
-      width: 1em;
-      text-align: center;
-    }
-    .fatal-note {
-      color: var(--ak-text-faint);
-      font-size: 0.8rem;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .empty {
-      padding: var(--ak-space-6);
-      text-align: center;
-      color: var(--ak-text-faint);
-    }
-    .empty code {
-      font-family: var(--ak-font-mono, monospace);
-      color: var(--ak-text-dim);
-    }
-  `
+  static styles = [
+    viewStyles,
+    css`
+      :host {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: var(--ak-space-4);
+        /* Horizontal padding belongs to ak-app main alone (shell alignment). */
+        padding: var(--ak-space-4) 0;
+        box-sizing: border-box;
+      }
+      .page-head {
+        margin-bottom: 0;
+      }
+      .banner {
+        padding: var(--ak-space-2) var(--ak-space-3);
+        border-radius: var(--ak-radius-sm);
+        font-size: var(--ak-fs-sm);
+      }
+      .banner[data-mode='poll'] {
+        background: color-mix(in srgb, var(--ak-status-working) 12%, transparent);
+        color: var(--ak-status-working);
+        border: 1px solid var(--ak-status-working-border, transparent);
+      }
+      .banner[data-mode='offline'] {
+        background: var(--ak-status-failed-bg);
+        color: var(--ak-status-failed);
+        border: 1px solid var(--ak-status-failed-border);
+      }
+      ak-program-table {
+        display: block;
+        min-width: 0;
+      }
+    `,
+  ]
 
   connectedCallback(): void {
     super.connectedCallback()
@@ -119,26 +87,51 @@ export class AkDashboard extends LitElement {
     return this.console?.snapshot ?? { doc: null, transport: 'connecting' as const }
   }
 
-  private byApp(): Map<string, ProgramInfo[]> {
+  /**
+   * Group by app; apps holding a problem program come first, then by name.
+   * Within a group the problem rows lead (spec: 故障程序无需下钻可见).
+   */
+  private groups(): AppGroup[] {
     const map = new Map<string, ProgramInfo[]>()
     for (const p of this.consoleState.doc?.programs ?? []) {
       const list = map.get(p.app) ?? []
       list.push(p)
       map.set(p.app, list)
     }
-    return map
+    const groups: AppGroup[] = [...map].map(([app, programs]) => ({
+      app,
+      programs: [...programs].sort(
+        (a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name),
+      ),
+      worst: Math.min(...programs.map((p) => rank(p.state))),
+    }))
+    groups.sort((a, b) => a.worst - b.worst || a.app.localeCompare(b.app))
+    return groups
   }
 
-  private go(e: MouseEvent, path: string): void {
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
-    e.preventDefault()
-    navigate(path)
+  private pendingOf(app: string): string[] {
+    return (this.consoleState.doc?.pending.programs ?? [])
+      .filter((x) => x.app === app)
+      .map((x) => x.program)
+  }
+
+  private onSelect(e: Event): void {
+    const detail = (e as CustomEvent<ProgramSelectDetail>).detail
+    if (!detail?.app || !detail.program) return
+    navigate(`/app/${encodeURIComponent(detail.app)}/program/${encodeURIComponent(detail.program)}`)
   }
 
   render() {
     const { doc, transport } = this.consoleState
+    const groups = this.groups()
+    const total = doc?.programs.length ?? 0
     return html`
-      <h1>总览</h1>
+      <header class="page-head">
+        <div>
+          <h1 class="page-title">总览</h1>
+          <p class="page-sub">${groups.length} 个应用 · ${total} 个程序</p>
+        </div>
+      </header>
       ${transport === 'poll'
         ? html`<div class="banner" data-mode="poll" role="status">
             实时连接已断开 — 正以轮询方式刷新（数据可能略有延迟）
@@ -149,40 +142,27 @@ export class AkDashboard extends LitElement {
             后端不可达 — 显示的是最后已知数据（已过期）；恢复后将自动更新
           </div>`
         : nothing}
-      ${doc && doc.programs.length === 0
-        ? html`<div class="empty">
-              还没有应用。<code>ak add &lt;目录&gt;</code> 注册后出现在这里。
-            </div>`
-        : nothing}
-      ${[...this.byApp()].map(
-        ([app, programs]) => html`
-          <section class="app">
-            <a
-              href=${`/app/${encodeURIComponent(app)}`}
-              @click=${(e: MouseEvent) => this.go(e, `/app/${encodeURIComponent(app)}`)}
-            >
-              <h2>▤ ${app}</h2>
-            </a>
-            <ul>
-              ${programs.map(
-                (p) => html`
-                  <li
-                    data-state=${p.state}
-                    @click=${() =>
-                      navigate(`/app/${encodeURIComponent(app)}/program/${encodeURIComponent(p.name)}`)}
-                  >
-                    <span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span>
-                    <ak-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
-                    ></ak-status-badge>
-                    <span>${p.name}</span>
-                    ${p.fatal_reason ? html`<span class="fatal-note">${p.fatal_reason}</span>` : nothing}
-                  </li>
-                `,
-              )}
-            </ul>
-          </section>
-        `,
-      )}
+      ${doc && total === 0
+        ? html`<div class="panel">
+            <div class="empty">
+              <span class="title">还没有应用</span>
+              <p class="hint">
+                <code class="mono">ak compose &lt;目录&gt;</code>
+                注册后，这里的程序总表会按应用分组列出全部程序。
+              </p>
+            </div>
+          </div>`
+        : html`${groups.map(
+            (g) => html`<ak-program-table
+              .programs=${g.programs}
+              .pending=${this.pendingOf(g.app)}
+              .store=${this.store}
+              heading=${g.app}
+              caption=${`${g.programs.length} 个程序`}
+              .showApp=${true}
+              @program-select=${this.onSelect}
+            ></ak-program-table>`,
+          )}`}
     `
   }
 }

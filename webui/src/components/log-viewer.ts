@@ -47,7 +47,11 @@ export class AkLogViewer extends LitElement {
     :host {
       display: flex;
       flex-direction: column;
-      min-height: 220px;
+      /* Fills the host's remaining height (program detail: 日志占满剩余高度);
+         260px is the floor before the page itself scrolls. */
+      flex: 1 1 auto;
+      min-height: 260px;
+      min-width: 0;
       border: 1px solid var(--ak-border);
       border-radius: var(--ak-radius-lg, 10px);
       background: var(--ak-well);
@@ -57,10 +61,11 @@ export class AkLogViewer extends LitElement {
       display: flex;
       align-items: center;
       gap: var(--ak-space-3);
-      padding: var(--ak-space-2) var(--ak-space-3);
+      padding: var(--ak-space-1) var(--ak-space-2);
       background: var(--ak-surface);
       border-bottom: 1px solid var(--ak-border);
-      font-size: 0.8rem;
+      font-size: var(--ak-fs-sm);
+      flex: 0 0 auto;
     }
     .tabs {
       display: inline-flex;
@@ -69,11 +74,14 @@ export class AkLogViewer extends LitElement {
       overflow: hidden;
     }
     .tabs button {
+      height: calc(var(--ak-control-h) - var(--ak-space-2));
+      padding: 0 var(--ak-space-3);
+      box-sizing: border-box;
       border: none;
       background: transparent;
       color: var(--ak-text-dim);
       font: inherit;
-      padding: 3px 12px;
+      font-size: var(--ak-fs-sm);
       cursor: pointer;
     }
     .tabs button[aria-pressed='true'] {
@@ -84,10 +92,11 @@ export class AkLogViewer extends LitElement {
     .follow {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: var(--ak-space-1);
       color: var(--ak-text-dim);
       cursor: pointer;
       user-select: none;
+      font-size: var(--ak-fs-sm);
     }
     .follow input {
       accent-color: var(--ak-accent-strong);
@@ -97,8 +106,9 @@ export class AkLogViewer extends LitElement {
     }
     .meta {
       color: var(--ak-text-faint);
-      font-size: 0.74rem;
+      font-size: var(--ak-fs-xs);
       font-variant-numeric: tabular-nums;
+      white-space: nowrap;
     }
     .scroller {
       flex: 1;

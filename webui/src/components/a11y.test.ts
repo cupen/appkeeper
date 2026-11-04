@@ -4,18 +4,18 @@ import './status-badge.js'
 import type { AkStatusBadge } from './status-badge.js'
 
 describe('accessibility baseline', () => {
-  it('status badge text remains available in greyscale (label + glyph nodes)', async () => {
+  it('status badge text remains available in greyscale (label + shape nodes)', async () => {
     const el = document.createElement('ak-status-badge') as AkStatusBadge
-    el.slug = 'failed'
-    el.label = 'Failed'
+    el.slug = 'fatal'
+    el.label = '故障'
     el.glyph = '✕'
     document.body.appendChild(el)
     await el.updateComplete
     const label = el.shadowRoot?.querySelector('.label')
-    const glyph = el.shadowRoot?.querySelector('.glyph')
-    // Shape and word nodes exist: greyscale cannot erase the state.
-    expect(label?.textContent).toBe('Failed')
-    expect(glyph?.textContent).toBe('✕')
+    const shape = el.shadowRoot?.querySelector('.glyph svg')
+    // Word and shape nodes both exist: greyscale cannot erase the state.
+    expect(label?.textContent).toBe('故障')
+    expect(shape).toBeTruthy()
     el.remove()
   })
 

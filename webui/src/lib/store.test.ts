@@ -262,4 +262,19 @@ describe('store', () => {
     expect(JSON.parse(String(init.body))).toEqual({ restart: true, app: 'demo' })
     store.stop()
   })
+
+  it('programAction() posts to the program endpoint and surfaces the result', async () => {
+    const { store } = openStore()
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ result: 'stopped web' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const msg = await store.programAction('web', 'stop')
+    expect(msg).toBe('stopped web')
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/programs/web/stop')
+    expect(init.method).toBe('POST')
+    store.stop()
+  })
 })

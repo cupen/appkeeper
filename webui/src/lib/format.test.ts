@@ -6,6 +6,7 @@ import {
   formatUptime,
   formatWindow,
   stateGlyph,
+  stateLabel,
 } from './format.js'
 
 describe('format', () => {
@@ -57,5 +58,21 @@ describe('format', () => {
     const glyphs = new Set(states.map(stateGlyph))
     expect(glyphs.size).toBe(states.length)
     expect(stateGlyph('unknown-state')).toBe('•')
+  })
+
+  it('maps every lifecycle state to its Chinese word', () => {
+    expect(stateLabel('running')).toBe('运行中')
+    expect(stateLabel('starting')).toBe('启动中')
+    expect(stateLabel('stopping')).toBe('停止中')
+    expect(stateLabel('backoff')).toBe('退避中')
+    expect(stateLabel('exited')).toBe('已退出')
+    expect(stateLabel('stopped')).toBe('已停止')
+    expect(stateLabel('fatal')).toBe('故障')
+  })
+
+  it('passes unknown slugs through unchanged (never empty)', () => {
+    expect(stateLabel('queued')).toBe('queued')
+    expect(stateLabel('unheard-of')).toBe('unheard-of')
+    expect(stateLabel('')).toBe('')
   })
 })

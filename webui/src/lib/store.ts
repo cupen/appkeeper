@@ -209,6 +209,25 @@ export class ConsoleStore {
   }
 
   /**
+   * Run one lifecycle action on a program (`start` / `stop` / `restart`) via
+   * the control plane. The daemon owns the semantics; a non-2xx answer throws
+   * an `ApiError` carrying its message so inline row actions can show it
+   * (webui-ui: 快捷操作失败有反馈). Degraded (polling) sessions refresh once
+   * so the row state converges without waiting for the next tick.
+   */
+  async programAction(
+    program: string,
+    action: 'start' | 'stop' | 'restart',
+  ): Promise<string> {
+    const v = await apiJson<{ result?: string }>(
+      `/api/programs/${encodeURIComponent(program)}/${action}`,
+      { method: 'POST' },
+    )
+    void this.pollOnceIfNotLive()
+    return v?.result ?? `${action} 已提交`
+  }
+
+  /**
    * Remove one whole app through the Web endpoint
    * (guard-remove-until-stopped). The daemon owns the guard and the result;
    * this never stops anything and never applies afterwards. A 409/404 throws

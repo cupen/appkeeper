@@ -31,25 +31,28 @@ export class AkOverviewBar extends LitElement {
 
   static styles = css`
     :host {
-      display: block;
+      display: flex;
+      flex-direction: column;
+      gap: var(--ak-space-2);
+      /* No horizontal padding: ak-app main owns the single page gutter so
+         this bar's left/right edges match every routed view. */
     }
     .pending {
       display: flex;
       align-items: center;
       flex-wrap: wrap;
       gap: var(--ak-space-2) var(--ak-space-3);
-      padding: var(--ak-space-2) var(--ak-space-4);
-      margin-bottom: calc(-1 * var(--ak-space-1, 4px));
+      padding: var(--ak-space-2) var(--ak-space-3);
       background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 12%, var(--ak-surface));
       border: 1px solid color-mix(in srgb, var(--ak-accent-strong, #6366f1) 35%, var(--ak-border));
       border-radius: var(--ak-radius-lg, 10px);
-      font-size: 0.82rem;
+      font-size: var(--ak-fs-sm, 0.8rem);
       color: var(--ak-text);
     }
     .pending .badge {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: var(--ak-space-2);
       font-weight: 600;
       color: var(--ak-text-bright);
     }
@@ -58,11 +61,11 @@ export class AkOverviewBar extends LitElement {
       place-items: center;
       min-width: 18px;
       height: 18px;
-      padding: 0 5px;
-      border-radius: 9px;
+      padding: 0 var(--ak-space-1);
+      border-radius: var(--ak-radius-full);
       background: var(--ak-accent-strong, #6366f1);
       color: var(--ak-accent-ink, #fff);
-      font-size: 0.72rem;
+      font-size: var(--ak-fs-xs, 0.72rem);
       font-weight: 700;
     }
     .pending .detail {
@@ -76,24 +79,27 @@ export class AkOverviewBar extends LitElement {
       margin-left: auto;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: var(--ak-space-2);
     }
     .pending .restart-opt {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
+      gap: var(--ak-space-1);
       color: var(--ak-text-dim);
-      font-size: 0.78rem;
+      font-size: var(--ak-fs-xs, 0.72rem);
       cursor: pointer;
     }
     .pending button {
+      height: var(--ak-control-h, 28px);
+      padding: 0 var(--ak-space-3);
       border: 1px solid var(--ak-border);
       background: var(--ak-surface-2);
       color: var(--ak-text);
       font: inherit;
-      padding: 4px 12px;
+      font-size: var(--ak-fs-sm, 0.8rem);
       border-radius: var(--ak-radius-sm, 6px);
       cursor: pointer;
+      box-sizing: border-box;
     }
     .pending button[data-primary='true'] {
       background: var(--ak-accent-strong, #6366f1);
@@ -106,9 +112,8 @@ export class AkOverviewBar extends LitElement {
       cursor: default;
     }
     .apply-result {
-      margin-top: 4px;
       padding: var(--ak-space-2) var(--ak-space-3);
-      font-size: 0.8rem;
+      font-size: var(--ak-fs-sm, 0.8rem);
       white-space: pre-wrap;
       background: var(--ak-surface);
       border: 1px solid var(--ak-border);
@@ -121,52 +126,109 @@ export class AkOverviewBar extends LitElement {
       border-color: var(--ak-status-failed, #ef4444);
       color: var(--ak-text);
     }
+
+    /* Daemon overview: an explicit grid, never flex-wrap. Fixed breakpoints:
+     *   ≥1120px — one row of seven columns;
+     *   720–1119px — two rows (version/config/uptime/monitor, then CPU/mem/refresh);
+     *   ≤720px — two columns so nothing is pushed off-screen.
+     * No margin-left:auto anywhere: a lone control cannot jump to a row's
+     * right edge (webui-visual-system: 断点行为). */
     .bar {
-      display: flex;
-      flex-wrap: wrap;
+      display: grid;
+      grid-template-areas: 'version config uptime monitor cpu mem refresh';
+      grid-template-columns:
+        max-content minmax(0, 1fr) max-content max-content
+        minmax(160px, 0.9fr) minmax(180px, 1fr) max-content;
       align-items: center;
-      gap: var(--ak-space-3) var(--ak-space-5);
-      padding: var(--ak-space-2) var(--ak-space-4);
+      gap: var(--ak-space-2);
+      padding: var(--ak-space-2) var(--ak-space-3);
       background: var(--ak-surface);
       border: 1px solid var(--ak-border);
       border-radius: var(--ak-radius-lg, 10px);
-      font-size: 0.82rem;
+      font-size: var(--ak-fs-sm, 0.8rem);
       color: var(--ak-text-dim);
     }
+    @media (max-width: 1119.98px) {
+      .bar {
+        grid-template-areas:
+          'version config uptime monitor refresh'
+          'cpu cpu mem mem refresh';
+        /* Only the config path stretches; every metric track stays at its
+           natural width and the refresh control spans both rows. This keeps
+           row 1 free of a wide empty hole while the CPU/memory meters get the
+           width they need on row 2. */
+        grid-template-columns: max-content minmax(0, 1fr) max-content max-content max-content;
+      }
+    }
+    @media (max-width: 719.98px) {
+      .bar {
+        grid-template-areas:
+          'version config'
+          'uptime monitor'
+          'cpu cpu'
+          'mem mem'
+          'refresh refresh';
+        grid-template-columns: max-content minmax(0, 1fr);
+      }
+    }
     .item {
-      display: inline-flex;
+      display: flex;
       align-items: baseline;
-      gap: 6px;
+      gap: var(--ak-space-1);
+      min-width: 0;
       white-space: nowrap;
     }
+    .version {
+      grid-area: version;
+    }
+    .config {
+      grid-area: config;
+    }
+    .uptime {
+      grid-area: uptime;
+    }
+    .monitor {
+      grid-area: monitor;
+    }
+    .cpu {
+      grid-area: cpu;
+    }
+    .mem {
+      grid-area: mem;
+    }
     .item .k {
-      font-size: 0.72rem;
+      font-size: var(--ak-fs-xs, 0.72rem);
       letter-spacing: 0.06em;
       text-transform: uppercase;
       color: var(--ak-text-faint);
+      flex: 0 0 auto;
     }
     .item .v {
+      min-width: 0;
       color: var(--ak-text);
       font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .cpu,
-    .mem {
-      min-width: 150px;
+    /* A long config path truncates instead of widening the row; the title
+       attribute on the item keeps the full path reachable. */
+    .config .v {
+      flex: 0 1 auto;
     }
     .meter {
       position: relative;
-      flex: 1 1 60px;
+      flex: 1 1 48px;
       height: 4px;
-      min-width: 48px;
+      min-width: 32px;
       align-self: center;
-      border-radius: 2px;
+      border-radius: var(--ak-radius-full);
       background: var(--ak-surface-3);
       overflow: hidden;
     }
     .meter > span {
       position: absolute;
       inset: 0 auto 0 0;
-      border-radius: 2px;
+      border-radius: var(--ak-radius-full);
       background: var(--ak-accent-strong);
       transition: width 0.4s var(--ak-ease, ease);
     }
@@ -174,21 +236,25 @@ export class AkOverviewBar extends LitElement {
       background: var(--ak-signal);
     }
     .refresh {
-      margin-left: auto;
+      grid-area: refresh;
+      justify-self: end;
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: var(--ak-space-2);
     }
     .refresh select {
+      height: var(--ak-control-h, 28px);
+      padding: 0 var(--ak-space-2);
       background: var(--ak-surface-2);
       color: var(--ak-text);
       border: 1px solid var(--ak-border);
       border-radius: var(--ak-radius-sm, 6px);
       font: inherit;
-      padding: 3px 6px;
+      font-size: var(--ak-fs-sm, 0.8rem);
+      box-sizing: border-box;
     }
     .refresh label {
-      font-size: 0.72rem;
+      font-size: var(--ak-fs-xs, 0.72rem);
       letter-spacing: 0.06em;
       text-transform: uppercase;
       color: var(--ak-text-faint);
@@ -315,13 +381,20 @@ export class AkOverviewBar extends LitElement {
           </div>`
         : nothing}
       <div class="bar" role="status" aria-label="守护进程概况">
-        <span class="item"><span class="k">版本</span><span class="v">${daemon?.version ?? '—'}</span></span>
-        <span class="item" title=${daemon?.config_source ?? ''}>
+        <span class="item version"
+          ><span class="k">版本</span><span class="v">${daemon?.version ?? '—'}</span></span
+        >
+        <span class="item config" title=${daemon?.config_source ?? ''}>
           <span class="k">配置</span>
           <span class="v">${daemon?.config_source ?? '—'}</span>
         </span>
-        <span class="item"><span class="k">巡检</span><span class="v">${daemon ? `${daemon.monitor_interval}s` : '—'}</span></span>
-        <span class="item"><span class="k">运行</span><span class="v">${formatUptime(daemon?.uptime_secs)}</span></span>
+        <span class="item uptime"
+          ><span class="k">运行</span><span class="v">${formatUptime(daemon?.uptime_secs)}</span></span
+        >
+        <span class="item monitor"
+          ><span class="k">巡检</span
+          ><span class="v">${daemon ? `${daemon.monitor_interval}s` : '—'}</span></span
+        >
         <span class="item cpu">
           <span class="k">系统 CPU</span>
           <span class="v">${formatPercent(sys?.cpu_percent ?? null)}</span>

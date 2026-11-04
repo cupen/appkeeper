@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import '../views/app-overview.js'
 import type { AkAppOverview } from './app-overview.js'
+import type { AkProgramTable } from '../components/program-table.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type ProgramInfo, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
@@ -251,5 +252,90 @@ describe('app overview remove action (guard-remove-until-stopped)', () => {
     expect(store.getSnapshot().doc!.programs.map((p) => p.name)).toEqual(['job'])
     // Other apps are untouched.
     expect(store.getSnapshot().doc!.programs[0]!.app).toBe('beta')
+  })
+})
+
+// webui-ui: App 概况 — the summary is the shared program table, status is a
+// real Chinese badge, and the page head is the one routed-view structure.
+describe('app overview program table (redesign)', () => {
+  let store: ConsoleStore
+  let ws: FakeWebSocket
+
+  beforeEach(async () => {
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+    vi.stubGlobal('fetch', vi.fn())
+    FakeWebSocket.instances = []
+    history.replaceState({}, '', '/app/alpha')
+    store = new ConsoleStore()
+    store.start()
+    ws = FakeWebSocket.instances[0]!
+    ws.serverOpen()
+    const sick = { ...program('alpha', 'sick', 'fatal'), fatal_reason: 'restart budget exhausted' }
+    ws.serverFrame(
+      snapshotFrame(
+        baseDoc([
+          program('alpha', 'web', 'running'),
+          sick,
+          program('alpha', 'worker', 'stopped'),
+          program('beta', 'job', 'running'),
+        ]),
+      ),
+    )
+    await new Promise((r) => setTimeout(r, 0))
+  })
+
+  afterEach(() => {
+    store.stop()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    history.replaceState({}, '', '/')
+  })
+
+  async function mount(): Promise<{ view: AkAppOverview; table: AkProgramTable }> {
+    const view = document.createElement('ak-app-overview') as AkAppOverview
+    view.store = store
+    view.app = 'alpha'
+    document.body.appendChild(view)
+    await view.updateComplete
+    const table = view.shadowRoot!.querySelector('ak-program-table') as AkProgramTable
+    expect(table).not.toBeNull()
+    await table.updateComplete
+    return { view, table }
+  }
+
+  it('uses the shared table and renders every status cell with a Chinese badge', async () => {
+    const { view, table } = await mount()
+    // The legacy duplicated table/layout is gone.
+    expect(view.shadowRoot!.querySelector('table')).toBeNull()
+    expect(view.shadowRoot!.querySelector('.window-switch')).toBeNull()
+    expect(table.shadowRoot!.querySelector('.table-head .rate-select')).not.toBeNull()
+
+    const rows = [...table.shadowRoot!.querySelectorAll('tbody tr[data-program]')]
+    expect(rows.map((r) => r.getAttribute('data-program'))).toEqual(['sick', 'web', 'worker'])
+    const words = rows.map(
+      (r) => r.querySelector('ak-status-badge')!.shadowRoot!.querySelector('.label')!.textContent,
+    )
+    expect(words).toEqual(['故障', '运行中', '已停止'])
+    for (const word of words) expect(word && word.length).toBeGreaterThan(0)
+    expect(rows.map((r) => r.getAttribute('data-fatal'))).toEqual(['true', 'false', 'false'])
+    expect(table.shadowRoot!.textContent).toContain('restart budget exhausted')
+    // Page-level summary alert so a fatal program is not only a tinted row.
+    expect(view.shadowRoot!.querySelector('.callout-error')!.textContent).toContain('sick')
+    view.remove()
+  })
+
+  it('keeps one page-head with equal-height controls and navigates from a row', async () => {
+    const { view, table } = await mount()
+    const head = view.shadowRoot!.querySelector('.page-head')
+    expect(head).not.toBeNull()
+    expect(head!.querySelector('h1')!.textContent).toContain('alpha')
+    const remove = head!.querySelector('button[data-kind="remove"]')!
+    expect(remove.classList.contains('btn')).toBe(true)
+    expect(remove.classList.contains('btn-danger')).toBe(true)
+
+    table.shadowRoot!.querySelector<HTMLElement>('tbody tr[data-program="web"] td.status')!.click()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(location.pathname).toBe('/app/alpha/program/web')
+    view.remove()
   })
 })

@@ -1,9 +1,15 @@
 // @vitest-environment happy-dom
+//
+// webui-ui: 全局程序总览 — the dashboard is now a grouped global program
+// table (problem programs first), not a stack of app cards. Banner and empty
+// states stay; row clicks still land on the program detail.
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import './dashboard.js'
 import type { AkDashboard } from './dashboard.js'
+import type { AkProgramTable } from '../components/program-table.js'
 import { ConsoleStore } from '../lib/store.js'
-import { MSG, type StatusDoc } from '../lib/types.js'
+import { MSG, type ProgramInfo, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
 
 class FakeWebSocket {
@@ -48,28 +54,14 @@ function snapshotFrame(doc: StatusDoc): Uint8Array {
   return out
 }
 
-function doc(): StatusDoc {
+function program(
+  app: string,
+  name: string,
+  state: string,
+  fatalReason: string | null = null,
+): ProgramInfo {
   return {
-    daemon: {
-      version: '0.1.0',
-      port: 9877,
-      apps: 1,
-      system: { cpu_percent: 3, mem_used_bytes: 1, mem_total_bytes: 2 },
-      monitor_interval: 1,
-      uptime_secs: 5,
-      config_source: '/t',
-    },
-    pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
-    programs: [
-      program('healthy', 'running', null),
-      program('sick', 'fatal', 'start failed 5 times'),
-    ],
-  }
-}
-
-function program(name: string, state: string, fatalReason: string | null): StatusDoc['programs'][number] {
-  return {
-    app: 'demo',
+    app,
     name,
     state,
     pid: state === 'running' ? 123 : null,
@@ -89,20 +81,44 @@ function program(name: string, state: string, fatalReason: string | null): Statu
   }
 }
 
-describe('dashboard (console overview)', () => {
+function doc(programs: ProgramInfo[]): StatusDoc {
+  return {
+    daemon: {
+      version: '0.1.0',
+      port: 9877,
+      apps: 2,
+      system: { cpu_percent: 3, mem_used_bytes: 1, mem_total_bytes: 2 },
+      monitor_interval: 1,
+      uptime_secs: 5,
+      config_source: '/t',
+    },
+    pending: { programs: [], apps_added: [], apps_removed: [], daemon_hints: [], errors: [] },
+    programs,
+  }
+}
+
+function healthyDoc(): StatusDoc {
+  return doc([
+    program('alpha', 'web', 'running'),
+    program('demo', 'healthy', 'running'),
+    program('demo', 'waiting', 'backoff'),
+    program('demo', 'sick', 'fatal', 'start failed 5 times'),
+  ])
+}
+
+describe('dashboard (global program table)', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+    history.replaceState({}, '', '/')
   })
 
-  function freshStore(): { store: ConsoleStore; ws: FakeWebSocket } {
+  function freshStore(payload: StatusDoc = healthyDoc()): { store: ConsoleStore; ws: FakeWebSocket } {
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({ ok: true, json: async () => doc() }),
-    )
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => payload }))
     FakeWebSocket.instances = []
+    history.replaceState({}, '', '/')
     const store = new ConsoleStore()
     store.start()
     const ws = FakeWebSocket.instances[0]!
@@ -118,37 +134,91 @@ describe('dashboard (console overview)', () => {
     return el
   }
 
-  it('renders app sections with program states from the live snapshot', async () => {
-    const { store, ws } = freshStore()
+  async function withSnapshot(
+    payload: StatusDoc = healthyDoc(),
+  ): Promise<{ store: ConsoleStore; ws: FakeWebSocket; el: AkDashboard }> {
+    const { store, ws } = freshStore(payload)
     const el = await mount(store)
-    ws.serverFrame(snapshotFrame(doc()))
+    ws.serverFrame(snapshotFrame(payload))
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
+    return { store, ws, el }
+  }
 
-    expect(el.shadowRoot?.textContent).toContain('demo')
-    expect(el.shadowRoot?.textContent).toContain('healthy')
-    expect(el.shadowRoot?.textContent).toContain('sick')
-    expect(el.shadowRoot?.textContent).toContain('start failed 5 times')
-    const fatalRow = el.shadowRoot?.querySelector('li[data-state="fatal"]')
-    expect(fatalRow).not.toBeNull()
-    expect(el.shadowRoot?.querySelector('.banner[data-mode="offline"]')).toBeNull()
+  function tables(el: AkDashboard): AkProgramTable[] {
+    return [...el.shadowRoot!.querySelectorAll('ak-program-table')] as AkProgramTable[]
+  }
+
+  function rows(table: AkProgramTable): HTMLElement[] {
+    return [
+      ...table.shadowRoot!.querySelectorAll<HTMLElement>('tbody tr[data-program]'),
+    ]
+  }
+
+  function statusWords(table: AkProgramTable): string[] {
+    return [...table.shadowRoot!.querySelectorAll('td.status ak-status-badge')].map(
+      (b) => b.shadowRoot!.querySelector('.label')!.textContent ?? '',
+    )
+  }
+
+  it('groups every program by app, with problem apps and rows first', async () => {
+    const { store, el } = await withSnapshot()
+    const groups = tables(el)
+    expect(groups).toHaveLength(2)
+    // demo holds the fatal program → it leads; alpha is healthy.
+    expect(groups[0]!.heading).toBe('demo')
+    expect(groups[0]!.caption).toBe('3 个程序')
+    expect(groups[1]!.heading).toBe('alpha')
+    expect(groups[1]!.caption).toBe('1 个程序')
+
+    // Inside the group: fatal, then backoff, then running.
+    expect(rows(groups[0]!).map((r) => r.getAttribute('data-program'))).toEqual([
+      'sick',
+      'waiting',
+      'healthy',
+    ])
+    expect(statusWords(groups[0]!)).toEqual(['故障', '退避中', '运行中'])
+    expect(groups[0]!.shadowRoot!.textContent).toContain('start failed 5 times')
     store.stop()
     el.remove()
   })
 
-  it('shows the offline banner with retained data when the socket dies', async () => {
-    const { store, ws } = freshStore()
-    const el = await mount(store)
-    ws.serverFrame(snapshotFrame(doc()))
+  it('has no app-card list and keeps the rate switch in the table title bar', async () => {
+    const { store, el } = await withSnapshot()
+    expect(el.shadowRoot!.querySelector('section.app')).toBeNull()
+    expect(el.shadowRoot!.querySelector('li[data-state]')).toBeNull()
+    const first = tables(el)[0]!
+    expect(first.shadowRoot!.querySelector('.table-head .rate-select')).not.toBeNull()
+    store.stop()
+    el.remove()
+  })
+
+  it('navigates to the program detail when a row is clicked', async () => {
+    const { store, el } = await withSnapshot()
+    const first = tables(el)[0]!
+    rows(first)[0]!.querySelector<HTMLElement>('td.status')!.click()
     await new Promise((r) => setTimeout(r, 0))
+    expect(location.pathname).toBe('/app/demo/program/sick')
+    store.stop()
+    el.remove()
+  })
+
+  it('shows the empty state when no app is registered', async () => {
+    const { store, el } = await withSnapshot(doc([]))
+    expect(tables(el)).toHaveLength(0)
+    expect(el.shadowRoot!.querySelector('.empty')!.textContent).toContain('还没有应用')
+    store.stop()
+    el.remove()
+  })
+
+  it('keeps the poll banner and the data when the socket dies', async () => {
+    const { store, ws, el } = await withSnapshot()
     ws.serverClose()
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
 
-    // Poll fallback produced fresh data (fetch mocked ok) → poll banner,
-    // and the app list stays visible.
-    expect(el.shadowRoot?.querySelector('.banner[data-mode="poll"]')).not.toBeNull()
-    expect(el.shadowRoot?.textContent).toContain('healthy')
+    expect(el.shadowRoot!.querySelector('.banner[data-mode="poll"]')).not.toBeNull()
+    expect(rows(tables(el)[0]!)).toHaveLength(3)
     store.stop()
     el.remove()
   })

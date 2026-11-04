@@ -24,7 +24,7 @@ export const viewStyles = css`
   }
   .page-title {
     margin: 0;
-    font-size: 1.25rem;
+    font-size: var(--ak-fs-xl);
     font-weight: 650;
     letter-spacing: -0.015em;
     color: var(--ak-text-bright);
@@ -32,7 +32,7 @@ export const viewStyles = css`
   .page-sub {
     margin: var(--ak-space-1) 0 0;
     color: var(--ak-text-dim);
-    font-size: 0.875rem;
+    font-size: var(--ak-fs-md);
   }
 
   /* --ak---ak- Panels --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
@@ -64,13 +64,13 @@ export const viewStyles = css`
   }
   .panel-title {
     margin: 0;
-    font-size: 0.95rem;
+    font-size: var(--ak-fs-lg);
     font-weight: 600;
     color: var(--ak-text-bright);
   }
   .panel-caption {
     color: var(--ak-text-faint);
-    font-size: 0.8rem;
+    font-size: var(--ak-fs-sm);
   }
 
   /* --ak---ak- Tables --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak-- */
@@ -88,7 +88,7 @@ export const viewStyles = css`
   th {
     color: var(--ak-text-faint);
     font-weight: 550;
-    font-size: 0.7rem;
+    font-size: var(--ak-fs-xs);
     text-transform: uppercase;
     letter-spacing: 0.08em;
     background: var(--ak-surface-2);
@@ -129,7 +129,7 @@ export const viewStyles = css`
   /* --ak---ak- Typography helpers --ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak---ak- */
   .mono {
     font-family: var(--ak-font-mono);
-    font-size: 0.82rem;
+    font-size: var(--ak-fs-sm);
   }
   .tnum {
     font-variant-numeric: tabular-nums;
@@ -187,11 +187,11 @@ export const viewStyles = css`
   .empty .title {
     color: var(--ak-text-bright);
     font-weight: 600;
-    font-size: 0.95rem;
+    font-size: var(--ak-fs-lg);
   }
   .empty .hint {
     margin: 0;
-    font-size: 0.85rem;
+    font-size: var(--ak-fs-sm);
     max-width: 42ch;
   }
   .empty .cta {
@@ -244,7 +244,7 @@ export const viewStyles = css`
     padding: var(--ak-space-3) var(--ak-space-4);
     border-radius: var(--ak-radius-md);
     border: 1px solid;
-    font-size: 0.875rem;
+    font-size: var(--ak-fs-md);
     margin: 0 0 var(--ak-space-4);
   }
   .callout svg {
@@ -278,7 +278,7 @@ export const viewStyles = css`
     border: 1px solid var(--ak-border);
     background: var(--ak-surface-2);
     color: var(--ak-text-dim);
-    font-size: 0.78rem;
+    font-size: var(--ak-fs-xs);
     white-space: nowrap;
   }
   .chip .dot {
@@ -307,7 +307,7 @@ export const viewStyles = css`
   }
   .kv dt {
     color: var(--ak-text-dim);
-    font-size: 0.875rem;
+    font-size: var(--ak-fs-md);
   }
   .kv dd {
     margin: 0;

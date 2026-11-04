@@ -105,13 +105,13 @@ export class AkApp extends LitElement {
     }
     .brand .name {
       font-weight: 700;
-      font-size: 1rem;
+      font-size: var(--ak-fs-lg, 1rem);
       letter-spacing: 0.01em;
     }
     .brand .name small {
       display: block;
       font-weight: 500;
-      font-size: 0.66rem;
+      font-size: var(--ak-fs-xs, 0.72rem);
       letter-spacing: 0.09em;
       text-transform: uppercase;
       color: var(--ak-text-faint);
@@ -122,7 +122,10 @@ export class AkApp extends LitElement {
       min-height: 0;
       display: flex;
       flex-direction: column;
-      padding: var(--ak-space-3) var(--ak-space-4);
+      /* The one and only horizontal page padding: the overview bar and every
+         routed view carry zero horizontal padding of their own, so their left
+         and right edges cannot drift apart (webui-visual-system: 单一内容列). */
+      padding: var(--ak-space-3) var(--ak-gutter);
       gap: var(--ak-space-3);
       box-sizing: border-box;
     }
@@ -157,7 +160,7 @@ export class AkApp extends LitElement {
         animation: none;
       }
     }
-    @media (max-width: 640px) {
+    @media (max-width: 720px) {
       :host {
         flex-direction: column;
       }
@@ -167,6 +170,10 @@ export class AkApp extends LitElement {
         width: auto;
         border-right: none;
         border-bottom: 1px solid var(--ak-border);
+        padding: var(--ak-space-3) var(--ak-space-4);
+      }
+      main {
+        /* Still the only horizontal padding, just tighter on narrow screens. */
         padding: var(--ak-space-3) var(--ak-space-4);
       }
       .brand .name small {

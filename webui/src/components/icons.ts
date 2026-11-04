@@ -35,6 +35,33 @@ const PATHS: Record<string, string> = {
     '<line x1="12" x2="12" y1="5" y2="19"/><line x1="5" x2="19" y1="12" y2="12"/>',
   sun:
     '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+  /* Lifecycle shapes: each slug gets a *different silhouette* so the status
+   * badge still reads in greyscale (webui-visual-system: 状态的颜色与形状分工).
+   * Rendered at 12px by the badge's fixed icon slot. */
+  'status-running': '<polygon points="6 3 20 12 6 21 6 3"/>',
+  'status-starting':
+    '<line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/>',
+  'status-stopping': '<rect width="14" height="14" x="5" y="5" rx="1.5"/>',
+  'status-backoff':
+    '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+  'status-exited':
+    '<rect width="14" height="14" x="5" y="5" rx="1.5" fill="currentColor" stroke="none"/>',
+  'status-stopped':
+    '<polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/>',
+  'status-fatal': '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+}
+
+/** Size of the badge icon slot; the badge CSS fixes the same 12px box. */
+export const STATUS_ICON_PX = 12
+
+const STATUS_ICON_NAMES: Record<string, string> = {
+  running: 'status-running',
+  starting: 'status-starting',
+  stopping: 'status-stopping',
+  backoff: 'status-backoff',
+  exited: 'status-exited',
+  stopped: 'status-stopped',
+  fatal: 'status-fatal',
 }
 
 /** Render a decorative inline-SVG icon by name; empty string when unknown. */
@@ -53,4 +80,13 @@ export function icon(name: string, size = 16): TemplateResult | typeof nothing {
     stroke-linejoin="round"
     innerHTML=${body}
   ></svg>`
+}
+
+/**
+ * The 12px lifecycle icon for a status slug, or `nothing` for a slug outside
+ * the known vocabulary. Decorative: the badge's word carries the meaning.
+ */
+export function statusIcon(slug: string): TemplateResult | typeof nothing {
+  const name = STATUS_ICON_NAMES[slug]
+  return name ? icon(name, STATUS_ICON_PX) : nothing
 }

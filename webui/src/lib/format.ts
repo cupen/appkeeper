@@ -77,3 +77,23 @@ export function stateGlyph(state: string): string {
       return '•'
   }
 }
+
+/**
+ * Chinese word for a lifecycle slug (webui-ui: 状态展示). The vocabulary is
+ * shared by the status badge, the sidebar tooltip/accessible name and the
+ * tables, so the same state always reads the same way. Unknown slugs pass
+ * through unchanged — never render an empty state.
+ */
+const STATE_LABELS: Record<string, string> = {
+  running: '运行中',
+  starting: '启动中',
+  stopping: '停止中',
+  backoff: '退避中',
+  exited: '已退出',
+  stopped: '已停止',
+  fatal: '故障',
+}
+
+export function stateLabel(state: string): string {
+  return STATE_LABELS[state] ?? state
+}

@@ -73,6 +73,15 @@ function snapshotFrame(doc: StatusDoc): Uint8Array {
   return out
 }
 
+/** STATUS deltas are JSON text ({programs, pending?, removed?}). */
+function statusFrame(body: unknown): Uint8Array {
+  const text = new TextEncoder().encode(JSON.stringify(body))
+  const out = new Uint8Array(text.length + 1)
+  out[0] = MSG.STATUS
+  out.set(text, 1)
+  return out
+}
+
 function doc(): StatusDoc {
   return {
     daemon: {
@@ -202,6 +211,88 @@ describe('console components', () => {
     el.remove()
   })
 
+  it('program detail is one column: header → metrics → command → notices → log', async () => {
+    const el = document.createElement('ak-program-detail') as AkProgramDetail
+    el.store = store
+    el.app = 'demo'
+    el.program = 'web'
+    document.body.appendChild(el)
+    await el.updateComplete
+    await new Promise((r) => setTimeout(r, 0))
+    await el.updateComplete
+
+    const root = el.shadowRoot!
+    // Structural order: the log viewer closes the column and nothing sits
+    // after it (webui-ui: 进程详情 / design D8).
+    const blocks = [...root.querySelectorAll('header, .metrics, .command, ak-log-viewer')]
+    expect(blocks.map((n) => n.tagName.toLowerCase())).toEqual([
+      'header',
+      'ul',
+      'div',
+      'ak-log-viewer',
+    ])
+    // The old card grid is gone.
+    expect(root.querySelector('.grid')).toBeNull()
+
+    // Six compact metrics in one strip.
+    const metrics = root.querySelector('.metrics')!
+    expect(metrics.querySelectorAll('li')).toHaveLength(6)
+    expect(metrics.textContent).toContain('PID')
+    expect(metrics.textContent).toContain('12.5%')
+    expect(metrics.textContent).toContain('4.0 KiB')
+    // Running without a confirmed probe yet reads as pending, never blank.
+    expect(metrics.textContent).toContain('待确认')
+
+    // Mono command block carries the command line and the working directory.
+    const command = root.querySelector('.command')!
+    expect(command.textContent).toContain('sh -c while :; do echo tick; sleep 1; done')
+    expect(command.textContent).toContain('/srv/demo')
+    expect(command.querySelector('code')).not.toBeNull()
+
+    // Breadcrumb links back to the app overview.
+    const crumb = root.querySelector('a.crumb') as HTMLAnchorElement
+    expect(crumb.getAttribute('href')).toBe('/app/demo')
+
+    // No duplicate glyph: the badge owns the shape + word, the h1 the name.
+    const h1 = root.querySelector('h1')!
+    expect(h1.textContent!.trim()).toBe('web')
+    expect(h1.textContent).not.toContain('▶')
+    const badge = root.querySelector('ak-status-badge') as unknown as { label: string }
+    expect(badge.label).toBe('运行中')
+    // A running program has no backoff countdown.
+    expect(root.querySelector('.backoff-note')).toBeNull()
+    el.remove()
+  })
+
+  it('program detail shows the backoff seconds beside the badge', async () => {
+    // Bring a backing-off program into the projection via a STATUS delta.
+    ws.serverFrame(
+      statusFrame({
+        programs: [{ ...program('demo', 'waiting', 'backoff'), restart_backoff: 5 }],
+      }),
+    )
+    await new Promise((r) => setTimeout(r, 0))
+
+    const el = document.createElement('ak-program-detail') as AkProgramDetail
+    el.store = store
+    el.app = 'demo'
+    el.program = 'waiting'
+    document.body.appendChild(el)
+    await el.updateComplete
+    await new Promise((r) => setTimeout(r, 0))
+    await el.updateComplete
+
+    const root = el.shadowRoot!
+    const badge = root.querySelector('ak-status-badge') as unknown as { label: string }
+    expect(badge.label).toBe('退避中')
+    // The seconds are secondary text beside the pill, never inside it
+    // (webui-ui: 状态展示 / backoff 状态可见).
+    const note = root.querySelector('.backoff-note')
+    expect(note?.textContent).toBe('5s 后重启')
+    expect(root.querySelector('ak-status-badge .backoff-note')).toBeNull()
+    el.remove()
+  })
+
   it('program detail surfaces failure feedback on 409', async () => {
     const el = document.createElement('ak-program-detail') as AkProgramDetail
     el.store = store
@@ -211,6 +302,10 @@ describe('console components', () => {
     await el.updateComplete
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
+
+    // fatal reason sits in its own warning block below the command.
+    const fatal = el.shadowRoot!.querySelector('.notice[data-tone="fatal"]')
+    expect(fatal?.textContent).toContain('retries exhausted')
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

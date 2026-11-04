@@ -69,7 +69,9 @@
   --ak-shadow-2: 0 12px 32px rgba(0, 0, 0, 0.42);
   --ak-shadow-up: 0 -10px 28px rgba(0, 0, 0, 0.38);
 
-  /* Spacing scale */
+  /* Spacing scale — the only source for paddings and gaps. Neighbouring
+   * values such as 6/9/10/14px are not part of the scale and must not be
+   * invented per component (webui-visual-system: 收敛的排版与间距尺度). */
   --ak-space-1: 4px;
   --ak-space-2: 8px;
   --ak-space-3: 12px;
@@ -78,6 +80,28 @@
   --ak-space-6: 24px;
   --ak-space-8: 32px;
   --ak-space-10: 40px;
+
+  /* Type scale (theme-invariant; the light re-map below only changes colours
+   * and shadows). Four semantic levels: xs = auxiliary/labels, sm = badges and
+   * table headers, md = body, lg = section, xl = page title. */
+  --ak-fs-xs: 0.72rem;
+  --ak-fs-sm: 0.8rem;
+  --ak-fs-md: 0.875rem;
+  --ak-fs-lg: 1rem;
+  --ak-fs-xl: 1.25rem;
+
+  /* One control height for selects, buttons and checkboxes: toolbar rows and
+   * table action bars share a baseline instead of drifting (28px). */
+  --ak-control-h: 28px;
+
+  /* The single page gutter. `ak-app`'s main applies it once; the overview bar
+   * and routed views carry zero horizontal padding of their own so their left
+   * edges cannot diverge (webui-visual-system: 单一内容列与对齐). */
+  --ak-gutter: var(--ak-space-5);
+
+  /* Fixed breakpoints (media queries cannot read custom properties — kept
+   * here as the written contract): 1120px = overview bar collapses from one
+   * row to two; 720px = sidebar collapses above the content column. */
 
   /* Radius scale */
   --ak-radius-sm: 6px;
@@ -107,7 +131,9 @@
 
 /* Light re-map: engages whenever <html> is missing the wa-dark class —
  * system-light via theme.ts, or an explicit light choice in
- * Settings → Appearance. */
+ * Settings → Appearance. Only colours and shadows are re-mapped: the type
+ * scale, spacing scale and control height defined in :root above are
+ * theme-invariant, so both themes share identical geometry. */
 :root:not(.wa-dark) {
   color-scheme: light;
 

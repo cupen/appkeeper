@@ -1,17 +1,22 @@
 /**
  * Operator-facing status badge. Renders the backend-owned status projection
- * (label + slug + glyph) as a tinted pill: glyph shape, colored dot, and the
- * word — so state survives greyscale and colour-blindness (shape + word +
- * colour). Pill background/border/text come from the per-slug status tokens
- * via the data-status attribute; the dot keeps an inline `--ak-status-*`
- * reference (stylesheet hook, mirrors the SSR projection).
+ * as a tinted pill: a 6px dot, a fixed 12px icon slot and the word — so the
+ * state survives greyscale and colour-blindness (shape + word + colour) and
+ * the glyph's font baseline can no longer push the row height around.
  *
- * The mapping lives server-side (single source); this component only
- * renders what the API sends.
+ * `label` and `glyph` stay caller-provided (the backend/UI vocabulary is not
+ * duplicated here): `label` is the word, `glyph` is only a fallback for slugs
+ * outside the built-in icon set. An unknown slug renders its raw text —
+ * never an empty badge.
+ *
+ * Pill background/border/text come from the per-slug status tokens via the
+ * data-status attribute; the dot keeps an inline `--ak-status-*` reference
+ * (stylesheet hook, mirrors the SSR projection).
  */
 
 import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property } from 'lit/decorators.js'
+import { statusIcon } from './icons.js'
 
 /**
  * The status vocabulary is owned by the backend (single source); the badge
@@ -24,19 +29,20 @@ export type StatusSlug = string
 export class AkStatusBadge extends LitElement {
   @property() slug: StatusSlug = ''
   @property() label = ''
+  /** Caller glyph, used only when the slug has no built-in 12px icon. */
   @property() glyph = ''
 
   static styles = css`
     .badge {
       display: inline-flex;
       align-items: center;
-      gap: 7px;
-      padding: 3px 10px 3px 9px;
+      gap: var(--ak-space-2, 8px);
+      padding: var(--ak-space-1, 4px) var(--ak-space-2, 8px);
       border-radius: var(--ak-radius-full, 999px);
-      border: 1px solid var(--ak-status-queued-border, rgba(56, 209, 221, 0.3));
-      background: var(--ak-status-queued-bg, rgba(56, 209, 221, 0.1));
-      color: var(--ak-status-queued, #38d1dd);
-      font-size: 0.78rem;
+      border: 1px solid var(--ak-status-dormant-border, rgba(148, 160, 180, 0.28));
+      background: var(--ak-status-dormant-bg, rgba(148, 160, 180, 0.1));
+      color: var(--ak-status-dormant, #94a0b4);
+      font-size: var(--ak-fs-xs, 0.72rem);
       font-weight: 550;
       letter-spacing: 0.01em;
       line-height: 1.4;
@@ -105,16 +111,22 @@ export class AkStatusBadge extends LitElement {
       border-color: var(--ak-status-failed-border);
       color: var(--ak-status-failed);
     }
+    /* Fixed icon slot: 12px wide regardless of glyph or font, so rows never
+       jitter when the status word changes. */
     .glyph {
-      font-size: 0.9em;
+      flex: 0 0 12px;
+      width: 12px;
+      height: 12px;
+      display: inline-grid;
+      place-items: center;
       line-height: 1;
     }
     .dot {
       position: relative;
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      background: var(--ak-status-queued, #38d1dd);
+      background: var(--ak-status-dormant, #94a0b4);
       flex: 0 0 auto;
     }
     /* Live pulse on the working status — CSS only, honours reduced motion. */
@@ -144,21 +156,29 @@ export class AkStatusBadge extends LitElement {
       }
     }
     .label {
-      font-size: 0.92em;
+      font-size: var(--ak-fs-xs, 0.72rem);
     }
   `
 
   private get statusColor(): string {
     const slug = this.slug.replace(/[^a-z]/g, '')
-    return `var(--ak-status-${slug}, var(--ak-status-queued, #b8860b))`
+    return `var(--ak-status-${slug}, var(--ak-status-dormant, #94a0b4))`
   }
 
   render() {
-    // Glyph and label are always rendered: colour is never the only channel.
+    // The word is the accessible text; an unknown slug reads back verbatim
+    // (webui-ui: 不认识的 slug 原样显示，不得渲染为空).
+    const label = this.label || this.slug
+    if (!label) return nothing
+    // Built-in 12px SVG wins; a caller glyph is the fallback for other slugs.
+    const icon = statusIcon(this.slug)
+    const mark = icon !== nothing ? icon : this.glyph || nothing
     return html`<span class="badge" data-status=${this.slug}>
       <span class="dot" style=${`background: ${this.statusColor}`} aria-hidden="true"></span>
-      <span class="glyph" aria-hidden="true">${this.glyph || nothing}</span>
-      <span class="label">${this.label || this.slug}</span>
+      ${mark === nothing
+        ? nothing
+        : html`<span class="glyph" aria-hidden="true">${mark}</span>`}
+      <span class="label">${label}</span>
     </span>`
   }
 }

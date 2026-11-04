@@ -1,32 +1,24 @@
 /**
- * App overview (webui-ui: App 概况): the app's program summary table —
- * name, status, restarts, uptime, CPU, memory, log line rate — plus the
- * rate-window switch (1s/10s/1m/5m, shared by every rate column) and links
- * into each program's detail. Not-running programs show placeholders, never
- * fake zeros; fatal rows are highlighted.
+ * App overview (webui-ui: App 概况): the app's programs in the shared
+ * `ak-program-table` — name, status badge, restarts, uptime, CPU, memory and
+ * the two log-rate columns, with the rate-window switch in the table's title
+ * bar. Row-tail quick actions and row navigation come from the shared table,
+ * so this page and the dashboard cannot drift apart. Not-running programs
+ * show placeholders, never fake zeros; fatal rows are highlighted.
+ *
+ * Page title area keeps the app-level apply entry and the destructive
+ * `移除应用` action (same control height/radius as any other button).
  */
 
-import { LitElement, css, html } from 'lit'
+import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property, state } from 'lit/decorators.js'
-import { nothing } from 'lit'
 import { ApiError } from '../lib/api.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import type { ProgramInfo } from '../lib/types.js'
-import {
-  formatBytes,
-  formatPercent,
-  formatRate,
-  formatUptime,
-  formatWindow,
-  stateGlyph,
-} from '../lib/format.js'
-import {
-  RATE_WINDOW_CHOICES_S,
-  loadRateWindowS,
-  saveRateWindowS,
-  type RateWindowS,
-} from '../lib/prefs.js'
 import { navigate } from '../router.js'
+import { viewStyles } from '../styles/shared.js'
+import '../components/program-table.js'
+import type { ProgramSelectDetail } from '../components/program-table.js'
 
 @customElement('ak-app-overview')
 export class AkAppOverview extends LitElement {
@@ -42,230 +34,142 @@ export class AkAppOverview extends LitElement {
     this.console = new ConsoleController(this, this.store)
   }
 
-  @state() private rateWindow: RateWindowS = loadRateWindowS()
   @state() private applying = false
   @state() private applyFeedback: { ok: boolean; text: string } | null = null
   @state() private removing = false
   @state() private removeFeedback: { ok: boolean; text: string } | null = null
 
-  static styles = css`
-    :host {
-      flex: 1;
-      min-height: 0;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: var(--ak-space-4);
-      padding: var(--ak-space-4) var(--ak-space-5);
-      box-sizing: border-box;
-    }
-    header {
-      display: flex;
-      align-items: baseline;
-      gap: var(--ak-space-3);
-    }
-    h1 {
-      margin: 0;
-      font-size: 1.25rem;
-      color: var(--ak-text-bright);
-    }
-    .sub {
-      color: var(--ak-text-faint);
-      font-size: 0.85rem;
-    }
-    .window-switch {
-      margin-left: auto;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.8rem;
-      color: var(--ak-text-dim);
-    }
-    .window-switch select {
-      background: var(--ak-surface-2);
-      color: var(--ak-text);
-      border: 1px solid var(--ak-border);
-      border-radius: var(--ak-radius-sm, 6px);
-      font: inherit;
-      padding: 3px 6px;
-    }
-    .remove {
-      display: inline-flex;
-      align-items: center;
-      gap: var(--ak-space-2);
-    }
-    .remove button {
-      font: inherit;
-      font-size: 0.8rem;
-      padding: 4px 12px;
-      border-radius: var(--ak-radius-sm, 6px);
-      border: 1px solid var(--ak-status-failed-border, #b91c1c);
-      background: transparent;
-      color: var(--ak-status-failed, #ef4444);
-      cursor: pointer;
-    }
-    .remove button:hover:not(:disabled) {
-      background: color-mix(in srgb, var(--ak-status-failed, #ef4444) 12%, transparent);
-    }
-    .remove button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    .remove-strip {
-      display: flex;
-      align-items: flex-start;
-      gap: var(--ak-space-2);
-      padding: var(--ak-space-2) var(--ak-space-4);
-      border-radius: var(--ak-radius-lg, 10px);
-      border: 1px solid var(--ak-border);
-      background: var(--ak-surface);
-      font-size: 0.82rem;
-      color: var(--ak-text-dim);
-      white-space: pre-wrap;
-    }
-    .remove-strip[data-error='true'] {
-      border-color: var(--ak-status-failed, #ef4444);
-      background: var(--ak-status-failed-bg);
-      color: var(--ak-text);
-    }
-    .remove-strip[data-ok='true'] {
-      border-color: var(--ak-status-done-border, #15803d);
-      background: var(--ak-status-done-bg);
-      color: var(--ak-status-done, #22c55e);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      background: var(--ak-surface);
-      border: 1px solid var(--ak-border);
-      border-radius: var(--ak-radius-lg, 10px);
-      overflow: hidden;
-      font-size: 0.86rem;
-    }
-    th,
-    td {
-      text-align: left;
-      padding: 9px 14px;
-      border-bottom: 1px solid var(--ak-border);
-      font-variant-numeric: tabular-nums;
-      white-space: nowrap;
-    }
-    th {
-      font-size: 0.72rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--ak-text-faint);
-      font-weight: 600;
-      background: var(--ak-surface-2);
-    }
-    tr:last-child td {
-      border-bottom: none;
-    }
-    tbody tr {
-      cursor: pointer;
-      transition: background var(--ak-dur, 150ms) var(--ak-ease, ease);
-    }
-    tbody tr:hover {
-      background: var(--ak-surface-2);
-    }
-    tr[data-fatal='true'] {
-      background: var(--ak-status-failed-bg);
-      box-shadow: inset 3px 0 0 var(--ak-status-failed);
-    }
-    tr[data-fatal='true']:hover {
-      background: color-mix(in srgb, var(--ak-status-failed-bg) 60%, var(--ak-surface-2));
-    }
-    td.num {
-      text-align: right;
-    }
-    .name-cell {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--ak-text-bright);
-      font-weight: 600;
-    }
-    .name-cell .glyph {
-      color: var(--ak-text-faint);
-    }
-    .prog-count {
-      color: var(--ak-text-faint);
-      font-size: 0.9rem;
-    }
-    .apply-strip {
-      display: flex;
-      align-items: center;
-      gap: var(--ak-space-3);
-      padding: var(--ak-space-2) var(--ak-space-4);
-      background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 12%, var(--ak-surface));
-      border: 1px solid color-mix(in srgb, var(--ak-accent-strong, #6366f1) 35%, var(--ak-border));
-      border-radius: var(--ak-radius-lg, 10px);
-      font-size: 0.84rem;
-    }
-    .apply-strip .count {
-      color: var(--ak-text-bright);
-      font-weight: 600;
-    }
-    .apply-strip button {
-      margin-left: auto;
-      border: 1px solid transparent;
-      background: var(--ak-accent-strong, #6366f1);
-      color: var(--ak-accent-ink, #fff);
-      font: inherit;
-      font-weight: 600;
-      padding: 4px 14px;
-      border-radius: var(--ak-radius-sm, 6px);
-      cursor: pointer;
-    }
-    .apply-strip button:disabled {
-      opacity: 0.55;
-      cursor: default;
-    }
-    .apply-strip .feedback {
-      color: var(--ak-text-dim);
-      white-space: pre-wrap;
-      max-width: 52ch;
-      max-height: 8em;
-      overflow-y: auto;
-      font-size: 0.78rem;
-    }
-    .apply-strip .feedback[data-error='true'] {
-      color: var(--ak-status-failed, #ef4444);
-    }
-    .changed-mark {
-      margin-left: 6px;
-      padding: 1px 7px;
-      border-radius: 999px;
-      font-size: 0.68rem;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 22%, transparent);
-      color: var(--ak-text-bright);
-    }
-    .empty {
-      padding: var(--ak-space-6);
-      text-align: center;
-      color: var(--ak-text-faint);
-    }
-  `
+  static styles = [
+    viewStyles,
+    css`
+      :host {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: var(--ak-space-4);
+        /* Horizontal padding belongs to ak-app main alone (shell alignment). */
+        padding: var(--ak-space-4) 0;
+        box-sizing: border-box;
+      }
+      /* One page-head for every routed view: same structure, same control
+         heights — the destructive action is not a different-sized control. */
+      .page-head {
+        margin-bottom: 0;
+      }
+      .head-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--ak-space-2);
+        flex-wrap: wrap;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        height: var(--ak-control-h);
+        padding: 0 var(--ak-space-3);
+        box-sizing: border-box;
+        border: 1px solid var(--ak-border);
+        border-radius: var(--ak-radius-sm);
+        background: var(--ak-surface-2);
+        color: var(--ak-text);
+        font: inherit;
+        font-size: var(--ak-fs-sm);
+        cursor: pointer;
+      }
+      .btn:hover:not(:disabled) {
+        border-color: var(--ak-border-strong);
+        color: var(--ak-text-bright);
+      }
+      .btn-danger {
+        border-color: var(--ak-status-failed-border, #b91c1c);
+        background: transparent;
+        color: var(--ak-status-failed, #ef4444);
+      }
+      .btn-danger:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--ak-status-failed, #ef4444) 12%, transparent);
+      }
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .remove-strip {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--ak-space-2);
+        padding: var(--ak-space-2) var(--ak-space-4);
+        border-radius: var(--ak-radius-lg);
+        border: 1px solid var(--ak-border);
+        background: var(--ak-surface);
+        font-size: var(--ak-fs-sm);
+        color: var(--ak-text-dim);
+        white-space: pre-wrap;
+      }
+      .remove-strip[data-error='true'] {
+        border-color: var(--ak-status-failed, #ef4444);
+        background: var(--ak-status-failed-bg);
+        color: var(--ak-text);
+      }
+      .remove-strip[data-ok='true'] {
+        border-color: var(--ak-status-done-border, #15803d);
+        background: var(--ak-status-done-bg);
+        color: var(--ak-status-done, #22c55e);
+      }
+      .apply-strip {
+        display: flex;
+        align-items: center;
+        gap: var(--ak-space-3);
+        padding: var(--ak-space-2) var(--ak-space-4);
+        background: color-mix(in srgb, var(--ak-accent-strong, #6366f1) 12%, var(--ak-surface));
+        border: 1px solid color-mix(in srgb, var(--ak-accent-strong, #6366f1) 35%, var(--ak-border));
+        border-radius: var(--ak-radius-lg);
+        font-size: var(--ak-fs-sm);
+      }
+      .apply-strip .count {
+        color: var(--ak-text-bright);
+        font-weight: 600;
+      }
+      .apply-strip button {
+        display: inline-flex;
+        align-items: center;
+        height: var(--ak-control-h);
+        padding: 0 var(--ak-space-3);
+        box-sizing: border-box;
+        margin-left: auto;
+        border: 1px solid transparent;
+        border-radius: var(--ak-radius-sm);
+        background: var(--ak-accent-strong, #6366f1);
+        color: var(--ak-accent-ink, #fff);
+        font: inherit;
+        font-weight: 600;
+        font-size: var(--ak-fs-sm);
+        cursor: pointer;
+      }
+      .apply-strip button:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .apply-strip .feedback {
+        color: var(--ak-text-dim);
+        white-space: pre-wrap;
+        max-width: 52ch;
+        max-height: 8em;
+        overflow-y: auto;
+        font-size: var(--ak-fs-xs);
+      }
+      .apply-strip .feedback[data-error='true'] {
+        color: var(--ak-status-failed, #ef4444);
+      }
+      ak-program-table {
+        display: block;
+        min-width: 0;
+      }
+    `,
+  ]
 
   private programsOf(app: string): ProgramInfo[] {
     return this.console?.snapshot.doc?.programs.filter((p) => p.app === app) ?? []
-  }
-
-  private rateOf(p: ProgramInfo, stream: 'out' | 'err'): number {
-    const w = this.rateWindow
-    const r = p.log_rate[stream]
-    switch (w) {
-      case 1:
-        return r.w1
-      case 60:
-        return r.w60
-      case 300:
-        return r.w300
-      default:
-        return r.w10
-    }
   }
 
   private pendingSet(): Set<string> {
@@ -296,11 +200,6 @@ export class AkAppOverview extends LitElement {
     } finally {
       this.applying = false
     }
-  }
-
-  private onWindowChange(e: Event): void {
-    this.rateWindow = Number((e.target as HTMLSelectElement).value) as RateWindowS
-    saveRateWindowS(this.rateWindow)
   }
 
   /**
@@ -367,27 +266,27 @@ export class AkAppOverview extends LitElement {
     return next ? `/app/${encodeURIComponent(next)}` : '/'
   }
 
-  private openDetail(program: string): void {
-    navigate(`/app/${encodeURIComponent(this.app)}/program/${encodeURIComponent(program)}`)
+  private onProgramSelect(e: Event): void {
+    const detail = (e as CustomEvent<ProgramSelectDetail>).detail
+    if (!detail?.program) return
+    navigate(
+      `/app/${encodeURIComponent(this.app)}/program/${encodeURIComponent(detail.program)}`,
+    )
   }
 
   render() {
     const programs = this.programsOf(this.app)
     const pendingSet = this.pendingSet()
+    const fatal = programs.filter((p) => p.state === 'fatal')
     return html`
-      <header>
-        <h1>▤ ${this.app}</h1>
-        <span class="sub">${programs.length} 个程序</span>
-        <label class="window-switch">
-          速率窗口
-          <select .value=${String(this.rateWindow)} @change=${this.onWindowChange}>
-            ${RATE_WINDOW_CHOICES_S.map(
-              (s) => html`<option value=${s} ?selected=${s === this.rateWindow}>${formatWindow(s)}</option>`,
-            )}
-          </select>
-        </label>
-        <span class="remove">
+      <header class="page-head">
+        <div>
+          <h1 class="page-title">${this.app}</h1>
+          <p class="page-sub">${programs.length} 个程序</p>
+        </div>
+        <div class="head-actions">
           <button
+            class="btn btn-danger"
             data-kind="remove"
             ?disabled=${this.removing}
             @click=${() => void this.onRemove()}
@@ -395,7 +294,7 @@ export class AkAppOverview extends LitElement {
           >
             ${this.removing ? '移除中…' : '移除应用'}
           </button>
-        </span>
+        </div>
       </header>
       ${this.removeFeedback
         ? html`<div
@@ -408,6 +307,11 @@ export class AkAppOverview extends LitElement {
             ${this.removeFeedback.text}
           </div>`
         : nothing}
+      ${fatal.length > 0
+        ? html`<div class="callout callout-error" role="alert">
+            ${fatal.length} 个程序处于故障：${fatal.map((p) => p.name).join(', ')}
+          </div>`
+        : nothing}
       ${pendingSet.size > 0 || this.applyFeedback
         ? html`<div class="apply-strip" role="alert">
             <span><span class="count">${pendingSet.size}</span> 个程序配置有变化（待应用）</span>
@@ -415,63 +319,21 @@ export class AkAppOverview extends LitElement {
               ${this.applying ? '应用中…' : 'Apply 此应用'}
             </button>
             ${this.applyFeedback
-              ? html`<span
-                  class="feedback"
-                  data-error=${!this.applyFeedback.ok}
-                  role="status"
+              ? html`<span class="feedback" data-error=${!this.applyFeedback.ok} role="status"
                   >${this.applyFeedback.text}</span
                 >`
               : nothing}
           </div>`
         : nothing}
-      ${programs.length === 0
-        ? html`<div class="empty">该应用没有声明任何程序</div>`
-        : html`
-            <table>
-              <thead>
-                <tr>
-                  <th>程序</th>
-                  <th>状态</th>
-                  <th class="num">重启</th>
-                  <th class="num">uptime</th>
-                  <th class="num">CPU</th>
-                  <th class="num">内存</th>
-                  <th class="num">stdout 速率</th>
-                  <th class="num">stderr 速率</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${programs.map(
-                  (p) => html`
-                    <tr
-                      data-fatal=${p.state === 'fatal'}
-                      @click=${() => this.openDetail(p.name)}
-                      title="查看 ${p.name} 详情"
-                    >
-                      <td>
-                        <span class="name-cell"
-                          ><span class="glyph" aria-hidden="true">${stateGlyph(p.state)}</span
-                          >${p.name}</span
-                        >${pendingSet.has(p.name) ? html`<span class="changed-mark">待应用</span>` : nothing}
-                      </td>
-                      <td>
-                        <ak-status-badge slug=${p.state} label=${p.state} glyph=${stateGlyph(p.state)}
-                        ></ak-status-badge>
-                        ${p.wait_reason ? html`<span class="sub">　${p.wait_reason}</span>` : nothing}
-                        ${p.fatal_reason ? html`<span class="sub">　${p.fatal_reason}</span>` : nothing}
-                      </td>
-                      <td class="num">${p.total_exits}</td>
-                      <td class="num">${formatUptime(p.uptime_secs)}</td>
-                      <td class="num">${formatPercent(p.cpu_percent)}</td>
-                      <td class="num">${formatBytes(p.mem_bytes)}</td>
-                      <td class="num">${formatRate(this.rateOf(p, 'out'))}</td>
-                      <td class="num">${formatRate(this.rateOf(p, 'err'))}</td>
-                    </tr>
-                  `,
-                )}
-              </tbody>
-            </table>
-          `}
+      <ak-program-table
+        .programs=${programs}
+        .pending=${[...pendingSet]}
+        .store=${this.store}
+        heading="程序"
+        caption=${`${programs.length} 个程序`}
+        emptyText="该应用没有声明任何程序"
+        @program-select=${this.onProgramSelect}
+      ></ak-program-table>
     `
   }
 }

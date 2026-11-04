@@ -10,6 +10,7 @@ import './overview-bar.js'
 import '../views/app-overview.js'
 import type { AkOverviewBar } from './overview-bar.js'
 import type { AkAppOverview } from '../views/app-overview.js'
+import type { AkProgramTable } from './program-table.js'
 import { ConsoleStore } from '../lib/store.js'
 import { MSG, type ProgramInfo, type StatusDoc } from '../lib/types.js'
 import { encode } from '@msgpack/msgpack'
@@ -150,6 +151,17 @@ describe('pending + apply UI (webui-ui: pending 变更提示与 apply 操作)', 
     return el
   }
 
+  /** The shared program table lives one shadow root deeper than the view. */
+  function tableOf(view: AkAppOverview): AkProgramTable {
+    const table = view.shadowRoot!.querySelector('ak-program-table')
+    expect(table).not.toBeNull()
+    return table as AkProgramTable
+  }
+
+  function tableShadow(view: AkAppOverview): ShadowRoot {
+    return tableOf(view).shadowRoot!
+  }
+
   function flushFrames(): Promise<void> {
     return new Promise((r) => setTimeout(r, 0))
   }
@@ -217,7 +229,7 @@ describe('pending + apply UI (webui-ui: pending 变更提示与 apply 操作)', 
 
   it('app overview marks changed rows and scopes its apply to that app only', async () => {
     const view = await mountOverview('alpha')
-    expect(view.shadowRoot!.querySelector('.changed-mark')).toBeNull()
+    expect(tableShadow(view).querySelector('.changed-mark')).toBeNull()
 
     // Both alpha and beta have pending changes.
     ws.serverFrame(statusFrame([], {
@@ -229,10 +241,10 @@ describe('pending + apply UI (webui-ui: pending 变更提示与 apply 操作)', 
     }))
     await flushFrames()
     await view.updateComplete
-    await view.updateComplete
+    await tableOf(view).updateComplete
 
     // Only alpha rows carry the mark.
-    const marks = view.shadowRoot!.querySelectorAll('.changed-mark')
+    const marks = tableShadow(view).querySelectorAll('.changed-mark')
     expect(marks).toHaveLength(1)
     expect(marks[0]!.closest('tr')!.textContent).toContain('worker')
 
@@ -259,8 +271,9 @@ describe('pending + apply UI (webui-ui: pending 变更提示与 apply 操作)', 
     }))
     await flushFrames()
     await view.updateComplete
+    await tableOf(view).updateComplete
     expect(view.shadowRoot!.querySelector('.apply-strip')).not.toBeNull()
-    expect(view.shadowRoot!.querySelector('.changed-mark')).toBeNull()
+    expect(tableShadow(view).querySelector('.changed-mark')).toBeNull()
     view.remove()
   })
 
