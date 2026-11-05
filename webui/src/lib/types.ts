@@ -26,9 +26,25 @@ export interface SystemMetrics {
   mem_total_bytes: number
 }
 
+/** Build identity of the running binary (server: server.rs BuildInfo). */
+export interface BuildInfo {
+  /** Short git hash, `-dirty` when tracked files were modified. */
+  git_commit: string
+  /** RFC 3339 UTC build timestamp. */
+  built_at: string
+  /** Cargo target triple. */
+  target: string
+  /** `rustc --version` output. */
+  rustc: string
+}
+
 export interface DaemonInfo {
   version: string
+  /** Build identity of this binary (show-build-version D2). */
+  build: BuildInfo
   port: number
+  /** Control endpoint (socket path / pipe name) the daemon serves. */
+  socket: string
   apps: number
   system: SystemMetrics
   monitor_interval: number

@@ -86,6 +86,13 @@ function doc(): StatusDoc {
   return {
     daemon: {
       version: '0.1.0',
+      build: {
+        git_commit: '02d37e02dedc',
+        built_at: '2026-01-01T00:00:00Z',
+        target: 'x86_64-unknown-linux-gnu',
+        rustc: 'rustc 1.90.0 (0000000 2026-01-01)',
+      },
+      socket: '/tmp/ak-test/ak.sock',
       port: 9877,
       apps: 1,
       system: { cpu_percent: 21.5, mem_used_bytes: 4 * 1024 ** 3, mem_total_bytes: 16 * 1024 ** 3 },

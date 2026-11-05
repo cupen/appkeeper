@@ -10,7 +10,7 @@
  * hides them from a shell-scoped listener.
  */
 
-import { LitElement, css, html } from 'lit'
+import { LitElement, css, html, nothing } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
 import { matchRoute, navigate, type RouteDef } from './router.js'
 import { ConsoleController, consoleStore } from './lib/store.js'
@@ -23,6 +23,7 @@ import './views/program-detail.js'
 import './components/console-tree.js'
 import './components/overview-bar.js'
 import './components/credential-gate.js'
+import './components/version-dialog.js'
 
 // Exported for tests: the route resolution audit iterates these. Deep links
 // to unknown paths fall through to the dashboard like any unmatched path.
@@ -37,6 +38,8 @@ export class AkApp extends LitElement {
   private console = new ConsoleController(this, consoleStore)
 
   @state() private routeId: string = 'dashboard'
+  /** About dialog visibility (show-build-version D3/D4). */
+  @state() private versionDialogOpen = false
 
   private params: Record<string, string> = {}
   /** Set while a removal-driven redirect is queued (one shot). */
@@ -79,6 +82,12 @@ export class AkApp extends LitElement {
       flex: 1;
       min-height: 0;
     }
+    .brand-block {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      min-width: 0;
+    }
     .brand {
       display: flex;
       align-items: center;
@@ -108,13 +117,27 @@ export class AkApp extends LitElement {
       font-size: var(--ak-fs-lg, 1rem);
       letter-spacing: 0.01em;
     }
-    .brand .name small {
-      display: block;
-      font-weight: 500;
+    /* Version slot under the app name (show-build-version D3): same small
+       grey type as the old brand caption, aligned with the name text, and it
+       never adds height to the brand row itself. */
+    .version {
+      margin-left: calc(var(--ak-space-2) + 28px + var(--ak-space-3));
+      padding: 0;
+      border: none;
+      background: none;
+      font: inherit;
       font-size: var(--ak-fs-xs, 0.72rem);
       letter-spacing: 0.09em;
-      text-transform: uppercase;
       color: var(--ak-text-faint);
+      cursor: pointer;
+    }
+    .version:hover {
+      color: var(--ak-text-dim);
+    }
+    .version:focus-visible {
+      outline: var(--ak-focus-ring, 1px solid #7c86ff);
+      outline-offset: 2px;
+      border-radius: var(--ak-radius-sm);
     }
     main {
       flex: 1;
@@ -176,7 +199,7 @@ export class AkApp extends LitElement {
         /* Still the only horizontal padding, just tighter on narrow screens. */
         padding: var(--ak-space-3) var(--ak-space-4);
       }
-      .brand .name small {
+      .version {
         display: none;
       }
     }
@@ -258,6 +281,34 @@ export class AkApp extends LitElement {
     return this.console.snapshot.doc?.programs.filter((p) => p.app === app) ?? []
   }
 
+  /** Version slot label: the projected daemon version, `v—` before any projection. */
+  private versionLabel(): string {
+    const version = this.console.snapshot.doc?.daemon.version
+    return version ? `v${version}` : 'v—'
+  }
+
+  private openVersionDialog(): void {
+    this.versionDialogOpen = true
+  }
+
+  /**
+   * Keyboard equivalent of the double-click (webui-ui: 键盘与关闭). Enter/Space
+   * would otherwise also fire a synthesised `click`; preventing the default
+   * keeps the dialog from being toggled by one keypress.
+   */
+  private onVersionKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Enter' && e.key !== ' ') return
+    e.preventDefault()
+    this.openVersionDialog()
+  }
+
+  private async closeVersionDialog(): Promise<void> {
+    this.versionDialogOpen = false
+    await this.updateComplete
+    // The trigger is outside the dialog, so focusing it never re-opens.
+    this.renderRoot.querySelector<HTMLButtonElement>('.version')?.focus()
+  }
+
   protected render(): unknown {
     const { doc } = this.console.snapshot
     const apps = [...new Set((doc?.programs ?? []).map((p) => p.app))].map((name) => ({
@@ -271,10 +322,24 @@ export class AkApp extends LitElement {
       this.routeId === 'program' ? decodeURIComponent(this.params['program'] ?? '') : ''
     return html`
       <nav aria-label="Primary">
-        <a class="brand" href="/">
-          <span class="mark" aria-hidden="true">ak</span>
-          <span class="name">appkeeper<small>console</small></span>
-        </a>
+        <div class="brand-block">
+          <a class="brand" href="/">
+            <span class="mark" aria-hidden="true">ak</span>
+            <span class="name">appkeeper</span>
+          </a>
+          <button
+            class="version"
+            type="button"
+            title="双击查看版本详情"
+            aria-label=${`appkeeper 版本 ${this.versionLabel()}，双击查看版本详情`}
+            aria-haspopup="dialog"
+            aria-expanded=${String(this.versionDialogOpen)}
+            @dblclick=${() => this.openVersionDialog()}
+            @keydown=${(e: KeyboardEvent) => this.onVersionKeydown(e)}
+          >
+            ${this.versionLabel()}
+          </button>
+        </div>
         <ak-console-tree
           .apps=${apps}
           selectedApp=${selectedApp}
@@ -296,6 +361,13 @@ export class AkApp extends LitElement {
               : html`<ak-dashboard></ak-dashboard>`}
         </div>
       </main>
+      ${this.versionDialogOpen
+        ? html`<ak-version-dialog
+            .daemon=${doc?.daemon ?? null}
+            .programCount=${doc?.programs.length ?? 0}
+            @ak-version-closed=${() => void this.closeVersionDialog()}
+          ></ak-version-dialog>`
+        : nothing}
       <ak-credential-gate></ak-credential-gate>
     `
   }

@@ -115,6 +115,13 @@ function doc(programs: ProgramInfo[]): StatusDoc {
   return {
     daemon: {
       version: '0.1.0',
+      build: {
+        git_commit: '02d37e02dedc',
+        built_at: '2026-01-01T00:00:00Z',
+        target: 'x86_64-unknown-linux-gnu',
+        rustc: 'rustc 1.90.0 (0000000 2026-01-01)',
+      },
+      socket: '/run/appkeeper/1000/ak.sock',
       port: 9877,
       apps: 2,
       system: { cpu_percent: 5, mem_used_bytes: 1, mem_total_bytes: 2 },
@@ -128,6 +135,139 @@ function doc(programs: ProgramInfo[]): StatusDoc {
 }
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+// -- show-build-version 3.1/3.3: version slot + about dialog ----------------
+
+describe('brand version slot and about dialog (show-build-version 3.1/3.3)', () => {
+  beforeEach(() => {
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+    // Fully offline: no REST fallback may inject a projection behind the
+    // assertions (the shared store keeps the last doc across tests).
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    FakeWebSocket.instances = []
+    history.replaceState({}, '', '/')
+  })
+
+  afterEach(() => {
+    consoleStore.stop()
+    document.body.innerHTML = ''
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  async function mount(): Promise<AkApp> {
+    const el = document.createElement('ak-app') as AkApp
+    document.body.appendChild(el)
+    await el.updateComplete
+    return el
+  }
+
+  function versionButton(el: AkApp): HTMLButtonElement {
+    return el.shadowRoot!.querySelector<HTMLButtonElement>('.version')!
+  }
+
+  function dialog(el: AkApp): HTMLElement | null {
+    return el.shadowRoot!.querySelector('ak-version-dialog')
+  }
+
+  it('keeps the brand mark and shows a version placeholder with no projection', async () => {
+    const shell = await mount()
+    const mark = shell.shadowRoot!.querySelector('.brand .mark')
+    expect(mark?.textContent?.trim()).toBe('ak')
+    expect(shell.shadowRoot!.querySelector('.brand .name')?.textContent?.trim()).toBe('appkeeper')
+    // The version button sits outside the anchor: a click cannot navigate.
+    expect(shell.shadowRoot!.querySelector('.brand .version')).toBeNull()
+    const button = versionButton(shell)
+    expect(button.textContent?.trim()).toBe('v—')
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog')
+    expect(button.getAttribute('title')).toContain('双击查看版本详情')
+    expect(button.getAttribute('aria-label')).toContain('双击查看版本详情')
+    button.click()
+    expect(location.pathname).toBe('/')
+    shell.remove()
+  })
+
+  it('opens the dialog on double-click (offline: only the notice) and closes on Esc', async () => {
+    const shell = await mount()
+    const button = versionButton(shell)
+    expect(dialog(shell)).toBeNull()
+
+    button.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, composed: true }))
+    await tick()
+    await shell.updateComplete
+
+    const host = dialog(shell) as unknown as { shadowRoot: ShadowRoot }
+    expect(host).not.toBeNull()
+    expect(host.shadowRoot.textContent).toContain('当前未连接守护进程')
+
+    host.shadowRoot
+      .querySelector('dialog')!
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await tick()
+    await shell.updateComplete
+    await tick()
+    await shell.updateComplete
+
+    expect(dialog(shell)).toBeNull()
+    expect(shell.shadowRoot!.activeElement).toBe(versionButton(shell))
+    shell.remove()
+  })
+
+  it('shows the projected version and build facts once a snapshot arrives', async () => {
+    consoleStore.start()
+    const ws = FakeWebSocket.instances[0]!
+    ws.serverOpen()
+    ws.serverFrame(snapshotFrame(doc([program('alpha', 'web')])))
+    await tick()
+
+    const shell = await mount()
+    const button = versionButton(shell)
+    expect(button.textContent?.trim()).toBe('v0.1.0')
+
+    button.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, composed: true }))
+    await tick()
+    await shell.updateComplete
+
+    const text = dialog(shell)!.shadowRoot!.textContent!.replace(/\s+/g, ' ')
+    expect(text).toContain('git 提交')
+    expect(text).toContain('02d37e02dedc')
+    expect(text).toContain('/run/appkeeper/1000/ak.sock')
+    shell.remove()
+  })
+
+  it('opens the dialog with Enter and Space without double-firing', async () => {
+    const shell = await mount()
+    const button = versionButton(shell)
+
+    button.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    await tick()
+    await shell.updateComplete
+    expect(dialog(shell)).not.toBeNull()
+
+    // Close again, then Space.
+    const host = dialog(shell) as unknown as { shadowRoot: ShadowRoot }
+    host.shadowRoot.querySelector<HTMLButtonElement>('.close')!.click()
+    await tick()
+    await shell.updateComplete
+    await tick()
+    await shell.updateComplete
+    expect(dialog(shell)).toBeNull()
+
+    versionButton(shell).dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }))
+    await tick()
+    await shell.updateComplete
+    expect(dialog(shell)).not.toBeNull()
+    shell.remove()
+  })
+
+  it('hides the version slot on narrow screens like the old brand caption', () => {
+    const cssText = (AkApp.styles as unknown as { cssText: string }).cssText
+    expect(cssText).toContain('.brand-block')
+    expect(cssText).toMatch(/@media \(max-width: 720px\)[\s\S]*\.version\s*\{\s*display: none/)
+    // Alignment to the app name: mark width + brand gap.
+    expect(cssText).toContain('margin-left: calc(var(--ak-space-2) + 28px + var(--ak-space-3))')
+  })
+})
 
 describe('shell convergence after a removal (guard-remove-until-stopped 4.3)', () => {
   let ws: FakeWebSocket

@@ -70,7 +70,11 @@ describe('frames.decodeFrame', () => {
   it('inflates zlib-compressed payloads (bit 7 flag)', async () => {
     const doc = {
       daemon: {
-        version: 't', port: 1, apps: 0,
+        version: 't', port: 1, apps: 0, socket: '/t/ak.sock',
+        build: {
+          git_commit: 't', built_at: '2026-01-01T00:00:00Z',
+          target: 'x86_64-unknown-linux-gnu', rustc: 'rustc 1.90.0',
+        },
         system: { cpu_percent: null, mem_used_bytes: 0, mem_total_bytes: 0 },
         monitor_interval: 1, uptime_secs: 0, config_source: '/t',
       },
@@ -90,6 +94,11 @@ describe('frames.decodeFrame', () => {
     const doc = {
       daemon: {
         version: '0.1.0',
+        build: {
+          git_commit: '02d37e02dedc', built_at: '2026-01-01T00:00:00Z',
+          target: 'x86_64-unknown-linux-gnu', rustc: 'rustc 1.90.0',
+        },
+        socket: '/x/ak.sock',
         port: 9877,
         apps: 2,
         system: { cpu_percent: 12.5, mem_used_bytes: 1, mem_total_bytes: 2 },

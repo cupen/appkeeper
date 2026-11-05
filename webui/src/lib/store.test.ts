@@ -49,6 +49,13 @@ function doc(programs: ProgramInfo[]): StatusDoc {
   return {
     daemon: {
       version: 't',
+      build: {
+        git_commit: 't',
+        built_at: '2026-01-01T00:00:00Z',
+        target: 'x86_64-unknown-linux-gnu',
+        rustc: 'rustc 1.90.0 (0000000 2026-01-01)',
+      },
+      socket: '/t/ak.sock',
       port: 1,
       apps: 1,
       system: { cpu_percent: 1, mem_used_bytes: 1, mem_total_bytes: 2 },
