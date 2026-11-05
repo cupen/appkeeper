@@ -87,9 +87,39 @@ pub(crate) struct StatusDoc {
     pub pending: crate::supervisor::PendingDoc,
 }
 
+/// Build identity of this binary (show-build-version D2), injected by
+/// `build.rs` at compile time. Any probe that failed at build time is the
+/// literal `unknown` — consumers render it verbatim rather than guessing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BuildInfo {
+    /// Short git hash, `-dirty` when tracked files were modified.
+    pub git_commit: String,
+    /// RFC 3339 UTC build timestamp.
+    pub built_at: String,
+    /// Cargo target triple.
+    pub target: String,
+    /// `rustc --version` output.
+    pub rustc: String,
+}
+
+impl BuildInfo {
+    /// The metadata compiled into this binary (never fails: missing probes
+    /// were already folded into `unknown` by the build script).
+    pub(crate) fn current() -> Self {
+        BuildInfo {
+            git_commit: env!("AK_BUILD_GIT").to_string(),
+            built_at: env!("AK_BUILD_TIME").to_string(),
+            target: env!("AK_BUILD_TARGET").to_string(),
+            rustc: env!("AK_BUILD_RUSTC").to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DaemonInfo {
     pub version: String,
+    /// This binary's build identity (show-build-version D2).
+    pub build: BuildInfo,
     /// Kept for wire compatibility with existing consumers, always 0: the
     /// control plane no longer listens on any TCP port
     /// (unix-socket-control-plane D2). New consumers read `socket`.
@@ -107,6 +137,23 @@ pub(crate) struct DaemonInfo {
     pub config_source: String,
 }
 
+/// The single `DaemonInfo` constructor: `status_doc()` (WS/API) and the
+/// `/v1/status` handler both call this, so the three surfaces cannot drift
+/// (show-build-version D2).
+fn daemon_info(st: &crate::supervisor::SupervisorState, sup: &Arc<Supervisor>) -> DaemonInfo {
+    DaemonInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: BuildInfo::current(),
+        port: 0,
+        socket: st.config.daemon.socket.to_string_lossy().into_owned(),
+        apps: st.apps.len(),
+        system: sup.metrics.system(),
+        monitor_interval: st.config.daemon.monitor_interval,
+        uptime_secs: (sup.uptime_secs() * 100.0).round() / 100.0,
+        config_source: sup.config_path().display().to_string(),
+    }
+}
+
 /// One status snapshot for any consumer (control plane + web console).
 pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
     let st = sup.state.lock().unwrap();
@@ -117,16 +164,7 @@ pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
         .collect();
     programs.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
     StatusDoc {
-        daemon: DaemonInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            port: 0,
-            socket: st.config.daemon.socket.to_string_lossy().into_owned(),
-            apps: st.apps.len(),
-            system: sup.metrics.system(),
-            monitor_interval: st.config.daemon.monitor_interval,
-            uptime_secs: (sup.uptime_secs() * 100.0).round() / 100.0,
-            config_source: sup.config_path().display().to_string(),
-        },
+        daemon: daemon_info(&st, sup),
         programs,
         pending: st.pending.clone(),
     }
@@ -420,16 +458,7 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
             json_bytes(
                 200,
                 StatusDoc {
-                    daemon: DaemonInfo {
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        port: 0,
-                        socket: st.config.daemon.socket.to_string_lossy().into_owned(),
-                        apps: st.apps.len(),
-                        system: sup.metrics.system(),
-                        monitor_interval: st.config.daemon.monitor_interval,
-                        uptime_secs: (sup.uptime_secs() * 100.0).round() / 100.0,
-                        config_source: sup.config_path().display().to_string(),
-                    },
+                    daemon: daemon_info(&st, sup),
                     programs,
                     pending: st.pending.clone(),
                 },
@@ -1430,6 +1459,12 @@ mod tests {
         StatusDoc {
             daemon: DaemonInfo {
                 version: "t".into(),
+                build: BuildInfo {
+                    git_commit: "abc1234".into(),
+                    built_at: "2026-01-01T00:00:00Z".into(),
+                    target: "x86_64-unknown-linux-gnu".into(),
+                    rustc: "rustc 1.90.0 (x)".into(),
+                },
                 port: 0,
                 socket: "/run/appkeeper/0/ak.sock".into(),
                 apps: 1,
@@ -2178,6 +2213,37 @@ mod tests {
             v["daemon"]["socket"].as_str().unwrap().ends_with("ak.sock"),
             "the endpoint path is what the projection carries now: {v}"
         );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// show-build-version 1.3: the projection carries this binary's build
+    /// identity, the version stays the package version, and `/v1/status`
+    /// serves exactly what `status_doc()` produces (one constructor, no drift).
+    #[test]
+    fn status_projection_carries_build_identity() {
+        let (sup, dir, ep) = serve_harness("build-identity");
+        let doc = status_doc(&sup);
+        assert_eq!(doc.daemon.version, env!("CARGO_PKG_VERSION"));
+        for (field, value) in [
+            ("git_commit", &doc.daemon.build.git_commit),
+            ("built_at", &doc.daemon.build.built_at),
+            ("target", &doc.daemon.build.target),
+            ("rustc", &doc.daemon.build.rustc),
+        ] {
+            assert!(!value.is_empty(), "daemon.build.{field} must be non-empty");
+        }
+        let body = ep.get("/v1/status");
+        let v: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            v["daemon"]["build"]["git_commit"],
+            doc.daemon.build.git_commit
+        );
+        assert_eq!(v["daemon"]["build"]["built_at"], doc.daemon.build.built_at);
+        assert_eq!(v["daemon"]["build"]["target"], doc.daemon.build.target);
+        assert_eq!(v["daemon"]["build"]["rustc"], doc.daemon.build.rustc);
+        assert_eq!(v["daemon"]["version"], env!("CARGO_PKG_VERSION"));
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

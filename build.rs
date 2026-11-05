@@ -26,6 +26,11 @@
 //! use whatever `dist/` is already on disk (used by CI jobs without a Node
 //! setup that don't serve the real UI). The legacy `AK_WEBUI_BUILD`
 //! variable is still honored with lower precedence.
+//!
+//! Independently of the frontend mode, every build emits this build's
+//! identity as `rustc-env` variables (show-build-version D1): git commit,
+//! build time, target triple and rustc version. Each one degrades to
+//! `unknown` instead of failing the build.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +38,11 @@ use std::process::Command;
 use std::time::SystemTime;
 
 fn main() {
+    // Build identity comes first: the frontend branch below may return early
+    // (BuildMode::Skip) and the binary must still carry its metadata
+    // (show-build-version D1).
+    emit_build_metadata();
+
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let webui = manifest.join("webui");
     let dist = webui.join("dist");
@@ -92,6 +102,138 @@ fn main() {
     }
 
     println!("cargo:rustc-env=AK_WEBUI_STAMP={}", stamp(&dist));
+}
+
+/// Collect this build's identity and export it to the crate as `rustc-env`
+/// variables (show-build-version D1). Every probe degrades to `unknown` on
+/// failure — a source tarball without git, or a rustc that cannot be spawned,
+/// must never break the build.
+fn emit_build_metadata() {
+    // The pinned timestamp is an input like any other: changing it must
+    // re-run this script rather than reuse the previous build's value.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    watch_git(&manifest);
+
+    let git = git_commit(&manifest).unwrap_or_else(|| {
+        warn_metadata("git metadata unavailable — AK_BUILD_GIT=unknown");
+        "unknown".to_string()
+    });
+    let built_at = build_time();
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    let rustc = rustc_version(&manifest).unwrap_or_else(|| {
+        warn_metadata("rustc --version failed — AK_BUILD_RUSTC=unknown");
+        "unknown".to_string()
+    });
+
+    println!("cargo:rustc-env=AK_BUILD_GIT={git}");
+    println!("cargo:rustc-env=AK_BUILD_TIME={built_at}");
+    println!("cargo:rustc-env=AK_BUILD_TARGET={target}");
+    println!("cargo:rustc-env=AK_BUILD_RUSTC={rustc}");
+}
+
+/// Emit a `cargo:warning` for a degraded build-identity probe. Both probes
+/// can only fail in unusual environments, so this does not spam normal builds.
+fn warn_metadata(msg: &str) {
+    println!("cargo:warning={msg}");
+}
+
+/// Re-run this script when the checked-out commit changes. Without these
+/// watches only a Rust source edit would refresh the embedded git hash.
+///
+/// Only a real git directory has `HEAD`; in a linked worktree `.git` is a
+/// file pointing at the common gitdir, so these paths do not exist — and
+/// cargo treats a missing rerun-if-changed path as dirty, which would re-run
+/// this script (and recompile the crate) on every single build. Probing
+/// `.git/HEAD` skips the watch there instead.
+fn watch_git(repo: &Path) {
+    let git = repo.join(".git");
+    if !git.join("HEAD").exists() {
+        return;
+    }
+    for watched in [".git/HEAD", ".git/refs"] {
+        println!("cargo:rerun-if-changed={watched}");
+    }
+}
+
+/// `<short-hash>` from `git rev-parse`, with a `-dirty` suffix when tracked
+/// files have uncommitted changes (untracked files do not count — they are
+/// not part of the build). `None` when the probe fails outright.
+fn git_commit(repo: &Path) -> Option<String> {
+    let hash = command_output(repo, "git", &["rev-parse", "--short=12", "HEAD"])?;
+    let dirty = command_output(
+        repo,
+        "git",
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .map(|out| !out.is_empty())
+    .unwrap_or(false);
+    Some(if dirty { format!("{hash}-dirty") } else { hash })
+}
+
+/// RFC 3339 UTC build timestamp. `SOURCE_DATE_EPOCH` wins when set so release
+/// pipelines can reproduce a build; otherwise the system clock is used. The
+/// conversion is a small dependency-free epoch→civil calculation — pulling
+/// `chrono` into a build script is not worth it.
+fn build_time() -> String {
+    let secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+    format_rfc3339_utc(secs)
+}
+
+/// Seconds since the Unix epoch → `YYYY-MM-DDTHH:MM:SSZ` (UTC, no leap
+/// seconds). Handles pre-1970 timestamps too (negative input).
+fn format_rfc3339_utc(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let rem = epoch_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days since 1970-01-01 → proleptic Gregorian (year, month, day). Howard
+/// Hinnant's `civil_from_days`: exact for the whole `i64` range we can reach.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `rustc --version` output, or `None` when the compiler cannot be probed.
+fn rustc_version(dir: &Path) -> Option<String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    command_output(dir, &rustc, &["--version"])
+}
+
+/// Run a command and return its trimmed stdout when it exits successfully.
+fn command_output(dir: &Path, program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 enum BuildMode {

@@ -1597,6 +1597,48 @@ mod tests {
         assert_eq!(doc.daemon.system.cpu_percent, Some(3.4));
     }
 
+    /// show-build-version (webui-api: 控制台投影与 WS 同构): `/api/overview`
+    /// and the `/ws` snapshot are the SAME projection — `daemon.build` agrees
+    /// field for field with the control plane's `/v1/status` shape, and with
+    /// this binary's compile-time identity. The test stops at the shape and
+    /// cross-surface equality; the metadata probes themselves live in build.rs.
+    #[tokio::test]
+    async fn ws_snapshot_and_overview_share_daemon_build() {
+        let (sup, _name) = sup_with_metrics();
+        let rest = get(build_router(sup.clone(), test_stop(), ""), "/api/overview").await;
+        assert_eq!(rest.0, StatusCode::OK);
+        let rest: serde_json::Value = serde_json::from_slice(&rest.1).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(sup2, test_stop(), "")).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let msg = ws.next().await.unwrap().unwrap();
+        let (t, payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+        assert_eq!(t, msg_type::SNAPSHOT, "the first frame is the snapshot");
+
+        // Decode on the wire type, then compare against REST as JSON so a
+        // field renamed on either side fails here rather than silently.
+        let snap: StatusDoc = rmp_serde::from_slice(&payload).unwrap();
+        let snap = serde_json::to_value(snap.daemon.build).unwrap();
+        assert_eq!(snap, rest["daemon"]["build"], "WS and /api/overview agree");
+        for field in ["git_commit", "built_at", "target", "rustc"] {
+            let value = snap[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("daemon.build.{field} must be a string"));
+            assert!(!value.is_empty(), "daemon.build.{field} must be non-empty");
+        }
+        // The identity is this binary's, not a fixture: the version is the
+        // package version and the target is whatever cargo compiled for.
+        assert_eq!(rest["daemon"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(snap["target"], env!("AK_BUILD_TARGET"));
+    }
+
     /// The control plane's projection is served over the local IPC endpoint —
     /// same JSON, no TCP port involved. It is queried with the in-tree client,
     /// which speaks HTTP/1.1 over that endpoint.
