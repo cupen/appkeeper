@@ -6843,6 +6843,211 @@ try {{
   if (mark !== 'ak') throw new Error('brand mark should read ak, got ' + JSON.stringify(mark));
   ok('brand mark reads ak');
 
+  // -- show-build-version: brand version slot + about dialog --------------
+  // The slot under the brand name carries the daemon's projected version. A
+  // real double-click opens the about dialog and Esc closes it, handing focus
+  // back to the slot. Values are cross-checked against the same REST
+  // projection the UI consumes, so nothing here hard-codes a fixture.
+  const projection = await page.evaluate(async () => {{
+    const res = await fetch('/api/overview');
+    if (!res.ok) throw new Error('/api/overview answered ' + res.status);
+    return res.json();
+  }});
+  const slot = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const el = app?.shadowRoot?.querySelector('.brand-block button.version');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return {{
+      text: el.textContent?.trim() ?? '',
+      popup: el.getAttribute('aria-haspopup'),
+      visible: r.width > 0 && r.height > 0,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+    }};
+  }});
+  if (!slot) throw new Error('brand version slot missing under the app name');
+  if (!/^v\d/.test(slot.text)) {{
+    throw new Error('version slot should read v<version>, got ' + JSON.stringify(slot.text));
+  }}
+  if (!slot.visible) throw new Error('version slot is not visible at 1440');
+  if (slot.popup !== 'dialog') throw new Error('version slot must advertise aria-haspopup=dialog');
+  ok('version slot reads ' + slot.text + ' and advertises a dialog');
+
+  const urlBeforeDialog = page.url();
+  await page.mouse.dblclick(slot.x, slot.y);
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const host = app?.shadowRoot?.querySelector('ak-version-dialog');
+    return !!host?.shadowRoot?.querySelector('dialog[open]');
+  }});
+  const about = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const dlg = app?.shadowRoot
+      ?.querySelector('ak-version-dialog')
+      ?.shadowRoot?.querySelector('dialog');
+    const rows = {{}};
+    for (const dl of dlg?.querySelectorAll('dl') ?? []) {{
+      const dts = [...dl.querySelectorAll('dt')];
+      const dds = [...dl.querySelectorAll('dd')];
+      dts.forEach((dt, i) => {{
+        rows[dt.textContent.trim()] = {{
+          value: dds[i]?.textContent?.trim() ?? '',
+          title: dds[i]?.getAttribute('title') ?? '',
+        }};
+      }});
+    }}
+    return {{
+      open: !!dlg?.open,
+      modal: !!dlg?.matches(':modal'),
+      rows,
+      url: location.href,
+    }};
+  }});
+  if (!about.open) throw new Error('double-click must open the about dialog');
+  if (!about.modal) throw new Error('the about dialog must be modal');
+  if (about.url !== urlBeforeDialog) throw new Error('opening the dialog must not navigate');
+  for (const label of [
+    '版本',
+    'git 提交',
+    '构建时间',
+    '目标平台',
+    'Rust 版本',
+    '控制端点',
+    '配置来源',
+    '运行时长',
+    '应用 / 程序',
+  ]) {{
+    if (!(label in about.rows)) throw new Error('about dialog is missing the "' + label + '" row');
+    if (about.rows[label].value === '') throw new Error('about row "' + label + '" is blank');
+  }}
+  const built = projection.daemon.build;
+  const projected = projection.daemon;
+  if (about.rows['版本'].value !== projected.version) {{
+    throw new Error(
+      'version row should show ' + projected.version + ', got ' + about.rows['版本'].value,
+    );
+  }}
+  for (const [label, key] of [
+    ['git 提交', 'git_commit'],
+    ['目标平台', 'target'],
+    ['Rust 版本', 'rustc'],
+  ]) {{
+    const seen = about.rows[label].value;
+    if (seen !== built[key]) {{
+      throw new Error(
+        label + ' should show ' + JSON.stringify(built[key]) + ', got ' + JSON.stringify(seen),
+      );
+    }}
+  }}
+  // Build time renders in local time; the raw RFC 3339 stays on the tooltip.
+  if (built.built_at !== 'unknown' && about.rows['构建时间'].title !== built.built_at) {{
+    throw new Error('build time tooltip should keep the raw ' + built.built_at);
+  }}
+  if (built.git_commit !== 'unknown' && !/^[0-9a-f]{{7,12}}(-dirty)?$/.test(built.git_commit)) {{
+    throw new Error('git commit should be a short hash: ' + built.git_commit);
+  }}
+  if (about.rows['控制端点'].value !== projected.socket) {{
+    throw new Error('the dialog should name the control endpoint ' + projected.socket);
+  }}
+  if (about.rows['应用 / 程序'].value !== projected.apps + ' / ' + projection.programs.length) {{
+    throw new Error(
+      'app/program counts should match the projection, got ' + about.rows['应用 / 程序'].value,
+    );
+  }}
+  ok('about dialog shows git ' + built.git_commit + ' on ' + built.target + ' plus runtime facts');
+
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    return !app?.shadowRoot?.querySelector('ak-version-dialog');
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    return !!app?.shadowRoot?.activeElement?.classList?.contains('version');
+  }});
+  ok('Escape closes the dialog and returns focus to the version slot');
+
+  // The keyboard path opens it exactly once (Enter must not also fire the
+  // synthesised click a bare button would produce), and the narrow layout
+  // hides the slot without leaving an empty gap in the brand row.
+  const focusable = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const el = app?.shadowRoot?.querySelector('.brand-block button.version');
+    el?.focus();
+    return !!el?.matches(':focus');
+  }});
+  if (!focusable) throw new Error('the version slot is not keyboard focusable');
+  // A real Enter keypress: the handler must open the dialog and its
+  // preventDefault must suppress the synthesised click, or the shell would
+  // see two opens (and could toggle itself shut).
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    return app?.shadowRoot?.querySelectorAll('ak-version-dialog').length === 1;
+  }});
+  ok('Enter on the focused version slot opens exactly one dialog');
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    return !app?.shadowRoot?.querySelector('ak-version-dialog');
+  }});
+
+  const wideBrand = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const root = app?.shadowRoot;
+    const b = (el) => {{
+      const r = el.getBoundingClientRect();
+      return {{ left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height }};
+    }};
+    return {{
+      brand: b(root?.querySelector('.brand')),
+      name: b(root?.querySelector('.brand .name')),
+      slot: b(root?.querySelector('.version')),
+    }};
+  }});
+  // The slot sits under the app name and aligns with the name text (the spec's
+  // "应用名下小号灰字"), not with the logo mark.
+  if (wideBrand.slot.top < wideBrand.brand.bottom - 1) {{
+    throw new Error('the version slot must sit below the brand row: ' + JSON.stringify(wideBrand));
+  }}
+  if (Math.abs(wideBrand.slot.left - wideBrand.name.left) > 1) {{
+    throw new Error(
+      'the version slot must align with the app name: ' +
+        wideBrand.slot.left +
+        ' vs ' +
+        wideBrand.name.left,
+    );
+  }}
+
+  await page.setViewportSize({{ width: 720, height: 800 }});
+  await new Promise((r) => setTimeout(r, 150));
+  const narrow = await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const brand = app?.shadowRoot?.querySelector('.brand');
+    const slot = app?.shadowRoot?.querySelector('.version');
+    const r = slot?.getBoundingClientRect();
+    return {{
+      hidden: !!slot && getComputedStyle(slot).display === 'none',
+      slotHeight: r?.height ?? 0,
+      brandHeight: brand?.getBoundingClientRect().height ?? 0,
+    }};
+  }});
+  if (!narrow.hidden || narrow.slotHeight > 0) {{
+    throw new Error('the version slot must hide at 720px: ' + JSON.stringify(narrow));
+  }}
+  if (wideBrand.brand.height > 0 && Math.abs(narrow.brandHeight - wideBrand.brand.height) > 1) {{
+    throw new Error(
+      'hiding the version slot must not resize the brand row: ' +
+        wideBrand.brand.height +
+        ' vs ' +
+        narrow.brandHeight,
+    );
+  }}
+  await page.setViewportSize({{ width: 1440, height: 900 }});
+  await new Promise((r) => setTimeout(r, 150));
+  ok('version slot sits under the app name, is keyboard-operable, hides at 720px');
+
   // -- webui-visual-system: one content column, overflow, status, long names --
   const near = (a, b, label) => {{
     if (!Number.isFinite(a) || !Number.isFinite(b) || Math.abs(a - b) > 1) {{
