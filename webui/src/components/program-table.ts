@@ -4,8 +4,9 @@
  * Presentational and dependency-light: the caller supplies the rows (already
  * scoped/sorted), whether the app column applies and which programs carry a
  * pending change; the component owns the column layout, number alignment,
- * fatal styling, the log-rate window switch in its title bar and the inline
- * start/stop/restart actions.
+ * fatal styling, the log-rate window switch in its title bar and the row-tail
+ * ⋯ trigger that opens the shared `ak-action-menu` (row right-click opens the
+ * same menu — webui-ui: 列表行快捷操作).
  *
  * One component for both places is the point (design D6): column widths,
  * placeholders and status rendering cannot drift between the dashboard and
@@ -13,11 +14,12 @@
  *
  * Hooks kept deliberately stable for e2e: rows carry `data-app`,
  * `data-program`, `data-status` and `data-fatal`; the pending marker keeps
- * the `.changed-mark` class.
+ * the `.changed-mark` class; the menu trigger keeps `.op-trigger` +
+ * `data-program`.
  */
 
 import { LitElement, css, html, nothing } from 'lit'
-import { customElement, property, state } from 'lit/decorators.js'
+import { customElement, property, query, state } from 'lit/decorators.js'
 import type { ProgramInfo } from '../lib/types.js'
 import {
   formatBytes,
@@ -34,23 +36,19 @@ import {
   type RateWindowS,
 } from '../lib/prefs.js'
 import { consoleStore, type ConsoleStore } from '../lib/store.js'
+import {
+  AkActionMenu,
+  actionsFor,
+  type MenuToggleDetail,
+  type ProgramActionResultDetail,
+} from './action-menu.js'
+import './action-menu.js'
 import './status-badge.js'
-
-export type ProgramAction = 'start' | 'stop' | 'restart'
 
 export interface ProgramSelectDetail {
   app: string
   program: string
 }
-
-const ACTION_LABEL: Record<ProgramAction, string> = {
-  start: '启动',
-  stop: '停止',
-  restart: '重启',
-}
-
-/** stop/restart on a live program ask for confirmation (design D7). */
-const DESTRUCTIVE: ReadonlySet<ProgramAction> = new Set(['stop', 'restart'])
 
 @customElement('ak-program-table')
 export class AkProgramTable extends LitElement {
@@ -72,6 +70,10 @@ export class AkProgramTable extends LitElement {
   /** Rate window lives in this table's title bar (design D5). */
   @state() private rateWindow: RateWindowS = loadRateWindowS()
 
+  /** The shared floating action menu rendered at the end of the template. */
+  @query('ak-action-menu') private menu!: AkActionMenu
+  @state() private feedback: { ok: boolean; text: string } | null = null
+
   /**
    * The preference is window-wide, but the dashboard renders one table per
    * app group. Every table exposes the switch, so a change in one must move
@@ -82,8 +84,6 @@ export class AkProgramTable extends LitElement {
     if (!RATE_WINDOW_CHOICES_S.includes(value)) return
     this.rateWindow = value
   }
-  @state() private busy: string | null = null
-  @state() private feedback: { ok: boolean; text: string } | null = null
 
   static styles = css`
     :host {
@@ -270,11 +270,11 @@ export class AkProgramTable extends LitElement {
       background: color-mix(in srgb, var(--ak-accent-strong) 22%, transparent);
       color: var(--ak-text-bright);
     }
-    /* Reserved action column: the buttons are always in the layout, only
-       their visibility follows hover/focus, so rows never widen on hover. */
+    /* Reserved action column: the trigger is always in the layout, only its
+       visibility follows hover/focus, so rows never widen on hover. */
     th.ops,
     td.ops {
-      width: 112px;
+      width: 56px;
       padding-left: 0;
       text-align: right;
     }
@@ -294,8 +294,11 @@ export class AkProgramTable extends LitElement {
         opacity: 1;
       }
     }
-    .op {
+    /* The single ⋯ trigger (webui-ui: 列表行快捷操作) — it opens the shared
+       action menu; the destructive confirm lives inside the menu now. */
+    .op-trigger {
       height: var(--ak-control-h);
+      min-width: 32px;
       padding: 0 var(--ak-space-2);
       box-sizing: border-box;
       border: 1px solid var(--ak-border);
@@ -303,20 +306,18 @@ export class AkProgramTable extends LitElement {
       background: var(--ak-surface-2);
       color: var(--ak-text);
       font: inherit;
-      font-size: var(--ak-fs-xs);
+      font-size: var(--ak-fs-md);
+      line-height: 1;
+      letter-spacing: 0.08em;
       cursor: pointer;
     }
-    .op:hover:not(:disabled) {
+    .op-trigger:hover {
       border-color: var(--ak-border-strong);
       color: var(--ak-text-bright);
     }
-    .op[data-kind='stop']:hover:not(:disabled) {
-      border-color: var(--ak-status-failed-border);
-      color: var(--ak-status-failed);
-    }
-    .op:disabled {
-      opacity: 0.5;
-      cursor: default;
+    .op-trigger:focus-visible {
+      outline: var(--ak-focus-ring, 1px solid var(--ak-accent-strong));
+      outline-offset: 1px;
     }
     .empty-cell {
       padding: var(--ak-space-8) var(--ak-space-4);
@@ -345,13 +346,6 @@ export class AkProgramTable extends LitElement {
       default:
         return r.w10
     }
-  }
-
-  private actionsFor(state: string): ProgramAction[] {
-    if (state === 'running' || state === 'starting') return ['stop', 'restart']
-    // "stopping" is transient: neither start nor stop is meaningful.
-    if (state === 'stopping') return []
-    return ['start']
   }
 
   /** Uptime is only meaningful while the process is actually up. */
@@ -385,9 +379,20 @@ export class AkProgramTable extends LitElement {
     )
   }
 
+  /**
+   * The menu's document-level pointerdown capture closes it before the click
+   * dispatches, so `isOpen` is already false by the time a row click arrives.
+   * A click within the recent-close window is the dismissal gesture itself and
+   * must not ALSO navigate (design D2: 菜单打开时防伪事件穿透).
+   */
+  private menuClickThrough(): boolean {
+    return !!this.menu && (this.menu.isOpen || this.menu.wasRecentlyClosed())
+  }
+
   private onNameClick(e: MouseEvent, p: ProgramInfo): void {
     // Modified clicks keep the browser's new-tab/window behaviour.
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    if (this.menuClickThrough()) return
     e.preventDefault()
     e.stopPropagation()
     this.emitSelect(p)
@@ -400,7 +405,44 @@ export class AkProgramTable extends LitElement {
     // Interactive children own their clicks (and must never bounce the user
     // into a detail page, webui-ui: 快捷操作不触发行导航).
     if (target?.closest('a, button, select, input')) return
+    if (this.menuClickThrough()) return
     this.emitSelect(p)
+  }
+
+  /**
+   * Row right-click opens the same menu the ⋯ button does
+   * (webui-ui: 右键与 ⋯ 打开同一菜单). The native context menu is suppressed
+   * for the whole row; a state with no actions (stopping) has no menu to show.
+   */
+  private onRowContextmenu(e: MouseEvent, p: ProgramInfo): void {
+    if (!this.actions) return
+    e.preventDefault()
+    if (actionsFor(p.state).length === 0) return
+    this.menu?.openFor(p, e.clientX, e.clientY)
+  }
+
+  private onTriggerClick(e: MouseEvent, p: ProgramInfo): void {
+    // Anchor on the trigger button so the menu opens where the pointer is not
+    // required to be; focus returns here on close (design D1).
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    this.menu?.openFor(p, rect.left, rect.bottom + 4, e.currentTarget as HTMLElement)
+  }
+
+  /** The menu marks its row so a dismiss-click cannot double-fire a select. */
+  private onMenuToggle = (e: Event): void => {
+    const { open, program } = (e as CustomEvent<MenuToggleDetail>).detail
+    for (const tr of this.renderRoot.querySelectorAll<HTMLElement>('tbody tr[data-program]')) {
+      if (tr.dataset.program === program) {
+        if (open) tr.setAttribute('data-menu-open', 'true')
+        else tr.removeAttribute('data-menu-open')
+      }
+    }
+  }
+
+  /** The surface owns feedback visuals (webui-ui: 菜单操作失败有反馈). */
+  private onActionResult = (e: Event): void => {
+    const { ok, text } = (e as CustomEvent<ProgramActionResultDetail>).detail
+    this.feedback = { ok, text }
   }
 
   private onRateChange(e: Event): void {
@@ -422,47 +464,21 @@ export class AkProgramTable extends LitElement {
     super.disconnectedCallback()
   }
 
-  private async onAction(e: MouseEvent, p: ProgramInfo, action: ProgramAction): Promise<void> {
-    e.stopPropagation()
-    const label = ACTION_LABEL[action]
-    if (DESTRUCTIVE.has(action)) {
-      const ok = window.confirm(`确认${label}程序「${p.name}」？`)
-      if (!ok) return
-    }
-    const key = `${p.app}\u0000${p.name}`
-    if (this.busy === key) return
-    this.busy = key
-    this.feedback = null
-    try {
-      const text = await this.store.programAction(p.name, action)
-      this.feedback = { ok: true, text: text || `${label}已提交` }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      this.feedback = { ok: false, text: `${label}失败：${msg}` }
-    } finally {
-      this.busy = null
-    }
-  }
-
   private renderActions(p: ProgramInfo) {
     if (!this.actions) return nothing
-    const key = `${p.app}\u0000${p.name}`
-    const list = this.actionsFor(p.state)
-    if (list.length === 0) return nothing
+    // No actions for this state (stopping): no trigger, no menu to open.
+    if (actionsFor(p.state).length === 0) return nothing
     return html`<span class="row-actions">
-      ${list.map(
-        (action) => html`<button
-          class="op"
-          data-kind=${action}
-          data-program=${p.name}
-          title=${`${ACTION_LABEL[action]} ${p.name}`}
-          aria-label=${`${ACTION_LABEL[action]} ${p.name}`}
-          ?disabled=${this.busy === key}
-          @click=${(e: MouseEvent) => void this.onAction(e, p, action)}
-        >
-          ${ACTION_LABEL[action]}
-        </button>`,
-      )}
+      <button
+        class="op-trigger"
+        data-program=${p.name}
+        aria-haspopup="menu"
+        aria-label=${`程序 ${p.name} 操作菜单`}
+        title="操作菜单"
+        @click=${(e: MouseEvent) => this.onTriggerClick(e, p)}
+      >
+        ⋯
+      </button>
     </span>`
   }
 
@@ -531,6 +547,7 @@ export class AkProgramTable extends LitElement {
                     data-status=${p.state}
                     data-fatal=${p.state === 'fatal'}
                     @click=${(e: MouseEvent) => this.onRowClick(e, p)}
+                    @contextmenu=${(e: MouseEvent) => this.onRowContextmenu(e, p)}
                   >
                     <td class="name">
                       <span class="name-cell">
@@ -577,6 +594,11 @@ export class AkProgramTable extends LitElement {
           </tbody>
         </table>
       </div>
+      <ak-action-menu
+        .store=${this.store}
+        @menu-toggle=${this.onMenuToggle}
+        @program-action-result=${this.onActionResult}
+      ></ak-action-menu>
     </section>`
   }
 }

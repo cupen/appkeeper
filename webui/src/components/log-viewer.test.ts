@@ -71,6 +71,7 @@ describe('ak-log-viewer', () => {
   let el: AkLogViewer
 
   beforeEach(async () => {
+    localStorage.clear()
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
     FakeWebSocket.instances = []
@@ -169,5 +170,67 @@ describe('ak-log-viewer', () => {
     scroller.scrollTop = 4800
     scroller.dispatchEvent(new Event('scroll'))
     expect(el.following).toBe(true)
+  })
+
+  it('defaults to the terminal-black palette (webui-ui: 缺省黑底白字)', async () => {
+    expect(el.palette).toBe('black')
+    expect(el.getAttribute('data-log-palette')).toBe('black')
+    const select = el.shadowRoot!.querySelector<HTMLSelectElement>('select.palette-select')!
+    expect(select.value).toBe('black')
+  })
+
+  it('switches palettes immediately and persists the choice (webui-ui: 档位切换即时生效且持久)', async () => {
+    const select = el.shadowRoot!.querySelector<HTMLSelectElement>('select.palette-select')!
+    select.value = 'cream'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await el.updateComplete
+    // Immediate effect: the host attribute that drives the variable groups.
+    expect(el.getAttribute('data-log-palette')).toBe('cream')
+    expect(localStorage.getItem('ak.log_style')).toBe('cream')
+    el.remove()
+
+    // A fresh viewer (page reload equivalent) comes back on the chosen档.
+    const el2 = document.createElement('ak-log-viewer') as AkLogViewer
+    el2.store = store
+    el2.program = 'p'
+    document.body.appendChild(el2)
+    await el2.updateComplete
+    expect(el2.palette).toBe('cream')
+    expect(el2.getAttribute('data-log-palette')).toBe('cream')
+    el2.remove()
+  })
+
+  it('renders no waiting placeholder for an empty program (webui-ui: 空输出无占位文案)', async () => {
+    // No frames sent: the program has produced no output yet.
+    await vi.advanceTimersByTimeAsync(120)
+    const root = el.shadowRoot!
+    expect(root.textContent).not.toContain('等待输出')
+    expect(root.querySelector('.empty-hint')).toBeNull()
+    // The row counter is unaffected: 0 lines, buffer cap still named.
+    expect(root.querySelector('.meta')?.textContent).toContain('0 行')
+  })
+
+  it('keeps the palette fixed when the app theme flips to wa-dark (webui-visual-system: 不随应用主题翻转)', async () => {
+    // Component-level equivalent: the compiled stylesheet must bind every log
+    // colour to the palette-local variables (never theme tokens), and the
+    // three spec'd palettes must all be present.
+    const css = (el.constructor as typeof AkLogViewer).styles.cssText as string
+    expect(css).toContain(':host([data-log-palette=\'white\'])')
+    expect(css).toContain(':host([data-log-palette=\'cream\'])')
+    // Spec-locked cream values (webui-visual-system: 米黄档).
+    expect(css).toContain('#f2eddf')
+    expect(css).toContain('#4a4234')
+    // The scroller colours come from the locals only — no theme token can
+    // reach the log area, so a `wa-dark` flip cannot re-skin it.
+    expect(css).toMatch(/\.row\s*\{[^}]*var\(--log-fg\)/)
+    expect(css).toMatch(/\.row\[data-stream='1'\]\s*\{[^}]*var\(--log-err\)/)
+    expect(css).toMatch(/\.gap-row\s*\{[^}]*var\(--log-gap\)/)
+    expect(css).not.toContain('--ak-well')
+    expect(css).not.toContain('--ak-status-failed')
+    expect(css).not.toContain('--ak-signal')
+    // And the runtime attribute that keys the groups is theme-independent.
+    document.documentElement.classList.add('wa-dark')
+    expect(el.getAttribute('data-log-palette')).toBe('black')
+    document.documentElement.classList.remove('wa-dark')
   })
 })

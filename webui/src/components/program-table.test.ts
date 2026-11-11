@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import './program-table.js'
 import type { AkProgramTable, ProgramSelectDetail } from './program-table.js'
+import type { AkActionMenu } from './action-menu.js'
 import type { ConsoleStore } from '../lib/store.js'
 import type { ProgramInfo } from '../lib/types.js'
 
@@ -40,6 +41,52 @@ function program(name: string, overrides: Partial<ProgramInfo> = {}): ProgramInf
 function stubStore(): { store: ConsoleStore; action: ReturnType<typeof vi.fn> } {
   const action = vi.fn().mockResolvedValue('ok')
   return { store: { programAction: action } as unknown as ConsoleStore, action }
+}
+
+/** Controllable store for the busy/confirm paths. */
+function gatedStore(): {
+  store: ConsoleStore
+  action: ReturnType<typeof vi.fn>
+  gate: { resolve: (t: string) => void; reject: (e: Error) => void }
+} {
+  let resolve!: (t: string) => void
+  let reject!: (e: Error) => void
+  const gate = {
+    resolve: (t: string) => resolve(t),
+    reject: (e: Error) => reject(e),
+  }
+  const action = vi.fn().mockImplementation(
+    () =>
+      new Promise<string>((res, rej) => {
+        resolve = res
+        reject = rej
+      }),
+  )
+  return { store: { programAction: action } as unknown as ConsoleStore, action, gate }
+}
+
+async function openMenuByRowClick(
+  el: AkProgramTable,
+  row = 0,
+): Promise<{ prevented: boolean }> {
+  const tr = el.shadowRoot!.querySelectorAll('tbody tr[data-program]')[row] as HTMLElement
+  const prevented = !tr.dispatchEvent(
+    new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 24, clientY: 24 }),
+  )
+  await el.updateComplete
+  return { prevented }
+}
+
+function menuEl(el: AkProgramTable): AkActionMenu {
+  return el.shadowRoot!.querySelector('ak-action-menu')!
+}
+
+function menuItems(el: AkProgramTable): HTMLButtonElement[] {
+  return [...menuEl(el).shadowRoot!.querySelectorAll<HTMLButtonElement>('.menu-item[data-kind]')]
+}
+
+function confirmButton(el: AkProgramTable): HTMLButtonElement | null {
+  return menuEl(el).shadowRoot!.querySelector<HTMLButtonElement>('.confirm-action')
 }
 
 describe('program-table', () => {
@@ -212,7 +259,7 @@ describe('program-table', () => {
     second.remove()
   })
 
-  it('emits program-select on row click but not from an action button', async () => {
+  it('emits program-select on row click but not from the ⋯ trigger', async () => {
     const { store } = stubStore()
     const el = await mount({ store })
     const seen: ProgramSelectDetail[] = []
@@ -223,56 +270,162 @@ describe('program-table', () => {
     el.shadowRoot!.querySelector<HTMLElement>('td.status')!.click()
     expect(seen).toEqual([{ app: 'demo', program: 'web' }])
 
-    vi.stubGlobal('confirm', vi.fn().mockReturnValue(false))
-    el.shadowRoot!.querySelector<HTMLButtonElement>('button[data-kind="stop"]')!.click()
-    await new Promise((r) => setTimeout(r, 0))
+    el.shadowRoot!.querySelector<HTMLButtonElement>('.op-trigger')!.click()
+    await el.updateComplete
     expect(seen).toHaveLength(1)
     el.remove()
   })
 
-  it('confirms destructive actions before requesting anything', async () => {
+  it('renders a single ⋯ trigger with stable hooks, no resident button group', async () => {
+    const el = await mount()
+    const trigger = el.shadowRoot!.querySelector<HTMLButtonElement>('td.ops .op-trigger')!
+    expect(trigger).not.toBeNull()
+    expect(trigger.getAttribute('data-program')).toBe('web')
+    expect(trigger.getAttribute('aria-haspopup')).toBe('menu')
+    expect(trigger.getAttribute('aria-label')).toContain('web')
+    // No per-action row buttons anymore (webui-ui: 列表行快捷操作).
+    expect(el.shadowRoot!.querySelectorAll('td.ops button')).toHaveLength(1)
+    expect(el.shadowRoot!.querySelectorAll('td.ops button[data-kind]')).toHaveLength(0)
+    // A stopping program offers nothing: no trigger cell content at all.
+    const stopping = await mount({ programs: [program('web', { state: 'stopping' })] })
+    expect(stopping.shadowRoot!.querySelector('td.ops .op-trigger')).toBeNull()
+    stopping.remove()
+    el.remove()
+  })
+
+  it('opens the same menu from the ⋯ trigger and from a row right-click', async () => {
     const { store, action } = stubStore()
     const el = await mount({ store })
-    const confirm = vi.fn().mockReturnValue(false)
-    vi.stubGlobal('confirm', confirm)
 
-    el.shadowRoot!.querySelector<HTMLButtonElement>('button[data-kind="stop"]')!.click()
-    await new Promise((r) => setTimeout(r, 0))
-    expect(confirm).toHaveBeenCalledTimes(1)
-    expect(String(confirm.mock.calls[0]![0])).toContain('停止')
-    expect(action).not.toHaveBeenCalled()
-
-    confirm.mockReturnValue(true)
-    el.shadowRoot!.querySelector<HTMLButtonElement>('button[data-kind="stop"]')!.click()
-    await new Promise((r) => setTimeout(r, 0))
-    expect(action).toHaveBeenCalledWith('web', 'stop')
+    // ⋯ path.
+    el.shadowRoot!.querySelector<HTMLButtonElement>('.op-trigger')!.click()
     await el.updateComplete
+    expect(menuEl(el).isOpen).toBe(true)
+    expect(menuItems(el).map((b) => b.dataset.kind)).toEqual(['stop', 'restart'])
+    expect(el.shadowRoot!.querySelectorAll('ak-action-menu')).toHaveLength(1)
+    // The row gets the defensive open marker while the menu is up.
+    expect(el.shadowRoot!.querySelector('tbody tr[data-menu-open="true"]')).not.toBeNull()
+
+    // Esc closes it (document-level key handler), then the right-click path
+    // opens the SAME menu with the same items (webui-ui: 双入口同一菜单).
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await el.updateComplete
+    expect(menuEl(el).isOpen).toBe(false)
+    expect(el.shadowRoot!.querySelector('tbody tr[data-menu-open="true"]')).toBeNull()
+
+    const { prevented } = await openMenuByRowClick(el)
+    expect(prevented).toBe(true) // the native context menu is suppressed
+    expect(menuEl(el).isOpen).toBe(true)
+    expect(menuItems(el).map((b) => b.dataset.kind)).toEqual(['stop', 'restart'])
+    expect(action).not.toHaveBeenCalled()
+    el.remove()
+  })
+
+  it('right-clicking a stopping row does not open an empty menu', async () => {
+    const el = await mount({ programs: [program('web', { state: 'stopping' })] })
+    const { prevented } = await openMenuByRowClick(el)
+    expect(prevented).toBe(true)
+    expect(menuEl(el).isOpen).toBe(false)
+    el.remove()
+  })
+
+  it('swallows the dismiss click that closes the menu without navigating or POSTing', async () => {
+    const { store, action } = stubStore()
+    const el = await mount({ store })
+    const seen: ProgramSelectDetail[] = []
+    el.addEventListener('program-select', (e) =>
+      seen.push((e as CustomEvent<ProgramSelectDetail>).detail),
+    )
+    // Freeze the clock around the dismissal so the window is deterministic.
+    const now = vi.spyOn(performance, 'now').mockReturnValue(5000)
+
+    await openMenuByRowClick(el)
+    // The closing gesture: pointerdown outside (captured) closes the menu,
+    // then the SAME interaction's click lands on the row.
+    document.body.dispatchEvent(
+      new MouseEvent('pointerdown', { bubbles: true, composed: true }),
+    )
+    await el.updateComplete
+    expect(menuEl(el).isOpen).toBe(false)
+    const tr = el.shadowRoot!.querySelector('tbody tr[data-program]') as HTMLElement
+    tr.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, button: 0 }))
+    await el.updateComplete
+    expect(seen).toEqual([]) // the dismissal click must not navigate
+    expect(action).not.toHaveBeenCalled() // …nor POST anything
+
+    // A normal click once the window has passed still navigates.
+    now.mockReturnValue(5200)
+    tr.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true, button: 0 }))
+    await el.updateComplete
+    expect(seen).toEqual([{ app: 'demo', program: 'web' }])
+    now.mockRestore()
+    el.remove()
+  })
+
+  it('confirms destructive actions inside the menu before requesting anything', async () => {
+    const { store, action, gate } = gatedStore()
+    const el = await mount({ store })
+
+    await openMenuByRowClick(el)
+    menuItems(el)[0]!.click() // 停止
+    await el.updateComplete
+    expect(action).not.toHaveBeenCalled()
+    // The inline confirm names the program and carries the red action colour.
+    const confirm = confirmButton(el)!
+    expect(confirm).not.toBeNull()
+    expect(confirm.dataset.kind).toBe('stop')
+    expect(menuEl(el).shadowRoot!.textContent).toContain('web')
+
+    // Cancel: zero side effects, back to the item list.
+    menuEl(el).shadowRoot!.querySelector<HTMLButtonElement>('.confirm-cancel')!.click()
+    await el.updateComplete
+    expect(action).not.toHaveBeenCalled()
+    expect(menuItems(el)).toHaveLength(2)
+
+    // Confirm: the request goes out, the result rides the table's feedback strip.
+    menuItems(el)[0]!.click()
+    await el.updateComplete
+    confirmButton(el)!.click()
+    await el.updateComplete
+    expect(action).toHaveBeenCalledWith('web', 'stop')
+    gate.resolve('ok')
+    await new Promise((r) => setTimeout(r, 0))
+    await el.updateComplete
+    expect(menuEl(el).isOpen).toBe(false)
     const feedback = el.shadowRoot!.querySelector('.table-feedback')!
     expect(feedback.getAttribute('role')).toBe('status')
     expect(feedback.textContent).toContain('ok')
     el.remove()
   })
 
-  it('starts a stopped program without a confirmation step', async () => {
+  it('starts a stopped program from the menu without a confirmation step', async () => {
     const { store, action } = stubStore()
     const el = await mount({ store, programs: [program('web', { state: 'stopped' })] })
-    const confirm = vi.fn()
-    vi.stubGlobal('confirm', confirm)
 
-    expect(el.shadowRoot!.querySelector('button[data-kind="stop"]')).toBeNull()
-    el.shadowRoot!.querySelector<HTMLButtonElement>('button[data-kind="start"]')!.click()
-    await new Promise((r) => setTimeout(r, 0))
-    expect(confirm).not.toHaveBeenCalled()
+    el.shadowRoot!.querySelector<HTMLButtonElement>('.op-trigger')!.click()
+    await el.updateComplete
+    expect(menuItems(el).map((b) => b.dataset.kind)).toEqual(['start'])
+    menuItems(el)[0]!.click()
+    await el.updateComplete
+    expect(confirmButton(el)).toBeNull()
     expect(action).toHaveBeenCalledWith('web', 'start')
+    await new Promise((r) => setTimeout(r, 0))
+    await el.updateComplete
+    expect(menuEl(el).isOpen).toBe(false)
+    expect(el.shadowRoot!.querySelector('.table-feedback')!.textContent).toContain('ok')
     el.remove()
   })
 
   it('surfaces an action failure in an alert strip instead of failing silently', async () => {
-    const action = vi.fn().mockRejectedValue(new Error('program is stopping'))
-    const el = await mount({ store: { programAction: action } as unknown as ConsoleStore })
-    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    const { store, gate } = gatedStore()
+    const el = await mount({ store })
 
-    el.shadowRoot!.querySelector<HTMLButtonElement>('button[data-kind="restart"]')!.click()
+    await openMenuByRowClick(el)
+    menuItems(el)[1]!.click() // 重启
+    await el.updateComplete
+    confirmButton(el)!.click()
+    await el.updateComplete
+    gate.reject(new Error('program is stopping'))
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
     const feedback = el.shadowRoot!.querySelector('.table-feedback')!

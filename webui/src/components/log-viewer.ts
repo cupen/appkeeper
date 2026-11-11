@@ -11,12 +11,17 @@
  *   frames) — distinct styling, never mixed into log content.
  * - Rendering is rAF-batched: log floods append DOM at most once per frame
  *   (~10 fps cap), so render cost is decoupled from output rate.
+ * - Fixed three-palette colour scheme (webui-visual-system: 日志窗口配色档位):
+ *   terminal black (default) / paper white / cream, chosen in the toolbar and
+ *   persisted per-browser. The palette lives in component-local variables —
+ *   it never joins tokens.css and never flips with the app's `wa-dark` theme.
  */
 
 import { LitElement, css, html } from 'lit'
 import { customElement, property, state } from 'lit/decorators.js'
 import { consoleStore, type ConsoleStore, type LogListener } from '../lib/store.js'
 import type { LogEntry, StreamId } from '../lib/types.js'
+import { LOG_STYLE_CHOICES, loadLogStyle, saveLogStyle, type LogStyle } from '../lib/prefs.js'
 
 const MAX_ENTRIES = 5000
 const MAX_RENDER_FPS_MS = 100
@@ -26,6 +31,14 @@ export class AkLogViewer extends LitElement {
   @property() program = ''
   /** Injectable for tests; defaults to the shared singleton. */
   @property({ attribute: false }) store: ConsoleStore = consoleStore
+
+  /**
+   * Log palette (terminal black / paper white / cream), reflected to the host
+   * as `data-log-palette` — the styles key the three variable groups off it.
+   * Persisted per-browser; never follows the app's light/dark theme.
+   */
+  @property({ attribute: 'data-log-palette', reflect: true })
+  palette: LogStyle = loadLogStyle()
 
   @state() private stream: StreamId = 0
   @state() following = true
@@ -54,8 +67,27 @@ export class AkLogViewer extends LitElement {
       min-width: 0;
       border: 1px solid var(--ak-border);
       border-radius: var(--ak-radius-lg, 10px);
-      background: var(--ak-well);
       overflow: hidden;
+      /* Fixed log palette (webui-visual-system: 日志窗口配色档位) — component
+         locals, not theme tokens: the scroller never flips with the app's
+         wa-dark class. Terminal black is the default档. */
+      --log-bg: #0f1115;
+      --log-fg: #e6e9ef;
+      --log-err: #f47174;
+      --log-gap: #ff9457;
+      background: var(--log-bg);
+    }
+    :host([data-log-palette='white']) {
+      --log-bg: #ffffff;
+      --log-fg: #1f2328;
+      --log-err: #b42318;
+      --log-gap: #b45309;
+    }
+    :host([data-log-palette='cream']) {
+      --log-bg: #f2eddf;
+      --log-fg: #4a4234;
+      --log-err: #a63d40;
+      --log-gap: #8a6d3b;
     }
     .toolbar {
       display: flex;
@@ -101,6 +133,28 @@ export class AkLogViewer extends LitElement {
     .follow input {
       accent-color: var(--ak-accent-strong);
     }
+    /* Palette switch: the toolbar keeps the surface's own colours — only the
+       log scroller below changes with the selected档. */
+    .palette {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--ak-space-1);
+      color: var(--ak-text-dim);
+      font-size: var(--ak-fs-sm);
+      white-space: nowrap;
+    }
+    .palette select {
+      height: calc(var(--ak-control-h) - var(--ak-space-2));
+      padding: 0 var(--ak-space-1);
+      box-sizing: border-box;
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-sm, 6px);
+      font: inherit;
+      font-size: var(--ak-fs-xs);
+      cursor: pointer;
+    }
     .spacer {
       flex: 1;
     }
@@ -122,11 +176,12 @@ export class AkLogViewer extends LitElement {
     .row {
       white-space: pre-wrap;
       word-break: break-all;
-      color: var(--ak-text);
+      color: var(--log-fg);
       min-height: 1.5em;
     }
     .row[data-stream='1'] {
-      color: color-mix(in srgb, var(--ak-status-failed) 70%, var(--ak-text));
+      /* stderr stays in the red family on every palette. */
+      color: var(--log-err);
     }
     .gap-row {
       display: flex;
@@ -134,18 +189,13 @@ export class AkLogViewer extends LitElement {
       gap: 8px;
       margin: 2px 0;
       padding: 2px 8px;
-      border-left: 3px solid var(--ak-signal);
-      background: color-mix(in srgb, var(--ak-signal) 12%, transparent);
-      color: var(--ak-signal);
+      border-left: 3px solid var(--log-gap);
+      background: color-mix(in srgb, var(--log-gap) 12%, transparent);
+      color: var(--log-gap);
       font-family: var(--ak-font-sans, sans-serif);
       font-size: 0.76rem;
       font-weight: 600;
       user-select: none;
-    }
-    .empty-hint {
-      color: var(--ak-text-faint);
-      font-family: var(--ak-font-sans, sans-serif);
-      padding: var(--ak-space-2) 0;
     }
   `
 
@@ -312,6 +362,21 @@ export class AkLogViewer extends LitElement {
     }
   }
 
+  private static readonly PALETTE_LABEL: Record<LogStyle, string> = {
+    black: '终端黑',
+    white: '纸面白',
+    cream: '米黄',
+  }
+
+  private onPaletteChange(e: Event): void {
+    const value = (e.target as HTMLSelectElement).value as LogStyle
+    if (!(LOG_STYLE_CHOICES as readonly string[]).includes(value)) return
+    // Takes effect immediately (the styles key off the reflected attribute)
+    // and persists for the next visit (webui-ui: 档位切换即时生效且持久).
+    this.palette = value
+    saveLogStyle(value)
+  }
+
   render() {
     return html`
       <div class="toolbar">
@@ -330,6 +395,21 @@ export class AkLogViewer extends LitElement {
           />
           跟随
         </label>
+        <label class="palette">
+          配色
+          <select
+            class="palette-select"
+            aria-label="日志配色档位"
+            .value=${this.palette}
+            @change=${this.onPaletteChange}
+          >
+            ${LOG_STYLE_CHOICES.map(
+              (style) => html`<option value=${style} ?selected=${style === this.palette}>
+                ${AkLogViewer.PALETTE_LABEL[style]}
+              </option>`,
+            )}
+          </select>
+        </label>
         <span class="spacer"></span>
         <span class="meta">${this.entryCount} 行 · 缓冲上限 ${MAX_ENTRIES} 行</span>
       </div>
@@ -338,9 +418,7 @@ export class AkLogViewer extends LitElement {
         role="log"
         aria-label=${`${this.program} ${this.stream === 0 ? 'stdout' : 'stderr'} 日志`}
         aria-live=${this.following ? 'polite' : 'off'}
-      >
-        <div class="empty-hint">${this.program ? '等待输出…' : ''}</div>
-      </div>
+      ></div>
     `
   }
 }

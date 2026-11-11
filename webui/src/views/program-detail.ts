@@ -6,21 +6,26 @@
  * the log viewer, which takes the remaining height (design D8).
  *
  * Status shape is owned by `ak-status-badge`; the title carries no duplicate
- * glyph. Destructive actions keep their inline confirmation step and the
- * `data-kind` hooks; controls share the top bar's control height so the two
- * rows never look staggered.
+ * glyph. Program control is one ⋯ trigger that opens the shared
+ * `ak-action-menu` (right-click anywhere on the page opens the same menu —
+ * webui-ui: 单程序控制); there is no resident start/stop/restart button group
+ * and no browser dialog. Action feedback rides the page's notice strip via
+ * the menu's `program-action-result` event.
  */
 
 import { LitElement, css, html, nothing } from 'lit'
-import { customElement, property, state } from 'lit/decorators.js'
-import { apiFetch } from '../lib/api.js'
+import { customElement, property, query, state } from 'lit/decorators.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import { formatBytes, formatPercent, formatUptime, stateLabel } from '../lib/format.js'
 import type { ProgramInfo } from '../lib/types.js'
+import {
+  AkActionMenu,
+  actionsFor,
+  type ProgramActionResultDetail,
+} from '../components/action-menu.js'
+import '../components/action-menu.js'
 import '../components/status-badge.js'
 import '../components/log-viewer.js'
-
-type PendingAction = 'stop' | 'restart' | null
 
 interface HealthView {
   text: string
@@ -41,9 +46,9 @@ export class AkProgramDetail extends LitElement {
     return this.console?.snapshot ?? { doc: null, transport: 'connecting' as const }
   }
 
-  @state() private confirm: PendingAction = null
+  /** The shared floating action menu rendered at the end of the template. */
+  @query('ak-action-menu') private menu!: AkActionMenu
   @state() private notice: { ok: boolean; text: string } | null = null
-  @state() private busy = false
 
   static styles = css`
     :host {
@@ -110,15 +115,19 @@ export class AkProgramDetail extends LitElement {
       gap: var(--ak-space-2);
       flex-wrap: wrap;
     }
-    /* Every control on this page matches the top bar's control height. */
-    button {
+    /* The single ⋯ trigger; it matches the top bar's control height so the
+       rows never look staggered. The action colours live inside the menu. */
+    .op-trigger {
       display: inline-flex;
       align-items: center;
       height: var(--ak-control-h);
+      min-width: 36px;
       padding: 0 var(--ak-space-3);
       box-sizing: border-box;
       font: inherit;
-      font-size: var(--ak-fs-sm);
+      font-size: var(--ak-fs-md);
+      line-height: 1;
+      letter-spacing: 0.08em;
       border-radius: var(--ak-radius-sm);
       border: 1px solid var(--ak-border);
       background: var(--ak-surface-2);
@@ -128,38 +137,13 @@ export class AkProgramDetail extends LitElement {
         background var(--ak-dur) var(--ak-ease),
         border-color var(--ak-dur) var(--ak-ease);
     }
-    button:hover:not(:disabled) {
+    .op-trigger:hover {
       border-color: var(--ak-border-strong);
       background: var(--ak-surface-3);
     }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    button[data-kind='start'] {
-      border-color: var(--ak-status-done-border);
-      color: var(--ak-status-done);
-    }
-    button[data-kind='stop'] {
-      border-color: var(--ak-status-failed-border);
-      color: var(--ak-status-failed);
-    }
-    /* Inline confirmation: same control height, no extra box around it. */
-    .confirm {
-      display: inline-flex;
-      align-items: center;
-      gap: var(--ak-space-2);
-      flex-wrap: wrap;
-      margin-left: auto;
-      font-size: var(--ak-fs-sm);
-    }
-    .confirm-text {
-      color: var(--ak-signal);
-      white-space: nowrap;
-    }
-    .confirm-text strong {
-      color: var(--ak-text-bright);
-      font-weight: 600;
+    .op-trigger:focus-visible {
+      outline: var(--ak-focus-ring, 1px solid var(--ak-accent-strong));
+      outline-offset: 1px;
     }
     .notice {
       padding: var(--ak-space-2) var(--ak-space-3);
@@ -317,6 +301,48 @@ export class AkProgramDetail extends LitElement {
   connectedCallback(): void {
     super.connectedCallback()
     this.console = new ConsoleController(this, this.store)
+    // Right-click anywhere on the page opens the same action menu
+    // (webui-ui: 单程序控制 — 页面任意处右键).
+    this.addEventListener('contextmenu', this.onPageContextmenu)
+  }
+
+  disconnectedCallback(): void {
+    this.removeEventListener('contextmenu', this.onPageContextmenu)
+    super.disconnectedCallback()
+  }
+
+  private onPageContextmenu = (e: MouseEvent): void => {
+    const p = this.info
+    if (!p) return
+    e.preventDefault()
+    if (actionsFor(p.state).length === 0) return
+    this.menu?.openFor(p, e.clientX, e.clientY)
+  }
+
+  private onTriggerClick(e: MouseEvent): void {
+    const p = this.info
+    if (!p) return
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    this.menu?.openFor(p, rect.left, rect.bottom + 4, e.currentTarget as HTMLElement)
+  }
+
+  /** Feedback rides the page's existing notice strip (design D2). */
+  private onActionResult = (e: Event): void => {
+    const { ok, text } = (e as CustomEvent<ProgramActionResultDetail>).detail
+    this.notice = { ok, text }
+  }
+
+  /**
+   * The dismiss click that closed the action menu must not also follow the
+   * breadcrumb back to the app view (design D2: 防伪事件穿透). Modified
+   * clicks keep their browser behaviour; the shell's own interceptor skips
+   * default-prevented events.
+   */
+  private onCrumbClick = (e: MouseEvent): void => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    if (this.menu && (this.menu.isOpen || this.menu.wasRecentlyClosed())) {
+      e.preventDefault()
+    }
   }
 
   private get info(): ProgramInfo | null {
@@ -337,61 +363,24 @@ export class AkProgramDetail extends LitElement {
     return { text: '待确认', tone: 'pending' }
   }
 
-  private async act(action: 'start' | 'stop' | 'restart'): Promise<void> {
-    this.busy = true
-    this.confirm = null
-    this.notice = null
-    try {
-      const res = await apiFetch(
-        `/api/programs/${encodeURIComponent(this.program)}/${action}`,
-        { method: 'POST' },
-      )
-      const body = (await res.json().catch(() => ({}))) as { result?: string; error?: string }
-      if (res.ok) {
-        this.notice = { ok: true, text: body.result ?? `${action} 已提交` }
-      } else {
-        this.notice = { ok: false, text: body.error ?? `${action} 失败（HTTP ${res.status}）` }
-      }
-    } catch (e) {
-      this.notice = { ok: false, text: `${action} 失败：${String(e)}` }
-    }
-    this.busy = false
-  }
-
   private renderActions() {
     const p = this.info
     if (!p) return nothing
-    const running = p.state === 'running' || p.state === 'starting'
-    if (this.confirm) {
-      return html`
-        <span class="confirm" role="alertdialog" aria-label="确认操作">
-          <span class="confirm-text">
-            确认对 <strong>${p.name}</strong> 执行
-            ${this.confirm === 'stop' ? '停止' : '重启'}？
-          </span>
-          <button
-            data-kind=${this.confirm}
-            ?disabled=${this.busy}
-            @click=${() => this.act(this.confirm!)}
-          >
-            确认
-          </button>
-          <button @click=${() => (this.confirm = null)}>取消</button>
-        </span>
-      `
-    }
+    // No resident button group: one ⋯ trigger opens the shared menu
+    // (webui-ui: 单程序控制 — MUST NOT 再渲染常驻按钮组). No actions for this
+    // state (stopping): no trigger to open an empty menu with.
+    if (actionsFor(p.state).length === 0) return nothing
     return html`
       <span class="head-actions">
-        ${running
-          ? html`
-              <button data-kind="stop" ?disabled=${this.busy} @click=${() => (this.confirm = 'stop')}>
-                停止
-              </button>
-              <button ?disabled=${this.busy} @click=${() => (this.confirm = 'restart')}>重启</button>
-            `
-          : html`<button data-kind="start" ?disabled=${this.busy} @click=${() => this.act('start')}>
-              启动
-            </button>`}
+        <button
+          class="op-trigger"
+          aria-haspopup="menu"
+          aria-label=${`程序 ${p.name} 操作菜单`}
+          title="操作菜单"
+          @click=${this.onTriggerClick}
+        >
+          ⋯
+        </button>
       </span>
     `
   }
@@ -459,6 +448,7 @@ export class AkProgramDetail extends LitElement {
           class="crumb"
           href=${`/app/${encodeURIComponent(this.app)}`}
           title=${`返回 ${this.app} 概况`}
+          @click=${this.onCrumbClick}
           >${this.app}</a
         >
         <span class="crumb-sep" aria-hidden="true">/</span>
@@ -486,6 +476,10 @@ export class AkProgramDetail extends LitElement {
         ? html`<div class="notice" data-tone="info">上次退出：${p.last_exit}</div>`
         : nothing}
       <ak-log-viewer .program=${this.program}></ak-log-viewer>
+      <ak-action-menu
+        .store=${this.store}
+        @program-action-result=${this.onActionResult}
+      ></ak-action-menu>
     `
   }
 }

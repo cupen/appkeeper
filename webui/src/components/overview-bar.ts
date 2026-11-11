@@ -1,9 +1,11 @@
 /**
- * Daemon overview bar (webui-ui: 守护进程概况): version, config source,
- * monitor interval, uptime, system CPU/memory — the page-level strip that
- * covers every app — plus the refresh-frequency selector (1/3/5/10s, default
- * 3s, persisted). The selector throttles LIST/METRIC display updates only;
- * log following is realtime regardless (webui-ui: 刷新频率控制).
+ * Daemon overview bar (webui-ui: 守护进程概况): config source, monitor
+ * interval, uptime, system CPU/memory — the page-level strip that covers
+ * every app — plus the refresh-frequency selector (1/3/5/10s, default 3s,
+ * persisted). The selector throttles LIST/METRIC display updates only; log
+ * following is realtime regardless (webui-ui: 刷新频率控制). The daemon
+ * version lives only in the sidebar brand slot (webui-ui: 品牌位版本号) —
+ * this bar deliberately does not repeat it.
  */
 
 import { LitElement, css, html, nothing } from 'lit'
@@ -128,16 +130,18 @@ export class AkOverviewBar extends LitElement {
     }
 
     /* Daemon overview: an explicit grid, never flex-wrap. Fixed breakpoints:
-     *   ≥1120px — one row of seven columns;
-     *   720–1119px — two rows (version/config/uptime/monitor, then CPU/mem/refresh);
+     *   ≥1120px — one row of six columns;
+     *   720–1119px — two rows (config/uptime/monitor, then CPU/mem/refresh);
      *   ≤720px — two columns so nothing is pushed off-screen.
-     * No margin-left:auto anywhere: a lone control cannot jump to a row's
-     * right edge (webui-visual-system: 断点行为). */
+     * No version cell: the daemon version lives only in the sidebar brand
+     * slot (webui-ui: 品牌位版本号与关于对话框). No margin-left:auto anywhere:
+     * a lone control cannot jump to a row's right edge (webui-visual-system:
+     * 断点行为). */
     .bar {
       display: grid;
-      grid-template-areas: 'version config uptime monitor cpu mem refresh';
+      grid-template-areas: 'config uptime monitor cpu mem refresh';
       grid-template-columns:
-        max-content minmax(0, 1fr) max-content max-content
+        minmax(0, 1fr) max-content max-content
         minmax(160px, 0.9fr) minmax(180px, 1fr) max-content;
       align-items: center;
       gap: var(--ak-space-2);
@@ -151,24 +155,24 @@ export class AkOverviewBar extends LitElement {
     @media (max-width: 1119.98px) {
       .bar {
         grid-template-areas:
-          'version config uptime monitor refresh'
+          'config uptime monitor refresh'
           'cpu cpu mem mem refresh';
         /* Only the config path stretches; every metric track stays at its
            natural width and the refresh control spans both rows. This keeps
            row 1 free of a wide empty hole while the CPU/memory meters get the
            width they need on row 2. */
-        grid-template-columns: max-content minmax(0, 1fr) max-content max-content max-content;
+        grid-template-columns: minmax(0, 1fr) max-content max-content max-content;
       }
     }
     @media (max-width: 719.98px) {
       .bar {
         grid-template-areas:
-          'version config'
+          'config'
           'uptime monitor'
           'cpu cpu'
           'mem mem'
           'refresh refresh';
-        grid-template-columns: max-content minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1fr) max-content;
       }
     }
     .item {
@@ -177,9 +181,6 @@ export class AkOverviewBar extends LitElement {
       gap: var(--ak-space-1);
       min-width: 0;
       white-space: nowrap;
-    }
-    .version {
-      grid-area: version;
     }
     .config {
       grid-area: config;
@@ -381,9 +382,6 @@ export class AkOverviewBar extends LitElement {
           </div>`
         : nothing}
       <div class="bar" role="status" aria-label="守护进程概况">
-        <span class="item version"
-          ><span class="k">版本</span><span class="v">${daemon?.version ?? '—'}</span></span
-        >
         <span class="item config" title=${daemon?.config_source ?? ''}>
           <span class="k">配置</span>
           <span class="v">${daemon?.config_source ?? '—'}</span>

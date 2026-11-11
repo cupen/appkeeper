@@ -7673,14 +7673,28 @@ try {{
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    return !!view?.shadowRoot?.querySelector('button[data-kind="start"]');
+    return !!view?.shadowRoot?.querySelector('button.op-trigger');
   }});
-  ok('program view shows the start button');
+  ok('program view shows the action trigger');
 
+  // Start runs straight from the menu: no confirm step for a loss-free action
+  // (webui-ui: 启动免确认直接执行).
   await page.evaluate(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    view?.shadowRoot?.querySelector('button[data-kind="start"]')?.click();
+    view?.shadowRoot?.querySelector('button.op-trigger')?.click();
+  }});
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot?.querySelector('ak-action-menu')?.shadowRoot?.querySelector('.menu-item[data-kind="start"]');
+  }});
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot
+      ?.querySelector('ak-action-menu')
+      ?.shadowRoot?.querySelector('.menu-item[data-kind="start"]')?.click();
   }});
 
   // Running state comes from the WS snapshot/deltas. The detail page is a
@@ -8663,8 +8677,10 @@ try {{
   if (!longName.title) throw new Error('app link must keep the full name in title');
   ok('long app name stays one line, ellipsized, row height unchanged');
 
-  // Row quick actions: hidden at rest, revealed by hover/focus, never shift
-  // another column, never navigate, and destructive actions confirm first.
+  // Row quick actions: a single ⋯ trigger, hidden at rest, revealed by
+  // hover/focus, never shifting another column (webui-ui: 列表行快捷操作).
+  // The trigger opens the shared action menu; destructive stop/restart
+  // confirm inline inside that menu (webui-ui: 程序操作菜单).
   const row = await page.evaluate(() => {{
     const app = document.querySelector('ak-app');
     const dash = app?.shadowRoot?.querySelector('ak-dashboard');
@@ -8672,10 +8688,9 @@ try {{
       for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
         if (tr.getAttribute('data-status') !== 'running') continue;
         const ops = tr.querySelector('td.ops .row-actions');
-        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
-        const restart = tr.querySelector('td.ops button[data-kind="restart"]');
+        const trigger = tr.querySelector('td.ops .op-trigger');
         const num = tr.querySelector('td.num');
-        if (!ops || !stop || !restart || !num) continue;
+        if (!ops || !trigger || !num) continue;
         const r = tr.getBoundingClientRect();
         return {{
           x: r.left + r.width / 2,
@@ -8689,7 +8704,7 @@ try {{
     }}
     return null;
   }});
-  if (!row) throw new Error('dashboard has no running row with stop/restart quick actions');
+  if (!row) throw new Error('dashboard has no running row with an action trigger');
   if (row.opacity !== '0') throw new Error('row actions must be hidden at rest, opacity ' + row.opacity);
   await page.mouse.move(row.x, row.y);
   await page.waitForFunction(() => {{
@@ -8718,9 +8733,9 @@ try {{
   }});
   if (!hovered) throw new Error('hover did not reveal the row actions');
   near(row.numLeft, hovered.numLeft, 'hover must not move the numeric columns');
-  ok('hover reveals stop/restart without shifting other columns');
+  ok('hover reveals the ⋯ trigger without shifting other columns');
 
-  // Focus (keyboard path) reveals the same actions after the pointer leaves.
+  // Focus (keyboard path) reveals the same trigger after the pointer leaves.
   await page.mouse.move(1, 1);
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
@@ -8738,9 +8753,9 @@ try {{
     const dash = app?.shadowRoot?.querySelector('ak-dashboard');
     for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
       for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
-        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
-        if (stop) {{
-          stop.focus();
+        const trigger = tr.querySelector('td.ops .op-trigger');
+        if (trigger) {{
+          trigger.focus();
           return;
         }}
       }}
@@ -8751,9 +8766,9 @@ try {{
     const dash = app?.shadowRoot?.querySelector('ak-dashboard');
     for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
       for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
-        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
+        const trigger = tr.querySelector('td.ops .op-trigger');
         const ops = tr.querySelector('td.ops .row-actions');
-        if (stop?.matches(':focus') && ops && getComputedStyle(ops).opacity === '1') return true;
+        if (trigger?.matches(':focus') && ops && getComputedStyle(ops).opacity === '1') return true;
       }}
     }}
     return false;
@@ -8763,11 +8778,11 @@ try {{
     const dash = app?.shadowRoot?.querySelector('ak-dashboard');
     for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
       for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
-        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
-        if (!stop) continue;
+        const trigger = tr.querySelector('td.ops .op-trigger');
+        if (!trigger) continue;
         const ops = tr.querySelector('td.ops .row-actions');
         return {{
-          focused: stop.matches(':focus'),
+          focused: trigger.matches(':focus'),
           opacity: getComputedStyle(ops).opacity,
         }};
       }}
@@ -8775,49 +8790,190 @@ try {{
     return null;
   }});
   if (!focusReveal || !focusReveal.focused || focusReveal.opacity !== '1') {{
-    throw new Error('keyboard focus must reveal the row actions: ' + JSON.stringify(focusReveal));
+    throw new Error('keyboard focus must reveal the row trigger: ' + JSON.stringify(focusReveal));
   }}
-  ok('keyboard focus reveals the row actions (:focus-within)');
+  ok('keyboard focus reveals the row trigger (:focus-within)');
 
-  // Cancel the destructive confirm: nothing POSTs, the row never navigates.
+  // -- the shared action menu (⋯ and right-click open the same one) ---------
   let stopRequests = 0;
   const countStop = (r) => {{
     if (r.url().includes('/api/programs/') && r.url().endsWith('/stop')) stopRequests++;
   }};
-  let confirmText = '';
-  const dismissConfirm = (d) => {{
-    confirmText = d.message();
-    d.dismiss();
-  }};
   page.on('request', countStop);
-  page.on('dialog', dismissConfirm);
   const beforeUrl = page.url();
+
+  // Helpers over the per-table ak-action-menu shadow roots.
+  const menuOpenWait = () =>
+    page.waitForFunction(() => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        const menu = table.shadowRoot?.querySelector('ak-action-menu');
+        if (menu?.shadowRoot?.querySelector('.overlay[role="menu"]')) return true;
+      }}
+      return false;
+    }});
+  const menuGoneWait = () =>
+    page.waitForFunction(() => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        const menu = table.shadowRoot?.querySelector('ak-action-menu');
+        if (menu?.shadowRoot?.querySelector('.overlay')) return false;
+      }}
+      return true;
+    }});
+  const menuInfo = async () =>
+    page.evaluate(() => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        const menu = table.shadowRoot?.querySelector('ak-action-menu');
+        const overlay = menu?.shadowRoot?.querySelector('.overlay[role="menu"]');
+        if (overlay) {{
+          return {{
+            kinds: [...menu.shadowRoot.querySelectorAll('.menu-item[data-kind]')].map(
+              (b) => b.dataset.kind,
+            ),
+            program: menu.shadowRoot.querySelector('.menu-item[data-kind]')?.dataset.program ?? '',
+            accessible: menu.shadowRoot.querySelector('.menu-item[data-kind]')?.getAttribute('aria-label') ?? '',
+          }};
+        }}
+      }}
+      return null;
+    }});
+
+  // ⋯ path: menu matches the running state, bound to that row's program.
+  await page.evaluate(
+    ([appName, program]) => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+          if (
+            tr.getAttribute('data-program') !== program ||
+            tr.getAttribute('data-app') !== appName
+          ) {{
+            continue;
+          }}
+          const trigger = tr.querySelector('td.ops .op-trigger');
+          if (trigger) {{
+            trigger.click();
+            return;
+          }}
+        }}
+      }}
+    }},
+    [row.app, row.program],
+  );
+  await menuOpenWait();
+  const viaDots = await menuInfo();
+  if (!viaDots) throw new Error('the action menu did not open from the ⋯ trigger');
+  if (viaDots.program !== row.program) {{
+    throw new Error('the menu must be bound to the row program, got ' + viaDots.program);
+  }}
+  if (JSON.stringify(viaDots.kinds) !== JSON.stringify(['stop', 'restart'])) {{
+    throw new Error(
+      'a running program offers stop + restart, got ' + JSON.stringify(viaDots.kinds),
+    );
+  }}
+  if (!viaDots.accessible || !viaDots.accessible.includes(row.program)) {{
+    throw new Error('menu items need accessible names naming the program: ' + viaDots.accessible);
+  }}
+  ok('⋯ opens the shared menu: stop/restart for a running program, names carry the program');
+
+  // Escape closes it, nothing is sent, and focus returns to the trigger.
+  await page.keyboard.press('Escape');
+  await menuGoneWait();
+  // The dashboard may hold several tables whose earlier rows are not running
+  // (the CLI passes stopped things); the trigger to check is the one this
+  // menu was opened from — the row's own (app, program).
+  const focusBack = await page.evaluate(
+    ([appName, program]) => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
+          if (
+            tr.getAttribute('data-program') !== program ||
+            tr.getAttribute('data-app') !== appName
+          ) {{
+            continue;
+          }}
+          const trigger = tr.querySelector('td.ops .op-trigger');
+          if (trigger) return trigger.matches(':focus');
+        }}
+      }}
+      return false;
+    }},
+    [row.app, row.program],
+  );
+  if (!focusBack) throw new Error('Escape must hand focus back to the ⋯ trigger');
+  if (stopRequests !== 0) {{
+    throw new Error('an Escape-closed menu must not POST, saw ' + stopRequests);
+  }}
+  ok('Escape closes the menu with no request and focus returns to the trigger');
+
+  // Right-click path: the SAME menu, same items (one component per table).
+  await page.mouse.click(row.x, row.y, {{ button: 'right' }});
+  await menuOpenWait();
+  const viaRightClick = await menuInfo();
+  if (!viaRightClick || JSON.stringify(viaRightClick.kinds) !== JSON.stringify(['stop', 'restart'])) {{
+    throw new Error('right-click must open the same running-state menu');
+  }}
+  if (page.url() !== beforeUrl) {{
+    throw new Error('opening the menu must not navigate');
+  }}
+  ok('right-click on the row opens the same menu');
+
+  // Inline confirm: stop → the overlay mutates into the confirm step (program
+  // name + red confirm button) → cancel keeps everything untouched.
   await page.evaluate(() => {{
     const app = document.querySelector('ak-app');
     const dash = app?.shadowRoot?.querySelector('ak-dashboard');
     for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
-      for (const tr of table.shadowRoot?.querySelectorAll('tbody tr[data-program]') ?? []) {{
-        const stop = tr.querySelector('td.ops button[data-kind="stop"]');
-        if (stop) {{
-          stop.click();
-          return;
-        }}
+      const menu = table.shadowRoot?.querySelector('ak-action-menu');
+      const item = menu?.shadowRoot?.querySelector('.menu-item[data-kind="stop"]');
+      if (item) {{
+        item.click();
+        return;
       }}
     }}
   }});
-  await new Promise((r) => setTimeout(r, 400));
-  page.removeListener('request', countStop);
-  page.removeListener('dialog', dismissConfirm);
-  if (!/停止/.test(confirmText)) {{
-    throw new Error('row stop must ask for confirmation, got: ' + JSON.stringify(confirmText));
-  }}
+  await page.waitForFunction(
+    (program) => {{
+      const app = document.querySelector('ak-app');
+      const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+      for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+        const menu = table.shadowRoot?.querySelector('ak-action-menu');
+        const confirm = menu?.shadowRoot?.querySelector('.confirm-action[data-kind="stop"]');
+        if (confirm && menu.shadowRoot.textContent.includes(program)) return true;
+      }}
+      return false;
+    }},
+    row.program,
+  );
+  ok('stop morphs the same overlay into an inline confirm naming the program');
+  await page.keyboard.press('Escape'); // confirming → open (zero side effects)
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const dash = app?.shadowRoot?.querySelector('ak-dashboard');
+    for (const table of dash?.shadowRoot?.querySelectorAll('ak-program-table') ?? []) {{
+      const menu = table.shadowRoot?.querySelector('ak-action-menu');
+      if (menu?.shadowRoot?.querySelector('.overlay[role="menu"]')) return true;
+    }}
+    return false;
+  }});
+  await page.keyboard.press('Escape'); // open → closed
+  await menuGoneWait();
   if (stopRequests !== 0) {{
-    throw new Error('a cancelled row stop must not POST, saw ' + stopRequests);
+    throw new Error('a cancelled inline confirm must not POST, saw ' + stopRequests);
   }}
   if (page.url() !== beforeUrl) {{
-    throw new Error('a row quick action must not navigate');
+    throw new Error('a cancelled inline confirm must not navigate');
   }}
-  ok('row stop confirms first, then cancels without a request or navigation');
+  page.removeListener('request', countStop);
+  ok('inline confirm cancels with no request and no navigation');
 
   // 1024 / 820: the page itself never scrolls sideways; the wide table
   // scrolls inside its own container.
@@ -9090,7 +9246,7 @@ try {{
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    return !!view?.shadowRoot?.querySelector('button[data-kind="stop"]');
+    return !!view?.shadowRoot?.querySelector('button.op-trigger');
   }});
 
   // Detail page: one column — title row (with a real badge) → six-metric
@@ -9142,28 +9298,50 @@ try {{
   }}
   ok('detail: title → 6 metrics → mono command → log viewer fills the rest');
 
+  // Stop through the shared menu: ⋯ → stop → inline confirm → submit
+  // (webui-ui: 单程序控制 — no resident button group, no browser dialog).
   await page.evaluate(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    view?.shadowRoot?.querySelector('button[data-kind="stop"]')?.click();
-  }});
-  // The confirm step inside the detail view has its own accept button.
-  await page.waitForFunction(() => {{
-    const app = document.querySelector('ak-app');
-    const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    return !!view?.shadowRoot?.querySelector('.confirm button');
-  }});
-  await page.evaluate(() => {{
-    const app = document.querySelector('ak-app');
-    const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    view?.shadowRoot?.querySelector('.confirm button')?.click();
+    view?.shadowRoot?.querySelector('button.op-trigger')?.click();
   }});
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
     const view = app?.shadowRoot?.querySelector('ak-program-detail');
-    return !!view?.shadowRoot?.querySelector('button[data-kind="start"]');
+    return !!view?.shadowRoot
+      ?.querySelector('ak-action-menu')
+      ?.shadowRoot?.querySelector('.menu-item[data-kind="stop"]');
   }});
-  ok('beta job stopped from the console');
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot
+      ?.querySelector('ak-action-menu')
+      ?.shadowRoot?.querySelector('.menu-item[data-kind="stop"]')?.click();
+  }});
+  // The inline confirm step appears before anything is sent.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    return !!view?.shadowRoot
+      ?.querySelector('ak-action-menu')
+      ?.shadowRoot?.querySelector('.confirm-action[data-kind="stop"]');
+  }});
+  await page.evaluate(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    view?.shadowRoot
+      ?.querySelector('ak-action-menu')
+      ?.shadowRoot?.querySelector('.confirm-action[data-kind="stop"]')?.click();
+  }});
+  // The WS delta flips the badge through the stop flow to 已停止.
+  await page.waitForFunction(() => {{
+    const app = document.querySelector('ak-app');
+    const view = app?.shadowRoot?.querySelector('ak-program-detail');
+    const badge = view?.shadowRoot?.querySelector('header ak-status-badge');
+    return badge?.shadowRoot?.querySelector('.label')?.textContent?.trim() === '已停止';
+  }});
+  ok('beta job stopped from the console menu (trigger → stop → inline confirm)');
 
   // F3: now the remove goes through, the app leaves the sidebar and the SPA
   // navigates to a still-resolving view.

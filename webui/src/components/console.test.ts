@@ -161,7 +161,10 @@ describe('console components', () => {
     await el.updateComplete
 
     const text = el.shadowRoot!.textContent!
-    expect(text).toContain('0.1.0')
+    // The version lives only in the sidebar brand slot now (webui-ui: 品牌位
+    // 版本号) — the overview bar must not repeat it.
+    expect(text).not.toContain('0.1.0')
+    expect(el.shadowRoot!.querySelector('.version')).toBeNull()
     expect(text).toContain('/tmp/appkeeper.toml')
     expect(text).toContain('21.5%')
     expect(text).toContain('4.0 GiB')
@@ -176,7 +179,7 @@ describe('console components', () => {
     el.remove()
   })
 
-  it('program detail shows run info and requires confirmation for stop', async () => {
+  it('program detail shows run info and controls stop through the action menu', async () => {
     const el = document.createElement('ak-program-detail') as AkProgramDetail
     el.store = store
     el.app = 'demo'
@@ -192,6 +195,13 @@ describe('console components', () => {
     expect(text).toContain('12.5%')
     expect(text).toContain('4.0 KiB')
 
+    // No resident button group: one ⋯ trigger opens the shared menu
+    // (webui-ui: 单程序控制).
+    const buttons = [...el.shadowRoot!.querySelectorAll('button')]
+    expect(buttons).toHaveLength(1)
+    const trigger = el.shadowRoot!.querySelector<HTMLButtonElement>('button.op-trigger')!
+    expect(trigger.getAttribute('aria-haspopup')).toBe('menu')
+
     // fetch mock tracks the control call
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -199,22 +209,21 @@ describe('console components', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const stopButton = [...el.shadowRoot!.querySelectorAll('button')].find(
-      (b) => b.textContent?.trim() === '停止',
-    )
-    expect(stopButton).toBeDefined()
-    stopButton!.click()
+    trigger.click()
     await el.updateComplete
-    // confirmation step: no request yet
+    const menu = el.shadowRoot!.querySelector('ak-action-menu')!
+    const items = [...menu.shadowRoot!.querySelectorAll<HTMLButtonElement>('.menu-item[data-kind]')]
+    expect(items.map((b) => b.dataset.kind)).toEqual(['stop', 'restart'])
+    items[0]!.click()
+    await el.updateComplete
+    // inline confirmation step inside the menu: no request yet
     expect(fetchMock).not.toHaveBeenCalled()
-    const confirmButton = [...el.shadowRoot!.querySelectorAll('button')].find(
-      (b) => b.textContent?.trim() === '确认',
-    )
-    confirmButton!.click()
+    menu.shadowRoot!.querySelector<HTMLButtonElement>('.confirm-action')!.click()
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
     expect(fetchMock).toHaveBeenCalledWith('/api/programs/web/stop', { method: 'POST', credentials: 'same-origin' })
-    expect(el.shadowRoot!.textContent).toContain('program web is stopped')
+    // The result lands in the page's notice strip.
+    expect(el.shadowRoot!.querySelector('.notice')!.textContent).toContain('program web is stopped')
     el.remove()
   })
 
@@ -300,6 +309,50 @@ describe('console components', () => {
     el.remove()
   })
 
+  it('program detail swallows the crumb click that dismisses the action menu', async () => {
+    const el = document.createElement('ak-program-detail') as AkProgramDetail
+    el.store = store
+    el.app = 'demo'
+    el.program = 'web'
+    document.body.appendChild(el)
+    await el.updateComplete
+    await new Promise((r) => setTimeout(r, 0))
+    await el.updateComplete
+
+    // Right-click anywhere opens the page's menu; a pointerdown outside then
+    // closes it before the click lands on the crumb (design D2).
+    const now = vi.spyOn(performance, 'now').mockReturnValue(5000)
+    el.dispatchEvent(
+      new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }),
+    )
+    await el.updateComplete
+    document.body.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, composed: true }))
+    await el.updateComplete
+
+    const crumb = el.shadowRoot!.querySelector('a.crumb') as HTMLAnchorElement
+    const dismissClick = new MouseEvent('click', {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      button: 0,
+    })
+    crumb.dispatchEvent(dismissClick)
+    expect(dismissClick.defaultPrevented).toBe(true) // shell interceptor will skip it
+
+    // Once the window has passed, a click follows the breadcrumb normally.
+    now.mockReturnValue(5200)
+    const laterClick = new MouseEvent('click', {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      button: 0,
+    })
+    crumb.dispatchEvent(laterClick)
+    expect(laterClick.defaultPrevented).toBe(false)
+    now.mockRestore()
+    el.remove()
+  })
+
   it('program detail surfaces failure feedback on 409', async () => {
     const el = document.createElement('ak-program-detail') as AkProgramDetail
     el.store = store
@@ -321,15 +374,18 @@ describe('console components', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const startButton = [...el.shadowRoot!.querySelectorAll('button')].find(
-      (b) => b.textContent?.trim() === '启动',
-    )
-    expect(startButton).toBeDefined()
-    startButton!.click()
+    // fatal → the menu offers start; selected means executed (no confirm).
+    const trigger = el.shadowRoot!.querySelector<HTMLButtonElement>('button.op-trigger')!
+    trigger.click()
+    await el.updateComplete
+    const menu = el.shadowRoot!.querySelector('ak-action-menu')!
+    const items = [...menu.shadowRoot!.querySelectorAll<HTMLButtonElement>('.menu-item[data-kind]')]
+    expect(items.map((b) => b.dataset.kind)).toEqual(['start'])
+    items[0]!.click()
     await new Promise((r) => setTimeout(r, 0))
     await el.updateComplete
     expect(fetchMock).toHaveBeenCalledWith('/api/programs/worker/start', { method: 'POST', credentials: 'same-origin' })
-    expect(el.shadowRoot!.textContent).toContain('cannot start: retries exhausted')
+    expect(el.shadowRoot!.querySelector('.notice')!.textContent).toContain('cannot start: retries exhausted')
     el.remove()
   })
 })
