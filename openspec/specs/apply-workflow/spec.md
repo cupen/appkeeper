@@ -12,12 +12,14 @@
 
 守护进程 SHALL 周期性重扫 `app_dir` 注册并重读 daemon 配置与全部 app 配置
 本体，将差异记为待应用（pending）变更，MUST NOT 因此停止、重启或拉起任何
-程序。检出 SHALL 复用 reload 的既有比对规则：程序按配置定义比对（内容
+程序。检出 SHALL 复用既有比对规则：程序按配置定义比对（内容
 变化 = changed）、注册新增/移除按 app 归属记录。跨应用校验失败时 SHALL
-整体不形成 pending 并上报错误（与 reload 现行为一致）；单个 app 文件
+整体不形成 pending 并上报错误；单个 app 文件
 非法时 SHALL 隔离——该 app 不进入 pending、保持旧定义，其余 app 照常检出。
-`ak reload` SHALL 触发一次立即重扫并输出 pending 预览，等价于一个
-周期的自动检出。
+pending 的用户可见面为 `ak ps` 的 PENDING 列与表格尾部摘要（见 `control-plane`
+能力规范）；立即重扫 SHALL 经 `/v1/reload` 端点触发，CLI 入口为
+`ak config --reload`（顶层 `reload` 动词已移除，见 `configuration`；周期检出使
+立即重扫仅为便捷入口而非必需）。
 
 #### Scenario: 配置修改只进入 pending
 
@@ -27,7 +29,7 @@
 #### Scenario: 周期检出免手工 reload
 
 - **WHEN** 直接编辑磁盘上的 app 配置文件（未执行任何命令），等待一个重扫周期
-- **THEN** 守护进程无需 `ak reload` 即形成 pending 变更
+- **THEN** 守护进程无需任何手工触发即形成 pending 变更
 
 #### Scenario: 单个 app 文件损坏不影响其他检出
 
@@ -42,6 +44,8 @@
 ### Requirement: apply 范围与幂等
 
 `ak apply` SHALL 应用 pending 变更，范围 SHALL 可指定：缺省为全部；字面量 `all` SHALL 为全量关键字，`apply all` 与缺省全量严格等价（`all` 为保留字，MUST NOT 被解析为 app 名，帮助与文档 MUST 注明 `all` 不可用作 app 名）；`apply all` 后 MUST NOT 再接受 program 参数——`apply all <program>` 形状 SHALL 报错，MUST NOT 静默忽略 program 部分而按全量执行；`apply <app>` 仅作用于该 app 的程序与该 app 的注册变化，MUST NOT 影响其他 app（其他 app 的 pending 保持不变）；`apply <app> <program>` 进一步收窄到单程序。范围内无 pending 时 SHALL 什么都不做，输出明确的「无变更」结论并以 0 退出（幂等）。新注册 app 的程序进入 apply 范围时 SHALL 按 `restart` 策略的启动语义处理：`no` 仅完成注册不启动；其余策略启动（`unless-stopped` 存在「用户停止」记录时保持停止）。
+
+对于手工删除配置形成的 app/program 移除，apply MUST 在修改范围内任何运行状态之前检查被删除对象。若范围内任何被删除 app/program 处于 `running`、`starting`、`stopping` 或 `backoff`，本次 apply SHALL 整批拒绝并以冲突错误报告全部阻塞对象，提示先停止对应 app/program；范围内其他新增、修改、删除与 `--restart` 动作 MUST NOT 执行，已加载运行状态不变。磁盘上已经删除的配置 MUST NOT 被恢复，后续检出 SHALL 保留该删除 pending。`stopped`、`exited`、`fatal` 不阻塞删除，MUST NOT 要求曾显式执行 stop。范围外的删除不阻止本次 apply，`--restart` 不豁免该前置检查。
 
 #### Scenario: 无变更时 apply 幂等
 
@@ -72,6 +76,31 @@
 
 - **WHEN** 全量 `ak apply` 成功后立即查询 pending
 - **THEN** pending 为空（应用失败被隔离的 app 除外，其 pending 保留）
+
+#### Scenario: 手工删除存活 app 时整批拒绝
+
+- **WHEN** 手工删除 running 的 app A 注册，且范围内 app B 也有 pending 修改，执行覆盖两者的 apply
+- **THEN** apply 返回冲突并列出 A 的阻塞程序与状态，A 未被停止，B 的修改未应用，范围内其他程序也未被重启或启动；磁盘不恢复 A 的注册，A/B 的 pending 均保留
+
+#### Scenario: 手工删除存活 program 时整批拒绝
+
+- **WHEN** 从 app A 配置中删除处于 starting、stopping 或 backoff 的 program 定义，执行包含该删除的 apply
+- **THEN** apply 在任何停止、删除、重建或 `--restart` 之前整批拒绝，提示先停止该程序，后续检出仍报告该 program 删除 pending
+
+#### Scenario: 已停止的手工删除可由 apply 生效
+
+- **WHEN** 被手工删除的 app/program 均处于 stopped、exited 或 fatal，执行覆盖它们的 apply
+- **THEN** 删除按既有范围规则生效，运行投影清理，pending 清除；其他合法变更正常应用
+
+#### Scenario: 范围外删除不阻塞
+
+- **WHEN** app A 的存活程序被手工删除且不在本次范围内，用户对无冲突的 app B 执行 `ak apply B`
+- **THEN** B 的合法变更正常应用，A 的状态与 pending 不变
+
+#### Scenario: restart 旗标不豁免删除守卫
+
+- **WHEN** 范围内包含 running 的手工删除对象并执行 `ak apply --restart`
+- **THEN** apply 仍整批拒绝，既未删除对象也未重启任何范围内程序
 
 ### Requirement: apply 的重启语义
 

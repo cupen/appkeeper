@@ -170,7 +170,7 @@ stdout 与 stderr 的日志速率。守护概况 SHALL 携带系统级 CPU 与�
 
 ### Requirement: 配置驱动的控制台生命周期
 
-控制台 SHALL 由 daemon 配置的 `[webui]` 段驱动启停：段存在即伺服，`webui.listen` 缺省 `127.0.0.1:9877`；段不存在 SHALL NOT 伺服。`ak daemon start` 启动时 SHALL 按该配置决定是否伺服。运行中的守护进程执行 `ak reload` 时 SHALL 重读 `[webui]` 段并立即热生效（MUST NOT 等待 apply、MUST NOT 进入 pending 预览）：由关到开 SHALL 起伺服；由开到关 SHALL 停止伺服并将既有 WebSocket 连接 graceful 关闭（先发关闭帧再断开，不丢已在途推送帧）；`listen` 变更 SHALL 停旧起新完成重绑。webui 监听地址被占用时 SHALL 降级为记录错误日志并继续守护运行（无控制台），MUST NOT 致使守护进程退出。reload 时 `[webui]` 段非法 SHALL 视为本轮 reload 失败（保持既有伺服状态不变并上报错误）。
+控制台 SHALL 由 daemon 配置的 `[webui]` 段驱动启停：段存在即伺服，`webui.listen` 缺省 `127.0.0.1:9877`；段不存在 SHALL NOT 伺服。`ak daemon start` 启动时 SHALL 按该配置决定是否伺服。运行中的守护进程重载配置（CLI 入口 `ak config --reload`，可单独执行，也可与 `ak config --set/--delete` 组合一步触发，见 `configuration`「config 子命令」）时 SHALL 重读 `[webui]` 段并立即热生效（MUST NOT 等待 apply、MUST NOT 进入 pending 预览）：由关到开 SHALL 起伺服；由开到关 SHALL 停止伺服并将既有 WebSocket 连接 graceful 关闭（先发关闭帧再断开，不丢已在途推送帧）；`listen` 变更 SHALL 停旧起新完成重绑。webui 监听地址被占用时 SHALL 降级为记录错误日志并继续守护运行（无控制台），MUST NOT 致使守护进程退出。reload 时 `[webui]` 段非法 SHALL 视为本轮 reload 失败（保持既有伺服状态不变并上报错误）。
 
 #### Scenario: 启动时按配置伺服
 
@@ -179,23 +179,25 @@ stdout 与 stderr 的日志速率。守护概况 SHALL 携带系统级 CPU 与�
 
 #### Scenario: reload 动态开启
 
-- **WHEN** 守护进程以无 `[webui]` 段的配置运行，执行 `ak config --set webui.listen=127.0.0.1:9877` 后执行 `ak reload`
+> 本变更后 CLI 重载入口为 `ak config --reload`（标题为既有场景锚点，现行行为以下文为准）。
+
+- **WHEN** 守护进程以无 `[webui]` 段的配置运行，执行 `ak config --set webui.listen=127.0.0.1:9877` 后执行 `ak config --reload`
 - **THEN** 控制台立即在该地址可访问，无需重启守护进程
 
 #### Scenario: reload 动态关闭
 
-- **WHEN** 控制台伺服中存在 WebSocket 订阅，执行 `ak config --delete webui` 后执行 `ak reload`
+- **WHEN** 控制台伺服中存在 WebSocket 订阅，执行 `ak config --delete webui` 后执行 `ak config --reload`
 - **THEN** 控制台停止伺服，WebSocket 连接以关闭帧 graceful 断开，守护进程与其余受管程序不受影响
 
 #### Scenario: listen 变更重绑
 
-- **WHEN** 控制台伺服于 `127.0.0.1:9877`，将配置改为 `webui.listen=127.0.0.1:9898` 后执行 `ak reload`
+- **WHEN** 控制台伺服于 `127.0.0.1:9877`，将配置改为 `webui.listen=127.0.0.1:9898` 后执行 `ak config --reload`
 - **THEN** 旧地址停止伺服、新地址开始伺服，守护进程不重启
 
 #### Scenario: webui 端口占用降级
 
-- **WHEN** `[webui]` 启用且目标端口已被其他进程占用，执行 `ak daemon start` 或 `ak reload`
-- **THEN** 记录控制台不可用的错误日志，守护进程与受管程序照常运行，后续修正配置并 reload 可恢复伺服
+- **WHEN** `[webui]` 启用且目标端口已被其他进程占用，执行 `ak daemon start` 或 `ak config --reload`
+- **THEN** 记录控制台不可用的错误日志，守护进程与受管程序照常运行，后续修正配置并重载（`ak config --reload`）可恢复伺服
 
 ### Requirement: 控制台访问控制
 
@@ -241,3 +243,52 @@ Web 控制台 SHALL 保留 TCP 监听并继续经 `webui.listen` 的绑定地址
 
 - **WHEN** 用户配置 `[webui]` 且未配置 `auth_token`，`ak` 以 root 运行
 - **THEN** 任何能连到 `webui.listen` 地址的本地用户均可通过控制台执行 stop / apply 等动作；该事实由文档与 `ak validate` 的提示明确告知
+
+### Requirement: Web App 移除端点
+
+控制台 SHALL 提供 `POST /api/apps/<app>/remove`，经与控制面 `POST /v1/apps/<app>/remove` 相同的 Supervisor 命令执行。两端点 SHALL 具有相同的前置状态检查、注册配置删除边界、成功结果字段及错误语义；Web 端点 MUST NOT 自行停止程序、直接删除注册或触发 apply。
+
+未知 app SHALL 返回 404 错误对象；存活或待自动重启程序阻塞时 SHALL 返回 409 与阻塞程序及状态；注册删除失败 SHALL 返回服务端错误。配置了 Web 凭据时，该端点 SHALL 与现有 `/api` 写操作一样要求有效会话。成功后的状态投影与 WS 更新 SHALL 反映 app 及其程序已移除，不保留该 app 的注销 pending。
+
+#### Scenario: Web 移除复用控制面语义
+
+- **WHEN** 对同一已停止 app 分别使用 `/api/apps/<app>/remove` 与 `/v1/apps/<app>/remove` 的移除操作
+- **THEN** 两者返回同构移除结果，产生相同的注册删除、配置保留及状态清理结果
+
+#### Scenario: Web 移除冲突
+
+- **WHEN** 对含 running、starting、stopping 或 backoff 程序的 app 请求 Web 移除端点
+- **THEN** 返回 409 与阻塞原因，app 继续运行且注册不变，未触发 stop 或 apply
+
+#### Scenario: Web 移除要求会话
+
+- **WHEN** Web 配置了 auth_token，未持有效会话请求 app 移除端点
+- **THEN** 返回 401，注册与程序状态均不变
+
+#### Scenario: 移除后投影同步
+
+- **WHEN** Web 移除成功且存在 WebSocket 订阅
+- **THEN** 后续状态查询与 WS 更新均不再包含该 app/program，其他 app 的状态与 pending 不受影响
+
+### Requirement: 守护概况携带构建元数据
+
+`/v1/status`、`/api/overview` 与 `/ws` 快照中的守护进程概况 SHALL 新增只读 `build` 对象，
+包含 `git_commit`、`built_at`、`target`、`rustc` 四个字符串字段：分别为构建时的 git 提交
+（短哈希，工作区不干净时带 `-dirty` 后缀）、构建时间（RFC 3339 UTC）、目标三元组与 Rust
+编译器版本。任一信息在构建期不可得时，该字段 SHALL 为 `unknown`，构建 MUST NOT 因此失败。
+三处投影 MUST 取自同一结构体、同源同构；未知字段对旧消费者 MUST 可安全忽略。
+
+#### Scenario: 控制面投影含构建信息
+
+- **WHEN** 请求 `GET /v1/status`
+- **THEN** `daemon.build` 含 `git_commit`、`built_at`、`target`、`rustc` 四个非空字符串
+
+#### Scenario: 控制台投影与 WS 同构
+
+- **WHEN** 同一时刻读取 `GET /api/overview` 与收到 `/ws` 快照帧
+- **THEN** 两者的 `daemon.build` 与 `/v1/status` 完全一致
+
+#### Scenario: 元数据缺失不阻断构建
+
+- **WHEN** 构建环境没有 git 仓库或无法取得编译器版本
+- **THEN** 二进制仍能构建成功，对应字段返回 `unknown`
