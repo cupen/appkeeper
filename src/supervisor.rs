@@ -564,13 +564,15 @@ pub struct AppRecord {
     pub priority: i32,
 }
 
-/// The persisted "user stopped" record file name inside `log_dir`.
+/// The persisted "user stopped" record file name inside the effective
+/// persistent-state directory (harden-daemon-autostart: the State-class
+/// `state_dir`, not `log_dir` and not the runtime directory).
 const USER_STOPPED_FILE: &str = "state.json";
 
 /// Load the persisted user-stop set. Missing file → empty; unreadable or
 /// corrupt → warn and treat as empty (worst case: one extra pull-up).
-fn load_user_stopped(log_dir: &Path) -> HashSet<String> {
-    let path = log_dir.join(USER_STOPPED_FILE);
+fn load_user_stopped(state_dir: &Path) -> HashSet<String> {
+    let path = state_dir.join(USER_STOPPED_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashSet::new(),
@@ -603,7 +605,7 @@ fn load_user_stopped(log_dir: &Path) -> HashSet<String> {
 
 /// Persist the user-stop set atomically (temp file + rename). A write failure
 /// is logged, never fatal — the in-memory set still governs this session.
-fn save_user_stopped(log_dir: &Path, set: &HashSet<String>) {
+fn save_user_stopped(state_dir: &Path, set: &HashSet<String>) {
     #[derive(Serialize)]
     struct State<'a> {
         user_stopped: Vec<&'a str>,
@@ -619,8 +621,8 @@ fn save_user_stopped(log_dir: &Path, set: &HashSet<String>) {
             return;
         }
     };
-    let path = log_dir.join(USER_STOPPED_FILE);
-    let tmp = log_dir.join(format!("{USER_STOPPED_FILE}.tmp"));
+    let path = state_dir.join(USER_STOPPED_FILE);
+    let tmp = state_dir.join(format!("{USER_STOPPED_FILE}.tmp"));
     if let Err(e) = std::fs::write(&tmp, body) {
         warn!("cannot write {}: {e}", tmp.display());
         return;
@@ -628,6 +630,97 @@ fn save_user_stopped(log_dir: &Path, set: &HashSet<String>) {
     if let Err(e) = std::fs::rename(&tmp, &path) {
         warn!("cannot replace {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// What the one-time record migration decided (harden-daemon-autostart 2.4).
+#[derive(Debug, PartialEq, Eq)]
+enum RecordMigration {
+    /// The legacy record was copied to the state dir and the old file removed.
+    Migrated,
+    /// The state dir already has a record — the legacy file MUST NOT be
+    /// overwritten, so it is left in place (and ignored).
+    TargetAlreadyPresent,
+    /// Nothing to migrate (no legacy file, or the copy failed — the old file
+    /// stays so a later start can retry).
+    NothingToMigrate,
+}
+
+/// One-time migration of the user-stop record out of the legacy location
+/// (`<log_dir>/state.json`) into the effective state dir, so changing or
+/// clearing `log_dir` can never lose it. Rules: an existing record at the
+/// target MUST NOT be overwritten, and every failure only warns.
+fn migrate_user_stopped_record(old_dir: &Path, state_dir: &Path) -> RecordMigration {
+    let old = old_dir.join(USER_STOPPED_FILE);
+    let new = state_dir.join(USER_STOPPED_FILE);
+    if new.exists() {
+        return RecordMigration::TargetAlreadyPresent;
+    }
+    let text = match std::fs::read_to_string(&old) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RecordMigration::NothingToMigrate;
+        }
+        Err(e) => {
+            warn!("cannot read the legacy record {}: {e}", old.display());
+            return RecordMigration::NothingToMigrate;
+        }
+    };
+    // Atomic copy (temp file + rename) so a crash never leaves a half
+    // written record at the target.
+    let tmp = state_dir.join(format!("{USER_STOPPED_FILE}.migrate.tmp"));
+    if let Err(e) = std::fs::write(&tmp, &text) {
+        warn!(
+            "cannot stage the record migration at {}: {e}",
+            tmp.display()
+        );
+        return RecordMigration::NothingToMigrate;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &new) {
+        warn!(
+            "cannot move the record migration into place at {}: {e}",
+            new.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return RecordMigration::NothingToMigrate;
+    }
+    if let Err(e) = std::fs::remove_file(&old) {
+        warn!(
+            "migrated the user-stop record to {} but cannot remove {}: {e}",
+            new.display(),
+            old.display()
+        );
+    } else {
+        log::info!(
+            "migrated the user-stop record {} -> {}",
+            old.display(),
+            new.display()
+        );
+    }
+    RecordMigration::Migrated
+}
+
+/// Create `dir` and prove it is writable (a throwaway probe file). The error
+/// text feeds the caller's fallback warning.
+fn ensure_dir_writable(dir: &Path) -> std::result::Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create it: {e}"))?;
+    let probe = dir.join(format!(".ak-state-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(|e| format!("cannot write into it: {e}"))?;
+    std::fs::remove_file(&probe).map_err(|e| format!("cannot clean the probe: {e}"))?;
+    Ok(())
+}
+
+/// Windows service run mode (`daemon start --service <name>`): the SCM entry
+/// latches its service name before the dispatcher starts, and the Windows
+/// state-dir default keys off it (%ProgramData% vs %LOCALAPPDATA%).
+fn windows_service_mode() -> bool {
+    #[cfg(windows)]
+    {
+        crate::service::windows_service_mode()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -721,10 +814,21 @@ pub struct SupervisorState {
     /// files on every detect pass.
     pub file_stamps: HashMap<PathBuf, (std::time::SystemTime, u64)>,
     /// Programs the user explicitly stopped (persisted across daemon restarts
-    /// in `{log_dir}/state.json`). Consulted by `unless-stopped` to decide
+    /// in `{state_dir}/state.json`). Consulted by `unless-stopped` to decide
     /// whether to pull a program up at daemon start / on apply. `always` and
     /// `on-failure` ignore it; shutdown never writes it.
     pub user_stopped: HashSet<String>,
+    /// The effective persistent-state directory (harden-daemon-autostart):
+    /// resolved at startup (explicit `state_dir` → `$STATE_DIRECTORY` →
+    /// platform State default) and pinned for this session, deliberately
+    /// independent of `log_dir`. Falls back to the effective `log_dir` when
+    /// nothing is derivable or the directory is unusable.
+    pub state_dir: PathBuf,
+    /// The service manager running this daemon, judged once at startup
+    /// (harden-daemon-autostart 4.3): `Some("systemd")` / `Some("scm")` when
+    /// service-managed, `None` for manual starts. The status projection
+    /// (`managed_by`) and the shutdown 409 gate both read it.
+    pub managed_by: Option<&'static str>,
     /// run-daemon-first D1: ad-hoc apps that are started but not yet persisted
     /// (keyed by app name). Detection merges these so their programs survive
     /// periodic rescans until the commit lands or the abort drops them.
@@ -759,11 +863,51 @@ impl Supervisor {
         let log_dir = config::resolve_path(&config.daemon.log_dir, config_dir);
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("failed to create log dir: {}", log_dir.display()))?;
+        // Effective persistent-state dir (harden-daemon-autostart 2.3):
+        // explicit `state_dir` → $STATE_DIRECTORY → platform State default,
+        // pinned for this session and independent of log_dir. Nothing
+        // derivable, an uncreatable or an unwritable directory only warns and
+        // falls back to log_dir — it must not block startup.
+        let state_dir = match config::resolve_state_dir(&config::StateDirEnv::capture(
+            config.daemon.state_dir.as_deref(),
+            windows_service_mode(),
+        )) {
+            Some(dir) => {
+                let dir = config::resolve_path(&dir, config_dir);
+                match ensure_dir_writable(&dir) {
+                    Ok(()) => {
+                        // One-time migration from the legacy log_dir record;
+                        // same dir (or an existing target) is a no-op.
+                        migrate_user_stopped_record(&log_dir, &dir);
+                        dir
+                    }
+                    Err(e) => {
+                        warn!(
+                            "state dir {} unusable ({}); falling back to log_dir {} for the \
+                             persistent state",
+                            dir.display(),
+                            e,
+                            log_dir.display()
+                        );
+                        log_dir.clone()
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    "cannot derive a persistent state dir; falling back to log_dir {} for the \
+                     persistent state",
+                    log_dir.display()
+                );
+                log_dir.clone()
+            }
+        };
         let interval = Duration::from_secs_f64(config.daemon.monitor_interval.max(0.05));
-        // Load the persisted "user stopped" records (unless-stopped support):
-        // a missing file is an empty set, a corrupt one is warned about and
-        // treated as empty (worst case: one extra pull-up).
-        let user_stopped = load_user_stopped(&log_dir);
+        // Load the persisted "user stopped" records (unless-stopped support)
+        // from the effective state dir: a missing file is an empty set, a
+        // corrupt one is warned about and treated as empty (worst case: one
+        // extra pull-up).
+        let user_stopped = load_user_stopped(&state_dir);
         Ok(Arc::new(Supervisor {
             state: Arc::new(Mutex::new(SupervisorState {
                 programs: HashMap::new(),
@@ -774,6 +918,8 @@ impl Supervisor {
                 pending: PendingDoc::default(),
                 file_stamps: HashMap::new(),
                 user_stopped,
+                state_dir,
+                managed_by: None,
                 staged: HashMap::new(),
             })),
             queue: Mutex::new(VecDeque::new()),
@@ -792,6 +938,15 @@ impl Supervisor {
     /// Remember where the daemon config lives so `reload` re-reads it.
     pub fn set_config_path(&self, p: &Path) {
         *self.config_path.lock().unwrap() = p.to_path_buf();
+    }
+
+    /// harden-daemon-autostart 4.3: `run_daemon_core` judges the service
+    /// manager once at startup (`service::managed_source`) and injects the
+    /// result here, before the control endpoint is bound — the status
+    /// projection and the shutdown gate can then only ever see a settled
+    /// answer.
+    pub fn set_managed_by(&self, source: Option<&'static str>) {
+        self.state.lock().unwrap().managed_by = source;
     }
 
     /// Where the daemon config lives (config-source display for the console).
@@ -984,11 +1139,11 @@ impl Supervisor {
                 for (name, action) in actions {
                     match action {
                         Action::Spawn => {
-                            if let Some(p) = st.programs.get_mut(&name) {
-                                if p.state() == ProgramState::Stopped {
-                                    p.spawn();
-                                    progress = true;
-                                }
+                            if let Some(p) = st.programs.get_mut(&name)
+                                && p.state() == ProgramState::Stopped
+                            {
+                                p.spawn();
+                                progress = true;
                             }
                         }
                         Action::Fatalize(reason) => {
@@ -1071,9 +1226,8 @@ impl Supervisor {
         // An explicit start clears the persisted "user stopped" record
         // (process-management spec: 对该程序的显式启动 SHALL 清除记录).
         let changed = st.user_stopped.remove(name);
-        let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
         if changed {
-            save_user_stopped(&log_dir, &st.user_stopped);
+            save_user_stopped(&st.state_dir, &st.user_stopped);
         }
         Ok(format!("program {name} is {state_now}"))
     }
@@ -1100,10 +1254,10 @@ impl Supervisor {
         }
         // An explicit stop writes the persisted "user stopped" record, which
         // `unless-stopped` consults at daemon start / apply (process-management
-        // spec). `always` ignores it; shutdown never writes it.
-        let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+        // spec). `always` ignores it; shutdown never writes it. The record
+        // goes to the effective state dir, not log_dir.
         if st.user_stopped.insert(name.to_string()) {
-            save_user_stopped(&log_dir, &st.user_stopped);
+            save_user_stopped(&st.state_dir, &st.user_stopped);
         }
         Ok(format!("program {name} is stopped"))
     }
@@ -1332,8 +1486,7 @@ impl Supervisor {
                 changed |= st.user_stopped.remove(name);
             }
             if changed {
-                let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
-                save_user_stopped(&log_dir, &st.user_stopped);
+                save_user_stopped(&st.state_dir, &st.user_stopped);
             }
             // The removal itself must never surface as a pending注销项.
             st.pending.programs.retain(|p| p.app != app);
@@ -2627,10 +2780,10 @@ impl WebuiControl {
         let mut sh = self.shared.lock().unwrap();
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some((g, ok, note)) = &sh.applied {
-                if *g >= generation {
-                    return (*ok, note.clone());
-                }
+            if let Some((g, ok, note)) = &sh.applied
+                && *g >= generation
+            {
+                return (*ok, note.clone());
             }
             let now = Instant::now();
             if now >= deadline {
@@ -2688,10 +2841,10 @@ impl RunningWebui {
             .map(|h| h.is_finished())
             .unwrap_or(true);
         if done {
-            if let Some(h) = self.handle.take() {
-                if let Err(e) = h.join() {
-                    error!("webui console thread panicked: {e:?}");
-                }
+            if let Some(h) = self.handle.take()
+                && let Err(e) = h.join()
+            {
+                error!("webui console thread panicked: {e:?}");
             }
             return true;
         }
@@ -3106,14 +3259,16 @@ mod tests {
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        // Pin log_dir per test: the built-in default is a shared
-        // /tmp/appkeeper/logs, where the persisted user-stop record
-        // (state.json) would leak across concurrently running tests.
+        // Pin log_dir and state_dir per test: the built-in defaults are
+        // shared (/tmp/appkeeper/logs, the home state dir), where the
+        // persisted user-stop record (state.json) would leak across
+        // concurrently running tests.
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -3173,8 +3328,9 @@ mod tests {
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -3400,13 +3556,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        // Pin log_dir per test: the shared default would let the persisted
-        // user-stop record (state.json) leak across concurrent tests.
+        // Pin log_dir and state_dir per test: the shared defaults would let
+        // the persisted user-stop record (state.json) leak across concurrent
+        // tests.
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -3993,13 +4151,15 @@ mod tests {
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let cfg_path = dir.join("daemon.toml");
-        // Pin log_dir per test: the shared default would let the persisted
-        // user-stop record (state.json) leak across concurrent tests.
+        // Pin log_dir and state_dir per test: the shared defaults would let
+        // the persisted user-stop record (state.json) leak across concurrent
+        // tests.
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -4773,12 +4933,9 @@ mod tests {
         // Explicit stop writes the record; explicit start clears it.
         sup.cmd_stop("unless").unwrap();
         assert!(sup.state.lock().unwrap().user_stopped.contains("unless"));
-        // The record is on disk.
-        let log_dir = {
-            let st = sup.state.lock().unwrap();
-            config::resolve_path(&st.config.daemon.log_dir, &st.config_dir)
-        };
-        let on_disk = std::fs::read_to_string(log_dir.join("state.json")).unwrap();
+        // The record is on disk, in the state dir (not log_dir).
+        let state_dir = sup.state.lock().unwrap().state_dir.clone();
+        let on_disk = std::fs::read_to_string(state_dir.join("state.json")).unwrap();
         assert!(on_disk.contains("unless"), "record persisted: {on_disk}");
         sup.cmd_start("unless").unwrap();
         assert!(!sup.state.lock().unwrap().user_stopped.contains("unless"));
@@ -4794,7 +4951,7 @@ mod tests {
     }
 
     /// process-management: the record survives a daemon restart — a new
-    /// supervisor built over the same log_dir reads it back and holds an
+    /// supervisor built over the same state_dir reads it back and holds an
     /// `unless-stopped` program down, while `always` is pulled up regardless.
     #[test]
     fn user_stop_record_persists_across_daemon_restart() {
@@ -4805,7 +4962,11 @@ mod tests {
         let cfg_path = dir.join("daemon.toml");
         std::fs::write(
             &cfg_path,
-            format!("[daemon]\nlog_dir = {:?}\n", logs.to_string_lossy()),
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                logs.to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
         )
         .unwrap();
         let app_file = dir.join("appkeeper.toml");
@@ -4852,17 +5013,265 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ak-test-state-{}", unique_tag()));
         let _ = std::fs::remove_dir_all(&dir);
         let logs = dir.join("logs");
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("state.json"), "{ not json").unwrap();
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("state.json"), "{ not json").unwrap();
         let cfg_path = dir.join("daemon.toml");
         std::fs::write(
             &cfg_path,
-            format!("[daemon]\nlog_dir = {:?}\n", logs.to_string_lossy()),
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                logs.to_string_lossy(),
+                state.to_string_lossy(),
+            ),
         )
         .unwrap();
         let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
         let sup = Supervisor::new(config, &dir).expect("a corrupt state file must not abort");
         assert!(sup.state.lock().unwrap().user_stopped.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// harden-daemon-autostart 2.3: the record lives in the explicit state
+    /// dir and survives a `log_dir` change — changing (or clearing) the logs
+    /// must not touch the persistent state.
+    #[test]
+    fn state_dir_holds_the_record_independently_of_log_dir() {
+        let dir = std::env::temp_dir().join(format!("ak-test-statedir-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let app_file = dir.join("appkeeper.toml");
+        std::fs::write(
+            &app_file,
+            "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n",
+        )
+        .unwrap();
+        link_for_test(&app_file, &dir.join("app.d").join("demo.toml"));
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        wait_state(&sup, "unless", ProgramState::Running);
+        sup.cmd_stop("unless").unwrap();
+
+        // The record landed in the state dir; log_dir has none.
+        let state_dir = sup.state.lock().unwrap().state_dir.clone();
+        assert_eq!(state_dir, dir.join("state"));
+        assert!(state_dir.join("state.json").exists(), "record in state dir");
+        assert!(
+            !dir.join("logs").join("state.json").exists(),
+            "the record must not fall back into log_dir"
+        );
+        let _ = sup.shutdown_all();
+
+        // A fresh daemon over a DIFFERENT log_dir (simulating a move or a
+        // cleanup) still reads the record: the program stays stopped.
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs-moved").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup2 = Supervisor::new(config, &dir).unwrap();
+        sup2.set_config_path(&cfg_path);
+        sup2.bootstrap().unwrap();
+        {
+            let st = sup2.state.lock().unwrap();
+            assert_eq!(
+                st.programs["unless"].state(),
+                ProgramState::Stopped,
+                "the record survives a log_dir change"
+            );
+        }
+        let _ = sup2.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// harden-daemon-autostart 2.3: a state dir that cannot be created only
+    /// warns — the daemon starts anyway and keeps the record in log_dir.
+    #[test]
+    fn unusable_state_dir_falls_back_to_log_dir() {
+        let dir = std::env::temp_dir().join(format!("ak-test-statefb-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        // A regular file occupies the state-dir path: creating the directory
+        // there can never succeed.
+        std::fs::write(dir.join("state"), "not a directory").unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup =
+            Supervisor::new(config, &dir).expect("an unusable state dir must not block startup");
+        assert_eq!(
+            sup.state.lock().unwrap().state_dir,
+            dir.join("logs"),
+            "the effective state dir falls back to log_dir"
+        );
+        sup.set_config_path(&cfg_path);
+        std::fs::write(
+            &dir.join("appkeeper.toml"),
+            "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n",
+        )
+        .unwrap();
+        link_for_test(
+            &dir.join("appkeeper.toml"),
+            &dir.join("app.d").join("demo.toml"),
+        );
+        sup.bootstrap().unwrap();
+        wait_state(&sup, "unless", ProgramState::Running);
+        sup.cmd_stop("unless").unwrap();
+        assert!(
+            dir.join("logs").join("state.json").exists(),
+            "the record lands in the fallback location"
+        );
+        let _ = sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// harden-daemon-autostart 2.4: the one-time legacy-record migration —
+    /// (a) migrate when the target is free (and remove the old file),
+    /// (b) never overwrite an existing target record, (c) no legacy file is
+    /// a no-op.
+    #[test]
+    fn record_migration_three_inputs() {
+        let dir = std::env::temp_dir().join(format!("ak-test-migrate-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_dir = dir.join("logs");
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // (a) legacy record + free target → migrated, old file removed.
+        std::fs::write(old_dir.join("state.json"), r#"{"user_stopped": ["web"]}"#).unwrap();
+        assert_eq!(
+            migrate_user_stopped_record(&old_dir, &state_dir),
+            RecordMigration::Migrated
+        );
+        let migrated = std::fs::read_to_string(state_dir.join("state.json")).unwrap();
+        assert!(
+            migrated.contains("web"),
+            "the record content is preserved: {migrated}"
+        );
+        assert!(
+            !old_dir.join("state.json").exists(),
+            "the legacy file is cleaned up"
+        );
+
+        // (b) existing target record → the legacy file is left alone and the
+        // target is untouched (MUST NOT overwrite).
+        std::fs::write(
+            old_dir.join("state.json"),
+            r#"{"user_stopped": ["legacy"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            state_dir.join("state.json"),
+            r#"{"user_stopped": ["current"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            migrate_user_stopped_record(&old_dir, &state_dir),
+            RecordMigration::TargetAlreadyPresent
+        );
+        assert!(
+            std::fs::read_to_string(state_dir.join("state.json"))
+                .unwrap()
+                .contains("current"),
+            "the target record was not overwritten"
+        );
+        assert!(old_dir.join("state.json").exists());
+
+        // (c) no legacy file → nothing to do.
+        std::fs::remove_file(old_dir.join("state.json")).unwrap();
+        std::fs::remove_file(state_dir.join("state.json")).unwrap();
+        assert_eq!(
+            migrate_user_stopped_record(&old_dir, &state_dir),
+            RecordMigration::NothingToMigrate
+        );
+        assert!(!state_dir.join("state.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// harden-daemon-autostart 2.4 (startup integration): a legacy
+    /// `<log_dir>/state.json` is migrated and takes effect on the first
+    /// start — the program is NOT pulled up and the old file is gone.
+    #[test]
+    fn legacy_record_migrates_and_holds_program_down_at_startup() {
+        let dir = std::env::temp_dir().join(format!("ak-test-legacy-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("state.json"), r#"{"user_stopped": ["unless"]}"#).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                logs.to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let app_file = dir.join("appkeeper.toml");
+        std::fs::write(
+            &app_file,
+            "[program.unless]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'unless-stopped'\n\
+             [program.always]\ncommand = 'sleep 30'\nstartsecs = 0.0\nrestart = 'always'\n",
+        )
+        .unwrap();
+        link_for_test(&app_file, &dir.join("app.d").join("demo.toml"));
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        wait_state(&sup, "always", ProgramState::Running);
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(
+                st.programs["unless"].state(),
+                ProgramState::Stopped,
+                "the migrated record still holds unless-stopped down"
+            );
+        }
+        assert!(
+            sup.state
+                .lock()
+                .unwrap()
+                .state_dir
+                .join("state.json")
+                .exists()
+        );
+        assert!(
+            !logs.join("state.json").exists(),
+            "the legacy file is cleaned up after the migration"
+        );
+        let _ = sup.shutdown_all();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4927,8 +5336,9 @@ mod tests {
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -6020,8 +6430,9 @@ mod tests {
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nlog_dir = {:?}\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();

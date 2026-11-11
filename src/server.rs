@@ -135,6 +135,11 @@ pub(crate) struct DaemonInfo {
     pub uptime_secs: f64,
     /// Where the daemon config was loaded from.
     pub config_source: String,
+    /// The service manager running this daemon (harden-daemon-autostart
+    /// 4.3): `systemd`, `scm`, or `null` for manual starts. Backward-
+    /// compatible addition — consumers that ignore it are unaffected.
+    #[serde(default)]
+    pub managed_by: Option<String>,
 }
 
 /// The single `DaemonInfo` constructor: `status_doc()` (WS/API) and the
@@ -151,6 +156,7 @@ fn daemon_info(st: &crate::supervisor::SupervisorState, sup: &Arc<Supervisor>) -
         monitor_interval: st.config.daemon.monitor_interval,
         uptime_secs: (sup.uptime_secs() * 100.0).round() / 100.0,
         config_source: sup.config_path().display().to_string(),
+        managed_by: st.managed_by.map(String::from),
     }
 }
 
@@ -684,6 +690,17 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
             }
         }
         ("POST", ["v1", "shutdown"]) => {
+            // 服务托管时的停机命令语义 (harden-daemon-autostart 4.4): a
+            // service-managed daemon refuses here, BEFORE anything is
+            // enqueued — no program stops, the daemon does not exit; the
+            // answer names the stop command the service manager owns. This
+            // is the single source both /v1 and the webui's shared gate ride.
+            let managed = sup.state.lock().unwrap().managed_by;
+            if let Some(source) = managed {
+                let _ =
+                    writer.write_all(&err_bytes(409, &crate::service::managed_stop_hint(source)));
+                return;
+            }
             let (tx, rx) = mpsc::channel();
             let (ftx, frx) = mpsc::channel();
             sup.enqueue(Command::Shutdown {
@@ -1476,6 +1493,7 @@ mod tests {
                 monitor_interval: 1.0,
                 uptime_secs: 5.0,
                 config_source: "/tmp/appkeeper.toml".into(),
+                managed_by: None,
             },
             programs: vec![info],
             pending: crate::supervisor::PendingDoc::default(),
@@ -1526,6 +1544,71 @@ mod tests {
             m.len() < j.len(),
             "msgpack should not be larger than json here"
         );
+    }
+
+    /// harden-daemon-autostart 4.3: `managed_by` rides the one `DaemonInfo`
+    /// struct — a manual start projects `null`, systemd projects `systemd`,
+    /// SCM projects `scm`; the field is backward-compatible (JSON written
+    /// without it still decodes).
+    #[test]
+    fn managed_by_projects_null_systemd_and_scm() {
+        // Manual start (sample doc): null.
+        let doc = sample_doc();
+        let v = serde_json::to_value(&doc).unwrap();
+        assert!(v["daemon"]["managed_by"].is_null(), "{v}");
+        // Managed: the source string round-trips through JSON and msgpack.
+        for (source, wire) in [("systemd", "systemd"), ("scm", "scm")] {
+            let mut doc = sample_doc();
+            doc.daemon.managed_by = Some(source.into());
+            let j = serde_json::to_vec(&doc).unwrap();
+            let m = rmp_serde::to_vec(&doc).unwrap();
+            let dj: StatusDoc = serde_json::from_slice(&j).unwrap();
+            let dm: StatusDoc = rmp_serde::from_slice(&m).unwrap();
+            assert_eq!(dj.daemon.managed_by.as_deref(), Some(wire));
+            assert_eq!(dm.daemon.managed_by.as_deref(), Some(wire));
+        }
+        // Backward compatibility: a projection written without the field
+        // still decodes — to `null` (existing consumers/writers unaffected).
+        let mut legacy = serde_json::to_value(sample_doc()).unwrap();
+        legacy["daemon"]
+            .as_object_mut()
+            .unwrap()
+            .remove("managed_by");
+        let old: StatusDoc = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.daemon.managed_by, None);
+    }
+
+    /// harden-daemon-autostart 4.3: the injection lands before projection —
+    /// `set_managed_by` feeds the same `daemon_info` constructor /v1, /api
+    /// and the WS snapshot share.
+    #[test]
+    fn managed_by_injection_reaches_the_projection() {
+        let dir = std::env::temp_dir().join(format!("ak-test-mgd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nsocket = {:?}\nlog_dir = {:?}\nstate_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("ak.sock").to_string_lossy(),
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let (config, _) = crate::config::DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        // Manual start: unmanaged until injected.
+        assert!(status_doc(&sup).daemon.managed_by.is_none());
+        sup.set_managed_by(Some("systemd"));
+        let doc = status_doc(&sup);
+        assert_eq!(doc.daemon.managed_by.as_deref(), Some("systemd"));
+        // 4.4: the gate reads the same state — the shutdown guard flips with it.
+        sup.set_managed_by(None);
+        assert!(status_doc(&sup).daemon.managed_by.is_none());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// metrics/control-plane: a supervised program's projection carries the
@@ -1622,9 +1705,10 @@ mod tests {
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nsocket = {:?}\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                "[daemon]\nsocket = {:?}\nlog_dir = {:?}\nstate_dir = {:?}\nmonitor_interval = 0.05\n",
                 socket.to_string_lossy(),
-                dir.join("logs").to_string_lossy()
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();
@@ -2439,6 +2523,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// harden-daemon-autostart 4.4: a service-managed daemon refuses
+    /// `POST /v1/shutdown` with 409 BEFORE anything is enqueued — the message
+    /// names the service manager's stop command, no program stops and the
+    /// daemon stays up.
+    #[test]
+    fn shutdown_is_refused_when_service_managed() {
+        let (sup, dir, ep) = serve_harness("shutdown-managed");
+        sup.set_managed_by(Some("systemd"));
+        let resp = ep.post("/v1/shutdown", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            body.contains("systemctl stop") && body.contains("systemd"),
+            "the 409 names the manager and its stop command: {body}"
+        );
+        // Nothing was enqueued: no shutdown intent, daemon still serving.
+        assert!(
+            !sup.state
+                .lock()
+                .unwrap()
+                .shutdown
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the refusal must not latch the shutdown intent"
+        );
+        assert!(ep.get("/v1/health").starts_with("HTTP/1.1 200"));
+        assert!(ep.get("/v1/status").starts_with("HTTP/1.1 200"));
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// harden-daemon-autostart 4.4: the manual-start path keeps its original
+    /// answer and order — 200 "shutting down" on the wire, THEN the daemon
+    /// stops everything and exits.
+    #[test]
+    fn shutdown_unmanaged_still_replies_then_stops() {
+        let (sup, dir, ep) = serve_harness("shutdown-manual");
+        let resp = ep.post("/v1/shutdown", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            resp.contains("shutting down"),
+            "the manual path keeps its response body: {resp}"
+        );
+        assert!(
+            sup.state
+                .lock()
+                .unwrap()
+                .shutdown
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the shutdown intent was accepted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 2.1: the TCP form serves the same endpoint under the Bearer gate.
     #[test]
     fn remove_endpoint_works_over_the_tcp_form() {
@@ -2531,8 +2668,9 @@ mod tests {
         std::fs::write(
             &cfg_path,
             format!(
-                "[daemon]\nsocket = \"tcp://127.0.0.1:{port}\"\nauth_token = {token:?}\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
-                dir.join("logs").to_string_lossy()
+                "[daemon]\nsocket = \"tcp://127.0.0.1:{port}\"\nauth_token = {token:?}\nlog_dir = {:?}\nstate_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
             ),
         )
         .unwrap();

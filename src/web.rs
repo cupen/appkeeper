@@ -771,10 +771,10 @@ async fn ws_session(socket: WebSocket, sup: Arc<Supervisor>, stop: Arc<WebuiLife
                                 }
                             }
                             Ok(ClientAction::Unsubscribe { program, stream }) => {
-                                if let Some(s) = stream_of(&stream) {
-                                    if let Some(handle) = subs.remove(&(program, s)) {
-                                        handle.abort();
-                                    }
+                                if let Some(s) = stream_of(&stream)
+                                    && let Some(handle) = subs.remove(&(program, s))
+                                {
+                                    handle.abort();
                                 }
                             }
                             Err(_) => {

@@ -21,17 +21,16 @@ pub fn rotation_chain(live: &Path) -> Vec<PathBuf> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut rotated: Vec<(u32, PathBuf)> = Vec::new();
-    if let Some(parent) = live.parent() {
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if let Some(num) = name.strip_prefix(&suffix) {
-                    if let Some(n) = num.strip_prefix('.') {
-                        if let Ok(n) = n.parse::<u32>() {
-                            rotated.push((n, e.path()));
-                        }
-                    }
-                }
+    if let Some(parent) = live.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(num) = name.strip_prefix(&suffix)
+                && let Some(n) = num.strip_prefix('.')
+                && let Ok(n) = n.parse::<u32>()
+            {
+                rotated.push((n, e.path()));
             }
         }
     }

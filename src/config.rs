@@ -513,6 +513,13 @@ pub struct DaemonSettings {
     pub auth_token: Option<String>,
     pub log_buffer_lines: usize,
     pub app_dir: PathBuf,
+    /// Persistent-state directory (harden-daemon-autostart): where the
+    /// `unless-stopped` user-stop records live. MUST be absolute when
+    /// configured and is deliberately independent of `log_dir` — changing or
+    /// clearing the logs never touches the records. `None` = derived (see
+    /// [`resolve_state_dir`]): `$STATE_DIRECTORY` (systemd injects the unit's
+    /// `StateDirectory=`), then the platform State default.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// The `[daemon]` keys earlier control-plane designs removed. They are
@@ -573,6 +580,7 @@ struct DaemonSettingsRaw {
     auth_token: Option<String>,
     log_buffer_lines: Option<usize>,
     app_dir: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     host: Option<toml::Value>,
     port: Option<toml::Value>,
 }
@@ -611,6 +619,9 @@ impl<'de> serde::Deserialize<'de> for DaemonSettings {
         if let Some(v) = raw.app_dir {
             out.app_dir = v;
         }
+        if let Some(v) = raw.state_dir {
+            out.state_dir = Some(v);
+        }
         Ok(out)
     }
 }
@@ -628,8 +639,239 @@ impl Default for DaemonSettings {
             // daemon config's directory (production default
             // `/etc/appkeeper/app.d`). An explicit `app_dir` overrides it.
             app_dir: PathBuf::from("app.d"),
+            state_dir: None,
         }
     }
+}
+
+/// Everything the effective `state_dir` derivation needs, captured as plain
+/// data so [`resolve_state_dir`] stays a pure, cross-platform-testable
+/// function (Linux unit tests drive the Windows branches too).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StateDirEnv {
+    /// Explicit `daemon.state_dir` (load-time validated absolute).
+    pub explicit: Option<PathBuf>,
+    /// `STATE_DIRECTORY`: systemd injects the unit's `StateDirectory=`
+    /// here — a colon-separated list, the first entry wins.
+    pub state_directory: Option<String>,
+    /// `$HOME` — anchors the unix non-root default.
+    pub home: Option<String>,
+    /// `$XDG_STATE_HOME`.
+    pub xdg_state_home: Option<String>,
+    /// `%ProgramData%` — the Windows service default anchor.
+    pub program_data: Option<String>,
+    /// `%LOCALAPPDATA%` — the Windows console default anchor.
+    pub local_app_data: Option<String>,
+    /// Effective uid (unix; root gets the `/var/lib` default).
+    pub uid: u32,
+    /// Windows service run mode (`daemon start --service`).
+    pub service_mode: bool,
+    /// Which platform's defaults to apply. Production passes `cfg!(windows)`;
+    /// tests set either side.
+    pub windows: bool,
+}
+
+impl StateDirEnv {
+    /// Capture the real process context (actual env vars, actual uid and
+    /// platform). `explicit` and `service_mode` come from the caller.
+    pub fn capture(explicit: Option<&Path>, service_mode: bool) -> StateDirEnv {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        StateDirEnv {
+            explicit: explicit.map(Path::to_path_buf),
+            state_directory: var("STATE_DIRECTORY"),
+            home: var("HOME"),
+            xdg_state_home: var("XDG_STATE_HOME"),
+            program_data: var("ProgramData"),
+            local_app_data: var("LOCALAPPDATA"),
+            uid: current_uid(),
+            service_mode,
+            windows: cfg!(windows),
+        }
+    }
+}
+
+/// Effective uid on unix; a placeholder on Windows (uid is unused there).
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// The effective persistent-state directory (configuration spec):
+/// explicit `state_dir` → `$STATE_DIRECTORY` → platform State default.
+///
+/// Platform defaults: unix root `/var/lib/appkeeper/<uid>`; unix non-root
+/// `$XDG_STATE_HOME/appkeeper` (else `~/.local/state/appkeeper`); Windows
+/// service `%ProgramData%\appkeeper\state`, console `%LOCALAPPDATA%\appkeeper\
+/// state`. Returns `None` when nothing is derivable (e.g. unix non-root
+/// without HOME) — the caller falls back to `log_dir` with a warning instead
+/// of refusing to start.
+pub fn resolve_state_dir(env: &StateDirEnv) -> Option<PathBuf> {
+    // 1. Explicit configuration wins over everything (spec: 显式配置优先 —
+    // even a present STATE_DIRECTORY is ignored).
+    if let Some(p) = &env.explicit
+        && !p.as_os_str().is_empty()
+    {
+        return Some(p.clone());
+    }
+    // 2. systemd StateDirectory injection: `/var/lib/appkeeper/<uid>` for the
+    // unit rendered by `daemon install`. Empty entries are skipped.
+    if let Some(list) = env.state_directory.as_deref()
+        && let Some(first) = list.split(':').map(str::trim).find(|s| !s.is_empty())
+    {
+        return Some(PathBuf::from(first));
+    }
+    // 3. Platform State default.
+    if env.windows {
+        let base = if env.service_mode {
+            env.program_data.as_deref()
+        } else {
+            env.local_app_data.as_deref()
+        };
+        return base.map(|b| PathBuf::from(b).join("appkeeper").join("state"));
+    }
+    if env.uid == 0 {
+        return Some(PathBuf::from("/var/lib/appkeeper").join(env.uid.to_string()));
+    }
+    let base = match env.xdg_state_home.as_deref().map(str::trim) {
+        Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ => {
+            let home = PathBuf::from(env.home.as_deref()?);
+            home.join(".local").join("state")
+        }
+    };
+    Some(base.join("appkeeper"))
+}
+
+/// Everything the default daemon-config-path resolution needs
+/// (harden-daemon-autostart 5.1), captured as plain data so
+/// [`resolve_default_config_path`] stays a pure, cross-platform-testable
+/// function (Linux unit tests drive the Windows branches too).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigPathEnv {
+    /// Which platform's defaults to apply. Production passes `cfg!(windows)`;
+    /// tests set either side.
+    pub windows: bool,
+    /// `%ProgramData%` — anchors the machine-level default.
+    pub program_data: Option<String>,
+    /// `%APPDATA%` — anchors the legacy (pre-5.1) per-user default.
+    pub appdata: Option<String>,
+    /// `%USERPROFILE%` — the last-ditch anchor when both env vars above are
+    /// missing (the pre-5.1 code's corner; mirrors its fallback shape).
+    pub user_profile: Option<String>,
+    /// `%ProgramData%\appkeeper\daemon.toml` exists (the caller probes the
+    /// real filesystem; the pure check must not do IO).
+    pub program_data_exists: bool,
+    /// `%APPDATA%\appkeeper\daemon.toml` exists.
+    pub appdata_exists: bool,
+}
+
+impl ConfigPathEnv {
+    /// Capture the real process context (actual env vars and the existence
+    /// of the two candidate paths). Existence is only probed on Windows —
+    /// the Windows paths are meaningless elsewhere.
+    pub fn capture() -> ConfigPathEnv {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let windows = cfg!(windows);
+        let probe = |anchor: &Option<String>| -> bool {
+            windows
+                && anchor
+                    .as_deref()
+                    .map(|a| Path::new(a).join("appkeeper").join("daemon.toml").exists())
+                    .unwrap_or(false)
+        };
+        ConfigPathEnv {
+            windows,
+            program_data: var("ProgramData"),
+            appdata: var("APPDATA"),
+            user_profile: var("USERPROFILE"),
+            program_data_exists: probe(&var("ProgramData")),
+            appdata_exists: probe(&var("APPDATA")),
+        }
+    }
+}
+
+/// The platform default daemon config path (configuration spec): Linux
+/// `/etc/appkeeper/daemon.toml`; Windows `%ProgramData%\appkeeper\daemon.toml`
+/// (machine-level, so the service account can read it).
+///
+/// harden-daemon-autostart 5.1 legacy fallback: when the machine-level file
+/// does not exist and the old `%APPDATA%\appkeeper\daemon.toml` does, the
+/// old path wins so an upgraded install keeps reading its config. When
+/// neither exists the machine-level path wins (fresh installs land there;
+/// the first write creates it). `%ProgramData%` unset entirely leaves only
+/// the legacy anchors (`%APPDATA%`, then `%USERPROFILE%` — the pre-5.1
+/// corner shape).
+pub fn resolve_default_config_path(env: &ConfigPathEnv) -> PathBuf {
+    if !env.windows {
+        return PathBuf::from("/etc/appkeeper/daemon.toml");
+    }
+    let new_path = env
+        .program_data
+        .as_deref()
+        .map(|pd| Path::new(pd).join("appkeeper").join("daemon.toml"));
+    if env.program_data_exists
+        && let Some(p) = new_path
+    {
+        return p;
+    }
+    let legacy_path = env
+        .appdata
+        .as_deref()
+        .map(|ad| Path::new(ad).join("appkeeper").join("daemon.toml"))
+        .or_else(|| {
+            env.user_profile.as_deref().map(|up| {
+                Path::new(up)
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("appkeeper")
+                    .join("daemon.toml")
+            })
+        });
+    // Legacy fallback: the machine-level file is missing (or its env anchor
+    // is gone) and the old one exists (spec: 旧 Windows 配置路径兼容回退).
+    if !env.program_data_exists
+        && env.appdata_exists
+        && let Some(legacy) = legacy_path
+    {
+        return legacy;
+    }
+    // Neither file exists (or neither anchor is usable): the machine-level
+    // path is the default going forward — unless %ProgramData% is missing
+    // entirely, in which case the legacy anchor is the only usable one.
+    new_path
+        .or(legacy_path)
+        .unwrap_or_else(|| PathBuf::from("daemon.toml"))
+}
+
+/// harden-daemon-autostart 5.3: `Some(target)` when `config_path` IS the
+/// legacy `%APPDATA%` default path (the fallback hit) — the machine-level
+/// path the `daemon install` migration hint tells the user to move it to.
+/// `None` on non-Windows, for any other path, or when the machine-level
+/// anchor is not derivable (no `%ProgramData%`).
+pub fn legacy_config_migration_target(env: &ConfigPathEnv, config_path: &Path) -> Option<PathBuf> {
+    if !env.windows {
+        return None;
+    }
+    let legacy = Path::new(env.appdata.as_deref()?)
+        .join("appkeeper")
+        .join("daemon.toml");
+    // Windows paths compare case-insensitively; the string forms are enough
+    // here (both sides come from the same env-derived spelling).
+    if !config_path
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&legacy.to_string_lossy())
+    {
+        return None;
+    }
+    env.program_data
+        .as_deref()
+        .map(|pd| Path::new(pd).join("appkeeper").join("daemon.toml"))
 }
 
 impl DaemonConfig {
@@ -696,6 +938,19 @@ impl DaemonConfig {
                 "daemon.log_dir: {:?} must be an absolute path (e.g. log_dir = \"/var/log/appkeeper\")",
                 d.log_dir
             ));
+        }
+        // state_dir holds the persistent user-stop records: a relative value
+        // would drift with the working directory, so it is rejected like
+        // log_dir (harden-daemon-autostart, configuration spec).
+        if let Some(sd) = &d.state_dir {
+            if sd.as_os_str().is_empty() {
+                errors.push("daemon.state_dir: must not be empty".to_string());
+            } else if !sd.is_absolute() {
+                errors.push(format!(
+                    "daemon.state_dir: {:?} must be an absolute path (e.g. state_dir = \"/var/lib/appkeeper/state\")",
+                    sd
+                ));
+            }
         }
         if d.monitor_interval <= 0.0 || d.monitor_interval > 60.0 {
             errors.push(format!(
@@ -806,32 +1061,32 @@ pub struct AppMeta {
 }
 
 fn check_level_defaults(label: &str, l: &AppDefaults, errors: &mut Vec<String>) {
-    if let Some(b) = l.restart_backoff {
-        if b <= 0.0 {
-            errors.push(format!("{label}.restart_backoff must be > 0"));
-        }
+    if let Some(b) = l.restart_backoff
+        && b <= 0.0
+    {
+        errors.push(format!("{label}.restart_backoff must be > 0"));
     }
-    if let (Some(mx), Some(mn)) = (l.max_restart_backoff, l.restart_backoff) {
-        if mx < mn {
-            errors.push(format!(
-                "{label}.max_restart_backoff must be >= restart_backoff"
-            ));
-        }
+    if let (Some(mx), Some(mn)) = (l.max_restart_backoff, l.restart_backoff)
+        && mx < mn
+    {
+        errors.push(format!(
+            "{label}.max_restart_backoff must be >= restart_backoff"
+        ));
     }
-    if let Some(t) = l.stop_timeout {
-        if t < 0.0 {
-            errors.push(format!("{label}.stop_timeout must be >= 0"));
-        }
+    if let Some(t) = l.stop_timeout
+        && t < 0.0
+    {
+        errors.push(format!("{label}.stop_timeout must be >= 0"));
     }
-    if let Some(s) = l.startsecs {
-        if s < 0.0 {
-            errors.push(format!("{label}.startsecs must be >= 0"));
-        }
+    if let Some(s) = l.startsecs
+        && s < 0.0
+    {
+        errors.push(format!("{label}.startsecs must be >= 0"));
     }
-    if let Some(b) = l.backoff_reset_after {
-        if b < 0.0 {
-            errors.push(format!("{label}.backoff_reset_after must be >= 0"));
-        }
+    if let Some(b) = l.backoff_reset_after
+        && b < 0.0
+    {
+        errors.push(format!("{label}.backoff_reset_after must be >= 0"));
     }
 }
 
@@ -1605,6 +1860,24 @@ fn parse_webui_listen(s: &str) -> std::result::Result<KeyValue, String> {
     Ok(KeyValue::Str(s.to_string()))
 }
 
+/// `state_dir` parser: non-empty and absolute — the same rule load-time
+/// validation applies, so a value `config --set` accepts can never fail the
+/// post-write whole-config validation (harden-daemon-autostart 2.2).
+fn parse_state_dir(s: &str) -> std::result::Result<KeyValue, String> {
+    if s.trim().is_empty() {
+        return Err(
+            "must not be empty (expected an absolute directory path, e.g. /var/lib/appkeeper)"
+                .to_string(),
+        );
+    }
+    if !Path::new(s).is_absolute() {
+        return Err(format!(
+            "must be an absolute path, got {s:?} (e.g. /var/lib/appkeeper)"
+        ));
+    }
+    Ok(KeyValue::Str(s.to_string()))
+}
+
 /// One known config key: a leaf inside a known table. Built-in defaults are
 /// NOT copied here — they flow from the settings structs' `Default` impls via
 /// the display helpers and the init template (design D3: one source of truth,
@@ -1643,6 +1916,10 @@ pub const DAEMON_KEYS: &[DaemonKey] = &[
     DaemonKey {
         name: "app_dir",
         parse: parse_string,
+    },
+    DaemonKey {
+        name: "state_dir",
+        parse: parse_state_dir,
     },
 ];
 
@@ -1733,6 +2010,15 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
         "auth_token" => settings.auth_token.clone().unwrap_or_default(),
         "log_buffer_lines" => settings.log_buffer_lines.to_string(),
         "app_dir" => settings.app_dir.to_string_lossy().into_owned(),
+        // Unconfigured prints the derived platform State default for THIS
+        // process environment (spec: 服务形态的实际取值由 systemd 注入，可能与
+        // CLI 打印结果不同 — the unit's StateDirectory reaches the daemon via
+        // STATE_DIRECTORY, which a CLI `--get` cannot see).
+        "state_dir" => {
+            resolve_state_dir(&StateDirEnv::capture(settings.state_dir.as_deref(), false))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
         // Callers resolve names through DAEMON_KEYS first.
         _ => unreachable!("key table and display are in sync: {name:?}"),
     }
@@ -2001,21 +2287,20 @@ pub fn config_apply_deletes(text: &str, targets: &[String]) -> Result<DeleteOutc
     for target in &resolved {
         match target {
             DeleteTarget::Leaf(table, leaf) => match doc.get_mut(*table) {
-                Some(toml_edit::Item::Table(tbl)) => {
-                    if tbl.contains_key(leaf.as_str()) {
-                        tbl.remove(leaf.as_str());
-                        any = true;
-                    }
+                Some(toml_edit::Item::Table(tbl)) if tbl.contains_key(leaf.as_str()) => {
+                    tbl.remove(leaf.as_str());
+                    any = true;
                 }
                 // Dotted-key style config: `daemon.port = 1` parses as an
                 // inline table.
-                Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(tbl))) => {
-                    if tbl.contains_key(leaf.as_str()) {
-                        tbl.remove(leaf.as_str());
-                        any = true;
-                    }
+                Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(tbl)))
+                    if tbl.contains_key(leaf.as_str()) =>
+                {
+                    tbl.remove(leaf.as_str());
+                    any = true;
                 }
-                // Table not present at all: the target is absent.
+                // Table present without the leaf, or not present at all: the
+                // target is absent.
                 _ => {}
             },
             DeleteTarget::Table(table) => {
@@ -2106,8 +2391,23 @@ pub fn render_init_template() -> String {
 log_level = {log_level}
 # Directory for child process stdout/stderr logs; must be an absolute path.
 # /tmp (%TEMP% on Windows) is volatile — pin an absolute path such as
-# /var/log/appkeeper for logs that survive reboots.
+# /var/log/appkeeper for logs that survive reboots. LOGS ONLY: the persistent
+# user-stop state lives in state_dir below, so this directory can be cleared
+# or rotated at any time.
 log_dir = {log_dir}
+# Persistent state directory — holds the `unless-stopped` user-stop records
+# and must survive reboots. Independent of log_dir (rotating or clearing the
+# logs never touches the records); must be an absolute path. Unset = derived:
+# under systemd the unit's StateDirectory is injected via $STATE_DIRECTORY
+# (/var/lib/appkeeper/<uid> for the `daemon install` unit); otherwise the
+# platform State default (/var/lib/appkeeper/<uid> for root,
+# $XDG_STATE_HOME/appkeeper or ~/.local/state/appkeeper on unix,
+# %ProgramData%/appkeeper/state for the Windows service). Pin it explicitly
+# when running outside systemd without a unit-provided StateDirectory.
+# state_dir = \"/var/lib/appkeeper/state\"
+# Service form (`daemon install`) note: the daemon does NOT inherit the login
+# shell's environment — the unit pins a deterministic PATH, and programs that
+# need HOME or similar must declare them in the app config's `env`.
 # Supervision loop period in seconds, range (0, 60].
 monitor_interval = {monitor_interval}
 # Control endpoint (URL, shape by scheme): the default below is a local IPC
@@ -2552,6 +2852,332 @@ mod tests {
         ok.validate().unwrap();
     }
 
+    /// harden-daemon-autostart 2.1: the effective state dir resolves
+    /// explicit config → $STATE_DIRECTORY → platform State default; the pure
+    /// resolver drives every branch from synthetic inputs, so the Linux test
+    /// run also covers the Windows and root/non-root paths.
+    #[test]
+    fn state_dir_resolution_order() {
+        // Explicit configuration wins over a present STATE_DIRECTORY.
+        let explicit_first = StateDirEnv {
+            explicit: Some(PathBuf::from("/srv/appkeeper/state")),
+            state_directory: Some("/var/lib/appkeeper/0".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&explicit_first),
+            Some(PathBuf::from("/srv/appkeeper/state"))
+        );
+        // STATE_DIRECTORY (systemd StateDirectory injection) wins over the
+        // platform defaults; the first entry of the colon list is used.
+        let injected = StateDirEnv {
+            state_directory: Some("/var/lib/appkeeper/0:/var/lib/appkeeper".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&injected),
+            Some(PathBuf::from("/var/lib/appkeeper/0"))
+        );
+        // Unix root: /var/lib/appkeeper/<uid>.
+        let root = StateDirEnv {
+            uid: 0,
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&root),
+            Some(PathBuf::from("/var/lib/appkeeper/0"))
+        );
+        // Unix non-root: $XDG_STATE_HOME/appkeeper, else ~/.local/state.
+        let xdg = StateDirEnv {
+            uid: 1000,
+            home: Some("/home/ak".into()),
+            xdg_state_home: Some("/xdg/state".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&xdg),
+            Some(PathBuf::from("/xdg/state/appkeeper"))
+        );
+        let home = StateDirEnv {
+            uid: 1000,
+            home: Some("/home/ak".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&home),
+            Some(PathBuf::from("/home/ak/.local/state/appkeeper"))
+        );
+        // Nothing derivable (no HOME): None — the caller falls back to
+        // log_dir with a warning instead of refusing to start.
+        let nothing = StateDirEnv {
+            uid: 1000,
+            ..StateDirEnv::default()
+        };
+        assert_eq!(resolve_state_dir(&nothing), None);
+    }
+
+    /// Windows branches of the state-dir default (service vs console run
+    /// mode), driven from synthetic inputs so Linux covers them
+    /// (harden-daemon-autostart 2.1).
+    #[test]
+    fn state_dir_windows_service_and_console_defaults() {
+        // Expectations are built with the same `PathBuf::join` the resolver
+        // uses, so the assertion is about the ANCHOR + suffix layout, not the
+        // separator a host platform would render (the resolver runs on every
+        // platform; on Linux the components still concatenate verbatim).
+        let service = StateDirEnv {
+            windows: true,
+            service_mode: true,
+            program_data: Some(r"C:\ProgramData".into()),
+            local_app_data: Some(r"C:\Users\ak\AppData\Local".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&service),
+            Some(
+                PathBuf::from(r"C:\ProgramData")
+                    .join("appkeeper")
+                    .join("state")
+            )
+        );
+        let console = StateDirEnv {
+            windows: true,
+            service_mode: false,
+            program_data: Some(r"C:\ProgramData".into()),
+            local_app_data: Some(r"C:\Users\ak\AppData\Local".into()),
+            ..StateDirEnv::default()
+        };
+        assert_eq!(
+            resolve_state_dir(&console),
+            Some(
+                PathBuf::from(r"C:\Users\ak\AppData\Local")
+                    .join("appkeeper")
+                    .join("state")
+            )
+        );
+        // Missing anchors → None (the runtime falls back to log_dir).
+        let no_anchor = StateDirEnv {
+            windows: true,
+            service_mode: true,
+            ..StateDirEnv::default()
+        };
+        assert_eq!(resolve_state_dir(&no_anchor), None);
+    }
+
+    /// harden-daemon-autostart 5.1: the Windows default config path is the
+    /// machine-level `%ProgramData%` file, with the legacy `%APPDATA%` file
+    /// as a read fallback only when the machine-level one is missing; Linux
+    /// stays `/etc/appkeeper/daemon.toml`. The pure resolver drives all six
+    /// cases from synthetic inputs.
+    #[test]
+    fn default_config_path_windows_machine_level_and_legacy_fallback() {
+        let pd = r"C:\ProgramData";
+        let ad = r"C:\Users\alice\AppData\Roaming";
+        let new_path = || {
+            PathBuf::from(r"C:\ProgramData")
+                .join("appkeeper")
+                .join("daemon.toml")
+        };
+        let old_path = || {
+            PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                .join("appkeeper")
+                .join("daemon.toml")
+        };
+        // 1. Machine-level path exists → it, even when the legacy one does too.
+        let both = ConfigPathEnv {
+            windows: true,
+            program_data: Some(pd.into()),
+            appdata: Some(ad.into()),
+            program_data_exists: true,
+            appdata_exists: true,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(resolve_default_config_path(&both), new_path());
+        // 2. New missing + old exists → the legacy fallback (spec: 旧 Windows
+        //    配置路径兼容回退).
+        let fallback = ConfigPathEnv {
+            windows: true,
+            program_data: Some(pd.into()),
+            appdata: Some(ad.into()),
+            program_data_exists: false,
+            appdata_exists: true,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(resolve_default_config_path(&fallback), old_path());
+        // 3. Both missing → the machine-level path (fresh installs land there).
+        let neither = ConfigPathEnv {
+            windows: true,
+            program_data: Some(pd.into()),
+            appdata: Some(ad.into()),
+            program_data_exists: false,
+            appdata_exists: false,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(resolve_default_config_path(&neither), new_path());
+        // 4. Linux is untouched: /etc/appkeeper/daemon.toml regardless.
+        let linux = ConfigPathEnv {
+            windows: false,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(
+            resolve_default_config_path(&linux),
+            PathBuf::from("/etc/appkeeper/daemon.toml")
+        );
+        // 5. %ProgramData% unset entirely → the legacy anchor is the only
+        //    usable one (mirror of the pre-5.1 corner).
+        let no_pd = ConfigPathEnv {
+            windows: true,
+            appdata: Some(ad.into()),
+            appdata_exists: true,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(resolve_default_config_path(&no_pd), old_path());
+        // 6. No anchors at all → the USERPROFILE corner shape the pre-5.1
+        //    code used.
+        let nothing = ConfigPathEnv {
+            windows: true,
+            user_profile: Some(r"C:\Users\alice".into()),
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(
+            resolve_default_config_path(&nothing),
+            PathBuf::from(r"C:\Users\alice")
+                .join("AppData")
+                .join("Roaming")
+                .join("appkeeper")
+                .join("daemon.toml")
+        );
+    }
+
+    /// harden-daemon-autostart 5.3: the migration target is detected only
+    /// when the CLI resolved the config to the legacy `%APPDATA%` default —
+    /// any other path (a `-c` path, the machine-level path itself) and the
+    /// Linux platform yield `None`.
+    #[test]
+    fn legacy_config_migration_target_detection() {
+        let env = ConfigPathEnv {
+            windows: true,
+            program_data: Some(r"C:\ProgramData".into()),
+            appdata: Some(r"C:\Users\alice\AppData\Roaming".into()),
+            ..ConfigPathEnv::default()
+        };
+        let target = PathBuf::from(r"C:\ProgramData")
+            .join("appkeeper")
+            .join("daemon.toml");
+        // The fallback hit: config path IS the legacy default.
+        assert_eq!(
+            legacy_config_migration_target(
+                &env,
+                &PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                    .join("appkeeper")
+                    .join("daemon.toml")
+            ),
+            Some(target.clone())
+        );
+        // An explicit -c path (anything else) is not the fallback.
+        assert_eq!(
+            legacy_config_migration_target(&env, Path::new(r"C:\conf.toml")),
+            None
+        );
+        // The machine-level path itself is not the fallback either.
+        assert_eq!(legacy_config_migration_target(&env, &target), None);
+        // Linux never reports a migration target.
+        let linux = ConfigPathEnv {
+            windows: false,
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(
+            legacy_config_migration_target(
+                &linux,
+                Path::new(r"C:\Users\alice\AppData\Roaming\appkeeper\daemon.toml")
+            ),
+            None
+        );
+        // %ProgramData% missing → no target to point at.
+        let no_pd = ConfigPathEnv {
+            windows: true,
+            appdata: Some(r"C:\Users\alice\AppData\Roaming".into()),
+            ..ConfigPathEnv::default()
+        };
+        assert_eq!(
+            legacy_config_migration_target(
+                &no_pd,
+                &PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                    .join("appkeeper")
+                    .join("daemon.toml")
+            ),
+            None
+        );
+    }
+
+    /// harden-daemon-autostart 2.1/2.2: a relative or empty state_dir is
+    /// rejected at load time and by the `config --set` parser; an absolute
+    /// one passes both.
+    #[test]
+    fn state_dir_must_be_absolute_when_configured() {
+        let rel: DaemonConfig = toml::from_str("[daemon]\nstate_dir = \"state\"\n").unwrap();
+        let err = rel.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("daemon.state_dir") && err.contains("absolute"),
+            "{err}"
+        );
+        let empty: DaemonConfig = toml::from_str("[daemon]\nstate_dir = \"\"\n").unwrap();
+        let err = empty.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("daemon.state_dir") && err.contains("empty"),
+            "{err}"
+        );
+        let ok: DaemonConfig =
+            toml::from_str("[daemon]\nstate_dir = \"/var/lib/appkeeper/data\"\n").unwrap();
+        ok.validate().unwrap();
+        // The set parser applies the same gate up front (all-or-nothing).
+        let err = parse_sets(&["state_dir=state".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("state_dir") && err.contains("absolute"),
+            "{err}"
+        );
+        assert!(parse_sets(&["state_dir=".to_string()]).is_err());
+        assert!(parse_sets(&["state_dir=/var/lib/appkeeper/data".to_string()]).is_ok());
+    }
+
+    /// harden-daemon-autostart 2.2: state_dir round-trips through the config
+    /// engine — set persists, get prints the file value, delete falls back to
+    /// the derived platform default, and whole-config validation still gates
+    /// (an absolute state_dir cannot be smuggled in as a relative one).
+    #[test]
+    fn state_dir_set_get_delete_roundtrip() {
+        let text = "[daemon]\nsocket = \"/tmp/ak.sock\"\n";
+        let rendered = config_apply_sets(
+            text,
+            &[(
+                "state_dir".to_string(),
+                KeyValue::Str("/var/lib/appkeeper/data".to_string()),
+            )],
+        )
+        .unwrap();
+        assert!(
+            rendered.contains("state_dir = \"/var/lib/appkeeper/data\""),
+            "{rendered}"
+        );
+        assert_eq!(
+            config_effective_value(Some(&rendered), "state_dir").unwrap(),
+            "/var/lib/appkeeper/data"
+        );
+        match config_apply_deletes(&rendered, &["state_dir".to_string()]).unwrap() {
+            DeleteOutcome::Changed(removed) => {
+                assert!(!removed.contains("state_dir ="), "{removed}");
+                let v = config_effective_value(Some(&removed), "state_dir").unwrap();
+                assert!(
+                    Path::new(&v).is_absolute() && v.ends_with("appkeeper"),
+                    "the derived default is this environment's appkeeper state dir: {v:?}"
+                );
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn command_and_args_are_mutually_exclusive() {
         let r = app_of("[program.api]\ncommand = \"python -m x\"\nargs = [\"-m\", \"x\"]\n");
@@ -2769,11 +3395,12 @@ mod tests {
 mod config_cmd_tests {
     use super::*;
 
-    /// The key table covers exactly the 7 documented `[daemon]` keys —
+    /// The key table covers exactly the 8 documented `[daemon]` keys —
     /// `host` / `port` are gone with the control-plane move, while
-    /// `auth_token` returned as a CONDITIONAL key (tcp-control-endpoint 3.1):
-    /// writable, readable and deletable, with its combination rule enforced
-    /// by whole-config validation.
+    /// `auth_token` returned as a CONDITIONAL key (tcp-control-endpoint 3.1)
+    /// and `state_dir` joined for the persistent-state split
+    /// (harden-daemon-autostart): writable, readable and deletable, with the
+    /// combination/absolute-path rules enforced by whole-config validation.
     #[test]
     fn key_table_lists_all_daemon_keys() {
         let names: Vec<_> = DAEMON_KEYS.iter().map(|k| k.name).collect();
@@ -2786,7 +3413,8 @@ mod config_cmd_tests {
                 "socket",
                 "auth_token",
                 "log_buffer_lines",
-                "app_dir"
+                "app_dir",
+                "state_dir"
             ]
         );
         for removed in REMOVED_DAEMON_KEYS {
@@ -3445,6 +4073,14 @@ log_buffer_lines = 7
         assert_eq!(cfg.daemon.socket, d.socket);
         assert_eq!(cfg.daemon.log_buffer_lines, d.log_buffer_lines);
         assert_eq!(cfg.daemon.app_dir, d.app_dir);
+        // harden-daemon-autostart 2.2: state_dir is documented as a COMMENTED
+        // line (unset = derived from $STATE_DIRECTORY / the platform State
+        // default) and the loaded template keeps it unconfigured.
+        assert!(
+            text.contains("# state_dir = \"/var/lib/appkeeper/state\""),
+            "the template documents state_dir: {text}"
+        );
+        assert_eq!(cfg.daemon.state_dir, None);
         // The template guides the out-of-the-box experience with an explicit
         // restart = "always" in [app-default] (configuration spec).
         let app_default = cfg.app_default.as_ref().expect("[app-default] rendered");

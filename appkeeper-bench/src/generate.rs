@@ -113,27 +113,27 @@ pub fn run(
             break;
         }
         // Absolute-schedule pacing for the upcoming line.
-        if let Some(r) = limits.rate {
-            if r > 0.0 {
-                let due = Duration::from_secs_f64((c.rows + 1) as f64 / r);
-                // If the next line is scheduled past the wall clock, stop now
-                // instead of sleeping into the deadline.
-                if let Some(d) = limits.duration {
-                    if due >= d {
-                        break;
-                    }
-                }
-                let target = start + due;
-                let now = Instant::now();
-                if target > now {
-                    std::thread::sleep(target - now);
-                }
-            }
-        }
-        if let Some(d) = limits.duration {
-            if start.elapsed() >= d {
+        if let Some(r) = limits.rate
+            && r > 0.0
+        {
+            let due = Duration::from_secs_f64((c.rows + 1) as f64 / r);
+            // If the next line is scheduled past the wall clock, stop now
+            // instead of sleeping into the deadline.
+            if let Some(d) = limits.duration
+                && due >= d
+            {
                 break;
             }
+            let target = start + due;
+            let now = Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+        }
+        if let Some(d) = limits.duration
+            && start.elapsed() >= d
+        {
+            break;
         }
         let stream = decide_stream(c.rows, stderr_every);
         let ts_ms = SystemTime::now()

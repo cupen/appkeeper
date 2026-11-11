@@ -159,12 +159,12 @@ pub fn discover_daemon(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(p);
     }
     // Sibling of this bench binary (same target profile, or release layout).
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(dir) = me.parent() {
-            let cand = dir.join(exe_name);
-            if cand.is_file() {
-                return Ok(cand);
-            }
+    if let Ok(me) = std::env::current_exe()
+        && let Some(dir) = me.parent()
+    {
+        let cand = dir.join(exe_name);
+        if cand.is_file() {
+            return Ok(cand);
         }
     }
     // Workspace target dirs, debug first (design D4).
@@ -430,10 +430,11 @@ fn bench_app_files(app_dir: &Path) -> Result<Vec<PathBuf>> {
         std::fs::read_dir(app_dir).with_context(|| format!("scan app_dir {}", app_dir.display()))?
     {
         let p = e?.path();
-        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with(BENCH_PREFIX) && name.ends_with(".toml") {
-                out.push(p);
-            }
+        if let Some(name) = p.file_name().and_then(|n| n.to_str())
+            && name.starts_with(BENCH_PREFIX)
+            && name.ends_with(".toml")
+        {
+            out.push(p);
         }
     }
     out.sort();
@@ -486,13 +487,13 @@ pub fn run_cleanup(ctx: &CleanupCtx) {
     let drop_app_files = !(ctx.spawn && ctx.keep);
     if drop_app_files {
         for f in &ctx.app_files {
-            if let Err(e) = std::fs::remove_file(f) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "[bench] warning: cannot remove app file {}: {e}",
-                        f.display()
-                    );
-                }
+            if let Err(e) = std::fs::remove_file(f)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "[bench] warning: cannot remove app file {}: {e}",
+                    f.display()
+                );
             }
         }
         if !ctx.spawn {
@@ -516,22 +517,21 @@ pub fn run_cleanup(ctx: &CleanupCtx) {
     if ctx.spawn {
         let _ = ctx.client.shutdown();
         wait_and_kill_daemon_child();
-        if !ctx.keep {
-            if let Some(root) = &ctx.root {
-                if let Err(e) = std::fs::remove_dir_all(root) {
-                    eprintln!(
-                        "[bench] warning: cannot remove workspace {}: {e}",
-                        root.display()
-                    );
-                }
-            }
+        if !ctx.keep
+            && let Some(root) = &ctx.root
+            && let Err(e) = std::fs::remove_dir_all(root)
+        {
+            eprintln!(
+                "[bench] warning: cannot remove workspace {}: {e}",
+                root.display()
+            );
         }
     }
     // 4. Transient counter dir (kept with the workspace in spawn+keep).
-    if !(ctx.spawn && ctx.keep) {
-        if let Some(cd) = &ctx.count_dir {
-            let _ = std::fs::remove_dir_all(cd);
-        }
+    if !(ctx.spawn && ctx.keep)
+        && let Some(cd) = &ctx.count_dir
+    {
+        let _ = std::fs::remove_dir_all(cd);
     }
 }
 

@@ -263,10 +263,10 @@ impl Client {
         let mut out = Vec::new();
         if let Some(ps) = v.get("programs").and_then(|p| p.as_array()) {
             for p in ps {
-                if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
-                    if name.starts_with(crate::cases::BENCH_PREFIX) {
-                        out.push(name.to_string());
-                    }
+                if let Some(name) = p.get("name").and_then(|n| n.as_str())
+                    && name.starts_with(crate::cases::BENCH_PREFIX)
+                {
+                    out.push(name.to_string());
                 }
             }
         }

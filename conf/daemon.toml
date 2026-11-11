@@ -1,6 +1,8 @@
 # appkeeper daemon 配置模板（daemon.toml）—— 全局唯一：守护进程自身设置 + 所有 app 的公共默认值。
 #
-# 默认查找位置：Linux /etc/appkeeper/daemon.toml，Windows %APPDATA%\appkeeper\daemon.toml；
+# 默认查找位置：Linux /etc/appkeeper/daemon.toml，Windows
+# %ProgramData%\appkeeper\daemon.toml（旧 %APPDATA%\appkeeper\daemon.toml 在
+# 新路径缺失时自动回退兼容）；
 # 可用 --config 覆盖：ak --config conf/daemon.toml run
 # 文件可以不存在 —— 缺失时按本文件注释中的内置默认值运行。
 #
@@ -13,7 +15,24 @@ log_level = "info"
 # 子进程 stdout/stderr 的落盘目录，必须是绝对路径。
 # 注意 /tmp 重启即清空；需要跨重启保留日志请改成如 /var/log/appkeeper。
 # Windows 下默认 %TEMP%\appkeeper\logs。
+# 这里只放日志：持久状态（unless-stopped 的用户停止记录）在下面的 state_dir，
+# 本目录可随时清理/轮转，不影响状态。
 log_dir = "/tmp/appkeeper/logs"
+
+# 持久状态目录（State 类）：unless-stopped 的「用户停止」记录落在这里，必须
+# 跨重启保留。与 log_dir 相互独立——改动或清理 log_dir 不影响记录；必须绝对
+# 路径。未配置时按顺序推导：环境变量 STATE_DIRECTORY（服务形态由 unit 的
+# StateDirectory= 注入，即 /var/lib/appkeeper/<uid>）→ 平台 State 缺省
+# （unix：root 为 /var/lib/appkeeper/<uid>，非 root 为
+# $XDG_STATE_HOME/appkeeper 或 ~/.local/state/appkeeper；Windows：服务形态
+# %ProgramData%\appkeeper\state，控制台 %LOCALAPPDATA%\appkeeper\state）。
+# 在 systemd 之外长期运行、又拿不到 StateDirectory 注入时建议显式配置。
+# state_dir = "/srv/appkeeper/state"
+
+# 服务形态说明（ak daemon install 注册的 systemd unit / Windows 服务）：
+# 守护进程不继承登录 shell 的环境——unit 内固定确定性 PATH，受管程序依赖
+# HOME 等变量时需在 app 配置的 env 里显式声明；停机走 systemctl stop / sc stop
+# （此形态下 ak daemon shutdown 会被拒绝）。
 
 # 守护循环巡检周期（秒），取值范围 (0, 60]
 monitor_interval = 1.0

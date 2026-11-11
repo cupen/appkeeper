@@ -272,18 +272,18 @@ fn flush_batch(
     if batch.is_empty() {
         return;
     }
-    if let Some(l) = limit {
-        if *size >= l {
-            match rotate(path, keep).and_then(|_| open_append(path)) {
-                Ok(f) => {
-                    *file = f;
-                    *size = 0;
-                }
-                Err(e) => {
-                    if !*warned {
-                        warn!("log rotation failed for {}: {e}", path.display());
-                        *warned = true;
-                    }
+    if let Some(l) = limit
+        && *size >= l
+    {
+        match rotate(path, keep).and_then(|_| open_append(path)) {
+            Ok(f) => {
+                *file = f;
+                *size = 0;
+            }
+            Err(e) => {
+                if !*warned {
+                    warn!("log rotation failed for {}: {e}", path.display());
+                    *warned = true;
                 }
             }
         }

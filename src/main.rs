@@ -546,27 +546,13 @@ fn daemon_usage_error(old_unit: bool) -> String {
     }
 }
 
-/// Platform default location for the daemon config.
+/// Platform default location for the daemon config. harden-daemon-autostart
+/// 5.1: on Windows the machine-level `%ProgramData%\appkeeper\daemon.toml`
+/// is the default, with the old `%APPDATA%` path kept as a read fallback for
+/// existing installs; the resolution (and its pure core) lives in
+/// `config::resolve_default_config_path`.
 pub(crate) fn default_config_path() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from("/etc/appkeeper/daemon.toml")
-    }
-    #[cfg(windows)]
-    {
-        // %APPDATA%\appkeeper\daemon.toml
-        match std::env::var("APPDATA") {
-            Ok(appdata) => PathBuf::from(appdata).join("appkeeper").join("daemon.toml"),
-            Err(_) => {
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                PathBuf::from(home)
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("appkeeper")
-                    .join("daemon.toml")
-            }
-        }
-    }
+    config::resolve_default_config_path(&config::ConfigPathEnv::capture())
 }
 
 fn config_path_of(cli: &Cli) -> PathBuf {
@@ -2512,6 +2498,17 @@ fn run_daemon_core(config_path: &Path) -> Result<Arc<Supervisor>> {
     let config_dir = config_dir_of(config_path);
     let sup = Supervisor::new(config, &config_dir)?;
     sup.set_config_path(config_path);
+
+    // 服务托管识别 (harden-daemon-autostart 4.3): judge the service manager
+    // once at startup — Linux sees the systemd-injected `INVOCATION_ID`,
+    // Windows the `--service` run mode — and inject the result before the
+    // control endpoint is bound, so the projection (`managed_by`) and the
+    // shutdown gate only ever see a settled answer.
+    sup.set_managed_by(service::managed_source(
+        service::Platform::current(),
+        service::windows_service_mode(),
+        &|key| std::env::var(key).ok(),
+    ));
 
     // Web console manager: converges the running console to the latest
     // intent (published here for startup and by `reload` later). Bind

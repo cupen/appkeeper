@@ -60,10 +60,10 @@ fn leftover_generators() -> Vec<u32> {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) {
-            if cmdline.split(|&b| b == 0).any(|a| a == b"__generate") {
-                out.push(name.parse().unwrap());
-            }
+        if let Ok(cmdline) = std::fs::read(e.path().join("cmdline"))
+            && cmdline.split(|&b| b == 0).any(|a| a == b"__generate")
+        {
+            out.push(name.parse().unwrap());
         }
     }
     out
@@ -82,10 +82,12 @@ fn leftover_workspaces() -> Vec<PathBuf> {
             let rest = name.strip_prefix("ak-bench-").unwrap_or("");
             let mut parts = rest.split('-');
             let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                if numeric(a) && numeric(b) && parts.next().is_none() {
-                    out.push(e.path());
-                }
+            if let (Some(a), Some(b)) = (parts.next(), parts.next())
+                && numeric(a)
+                && numeric(b)
+                && parts.next().is_none()
+            {
+                out.push(e.path());
             }
         }
     }

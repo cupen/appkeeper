@@ -27,7 +27,18 @@ ak start web                                          # 5. 再启动
 | `ak daemon start --foreground` | 前台运行（systemd / 调试用） |
 | `ak daemon install [--start]` | 注册为系统服务（systemd unit / Windows 服务，需 root/管理员） |
 | `ak daemon uninstall` | 注销系统服务 |
-| `ak daemon shutdown` | 停止全部程序并退出守护进程 |
+| `ak daemon shutdown` | 停止全部程序并退出守护进程（服务托管时被拒绝，见下） |
+
+服务形态（`ak daemon install` 注册的 systemd unit / Windows 服务）要点：
+
+- **停机走服务管理器**：`sudo systemctl stop ak` / `sc stop ak`。服务托管时
+  `ak daemon shutdown` 会以 409 拒绝并提示对应命令——服务生命周期归管理器所有。
+- **环境不继承登录 shell**：unit 内固定确定性 `PATH`；受管程序依赖 `HOME` 等
+  变量时需在 app 配置的 `env` 里显式声明（如 `env = { HOME = "/var/lib/xx" }`）。
+- **日志与持久状态分家**：`log_dir` 只放子进程日志（可随时清理/轮转）；
+  `state_dir` 放持久状态（`unless-stopped` 的用户停止记录），未配置时服务形态
+  由 unit 的 `StateDirectory` 提供（`/var/lib/appkeeper/<uid>`，停服/卸载不删），
+  其余形态按 `STATE_DIRECTORY` → 平台 State 缺省推导，可显式配置覆盖。
 
 **启停（`ak start` / `ak stop` / `ak restart`，双位置参数 `<app> [<program>]`）**
 
@@ -138,11 +149,14 @@ sha256sum -c SHA256SUMS --ignore-missing && tar -xzf "ak-${version}-${target}.ta
 完整模板见 `conf/daemon.toml`、`conf/app.toml`，可运行示例见 `examples/`。
 
 daemon 配置（缺省 Linux `/etc/appkeeper/daemon.toml`，Windows
-`%APPDATA%\appkeeper\daemon.toml`，`-c` 可覆盖）：
+`%ProgramData%\appkeeper\daemon.toml`——旧 `%APPDATA%` 路径缺失时自动回退兼容，
+`-c` 可覆盖）：
 
 ```toml
 [daemon]
-log_dir = "/var/log/appkeeper"      # 缺省 /tmp/appkeeper/logs；必须绝对路径
+log_dir = "/var/log/appkeeper"      # 缺省 /tmp/appkeeper/logs；必须绝对路径；只放子进程日志
+state_dir = "/srv/appkeeper/state"  # 持久状态目录（unless-stopped 用户停止记录）；缺省按
+                                    # STATE_DIRECTORY → 平台 State 缺省推导，独立于 log_dir
 app_dir = "app.d"                   # 注册目录（相对 daemon 配置所在目录）
 # socket = "tcp://127.0.0.1:7310"   # 缺省本地 IPC：/run/appkeeper/<uid>/ak.sock
 # auth_token = "<随机串>"           # 仅 tcp:// 形态必配，路径形态拒绝
@@ -223,7 +237,20 @@ ak config --delete webui                              # 删段 = 关闭
   `ak run -- python -m http.server 8000 --app web`）。
 - 顶层 `reload` 已删：`ak reload` → `ak config --reload`（可与 `--set` /
   `--delete` / `--edit` 组合，`--get`/`--init` 组合为用法错误）。
-- 已装机 systemd unit 必须重新生成：`sudo ak daemon install --force --now`。
+- 已装机 systemd unit 必须重新生成：`sudo ak daemon install --force --now`，
+  以获得硬化键（`KillMode=mixed`、确定性 `Environment=PATH`、开机等网络就绪、
+  `StartLimit*` 启动失败上限）与 `StateDirectory=appkeeper/<uid>`（持久状态目录
+  `/var/lib/appkeeper/<uid>`；`<uid>` 为安装期按 `--user` 解析的运行账号字面
+  uid，root 服务为 0——systemd 的 `%U` 在 system unit 中恒展开为 0，故不可用）。
+- 用户停止记录（`unless-stopped`）已从 `<log_dir>/state.json` 迁到持久状态目录
+  （生效 `state_dir`）：守护进程首次启动自动一次性迁移（目标已有记录不覆盖、
+  失败仅告警），之后改动或清理 `log_dir` 不再影响记录；未显式配置 `state_dir`
+  时按 `STATE_DIRECTORY` → 平台 State 缺省推导（非 root 为
+  `~/.local/state/appkeeper`），建议显式配置以免依赖登录环境。
+- Windows 配置默认路径迁移：`%APPDATA%\appkeeper\daemon.toml` →
+  `%ProgramData%\appkeeper\daemon.toml`（机器级，服务账号可读）；新路径不存在
+  而旧路径存在时自动回退读旧路径，`daemon install` 会输出迁移提示（含 `-c`
+  用法）。
 - `[daemon]` 死键 `host`/`port` 被校验拒绝（端点由 `socket` 表达）；
   `auth_token` 仅 `tcp://` 形态合法。
 - `app_dir` 默认名 `apps` → `app.d`；`startsecs` 默认 1.0s → 3.0s（可显式声明覆盖）。

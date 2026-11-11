@@ -1333,4 +1333,34 @@ mod tests {
         assert!(text.contains(UNREACHABLE), "{text}");
         assert_eq!(exit_code_of(&err), 3);
     }
+
+    /// harden-daemon-autostart 4.5: the shutdown refusal (409) is a business
+    /// answer the CLI reuses verbatim — the message carries the service
+    /// manager's stop command (`systemctl stop <unit>`) and the exit class is
+    /// the non-zero "everything else" (1), never the unreachable 3.
+    #[test]
+    fn shutdown_409_presents_the_service_manager_command() {
+        let port = free_tcp_port();
+        let (_, listener) = bound_tcp(port);
+        let server = fake_server(
+            listener,
+            http_response(
+                "HTTP/1.1 409 Conflict",
+                r#"{"error":"daemon is managed by systemd — stop it with `systemctl stop appkeeper` (it owns the service lifecycle)"}"#,
+            ),
+        );
+        let c = Client::from_config(&config_with_tcp(port, Some("t")));
+        let err = c
+            .shutdown()
+            .expect_err("a managed shutdown must be refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("409"), "{text}");
+        assert!(
+            text.contains("systemctl stop appkeeper"),
+            "the message contains the service manager command: {text}"
+        );
+        assert!(text.contains("systemd"), "{text}");
+        assert_eq!(exit_code_of(&err), 1, "non-zero, but not the unreachable 3");
+        server.join().unwrap();
+    }
 }

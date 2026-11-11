@@ -69,6 +69,16 @@
 //!   plane, then `daemon uninstall` and confirm an idempotent second uninstall.
 //!   A non-admin shell warns and skips; an sc.exe stop+delete scrub guard
 //!   guarantees no `ak-xtask-e2e-*` service is left behind on failure.
+//! - harden-daemon-autostart pass: BS (boot simulation — the same config runs
+//!   `daemon start --foreground` rounds; pull-up per restart policy, the
+//!   unless-stopped user-stop record persists in the explicit state_dir,
+//!   managed_by stays null and `daemon shutdown` exits 0), SD (state_dir
+//!   isolation — a log_dir change cannot lose the record, the legacy
+//!   `<log_dir>/state.json` is migrated once and never overwrites an existing
+//!   target), SM (AK_E2E_SYSTEMD=1 + root gated real-systemd smoke: the
+//!   hardened unit's keys and section placement, managed_by=systemd under the
+//!   unit, shutdown 409 naming `systemctl stop <unit>`, graceful stop with no
+//!   leftover children, uninstall keeps the StateDirectory).
 //!
 //! Fast correctness tests stay in `cargo test` + `pnpm test`; this harness
 //! exists because these paths span process boundaries (child processes, HTTP,
@@ -119,6 +129,11 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     // Forward slashes in the TOML basic string: a raw Windows path would
     // put invalid `\U`-style escapes into the config.
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    // The persistent state rides an EXPLICIT state_dir inside the workspace
+    // (harden-daemon-autostart): the derived default (~/.local/state/appkeeper
+    // for a non-root run) would couple every scenario to one shared record
+    // file and leak user-stop state across workspaces.
+    let state_dir = root.join("state").to_string_lossy().replace('\\', "/");
     // The web console is config-driven: the `[webui]` section enables it and
     // pins its port for the browser pass. `[app-default] restart = "always"`
     // mirrors what `config --init` renders, so the scaffolded apps in this
@@ -133,7 +148,7 @@ fn setup_workspace(tag: &str) -> Result<Workspace> {
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nstate_dir = \"{state_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[app-default]\nrestart = \"always\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
             socket = socket_toml_value(&control_socket),
         ),
     )?;
@@ -558,10 +573,10 @@ fn find_sleep() -> Result<PathBuf> {
     if !dst.is_file() {
         std::fs::copy(&src, &dst)
             .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-        if let Some(dll) = src.parent().map(|d| d.join("msys-2.0.dll")) {
-            if dll.is_file() {
-                let _ = std::fs::copy(&dll, dst_dir.join("msys-2.0.dll"));
-            }
+        if let Some(dll) = src.parent().map(|d| d.join("msys-2.0.dll"))
+            && dll.is_file()
+        {
+            let _ = std::fs::copy(&dll, dst_dir.join("msys-2.0.dll"));
         }
     }
     Ok(dst)
@@ -3070,7 +3085,9 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     )?;
     wait_running(ws, "adhoc-us")?;
     cli(bin, ws, &["stop", "adhoc-us", "adhoc-us"])?;
-    let state_file = ws.root.join("logs/state.json");
+    // harden-daemon-autostart: the record lives in the effective state_dir
+    // (this workspace pins one) — never in log_dir.
+    let state_file = ws.root.join("state/state.json");
     let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
     expect(
         state_text.contains("adhoc-us"),
@@ -3250,10 +3267,13 @@ fn setup_runfirst_workspace() -> Result<Workspace> {
     let control_socket = control_socket_in(&root);
     let webui_port = free_port()?;
     let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    // Explicit workspace-local state_dir — same isolation rule as setup_workspace
+    // (harden-daemon-autostart): the derived default is shared per-user.
+    let state_dir = root.join("state").to_string_lossy().replace('\\', "/");
     std::fs::write(
         root.join("daemon.toml"),
         format!(
-            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nstate_dir = \"{state_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
             socket = socket_toml_value(&control_socket),
         ),
     )?;
@@ -4466,6 +4486,657 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
     let _ = &mut *daemon;
     Ok(())
+}
+
+// -- harden-daemon-autostart: boot simulation / state_dir / systemd smoke ----
+
+/// A per-pass isolated workspace: own socket, log_dir, EXPLICIT workspace
+/// local `state_dir` (harden-daemon-autostart — the derived default would be
+/// shared per-user and couple scenarios), a spare `logs2` for the log-dir
+/// migration scenario, no webui, and one app (name `app_name`) from the given
+/// TOML body.
+fn setup_pass_workspace(tag: &str, app_name: &str, app_toml: &str) -> Result<Workspace> {
+    let root = std::env::temp_dir().join(format!("ak-xtask-e2e-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["apps", "logs", "logs2", "state", "app-pass"] {
+        std::fs::create_dir_all(root.join(d)).context("create pass workspace dirs")?;
+    }
+    std::fs::write(root.join("app-pass/appkeeper.toml"), app_toml)?;
+    link_registration(
+        &root.join("app-pass/appkeeper.toml"),
+        &root.join(format!("apps/{app_name}.toml")),
+    )?;
+    let control_socket = control_socket_in(&root);
+    write_pass_daemon_config(&root, &control_socket, "logs")?;
+    Ok(Workspace {
+        root,
+        control_socket,
+        webui_port: 0,
+    })
+}
+
+/// The `[daemon]` block the pass workspaces run on: socket pinned into the
+/// workspace, `log_dir` the named subdir, `state_dir` the workspace-local
+/// `state/`. Rewritten between rounds (7.3 changes log_dir with the state
+/// pinned).
+fn write_pass_daemon_config(root: &Path, socket: &Path, log_subdir: &str) -> Result<()> {
+    let log_dir = root.join(log_subdir).to_string_lossy().replace('\\', "/");
+    let state_dir = root.join("state").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nstate_dir = \"{state_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"apps\"\n",
+            socket = socket_toml_value(socket),
+        ),
+    )?;
+    Ok(())
+}
+
+/// 7.2 模拟开机 (boot simulation): the SAME daemon config runs
+/// `daemon start --foreground` rounds that mimic a reboot — programs are
+/// pulled up per their restart policy, the unless-stopped user-stop record
+/// persists across the restart, `managed_by` stays null (manual foreground
+/// start is not service-managed) and `ak daemon shutdown` exits 0.
+fn boot_sim_pass(bin: &Path) -> Result<()> {
+    let ws = setup_pass_workspace(
+        "bootsim",
+        "sim",
+        "[app]\n\n[program.sim-always]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\nrestart = \"always\"\n\n[program.sim-us]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\nrestart = \"unless-stopped\"\n\n[program.sim-no]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\nrestart = \"no\"\n",
+    )?;
+    let mut daemon = spawn_daemon(bin, &ws)?;
+    let result = boot_sim_scenarios(bin, &ws, &mut daemon);
+    shutdown_daemon(&ws, &mut daemon);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+fn boot_sim_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
+    step("BS1. boot round 1: pull-up per restart policy; manual start is unmanaged");
+    wait_running(ws, "sim-always")?;
+    wait_running(ws, "sim-us")?;
+    expect(
+        pid_of(ws, "sim-no")?.is_none(),
+        "restart = no is not pulled up at daemon boot",
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/status")?)?;
+    expect(
+        v["daemon"]["managed_by"].is_null(),
+        &format!(
+            "foreground manual start projects managed_by = null, got {}",
+            v["daemon"]["managed_by"]
+        ),
+    )?;
+
+    step("BS2. user stop persists the record in state_dir (never log_dir)");
+    cli(bin, ws, &["stop", "sim", "sim-us"])?;
+    wait_state_in(ws, "sim-us", &["stopped"])?;
+    let record = ws.root.join("state/state.json");
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    expect(
+        text.contains("sim-us"),
+        &format!("the user-stop record is persisted in state_dir: {text:?}"),
+    )?;
+    expect(
+        !ws.root.join("logs/state.json").exists(),
+        "no record is kept in log_dir",
+    )?;
+
+    step("BS3. `ak daemon shutdown` on a manual daemon exits 0");
+    shutdown_and_wait(bin, ws)?;
+
+    step("BS4. boot round 2 (same config): record keeps unless-stopped down");
+    *daemon = spawn_daemon(bin, ws)?;
+    wait_running(ws, "sim-always")?;
+    expect(
+        pid_of(ws, "sim-no")?.is_none(),
+        "restart = no stays down across the restart",
+    )?;
+    expect(
+        pid_of(ws, "sim-us")?.is_none(),
+        "unless-stopped stays stopped across the reboot (record kept)",
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&api(ws, "/v1/status")?)?;
+    expect(
+        v["daemon"]["managed_by"].is_null(),
+        "the second manual boot is still unmanaged",
+    )?;
+    // An explicit start clears the record.
+    cli(bin, ws, &["start", "sim", "sim-us"])?;
+    wait_running(ws, "sim-us")?;
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    expect(
+        !text.contains("sim-us"),
+        &format!("an explicit start cleared the record: {text:?}"),
+    )?;
+    Ok(())
+}
+
+/// 7.3 state_dir isolation + one-time migration: a user stop lands in the
+/// explicit state_dir, a log_dir change (round 2) cannot lose it, and a
+/// legacy `<log_dir>/state.json` is migrated once (removed at the old spot,
+/// an existing record at the target is never overwritten).
+fn state_dir_pass(bin: &Path) -> Result<()> {
+    let ws = setup_pass_workspace(
+        "statedir",
+        "sd",
+        "[app]\n\n[program.sd-a]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\nrestart = \"unless-stopped\"\n\n[program.sd-b]\ncommand = \"sleep 100000\"\nstartsecs = 0.2\nrestart = \"unless-stopped\"\n",
+    )?;
+    let mut daemon = spawn_daemon(bin, &ws)?;
+    let result = state_dir_scenarios(bin, &ws, &mut daemon);
+    shutdown_daemon(&ws, &mut daemon);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+fn state_dir_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
+    let record = ws.root.join("state/state.json");
+    step("SD1. explicit state_dir: the user stop lands there, not in log_dir");
+    wait_running(ws, "sd-a")?;
+    wait_running(ws, "sd-b")?;
+    cli(bin, ws, &["stop", "sd", "sd-a"])?;
+    wait_state_in(ws, "sd-a", &["stopped"])?;
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    expect(
+        text.contains("sd-a"),
+        &format!("the record is in the explicit state_dir: {text:?}"),
+    )?;
+    expect(
+        !ws.root.join("logs/state.json").exists(),
+        "log_dir holds no record",
+    )?;
+    shutdown_and_wait(bin, ws)?;
+
+    step("SD2. changing log_dir cannot lose the record");
+    write_pass_daemon_config(&ws.root, &ws.control_socket, "logs2")?;
+    *daemon = spawn_daemon(bin, ws)?;
+    expect(
+        pid_of(ws, "sd-a")?.is_none(),
+        "sd-a stays stopped after the log_dir change (record independent of log_dir)",
+    )?;
+    wait_running(ws, "sd-b")?;
+    shutdown_and_wait(bin, ws)?;
+
+    step("SD3. legacy <log_dir>/state.json is migrated once on boot");
+    // Pre-upgrade shape: the record sits in the CURRENT log_dir and the state
+    // dir has nothing yet.
+    std::fs::remove_file(&record).ok();
+    std::fs::write(
+        ws.root.join("logs2/state.json"),
+        "{\"user_stopped\": [\"sd-a\"]}",
+    )?;
+    *daemon = spawn_daemon(bin, ws)?;
+    expect(
+        !ws.root.join("logs2/state.json").exists(),
+        "the legacy record was removed from the old location",
+    )?;
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    expect(
+        text.contains("sd-a"),
+        &format!("the legacy record now lives in state_dir: {text:?}"),
+    )?;
+    expect(
+        pid_of(ws, "sd-a")?.is_none(),
+        "the migrated record keeps sd-a stopped",
+    )?;
+    wait_running(ws, "sd-b")?;
+    shutdown_and_wait(bin, ws)?;
+
+    step("SD4. an existing record at the target is never overwritten");
+    std::fs::write(
+        ws.root.join("logs2/state.json"),
+        "{\"user_stopped\": [\"sd-a\", \"sd-b\"]}",
+    )?;
+    *daemon = spawn_daemon(bin, ws)?;
+    expect(
+        ws.root.join("logs2/state.json").exists(),
+        "the legacy file stays in place when the target already has a record",
+    )?;
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    expect(
+        text.contains("sd-a") && !text.contains("sd-b"),
+        &format!("the target record was not merged/overwritten: {text:?}"),
+    )?;
+    expect(
+        pid_of(ws, "sd-a")?.is_none(),
+        "sd-a still governed by the state_dir record",
+    )?;
+    wait_running(ws, "sd-b")?;
+    Ok(())
+}
+
+/// One parsed `[section]` of a unit file: (name, key=value pairs in order).
+#[cfg_attr(windows, allow(dead_code))] // only the gated unix smoke calls it
+fn unit_sections(unit: &str) -> Vec<(&str, Vec<(&str, &str)>)> {
+    let mut out: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+    for line in unit.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            out.push((name, Vec::new()));
+            continue;
+        }
+        if let (Some(section), Some((k, v))) = (out.last_mut(), line.split_once('=')) {
+            section.1.push((k.trim(), v.trim()));
+        }
+    }
+    out
+}
+
+/// The value of `key` inside `section`, or `None` (wrong section = missing).
+#[cfg_attr(windows, allow(dead_code))] // only the gated unix smoke calls it
+fn unit_value<'a>(
+    secs: &'a [(&str, Vec<(&'a str, &'a str)>)],
+    section: &str,
+    key: &str,
+) -> Option<&'a str> {
+    secs.iter()
+        .find(|(n, _)| *n == section)
+        .and_then(|(_, kvs)| kvs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
+}
+
+/// The SM2 unit assertions ride a root-gated smoke, so the section parser is
+/// pinned here against a sample that mirrors `render_unit`'s output shape
+/// (src/service.rs's own tests pin the renderer itself).
+#[cfg(test)]
+mod unit_assert_tests {
+    use super::*;
+
+    const SAMPLE_UNIT: &str = "\
+[Unit]
+Description=appkeeper process keeper
+Wants=network-online.target
+After=network.target network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/local/bin/ak daemon start --foreground --config /etc/appkeeper/daemon.toml
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=16
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RuntimeDirectory=appkeeper/0
+RuntimeDirectoryMode=0700
+StateDirectory=appkeeper/0
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
+";
+
+    #[test]
+    fn unit_sections_expose_keys_per_section() {
+        let secs = unit_sections(SAMPLE_UNIT);
+        assert_eq!(
+            unit_value(&secs, "Unit", "After"),
+            Some("network.target network-online.target")
+        );
+        assert_eq!(
+            unit_value(&secs, "Unit", "StartLimitIntervalSec"),
+            Some("60")
+        );
+        assert_eq!(unit_value(&secs, "Unit", "StartLimitBurst"), Some("5"));
+        assert_eq!(unit_value(&secs, "Service", "KillMode"), Some("mixed"));
+        assert_eq!(
+            unit_value(&secs, "Service", "RuntimeDirectory"),
+            // The per-uid layer carries the LITERAL uid of the service
+            // account (root smoke install = 0): `%U` would always expand to
+            // 0 in a system unit regardless of User= (systemd.unit(5)).
+            Some("appkeeper/0")
+        );
+        assert_eq!(
+            unit_value(&secs, "Service", "StateDirectory"),
+            Some("appkeeper/0")
+        );
+        assert_eq!(
+            unit_value(&secs, "Service", "Environment"),
+            Some("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        );
+        assert_eq!(
+            unit_value(&secs, "Install", "WantedBy"),
+            Some("multi-user.target")
+        );
+        // Keys do not leak across sections.
+        assert_eq!(unit_value(&secs, "Service", "StartLimitBurst"), None);
+        assert_eq!(unit_value(&secs, "Unit", "KillMode"), None);
+    }
+
+    #[test]
+    fn unit_sections_keep_section_order() {
+        let (iu, is, ii) = (
+            SAMPLE_UNIT.find("[Unit]"),
+            SAMPLE_UNIT.find("[Service]"),
+            SAMPLE_UNIT.find("[Install]"),
+        );
+        assert!(matches!((iu, is, ii), (Some(a), Some(b), Some(c)) if a < b && b < c));
+    }
+}
+
+/// The last journal lines of one unit — failure diagnostics for the smoke.
+#[cfg(unix)]
+fn systemd_unit_journal(unit: &str) -> String {
+    Command::new("journalctl")
+        .args(["-u", unit, "-n", "40", "--no-pager"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// 7.4 real-systemd smoke + 7.1 unit content assertions. Gated: runs ONLY
+/// with `AK_E2E_SYSTEMD=1` as root on a booted systemd host (it registers a
+/// real, uniquely named unit and boots the daemon as a system service);
+/// every other environment prints skip and continues.
+fn systemd_smoke_pass(bin: &Path) -> Result<()> {
+    let gated = std::env::var("AK_E2E_SYSTEMD").ok().as_deref() == Some("1");
+    if !cfg!(unix) || current_uid_e2e() != 0 || !gated {
+        println!(
+            "    skip: the systemd smoke needs AK_E2E_SYSTEMD=1 and root \
+             (installs a real unit and boots it)"
+        );
+        return Ok(());
+    }
+    if !Path::new("/run/systemd/system").is_dir() {
+        println!("    skip: no running systemd manager (/run/systemd/system is missing)");
+        return Ok(());
+    }
+    let root = std::env::temp_dir().join(format!("ak-xtask-systemd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root)?;
+    let result = systemd_smoke_body(bin, &root);
+    // Scrub guard (mirrors the Windows service pass): no ak-e2e-smoke unit may
+    // survive a failed run.
+    let unit = format!("ak-e2e-smoke-{}.service", std::process::id());
+    let _ = Command::new("systemctl").args(["stop", &unit]).output();
+    let _ = Command::new("systemctl").args(["disable", &unit]).output();
+    let _ = std::fs::remove_file(Path::new("/etc/systemd/system").join(&unit));
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+fn systemd_smoke_body(bin: &Path, root: &Path) -> Result<()> {
+    for d in ["apps", "logs", "state", "app-smoke"] {
+        std::fs::create_dir_all(root.join(d))?;
+    }
+    let socket = root.join("ak.sock");
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    let state_dir = root.join("state").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nsocket = {:?}\nlog_dir = \"{log_dir}\"\nstate_dir = \"{state_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.3\napp_dir = \"apps\"\n",
+            socket.to_string_lossy(),
+        ),
+    )?;
+    let sleep = find_sleep()?;
+    std::fs::write(
+        root.join("app-smoke/appkeeper.toml"),
+        format!(
+            "[app]\n\n[program.smoke]\ncommand = {:?}\nstartsecs = 0.2\nrestart = \"always\"\n",
+            sleep.to_string_lossy()
+        ),
+    )?;
+    link_registration(
+        &root.join("app-smoke/appkeeper.toml"),
+        &root.join("apps/smoke.toml"),
+    )?;
+    let ws = Workspace {
+        root: root.to_path_buf(),
+        control_socket: socket,
+        webui_port: 0,
+    };
+    let unit_name = format!("ak-e2e-smoke-{}", std::process::id());
+    let unit_path = Path::new("/etc/systemd/system").join(format!("{unit_name}.service"));
+
+    step("SM1. real systemd: `install --start` registers and boots the service");
+    cli(
+        bin,
+        &ws,
+        &[
+            "daemon",
+            "install",
+            "--unit-file",
+            unit_path.to_str().unwrap(),
+            "--start",
+        ],
+    )?;
+
+    step("SM2. unit content: hardening keys land in the right sections");
+    let unit_text = std::fs::read_to_string(&unit_path)?;
+    let secs = unit_sections(&unit_text);
+    // [Unit]: boot ordering + start-rate limit.
+    expect(
+        unit_value(&secs, "Unit", "Wants") == Some("network-online.target"),
+        &format!(
+            "Wants=network-online.target in [Unit]: {:?}",
+            unit_value(&secs, "Unit", "Wants")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Unit", "After") == Some("network.target network-online.target"),
+        &format!(
+            "After=network.target network-online.target in [Unit]: {:?}",
+            unit_value(&secs, "Unit", "After")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Unit", "StartLimitIntervalSec") == Some("60"),
+        &format!(
+            "StartLimitIntervalSec=60 in [Unit]: {:?}",
+            unit_value(&secs, "Unit", "StartLimitIntervalSec")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Unit", "StartLimitBurst") == Some("5"),
+        &format!(
+            "StartLimitBurst=5 in [Unit]: {:?}",
+            unit_value(&secs, "Unit", "StartLimitBurst")
+        ),
+    )?;
+    // [Service]: the hardened stop/restart/runtime/state set.
+    let exec = unit_value(&secs, "Service", "ExecStart").unwrap_or_default();
+    expect(
+        exec.contains("daemon start --foreground --config"),
+        &format!("ExecStart is the foreground entry: {exec:?}"),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "Restart") == Some("always"),
+        &format!(
+            "Restart=always (default policy): {:?}",
+            unit_value(&secs, "Service", "Restart")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "KillMode") == Some("mixed"),
+        &format!(
+            "KillMode=mixed: {:?}",
+            unit_value(&secs, "Service", "KillMode")
+        ),
+    )?;
+    expect(
+        // The smoke installs as root without --user, so the literal uid is 0
+        // (`%U` would expand to 0 anyway — but NOT because of User=; the
+        // literal keeps non-root installs pointing at their own uid layer).
+        unit_value(&secs, "Service", "RuntimeDirectory") == Some("appkeeper/0"),
+        &format!(
+            "RuntimeDirectory=appkeeper/0: {:?}",
+            unit_value(&secs, "Service", "RuntimeDirectory")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "RuntimeDirectoryMode") == Some("0700"),
+        &format!(
+            "RuntimeDirectoryMode=0700: {:?}",
+            unit_value(&secs, "Service", "RuntimeDirectoryMode")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "StateDirectory") == Some("appkeeper/0"),
+        &format!(
+            "StateDirectory=appkeeper/0: {:?}",
+            unit_value(&secs, "Service", "StateDirectory")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "StateDirectoryMode") == Some("0750"),
+        &format!(
+            "StateDirectoryMode=0750: {:?}",
+            unit_value(&secs, "Service", "StateDirectoryMode")
+        ),
+    )?;
+    expect(
+        unit_value(&secs, "Service", "Environment")
+            == Some("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        &format!(
+            "Environment=PATH=… is pinned: {:?}",
+            unit_value(&secs, "Service", "Environment")
+        ),
+    )?;
+    // The stop budget derives from the slowest stop_timeout (2×3.0s + 10s).
+    let tts = unit_value(&secs, "Service", "TimeoutStopSec")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    expect(
+        tts >= 16,
+        &format!("TimeoutStopSec >= 2*stop_timeout+10: {tts}"),
+    )?;
+    expect(
+        !unit_text.contains("KillMode=control-group")
+            && !unit_text.contains("ProtectSystem")
+            && !unit_text.contains("RuntimeDirectory=appkeeper\n"),
+        "no shared-root runtime dir, no control-group kill, no sandbox directives",
+    )?;
+    expect(
+        unit_value(&secs, "Install", "WantedBy") == Some("multi-user.target"),
+        &format!(
+            "WantedBy=multi-user.target in [Install]: {:?}",
+            unit_value(&secs, "Install", "WantedBy")
+        ),
+    )?;
+    let (iu, is, ii) = (
+        unit_text.find("[Unit]"),
+        unit_text.find("[Service]"),
+        unit_text.find("[Install]"),
+    );
+    expect(
+        matches!((iu, is, ii), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        &format!("section order [Unit] < [Service] < [Install]: {iu:?} {is:?} {ii:?}"),
+    )?;
+
+    step("SM3. service-managed daemon: managed_by=systemd, shutdown refused");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if socket_health_ok(&ws.control_socket) {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the systemd-smoke daemon never became healthy: {}",
+                systemd_unit_journal(&unit_name)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    wait_running(&ws, "smoke")?;
+    let pid = pid_of(&ws, "smoke")?.context("the smoke program has a pid")?;
+    let v: serde_json::Value = serde_json::from_str(&api(&ws, "/v1/status")?)?;
+    expect(
+        v["daemon"]["managed_by"] == "systemd",
+        &format!(
+            "managed_by projects systemd under the unit, got {}",
+            v["daemon"]["managed_by"]
+        ),
+    )?;
+    let (code, body) = control_http(&ws.control_socket, "POST", "/v1/shutdown", None)?;
+    expect(
+        code == 409,
+        &format!("shutdown of a systemd-managed daemon is 409, got {code}: {body}"),
+    )?;
+    expect(
+        body.contains("systemctl stop") && body.contains(&unit_name),
+        &format!("the 409 names `systemctl stop <unit>`: {body}"),
+    )?;
+    expect(
+        pid_of(&ws, "smoke")? == Some(pid),
+        "the refused shutdown stopped nothing",
+    )?;
+
+    step("SM4. systemctl stop: graceful, no leftover children");
+    let out = Command::new("systemctl")
+        .args(["stop", &format!("{unit_name}.service")])
+        .output()
+        .context("systemctl stop")?;
+    expect(out.status.success(), "systemctl stop succeeded")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if !socket_health_ok(&ws.control_socket) {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the daemon did not exit after systemctl stop: {}",
+                systemd_unit_journal(&unit_name)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // KillMode=mixed + the daemon's own graceful stop: the child must be gone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(pid) {
+        if Instant::now() > deadline {
+            bail!("leftover child process {pid} after systemctl stop");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let active = Command::new("systemctl")
+        .args(["is-active", &format!("{unit_name}.service")])
+        .output()
+        .context("systemctl is-active")?;
+    expect(
+        !active.status.success(),
+        "the unit is inactive after the stop",
+    )?;
+    // The unit's StateDirectory (/var/lib/appkeeper/0 for the root unit) must
+    // survive both the stop and the uninstall below.
+    expect(
+        Path::new("/var/lib/appkeeper/0").is_dir(),
+        "the unit's StateDirectory survives the stop",
+    )?;
+
+    step("SM5. uninstall removes the unit, keeps the state");
+    cli(
+        bin,
+        &ws,
+        &[
+            "daemon",
+            "uninstall",
+            "--unit-file",
+            unit_path.to_str().unwrap(),
+        ],
+    )?;
+    expect(!unit_path.exists(), "the unit file is gone")?;
+    let enabled = Command::new("systemctl")
+        .args(["is-enabled", &format!("{unit_name}.service")])
+        .output()
+        .context("systemctl is-enabled")?;
+    expect(!enabled.status.success(), "the unit is no longer enabled")?;
+    expect(
+        Path::new("/var/lib/appkeeper/0").is_dir(),
+        "uninstall did not delete the StateDirectory",
+    )?;
+    Ok(())
+}
+
+/// Non-unix hosts never reach the systemd smoke (the gate above already
+/// skips); this arm only keeps the call site cfg-free.
+#[cfg(not(unix))]
+fn systemd_smoke_body(_bin: &Path, _root: &Path) -> Result<()> {
+    bail!("the systemd smoke is unix-only")
 }
 
 /// Ask the daemon to shut down and wait for the endpoint to go quiet.
@@ -6027,10 +6698,12 @@ fn bench_workspaces() -> Vec<PathBuf> {
             };
             let mut parts = rest.split('-');
             let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                if numeric(a) && numeric(b) && parts.next().is_none() {
-                    out.push(e.path());
-                }
+            if let (Some(a), Some(b)) = (parts.next(), parts.next())
+                && numeric(a)
+                && numeric(b)
+                && parts.next().is_none()
+            {
+                out.push(e.path());
             }
         }
     }
@@ -6442,10 +7115,10 @@ fn tcp_wait_running(bin: &Path, ws: &TcpWs, program: &str) -> Result<u32> {
             .and_then(|ps| ps.iter().find(|p| p["name"] == program))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        if prog["state"] == "running" {
-            if let Some(pid) = prog["pid"].as_u64() {
-                return Ok(pid as u32);
-            }
+        if prog["state"] == "running"
+            && let Some(pid) = prog["pid"].as_u64()
+        {
+            return Ok(pid as u32);
         }
         if Instant::now() > deadline {
             bail!("{program} never reached running (tcp form): {prog}");
@@ -8110,6 +8783,15 @@ fn windows_service_pass(bin: &Path) -> Result<()> {
 
 pub(crate) fn run(args: Args) -> Result<()> {
     let started = Instant::now();
+    // The e2e drives the MANUAL-start path end to end. A harness that itself
+    // runs inside a systemd scope (a desktop user session, a CI runner unit)
+    // leaks INVOCATION_ID into every child — CLI auto-pulled daemons included
+    // — which would flip managed_by to `systemd` and turn the managed-shutdown
+    // refusals on for every scenario. The gated SM smoke is unaffected: a real
+    // systemd manager re-injects the variable into the unit's own environment.
+    // SAFETY: single-threaded at entry — no other thread reads the environment
+    // yet, and every later child inherits the cleaned table.
+    unsafe { std::env::remove_var("INVOCATION_ID") };
     let bin = crate::build_daemon()?;
     let ws = setup_workspace("main")?;
     // The actions scenario app must exist before the daemon boots (bootstrap
@@ -8134,6 +8816,8 @@ pub(crate) fn run(args: Args) -> Result<()> {
         remove_guard_pass(&bin)?;
         run_daemon_first_pass(&bin)?;
         detach_pass(&bin)?;
+        boot_sim_pass(&bin)?;
+        state_dir_pass(&bin)?;
         stop_signal_pass(&bin)?;
         webui_pass(&bin, &ws)?;
         if args.no_browser {
@@ -8145,6 +8829,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         }
         bench_pass(&bin, &ws)?;
         tcp_control_endpoint_pass(&bin)?;
+        systemd_smoke_pass(&bin)?;
         #[cfg(windows)]
         windows_service_pass(&bin)?;
         Ok(())
