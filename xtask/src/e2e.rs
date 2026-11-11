@@ -4732,6 +4732,51 @@ fn compose_up_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         api(ws, "/v1/status")?.contains("p0_web"),
         "the auto-pulled daemon serves the new app",
     )?;
+
+    // The dev-lifecycle round (README 开发场景速览): the developer stops the
+    // app for the day — the record lands in the explicit state_dir — and the
+    // NEXT offline `compose up` pulls the daemon up again: the unless-stopped
+    // program stays down with the notice while the boot pulls the rest per
+    // policy, and the identical up never rewrites the record.
+    let record0 = apps.join("proj.toml");
+    let mtime0 = mtime_of(&record0);
+    cli(bin, ws, &["stop", "proj", "p0_opt"])?;
+    wait_state_in(ws, "p0_opt", &["stopped"])?;
+    let state_text = std::fs::read_to_string(ws.root.join("state/state.json")).unwrap_or_default();
+    expect(
+        state_text.contains("p0_opt"),
+        &format!("the user stop record landed in the explicit state_dir: {state_text:?}"),
+    )?;
+    cli(bin, ws, &["daemon", "shutdown"])?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while socket_health_ok(&ws.control_socket) {
+        if Instant::now() > deadline {
+            bail!("the auto-pulled-up daemon did not shut down");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let out = cli(bin, ws, &["compose", "up", &proj_s])?;
+    expect(
+        out.contains("daemon started in the background"),
+        &format!("the second dev round pulls the daemon up again: {out:?}"),
+    )?;
+    expect(
+        out.contains("p0_opt skipped")
+            && out.contains("kept it stopped")
+            && out.contains("ak start proj p0_opt"),
+        &format!("the kept-stopped notice names the record and the pull-up hint: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "p0_opt")?.is_none(),
+        "the stop record keeps the unless-stopped program down across the implicit pull-up",
+    )?;
+    expect(
+        mtime_of(&record0) == mtime0,
+        "the identical up never rewrites the record",
+    )?;
+    wait_running(ws, "p0_web")?;
+    wait_running(ws, "p0_worker")?;
+
     // The adopted daemon is shut down again so the explicit spawn below owns
     // the control plane.
     cli(bin, ws, &["daemon", "shutdown"])?;
@@ -4858,6 +4903,66 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     )?;
     expect(
         mtime_of(&record2) == mtime_before,
+        "the record was not rewritten",
+    )?;
+
+    step(
+        "CU3b. identical: a naturally-exited program is pulled up (the reachable ensure-running path)",
+    );
+    // The end-to-end shape of the ensure-running pull-up: an `on-failure`
+    // program whose exit code is expected lands `exited` with no user stop
+    // record — the same shape a daemon boot loads, so the identical up pulls
+    // it exactly as a boot would, and the record stays untouched. (A
+    // `stopped`-without-record program is boot-only state mid-lifetime: every
+    // CLI stop writes the record.)
+    let exit_proj = ws.root.join("exit-proj");
+    std::fs::create_dir_all(&exit_proj)?;
+    std::fs::write(
+        exit_proj.join(".appkeeper.toml"),
+        format!(
+            "[program.of_web]\ncommand = \"{sleep_s}\"\nargs = [\"2\"]\nstartsecs = 0.2\nrestart = \"on-failure\"\n"
+        ),
+    )?;
+    let exit_s = exit_proj.to_string_lossy().replace('\\', "/");
+    let exit_record = apps.join("exit-proj.toml");
+    let out = cli(bin, ws, &["compose", "up", &exit_s])?;
+    expect(
+        out.contains("app[exit-proj] registered"),
+        &format!("the fresh on-failure declaration registers: {out:?}"),
+    )?;
+    wait_running(ws, "of_web")?;
+    let exit_mtime = mtime_of(&exit_record);
+    // exit 0 is on-failure's expected code: no restart, just `exited`.
+    wait_state_in(ws, "of_web", &["exited"])?;
+    expect(
+        pid_of(ws, "of_web")?.is_none(),
+        "the program is down on its own (no stop record involved)",
+    )?;
+    let out = cli(bin, ws, &["compose", "up", &exit_s])?;
+    expect(
+        out.contains("converged") && out.contains("started of_web"),
+        &format!("the identical up pulled the exited program: {out:?}"),
+    )?;
+    expect(
+        mtime_of(&exit_record) == exit_mtime,
+        "ensure-running never rewrites the record",
+    )?;
+    wait_running(ws, "of_web")?;
+    // The record branch of the same gates: with a user stop record the same
+    // identical up keeps the program down with the notice.
+    cli(bin, ws, &["stop", "exit-proj", "of_web"])?;
+    wait_state_in(ws, "of_web", &["stopped"])?;
+    let out = cli(bin, ws, &["compose", "up", &exit_s])?;
+    expect(
+        out.contains("unchanged") && out.contains("kept it stopped"),
+        &format!("the user stop record branch keeps it stopped: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "of_web")?.is_none(),
+        "the recorded program stays stopped",
+    )?;
+    expect(
+        mtime_of(&exit_record) == exit_mtime,
         "the record was not rewritten",
     )?;
 
@@ -7973,7 +8078,21 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
         token: "tcp-e2e-token",
         cfg: cfg.clone(),
     };
+    // Failure guard (the other passes' convention): the scenarios' daemon is
+    // stopped through the control plane and the workspace scrubbed whether or
+    // not the scenarios succeeded.
+    let result = tcp_control_scenarios(bin, &ws, &root);
+    let _ = tcp_get(&ws.addr, "/v1/shutdown", Some(ws.token));
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
 
+fn tcp_control_scenarios(bin: &Path, ws: &TcpWs, root: &Path) -> Result<()> {
+    // Recomputed from the wrapper's setup so the scenario bodies stay
+    // self-contained (the same values the daemon config pins).
+    let endpoint = format!("tcp://{}", ws.addr);
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    let app_dir = root.join("apps").to_string_lossy().replace('\\', "/");
     // T0. The combination gate: `tcp://` without a token fails validate AND
     // the daemon refuses to boot (control-plane spec: TCP 无 token 不可启动).
     let no_token_cfg = root.join("daemon-no-token.toml");
@@ -8041,14 +8160,14 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // (background-daemon spec: the readiness probe dials the configured
     // endpoint whatever shape it is).
     let sleep = find_sleep()?;
-    let (ok, code, combined) = tcp_cli_try(bin, &ws, &["ps"]);
+    let (ok, code, combined) = tcp_cli_try(bin, ws, &["ps"]);
     expect(
         !ok && code == 3 && combined.contains("unreachable"),
         &format!("offline tcp:// ps is exit-3 unreachable, got {code}: {combined:?}"),
     )?;
     let out = tcp_cli(
         bin,
-        &ws,
+        ws,
         &[
             "compose",
             sleep.to_str().unwrap(),
@@ -8075,22 +8194,22 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     // T2. Control subcommands over TCP with the correct token: the same
     // verbs, same outputs as the IPC form (control-plane spec: TCP 形态提供
     // 同一套端点).
-    let pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
-    let out = tcp_cli(bin, &ws, &["ps"])?;
+    let pid = tcp_wait_running(bin, ws, "tcpdemo")?;
+    let out = tcp_cli(bin, ws, &["ps"])?;
     expect(
         out.contains("tcpdemo") && out.contains("running") && !out.contains("starting"),
         &format!("ps lists the program over tcp://: {out:?}"),
     )?;
     expect(
-        tcp_cli(bin, &ws, &["pid", "tcpdemo"])?.trim() == pid.to_string(),
+        tcp_cli(bin, ws, &["pid", "tcpdemo"])?.trim() == pid.to_string(),
         "pid prints the live pid over tcp://",
     )?;
     // `log` rides the token'd endpoint too; the sleeper is silent, so the
     // assertion is the exit-0 round trip itself.
-    tcp_cli(bin, &ws, &["log", "tcpdemo", "--tail", "5"])?;
+    tcp_cli(bin, ws, &["log", "tcpdemo", "--tail", "5"])?;
     let out = tcp_cli(
         bin,
-        &ws,
+        ws,
         &[
             "run",
             "--",
@@ -8104,7 +8223,7 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
         out.contains("tcpadhoc") && out.contains("pid"),
         &format!("ad-hoc run registers over tcp://: {out:?}"),
     )?;
-    tcp_wait_running(bin, &ws, "tcpadhoc")?;
+    tcp_wait_running(bin, ws, "tcpadhoc")?;
     // reload + apply ride the token'd endpoint too (a disk edit enters
     // pending, reload previews it, apply lands it).
     std::fs::write(
@@ -8114,36 +8233,68 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
             sleep.display().to_string()
         ),
     )?;
-    let out = tcp_cli(bin, &ws, &["config", "--reload"])?;
+    let out = tcp_cli(bin, ws, &["config", "--reload"])?;
     expect(
         out.contains("tcpdemo") && out.contains("apply"),
         &format!("reload previews the pending change over tcp://: {out:?}"),
     )?;
-    let out = tcp_cli(bin, &ws, &["apply"])?;
+    let out = tcp_cli(bin, ws, &["apply"])?;
     expect(
         out.contains("update-and-restart") && out.contains("tcpdemo"),
         &format!("apply lands the change over tcp://: {out:?}"),
     )?;
-    let new_pid = tcp_wait_running(bin, &ws, "tcpdemo")?;
+    let new_pid = tcp_wait_running(bin, ws, "tcpdemo")?;
     expect(
         new_pid != pid,
         "the changed program was restarted (pid changed)",
     )?;
     // stop + start round the gate as well.
-    tcp_cli(bin, &ws, &["stop", "tcpadhoc"])?;
+    tcp_cli(bin, ws, &["stop", "tcpadhoc"])?;
     let (ok, _code, combined) = {
         // Starting a registered app goes through `start <app>`.
-        tcp_cli_try(bin, &ws, &["start", "tcpadhoc"])
+        tcp_cli_try(bin, ws, &["start", "tcpadhoc"])
     };
     expect(
         ok,
         &format!("start <app> restarts the stopped program: {combined:?}"),
     )?;
-    tcp_wait_running(bin, &ws, "tcpadhoc")?;
+    tcp_wait_running(bin, ws, "tcpadhoc")?;
     expect(
-        tcp_cli(bin, &ws, &["ps", "--all"])?.contains("tcpdemo"),
+        tcp_cli(bin, ws, &["ps", "--all"])?.contains("tcpdemo"),
         "ps --all works over tcp://",
     )?;
+
+    // T2b. `compose up` over tcp:// submits CONTENT, not a file path
+    // (control-plane spec: 远程客户端按内容提交): the caller reads the
+    // declaration and posts it with its base dir, and the daemon renders the
+    // relative work_dir against that base dir — the landed record proves the
+    // render happened from the submitted content (the renderer joins without
+    // normalizing, so `./data` shows up verbatim after the base dir).
+    let tcp_proj = root.join("tcp-proj");
+    let tcp_sub = tcp_proj.join("./data");
+    std::fs::create_dir_all(&tcp_sub)?;
+    std::fs::write(
+        tcp_proj.join(".appkeeper.toml"),
+        format!(
+            "[program.tcp_up]\ncommand = {:?}\nargs = [\"100000\"]\nstartsecs = 0.2\nwork_dir = \"./data\"\n",
+            sleep.display().to_string()
+        ),
+    )?;
+    let out = tcp_cli(bin, ws, &["compose", "up", tcp_proj.to_str().unwrap()])?;
+    expect(
+        out.contains("app[tcp-proj] registered"),
+        &format!("compose up registers over tcp://: {out:?}"),
+    )?;
+    let record_text = std::fs::read_to_string(root.join("apps/tcp-proj.toml"))?;
+    let rendered_wd = format!("work_dir = \"{}\"", tcp_sub.display());
+    expect(
+        record_text.contains(&rendered_wd),
+        &format!(
+            "the record renders work_dir from the caller's base dir (want {rendered_wd:?}): \
+             {record_text:?}"
+        ),
+    )?;
+    tcp_wait_running(bin, ws, "tcp_up")?;
 
     // T3. Wire contract: /v1/health is credential-free, /v1/status is not
     // (control-plane spec: TCP 形态拒绝匿名请求 / 健康探测免凭据).
@@ -8202,9 +8353,8 @@ fn tcp_control_endpoint_pass(bin: &Path) -> Result<()> {
     )?;
 
     // T5. Shutdown through the token'd endpoint; the daemon goes away.
-    tcp_cli(bin, &ws, &["daemon", "shutdown"])?;
-    tcp_wait_dead(&ws)?;
-    let _ = std::fs::remove_dir_all(&root);
+    tcp_cli(bin, ws, &["daemon", "shutdown"])?;
+    tcp_wait_dead(ws)?;
     Ok(())
 }
 

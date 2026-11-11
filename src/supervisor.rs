@@ -2755,9 +2755,14 @@ impl Supervisor {
     /// `identical` submission (D5): no disk write; pull up the app's programs
     /// that the daemon start rules pull up — `no` never, `unless-stopped` only
     /// without a user stop record (reported as a notice), `always`/
-    /// `on-failure` always. The user stop records themselves are never
-    /// written or cleared by `up` (it is a deployment convergence, not a
-    /// program-level start).
+    /// `on-failure` always. The start rules reach the daemon-boot state where
+    /// every loaded program is `stopped`, so a program that has since dropped
+    /// to `exited` on its own (e.g. `on-failure` with an expected exit code)
+    /// is pulled exactly as a boot would pull it; `fatal` is left alone (a
+    /// convergence command must not relaunch a program that exhausted its
+    /// start retries — the notice points at an explicit start). The user stop
+    /// records themselves are never written or cleared by `up` (it is a
+    /// deployment convergence, not a program-level start).
     fn ensure_running_app(
         &self,
         name: &str,
@@ -2782,16 +2787,20 @@ impl Supervisor {
                     program: pname.clone(),
                     reason: "auto-restart pending (backoff)".into(),
                 }),
-                // The daemon start rules only pull `stopped` programs.
-                ProgramState::Exited | ProgramState::Fatal | ProgramState::Stopping => skipped
-                    .push(ComposeSkip {
-                        program: pname.clone(),
-                        reason: format!(
-                            "program is {} (the daemon start rules do not pull it up)",
-                            p.state()
-                        ),
-                    }),
-                ProgramState::Stopped => {
+                // A fatal program is re-pulled only by an explicit start;
+                // `stopping` is transient and settles on its own.
+                ProgramState::Fatal | ProgramState::Stopping => skipped.push(ComposeSkip {
+                    program: pname.clone(),
+                    reason: format!(
+                        "program is {} (an explicit `ak start {name} {pname}` pulls it up)",
+                        p.state()
+                    ),
+                }),
+                // The daemon start rules pull `stopped` programs; a program
+                // that exited on its own is in the same "not running, no user
+                // stop record" shape a boot would load, so the identical
+                // policy/record gates apply (spec: identical 提交无操作或补拉起).
+                ProgramState::Stopped | ProgramState::Exited => {
                     let record_kept = p.user_stopped() || st.user_stopped.contains(&pname);
                     if record_kept {
                         skipped.push(ComposeSkip {
@@ -7692,6 +7701,61 @@ mod tests {
         // Committing without a staged entry is an error — the endpoint simply
         // never commits this branch.
         assert!(adhoc_commit(&sup, "shop").is_err());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3, branch 2 in its end-to-end reachable shape: a program that dropped
+    /// to `exited` on its own (`on-failure` with an expected exit code) is in
+    /// exactly the "not running, no user stop record" shape a daemon boot
+    /// loads, so the identical submission pulls it up without rewriting the
+    /// record — the same gate set the `stopped` branch applies.
+    #[test]
+    fn compose_identical_pulls_up_exited_programs() {
+        let (sup, dir, h) = adhoc_harness("compose-exited");
+        let base = compose_base("exited");
+        let sleep = sleep_bin().to_str().unwrap().replace('\\', "/");
+        // `brief` outlives the startsecs-0 judgement (~first poll) and then
+        // exits 0 — inside `on-failure`'s expected list, so it lands `exited`
+        // and stays there (process-management spec: on-failure 对期望退出码不重启).
+        #[cfg(unix)]
+        let brief = "\n[program.brief]\ncommand = '/bin/sh'\nargs = ['-c', 'sleep 1']\n\
+                     startsecs = 0.0\nrestart = 'on-failure'\n";
+        #[cfg(windows)]
+        let brief = "\n[program.brief]\ncommand = 'cmd'\n\
+                     args = ['/c', 'ping -n 2 127.0.0.1 >nul']\n\
+                     startsecs = 0.0\nrestart = 'on-failure'\n";
+        let content = format!(
+            "[program.web]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\n\
+             restart = 'always'\n{brief}"
+        );
+        let first = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        wait_compose(&sup, &first);
+        adhoc_commit(&sup, "shop").unwrap();
+        wait_state(&sup, "brief", ProgramState::Exited);
+        assert!(
+            !sup.state.lock().unwrap().user_stopped.contains("brief"),
+            "a natural exit writes no user stop record"
+        );
+        let record = dir.join("app.d").join("shop.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        let web_pid = sup.state.lock().unwrap().programs["web"].pid();
+
+        let again = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        assert!(again.identical && !again.unchanged, "{again:?}");
+        assert_eq!(again.waits.len(), 1, "only the exited program: {again:?}");
+        assert_eq!(again.waits[0].program, "brief", "{again:?}");
+        wait_compose(&sup, &again);
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["brief"].state(), ProgramState::Running);
+            assert_eq!(st.programs["web"].pid(), web_pid, "web untouched");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "the record is not rewritten by ensure-running"
+        );
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
