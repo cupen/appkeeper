@@ -234,7 +234,10 @@ enum Cmd {
     },
     /// Register an app (deploy dir, config file, or executable)
     Compose {
-        /// App dir, config file, or executable to scaffold from
+        /// App dir, config file, or executable to scaffold from. `up` is
+        /// reserved for the `compose up` subcommand — a project directory
+        /// named `up` needs the file form (`compose up -f up/.appkeeper.toml`
+        /// or `compose ./up`)
         #[arg(default_value = ".")]
         path: PathBuf,
         /// App name (default: directory or executable name; `all` is reserved)
@@ -261,6 +264,9 @@ enum Cmd {
         /// Apply this app right after registering
         #[arg(long = "apply")]
         apply: bool,
+        /// The declarative `compose up` form (add-compose-up)
+        #[command(subcommand)]
+        sub: Option<ComposeSub>,
     },
     /// Unregister an app: only when it has no running/starting/stopping/
     /// backoff program; the daemon removes it immediately (no apply needed)
@@ -274,6 +280,40 @@ enum Cmd {
         /// Execute one command and exit
         #[arg(short = 'e', long = "exec")]
         cmd: Option<String>,
+    },
+}
+
+/// The `compose up` subcommand family (add-compose-up D6). `up` is a reserved
+/// first argument of `compose`: `ak compose up [dir]` brings a whole
+/// `.appkeeper.toml` declaration up through the daemon in one command.
+#[derive(Subcommand, Debug)]
+enum ComposeSub {
+    /// Register and start every program of a `.appkeeper.toml` via the daemon
+    /// (daemon-first; the record lands at the app_dir top level)
+    #[command(
+        after_help = "Lookup: <DIR>/.appkeeper.toml only — no upward search. The word `up` \
+is reserved, so a project directory named `up` cannot be the positional: pass \
+`-f up/.appkeeper.toml` (or register it with `ak compose ./up`).\n\nContent \
+tuning flags (--restart/--priority/...) are refused here — the declaration file \
+is the single source of truth."
+    )]
+    Up {
+        /// Project directory holding the declaration (default: `.`)
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Declaration file (any name; default: <DIR>/.appkeeper.toml)
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// App name (default: the declaration directory's name; `all` is reserved)
+        #[arg(long = "name", value_name = "APP")]
+        name: Option<String>,
+        /// Skip the update confirmation (the non-interactive yes: stop, rewrite,
+        /// restart on a same-name record)
+        #[arg(long = "force")]
+        force: bool,
+        /// Machine-readable output: the NDJSON frame stream is passed through
+        #[arg(long = "json")]
+        json: bool,
     },
 }
 
@@ -341,6 +381,11 @@ fn main() {
     // subcommand (daemon-subcommand spec). Intercepted before clap for the
     // same reason — the error must carry the per-form migration hint.
     reject_removed_run();
+    // `compose up` rejects the content-tuning flags with a message that says
+    // WHY (the declaration file is the only content source of truth) — clap
+    // could only answer "unexpected argument", so this is intercepted first
+    // (add-compose-up app-registry spec).
+    reject_compose_up_tweak_flags();
     let cli = Cli::parse();
     let code = match dispatch(&cli) {
         Ok(()) => EXIT_OK,
@@ -544,6 +589,104 @@ fn daemon_usage_error(old_unit: bool) -> String {
     } else {
         base.to_string()
     }
+}
+
+// -- compose up: pre-clap interception + CLI helpers (add-compose-up) ---------
+
+/// The content-tuning flags the `compose` path form carries and `compose up`
+/// MUST refuse (app-registry spec: the declaration file is the single content
+/// source of truth).
+const COMPOSE_UP_TWEAK_FLAGS: [&str; 8] = [
+    "--restart",
+    "--restart-backoff",
+    "--priority",
+    "--args",
+    "--env",
+    "--workdir",
+    "--description",
+    "--apply",
+];
+
+/// Which tokens of the argv after the `compose` token belong to the `up`
+/// subcommand form: the first positional-looking token after `compose`
+/// (global `-c/--config` flags and compose's own flag tokens skipped with
+/// their values) is exactly `up`. `None` when the argv is some other
+/// `compose` form — the path dispatch's business, never intercepted.
+fn compose_up_form_end(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    // Tokens before the subcommand: global flags (rejected-removed-form style).
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => i += 2,
+            _ if args[i].starts_with("--config=") => i += 1,
+            _ if args[i].starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    if args.get(i).map(String::as_str) != Some("compose") {
+        return None;
+    }
+    // After `compose`: flag tokens (with their values for the value-taking
+    // path-form flags), then the first positional decides.
+    let mut j = i + 1;
+    while j < args.len() {
+        match args[j].as_str() {
+            "--name" | "--description" | "--restart" | "--restart-backoff" | "--args" | "--env"
+            | "--workdir" => j += 2, // flag + its value
+            _ if args[j].starts_with("--name=") || args[j].starts_with("--env=") => j += 1,
+            _ if args[j].starts_with('-') => j += 1,
+            _ => break,
+        }
+    }
+    (args.get(j).map(String::as_str) == Some("up")).then_some(j + 1)
+}
+
+/// The `compose up` command line's content-tuning flags (empty when the form
+/// does not match or the flags are all legal). Pure so the parse tests can
+/// drive every branch (add-compose-up task 4.1).
+fn compose_up_tweak_flags(args: &[String]) -> Vec<String> {
+    let Some(mut i) = compose_up_form_end(args) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    while i < args.len() {
+        let tok = args[i].as_str();
+        match tok {
+            // Legal value-taking flags: skip the value so a file named
+            // `--restart` is not misread as a flag.
+            "-f" | "--file" | "--name" => i += 2,
+            _ if tok.starts_with("--file=") || tok.starts_with("--name=") => i += 1,
+            other => {
+                let flag = other.split('=').next().unwrap_or(other);
+                if COMPOSE_UP_TWEAK_FLAGS.contains(&flag) && !found.iter().any(|f| f == flag) {
+                    found.push(flag.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    found
+}
+
+/// The usage error for content-tuning flags on `compose up` (app-registry
+/// spec: 说明 up 不接受内容微调旗标，配置内容只能改声明文件).
+fn compose_up_tweak_error(flags: &[String]) -> String {
+    format!(
+        "`compose up` does not accept content-tuning flags ({}) — the declaration file \
+         (.appkeeper.toml) is the single source of truth: edit it and run `compose up` again",
+        flags.join(", ")
+    )
+}
+
+/// Exit-2 interception of the tweak flags on the `compose up` form.
+fn reject_compose_up_tweak_flags() {
+    let args = argv();
+    let flags = compose_up_tweak_flags(&args);
+    if flags.is_empty() {
+        return;
+    }
+    eprintln!("ak: error: {}", compose_up_tweak_error(&flags));
+    std::process::exit(EXIT_CONFIG);
 }
 
 /// Platform default location for the daemon config. harden-daemon-autostart
@@ -768,6 +911,24 @@ fn dispatch(cli: &Cli) -> Result<()> {
             stream,
         }) => client_cmd(&config_path, |c| log_cmd(c, names, *tail, *follow, stream)),
         Some(Cmd::Compose {
+            sub:
+                Some(ComposeSub::Up {
+                    dir,
+                    file,
+                    name,
+                    force,
+                    json,
+                }),
+            ..
+        }) => compose_up_cmd(
+            &config_path,
+            dir.as_deref(),
+            file.as_deref(),
+            name.as_deref(),
+            *force,
+            *json,
+        ),
+        Some(Cmd::Compose {
             path,
             name,
             description,
@@ -778,6 +939,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             envs,
             workdir,
             apply: apply_now,
+            sub: None,
         }) => {
             let config = client::load_config(&config_path)?;
             let config_dir = config_dir_of(&config_path);
@@ -1018,9 +1180,9 @@ fn run_background(config_path: &Path) -> Result<()> {
     }
 }
 
-/// Local registration rows for `ps` (name / config object / description).
-/// Broken records are filtered out (`ListedApp::good`), the same semantics the
-/// former `list` verb had.
+/// Local registration rows for `ps` (name / config object / description /
+/// origin marker). Broken records are filtered out (`ListedApp::good`), the
+/// same semantics the former `list` verb had.
 fn ps_registry_rows(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<shell::RegistryRow>> {
     Ok(
         registry::ListedApp::good(registry::list(config, config_dir)?)
@@ -1029,6 +1191,7 @@ fn ps_registry_rows(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<shel
                 name: a.name,
                 path: a.path.display().to_string(),
                 description: a.description,
+                origin: a.origin,
             })
             .collect(),
     )
@@ -1118,6 +1281,7 @@ fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
                                 "name": r.name,
                                 "config_path": r.path,
                                 "description": r.description,
+                                "origin": r.origin.as_str(),
                                 "state": "not-applied",
                             })
                         })
@@ -1136,6 +1300,7 @@ fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
                             "name": r.name,
                             "config_path": r.path,
                             "description": r.description,
+                            "origin": r.origin.as_str(),
                         })
                     })
                     .collect();
@@ -2012,6 +2177,462 @@ fn apply_after_add(config: &DaemonConfig, config_path: &Path, app: &str) -> AddA
         ),
         Err(e) => AddApplyOutcome::Failed(format!("{e:#}"), client::exit_code_of(&e)),
     }
+}
+
+// -- compose up (add-compose-up) ----------------------------------------------
+
+/// `ak compose up [dir]`: declarative one-command bring-up (add-compose-up
+/// D6). The CLI reads the declaration, asks the daemon for the
+/// zero-side-effect preview, resolves the same-name branch (TTY confirmation
+/// for needs-update/adhoc-takeover) and streams the execution frames. With
+/// the daemon offline it is pulled up in the background first
+/// (`daemonize::ensure_daemon` — the `compose --apply` family behavior).
+fn compose_up_cmd(
+    config_path: &Path,
+    dir: Option<&Path>,
+    file: Option<&Path>,
+    name: Option<&str>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    // 1. Client-side resolution: declaration file, base dir, app name. All
+    //    failures here are config-class errors with zero side effects and no
+    //    daemon contact (app-registry spec: 找不到声明文件 / 保留字与非法名).
+    let decl = match compose_up_declaration_path(dir, file) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("ak: error: {msg}");
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
+    let content = std::fs::read_to_string(&decl)
+        .with_context(|| format!("cannot read the declaration {}", decl.display()))?;
+    let base_dir = match compose_up_base_dir(&decl) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("ak: error: {msg}");
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
+    let app = match compose_up_app_name(&base_dir, name) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("ak: error: {msg}");
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
+
+    // 2. Daemon-first with the implicit background pull-up (app-registry
+    //    spec: 守护离线隐式拉起 — never an offline error, never offline
+    //    direct writes).
+    let config = client::load_config(config_path)?;
+    let config_dir = config_dir_of(config_path);
+    match daemonize::ensure_daemon(&config, config_path, &config_dir) {
+        daemonize::SpawnOutcome::Ready { already_online } => {
+            if !already_online && !json {
+                println!("daemon started in the background");
+            }
+        }
+        daemonize::SpawnOutcome::TimedOut { log_path } => {
+            eprintln!(
+                "ak: error: the daemon did not become ready, so app[{app}] could not be \
+                 brought up; see {} (check the config with `ak validate`)",
+                log_path.display()
+            );
+            std::process::exit(EXIT_ERROR);
+        }
+    }
+
+    // 3. Preview (zero side effects): the daemon renders + classifies.
+    let c = client::Client::from_config(&config);
+    let pv = match c.compose_up_preview(&compose_up_body(&app, &content, &base_dir, false)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ak: error: {e:#}");
+            std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    let class = pv
+        .get("classification")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !json {
+        print_up_preview(&app, &pv);
+    }
+
+    // 4. The same-name branch: TTY confirmation for needs-update /
+    //    adhoc-takeover, refusal for external-refused (with or without
+    //    --force), direct submission otherwise.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let needs_confirmation = matches!(class.as_str(), "needs-update" | "adhoc-takeover");
+    let answer = if needs_confirmation && interactive && !force {
+        // The prompt rides stderr so a piped/captured stdout stays clean.
+        eprint!("{}", compose_up_prompt(&app, &class));
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        Some(line)
+    } else {
+        None
+    };
+    let submit_force = match compose_up_decision(&class, force, interactive, answer.as_deref()) {
+        UpDecision::Submit(f) => f,
+        UpDecision::Decline => {
+            eprintln!(
+                "ak: error: nothing was changed — the existing record and its programs \
+                 are untouched"
+            );
+            std::process::exit(EXIT_ERROR);
+        }
+        UpDecision::RefuseNoTty => {
+            eprintln!(
+                "ak: error: app {app:?} needs a confirmation ({class}) but this session \
+                 is not interactive — re-run with --force to skip the prompt"
+            );
+            std::process::exit(EXIT_ERROR);
+        }
+        UpDecision::RefuseExternal => {
+            let hint = pv.get("hint").and_then(|h| h.as_str()).unwrap_or("");
+            eprintln!("ak: error: {hint}");
+            std::process::exit(EXIT_ERROR);
+        }
+    };
+
+    // 5. Submit and stream. A non-2xx answer (a race moved the classification
+    //    between preview and submit, or staging failed) is an api error.
+    let mut terminal = serde_json::Value::Null;
+    let frames = c.compose_up(
+        &compose_up_body(&app, &content, &base_dir, submit_force),
+        |frame| {
+            if json {
+                // --json 直通帧流: every frame passes through as one JSON line.
+                if let Ok(line) = serde_json::to_string(frame) {
+                    println!("{line}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            } else {
+                print_up_frame(frame);
+            }
+            terminal = frame.clone();
+        },
+    );
+    if let Err(e) = frames {
+        eprintln!("ak: error: {e:#}");
+        std::process::exit(client::exit_code_of(&e));
+    }
+    let (code, out, err) = up_terminal_render(&terminal, json);
+    for line in out {
+        println!("{line}");
+    }
+    for line in err {
+        eprintln!("{line}");
+    }
+    if code != EXIT_OK {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The `/v1/compose/up(/preview)` request body: the declaration CONTENT, the
+/// base directory and the caller's PATH — never a file path (control-plane
+/// spec: TCP 形态下 CLI 与守护进程可不在同一台机器).
+fn compose_up_body(app: &str, content: &str, base_dir: &Path, force: bool) -> serde_json::Value {
+    serde_json::json!({
+        "name": app,
+        "content": content,
+        "base_dir": base_dir.display().to_string(),
+        "caller_path": std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned()),
+        "force": force,
+    })
+}
+
+/// The declaration file `compose up` reads: `-f` wins (the name is
+/// unrestricted); otherwise the ONLY candidate is `<dir>/.appkeeper.toml` —
+/// no upward recursion (add-compose-up spec). The error names the searched
+/// location(s).
+fn compose_up_declaration_path(
+    dir: Option<&Path>,
+    file: Option<&Path>,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(f) = file {
+        if f.is_file() {
+            return Ok(f.to_path_buf());
+        }
+        return Err(format!(
+            "declaration file {} not found (`-f` names the file exactly, no search)",
+            f.display()
+        ));
+    }
+    let dir = dir.unwrap_or(Path::new("."));
+    let candidate = dir.join(config::DECLARATION_FILE);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    if !dir.is_dir() {
+        return Err(format!(
+            "{} is not a directory (looked for {}); pass `-f <file>` to name the \
+             declaration explicitly",
+            dir.display(),
+            candidate.display()
+        ));
+    }
+    Err(format!(
+        "no declaration at {} (compose up does not search parent directories); pass \
+         `-f <file>` to name the declaration explicitly",
+        candidate.display()
+    ))
+}
+
+/// The rendering base directory: the declaration file's directory,
+/// canonicalized so relative `work_dir`s land as absolute paths.
+fn compose_up_base_dir(decl: &Path) -> std::result::Result<PathBuf, String> {
+    let dir = decl.parent().unwrap_or(Path::new("."));
+    std::fs::canonicalize(dir).map_err(|e| {
+        format!(
+            "cannot resolve the declaration directory {}: {e}",
+            dir.display()
+        )
+    })
+}
+
+/// The compose-up app name: `--name` wins; the default is the declaration
+/// directory's name. Both must pass the shared naming rules and never be the
+/// reserved `all` — validated before any daemon contact (zero side effects).
+fn compose_up_app_name(
+    base_dir: &Path,
+    override_name: Option<&str>,
+) -> std::result::Result<String, String> {
+    let name = match override_name {
+        Some(n) => n.to_string(),
+        None => base_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "app".to_string()),
+    };
+    if config::RESERVED_APP_NAMES.contains(&name.as_str()) {
+        return Err(format!(
+            "app name {name:?} is reserved: `ak apply all` means apply-all; choose another --name"
+        ));
+    }
+    if !config::is_valid_name(&name) {
+        return Err(format!(
+            "app name {name:?} is invalid: {} (pass --name to choose one)",
+            config::NAME_RULE
+        ));
+    }
+    Ok(name)
+}
+
+/// What `compose up` does after the preview (add-compose-up D6 / app-registry
+/// spec). Pure over the classification, the flags and the session kind so
+/// every branch is unit-testable (tasks 4.2/4.3).
+#[derive(Debug, PartialEq, Eq)]
+enum UpDecision {
+    /// Submit with this force flag (fresh/identical ride the caller's flag;
+    /// the daemon ignores it for those classes).
+    Submit(bool),
+    /// The user answered no on the TTY: zero changes, non-zero exit.
+    Decline,
+    /// Confirmation needed but stdin is not a TTY: zero side effects, non-zero
+    /// exit; `--force` is the documented bypass.
+    RefuseNoTty,
+    /// An external deployment record: never overwritten, even with --force.
+    RefuseExternal,
+}
+
+/// The post-preview decision (app-registry spec): external-refused refuses
+/// outright; needs-update/adhoc-takeover need `--force` or an interactive
+/// yes; a decline and a non-TTY session both refuse with zero side effects;
+/// fresh/identical submit directly.
+fn compose_up_decision(
+    class: &str,
+    force: bool,
+    interactive: bool,
+    answer: Option<&str>,
+) -> UpDecision {
+    match class {
+        "external-refused" => UpDecision::RefuseExternal,
+        "needs-update" | "adhoc-takeover" => {
+            if force {
+                // `--force` is the passthrough form of answering yes.
+                return UpDecision::Submit(true);
+            }
+            if !interactive {
+                return UpDecision::RefuseNoTty;
+            }
+            match answer.map(|a| a.trim().to_ascii_lowercase()) {
+                Some(a) if a == "y" || a == "yes" => UpDecision::Submit(true),
+                _ => UpDecision::Decline,
+            }
+        }
+        _ => UpDecision::Submit(force),
+    }
+}
+
+/// The TTY confirmation prompt (add-compose-up D6): the takeover branch says
+/// what adoption means.
+fn compose_up_prompt(app: &str, class: &str) -> String {
+    if class == "adhoc-takeover" {
+        format!(
+            "app {app:?} is a run (ad-hoc) record — adopt it as a compose record \
+             (stop, rewrite, restart)? [y/N] "
+        )
+    } else {
+        format!(
+            "app {app:?} already exists with a different configuration — overwrite it \
+             (stop, rewrite, restart)? [y/N] "
+        )
+    }
+}
+
+/// The human preview summary printed before the submission (add-compose-up
+/// D3: the CLI renders the classification details the daemon attached).
+fn print_up_preview(app: &str, pv: &serde_json::Value) {
+    let class = pv
+        .get("classification")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let record = pv.get("record_path").and_then(|v| v.as_str()).unwrap_or("");
+    match class {
+        "fresh" => println!("app[{app}] is new — registering via the daemon"),
+        "identical" => {
+            println!("declaration matches app[{app}] ({record}) — converging programs");
+        }
+        "needs-update" | "adhoc-takeover" => {
+            let what = if class == "adhoc-takeover" {
+                "is an ad-hoc run record"
+            } else {
+                "differs from the declaration"
+            };
+            println!("app[{app}] {what} (record {record}):");
+            if let Some(diff) = pv.get("diff").and_then(|d| d.as_array()) {
+                for d in diff {
+                    if let Some(text) = d.as_str() {
+                        println!("  changed: {text}");
+                    }
+                }
+            }
+            print_up_program_states(pv);
+        }
+        "external-refused" => {
+            // The refusal message carries the daemon's hint.
+        }
+        _ => {}
+    }
+}
+
+/// The existing programs' states as the preview reports them.
+fn print_up_program_states(pv: &serde_json::Value) {
+    if let Some(programs) = pv.get("programs").and_then(|p| p.as_array()) {
+        for p in programs {
+            let name = p.get("program").and_then(|v| v.as_str()).unwrap_or("?");
+            let state = p.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let stopped = p
+                .get("user_stopped")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            println!(
+                "  program {name} is {state}{}",
+                if stopped { " (user stopped)" } else { "" }
+            );
+        }
+    }
+}
+
+/// One human-readable progress frame of the compose-up stream (add-compose-up
+/// task 4.2: 进度逐行打印).
+fn print_up_frame(frame: &serde_json::Value) {
+    match frame.get("phase").and_then(|p| p.as_str()) {
+        Some("staged") | Some("ensuring") => {
+            if let Some(line) = progress_line(frame) {
+                println!("{line}");
+            } else {
+                println!("ensuring the declared programs are running...");
+            }
+        }
+        Some("starting") => {
+            let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
+            println!("starting {program}...");
+        }
+        Some("started") => {
+            let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("?");
+            let pid = frame.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+            println!("started {program} (pid {pid})");
+        }
+        _ => {}
+    }
+}
+
+/// Pure rendering of the compose-up terminal frame into `(exit_code, stdout,
+/// stderr)` (add-compose-up tasks 4.2/4.3). In `--json` mode the frame stream
+/// already passed through, so only the exit code comes back. Skipped programs
+/// (restart=no / user stop records) surface as notes in both branches.
+fn up_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<String>, Vec<String>) {
+    let ok = frame.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+    if json {
+        return (
+            if ok { EXIT_OK } else { EXIT_ERROR },
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if !ok {
+        let phase = frame
+            .get("phase")
+            .and_then(|p| p.as_str())
+            .unwrap_or("startup");
+        let program = frame.get("program").and_then(|p| p.as_str());
+        let reason = frame
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("compose up failed");
+        let scope = program.map(|p| format!(" ({p})")).unwrap_or_default();
+        return (
+            EXIT_ERROR,
+            Vec::new(),
+            vec![format!("ak: error: {phase}{scope}: {reason}")],
+        );
+    }
+    let app = frame.get("app").and_then(|a| a.as_str()).unwrap_or("?");
+    let config_path = frame
+        .get("config_path")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let unchanged = frame.get("unchanged").and_then(|u| u.as_bool()) == Some(true);
+    let identical = frame.get("identical").and_then(|u| u.as_bool()) == Some(true);
+    let mut out = Vec::new();
+    if unchanged {
+        out.push(format!(
+            "app[{app}] unchanged: the declaration matches the record and every program \
+             is running"
+        ));
+    } else if identical {
+        out.push(format!(
+            "app[{app}] converged: the record was untouched, missing programs were pulled up"
+        ));
+    } else {
+        out.push(format!("app[{app}] registered"));
+        out.push(format!("  config: {config_path}"));
+    }
+    if let Some(programs) = frame.get("programs").and_then(|p| p.as_array()) {
+        for p in programs {
+            let name = p.get("program").and_then(|v| v.as_str()).unwrap_or("?");
+            let pid = p.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+            out.push(format!("  started {name} (pid {pid})"));
+        }
+    }
+    if let Some(skipped) = frame.get("skipped").and_then(|p| p.as_array()) {
+        for s in skipped {
+            let name = s.get("program").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = s.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            out.push(format!("  note: {name} skipped: {reason}"));
+        }
+    }
+    (EXIT_OK, out, Vec::new())
 }
 
 // -- validate ---------------------------------------------------------------
@@ -4284,5 +4905,352 @@ mod cli_verb_tests {
         );
         assert!(projection_apps(&serde_json::json!({})).is_empty());
         assert!(projection_apps(&serde_json::json!({"programs": []})).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests: `compose up` CLI (add-compose-up tasks 4.1/4.2/4.3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod compose_up_tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Cli {
+        let mut full = vec!["appkeeper"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(&full).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"))
+    }
+
+    fn up_of(cli: &Cli) -> &ComposeSub {
+        match &cli.cmd {
+            Some(Cmd::Compose {
+                sub: Some(up @ ComposeSub::Up { .. }),
+                ..
+            }) => up,
+            _ => panic!("expected Compose up, got {:?}", cli.cmd),
+        }
+    }
+
+    /// 4.1: `compose up` parses as the reserved subcommand with `dir` default
+    /// `.` and exactly the four flags; the path form keeps working next to it.
+    #[test]
+    fn compose_up_parses_and_path_form_survives() {
+        let cli = parse(&["compose", "up"]);
+        match up_of(&cli) {
+            ComposeSub::Up {
+                dir,
+                file,
+                name,
+                force,
+                json,
+            } => {
+                assert_eq!(dir.as_deref(), None, "dir defaults to `.` in dispatch");
+                assert!(file.is_none() && name.is_none());
+                assert!(!force && !json);
+            }
+        }
+        let cli = parse(&["compose", "up", "proj"]);
+        match up_of(&cli) {
+            ComposeSub::Up { dir, .. } => assert_eq!(dir.as_deref(), Some(Path::new("proj"))),
+        }
+        let cli = parse(&["compose", "up", "-f", "up/.appkeeper.toml", "--name", "x"]);
+        match up_of(&cli) {
+            ComposeSub::Up { file, name, .. } => {
+                assert_eq!(file.as_deref(), Some(Path::new("up/.appkeeper.toml")));
+                assert_eq!(name.as_deref(), Some("x"));
+            }
+        }
+        let cli = parse(&["compose", "up", "--force", "--json"]);
+        assert!(matches!(
+            up_of(&cli),
+            ComposeSub::Up {
+                force: true,
+                json: true,
+                ..
+            }
+        ));
+        // The path form is untouched: a non-`up` positional stays the scaffold
+        // flow, and `--config` rides as a global in both positions.
+        let cli = parse(&["compose", "."]);
+        assert!(matches!(cli.cmd, Some(Cmd::Compose { sub: None, .. })));
+        let cli = parse(&["-c", "/tmp/x.toml", "compose", "up"]);
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/tmp/x.toml")));
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Compose {
+                sub: Some(ComposeSub::Up { .. }),
+                ..
+            })
+        ));
+    }
+
+    /// 4.1: the content-tuning flags are a usage error naming the reason
+    /// (the declaration file is the single source of truth). Pure detector:
+    /// every tweak flag, the `=` form, and non-`up` compose forms are shaped
+    /// right.
+    #[test]
+    fn compose_up_tweak_flags_rejected_with_reason() {
+        let args: Vec<String> = ["compose", "up", "--restart", "always"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(compose_up_tweak_flags(&args), vec!["--restart".to_string()]);
+        assert!(compose_up_tweak_error(&compose_up_tweak_flags(&args)).contains("single source"));
+        let args: Vec<String> = ["compose", "up", "--priority=5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            compose_up_tweak_flags(&args),
+            vec!["--priority".to_string()]
+        );
+        // Every member of the list is caught.
+        for flag in COMPOSE_UP_TWEAK_FLAGS {
+            let args: Vec<String> = ["compose", "up", flag, "x"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(
+                compose_up_tweak_flags(&args),
+                vec![flag.to_string()],
+                "{flag} is refused"
+            );
+        }
+        // Legal flags are not refused.
+        let args: Vec<String> = ["compose", "up", "-f", "--restart", "--name", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            compose_up_tweak_flags(&args).is_empty(),
+            "-f eats its value"
+        );
+        // The path form is not the up form — its flags stay legal.
+        let args: Vec<String> = ["compose", ".", "--restart", "always"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(compose_up_tweak_flags(&args).is_empty());
+        let args: Vec<String> = ["compose"].iter().map(|s| s.to_string()).collect();
+        assert!(compose_up_tweak_flags(&args).is_empty());
+    }
+
+    /// 4.1: the `up` reserved word is documented where the user meets it —
+    /// the subcommand's help names the `-f` escape hatch.
+    #[test]
+    fn compose_up_help_names_reserved_word_hint() {
+        let mut cmd = Cli::command();
+        let compose = cmd.find_subcommand_mut("compose").expect("compose exists");
+        let up = compose.find_subcommand_mut("up").expect("up exists");
+        let help = up.render_help().to_string();
+        assert!(
+            help.contains("`up`") && help.contains("-f up/.appkeeper.toml"),
+            "the help names the reserved word and the -f form: {help}"
+        );
+    }
+
+    /// 4.1: the app name defaults to the declaration directory's name,
+    /// `--name` overrides, `all` and invalid names are refused.
+    #[test]
+    fn compose_up_app_name_rules() {
+        let dir = Path::new("/opt/shop");
+        assert_eq!(compose_up_app_name(dir, None).unwrap(), "shop");
+        assert_eq!(compose_up_app_name(dir, Some("other")).unwrap(), "other");
+        let err = compose_up_app_name(dir, Some("all")).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        let err = compose_up_app_name(dir, Some("bad name")).unwrap_err();
+        assert!(err.contains("invalid"), "{err}");
+        // A directory named `all` is refused even without --name.
+        assert!(compose_up_app_name(Path::new("/srv/all"), None).is_err());
+    }
+
+    /// 4.1: the declaration lookup names the searched path(s) and never goes
+    /// upward; `-f` is exact.
+    #[test]
+    fn compose_up_declaration_lookup_errors() {
+        let tmp = std::env::temp_dir().join(format!("ak-compose-up-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Empty dir: the error names <dir>/.appkeeper.toml.
+        let err = compose_up_declaration_path(Some(&tmp), None).unwrap_err();
+        assert!(
+            err.contains(&tmp.join(".appkeeper.toml").display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("does not search parent directories"), "{err}");
+        // Not a directory: both paths named.
+        let missing = tmp.join("nope");
+        let err = compose_up_declaration_path(Some(&missing), None).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        // -f: exact, no search, error names the file.
+        let err = compose_up_declaration_path(None, Some(&missing)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        // Found: the candidate path comes back.
+        std::fs::write(
+            tmp.join(config::DECLARATION_FILE),
+            "[program.a]\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+        let found = compose_up_declaration_path(Some(&tmp), None).unwrap();
+        assert_eq!(found, tmp.join(config::DECLARATION_FILE));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 4.2/4.3: the post-preview decision. fresh/identical submit; the
+    /// confirmation classes need --force or an interactive yes; a decline and
+    /// a non-TTY session refuse; external-refused refuses with or without
+    /// --force.
+    #[test]
+    fn compose_up_decision_branches() {
+        use UpDecision::*;
+        // fresh / identical: no confirmation, the force flag rides along.
+        assert_eq!(
+            compose_up_decision("fresh", false, false, None),
+            Submit(false)
+        );
+        assert_eq!(
+            compose_up_decision("fresh", true, false, None),
+            Submit(true)
+        );
+        assert_eq!(
+            compose_up_decision("identical", false, true, Some("n")),
+            Submit(false)
+        );
+        // needs-update: --force is the passthrough yes.
+        assert_eq!(
+            compose_up_decision("needs-update", true, false, None),
+            Submit(true)
+        );
+        // Interactive yes (any case/whitespace) submits; anything else declines.
+        assert_eq!(
+            compose_up_decision("needs-update", false, true, Some("y\n")),
+            Submit(true)
+        );
+        assert_eq!(
+            compose_up_decision("needs-update", false, true, Some(" YES ")),
+            Submit(true)
+        );
+        assert_eq!(
+            compose_up_decision("needs-update", false, true, Some("n")),
+            Decline
+        );
+        assert_eq!(
+            compose_up_decision("needs-update", false, true, None),
+            Decline
+        );
+        assert_eq!(
+            compose_up_decision("needs-update", false, true, Some("")),
+            Decline
+        );
+        // Non-TTY: refuse even with an answer riding on stdin.
+        assert_eq!(
+            compose_up_decision("needs-update", false, false, Some("y")),
+            RefuseNoTty
+        );
+        // adhoc-takeover behaves identically.
+        assert_eq!(
+            compose_up_decision("adhoc-takeover", true, false, None),
+            Submit(true)
+        );
+        assert_eq!(
+            compose_up_decision("adhoc-takeover", false, false, None),
+            RefuseNoTty
+        );
+        assert_eq!(
+            compose_up_decision("adhoc-takeover", false, true, Some("n")),
+            Decline
+        );
+        // external-refused: never, with or without --force, TTY or not.
+        assert_eq!(
+            compose_up_decision("external-refused", true, true, Some("y")),
+            RefuseExternal
+        );
+        assert_eq!(
+            compose_up_decision("external-refused", false, false, None),
+            RefuseExternal
+        );
+    }
+
+    /// 4.2: the prompt wording distinguishes the takeover branch.
+    #[test]
+    fn compose_up_prompt_wording() {
+        assert!(compose_up_prompt("shop", "needs-update").contains("overwrite"));
+        assert!(compose_up_prompt("shop", "adhoc-takeover").contains("adopt"));
+        assert!(compose_up_prompt("shop", "needs-update").ends_with("[y/N] "));
+    }
+
+    /// 4.3: the terminal frame rendering — the no-op prints the unchanged
+    /// hint with exit 0, failures exit non-zero with the phase and program,
+    /// and skipped programs surface as notes.
+    #[test]
+    fn compose_up_terminal_render_codes() {
+        // identical + all running: exit 0, the human line says unchanged.
+        let frame = serde_json::json!({
+            "ok": true, "app": "shop", "config_path": "/d/shop.toml",
+            "unchanged": true, "identical": true, "programs": [], "skipped": []
+        });
+        let (code, out, err) = up_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(out[0].contains("unchanged"), "{out:?}");
+        assert!(err.is_empty());
+        // json mode: no extra output (the stream already passed through).
+        let (code, out, err) = up_terminal_render(&frame, true);
+        assert_eq!(code, EXIT_OK);
+        assert!(out.is_empty() && err.is_empty());
+        // identical + pulled up: converged, record untouched.
+        let frame = serde_json::json!({
+            "ok": true, "app": "shop", "config_path": "/d/shop.toml",
+            "unchanged": false, "identical": true,
+            "programs": [{"program": "web", "pid": 7}], "skipped": []
+        });
+        let (code, out, _) = up_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(out[0].contains("converged"), "{out:?}");
+        assert!(out.iter().any(|l| l.contains("web") && l.contains("7")));
+        // fresh success: registered + config path.
+        let frame = serde_json::json!({
+            "ok": true, "app": "shop", "config_path": "/d/shop.toml",
+            "unchanged": false, "identical": false,
+            "programs": [{"program": "web", "pid": 7}],
+            "skipped": [{"program": "opt", "reason": "user stop record kept it stopped"}]
+        });
+        let (code, out, _) = up_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(out[0].contains("registered"), "{out:?}");
+        assert!(out.iter().any(|l| l.contains("/d/shop.toml")));
+        assert!(
+            out.iter()
+                .any(|l| l.contains("opt skipped") && l.contains("user stop record")),
+            "the skip note carries the reason: {out:?}"
+        );
+        // Startup failure: non-zero, the message names the phase and program.
+        let frame = serde_json::json!({
+            "ok": false, "phase": "startsecs", "program": "bad", "error": "exited 1"
+        });
+        let (code, out, err) = up_terminal_render(&frame, false);
+        assert_ne!(code, EXIT_OK);
+        assert!(out.is_empty());
+        assert!(
+            err[0].contains("startsecs") && err[0].contains("bad"),
+            "{err:?}"
+        );
+        // json failure: code only.
+        let (code, out, err) = up_terminal_render(&frame, true);
+        assert_ne!(code, EXIT_OK);
+        assert!(out.is_empty() && err.is_empty());
+    }
+
+    /// 4.2: the request body carries the declaration CONTENT, the base dir
+    /// and the caller's PATH — never a file path (control-plane spec).
+    #[test]
+    fn compose_up_body_shape() {
+        let body = compose_up_body("shop", "CONTENT", Path::new("/opt/shop"), true);
+        assert_eq!(body["name"], "shop");
+        assert_eq!(body["content"], "CONTENT");
+        assert_eq!(body["base_dir"], "/opt/shop");
+        assert_eq!(body["force"], true);
+        // PATH resolution rides along when the environment provides it.
+        assert!(body["caller_path"].is_null() || body["caller_path"].is_string());
     }
 }

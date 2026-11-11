@@ -598,6 +598,16 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
             respond_adhoc_run(sup, &body, Box::new(writer));
             return;
         }
+        // add-compose-up D3: the zero-side-effect preview half of the compose
+        // up protocol (render + compare + classify on this thread).
+        ("POST", ["v1", "compose", "up", "preview"]) => respond_compose_preview(sup, &body),
+        // add-compose-up D3/D4: the execute half — the classification decision
+        // runs in the command handler; the pipeline streams NDJSON progress
+        // (the /v1/run transport mode) and owns the connection.
+        ("POST", ["v1", "compose", "up"]) => {
+            respond_compose_up(sup, &body, Box::new(writer));
+            return;
+        }
         // Residual-state confirmation (D4): commit a staged-but-unpersisted
         // app without restarting it.
         ("POST", ["v1", "run", "commit"]) => {
@@ -1332,6 +1342,306 @@ fn stop_via_command(sup: &Arc<Supervisor>, name: &str) -> Result<String> {
     }
 }
 
+// -- compose up (add-compose-up D2/D3) ----------------------------------------
+
+/// Parse the `/v1/compose/up(/preview)` request body. The request carries the
+/// declaration CONTENT, the base directory, the caller's PATH and the app
+/// name — never a file path (control-plane spec: TCP 形态下 CLI 与守护进程可
+/// 不在同一台机器).
+fn parse_compose_request(
+    body: &[u8],
+) -> std::result::Result<crate::supervisor::ComposeUpRequest, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "request body must carry a non-empty \"name\"".to_string())?;
+    let content = v.get("content").and_then(|c| c.as_str()).ok_or_else(|| {
+        "request body must carry the declaration \"content\" (a file path is not accepted — \
+         the client and the daemon may live on different machines)"
+            .to_string()
+    })?;
+    let base_dir = v
+        .get("base_dir")
+        .and_then(|b| b.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "request body must carry a non-empty \"base_dir\" (the declaration file's \
+             directory, used to absolutize relative paths)"
+                .to_string()
+        })?;
+    Ok(crate::supervisor::ComposeUpRequest {
+        name: name.to_string(),
+        content: content.to_string(),
+        base_dir: std::path::PathBuf::from(base_dir),
+        caller_path: v
+            .get("caller_path")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::ffi::OsString::from),
+        force: v.get("force").and_then(|b| b.as_bool()).unwrap_or(false),
+    })
+}
+
+/// The wire shape of a compose preview, shared by the preview endpoint and
+/// the conflict errors of the submit endpoint.
+fn compose_preview_json(pv: &crate::supervisor::ComposePreview) -> serde_json::Value {
+    serde_json::json!({
+        "classification": pv.class.as_str(),
+        "record_path": pv.record_path.display().to_string(),
+        "declared": pv.declared,
+        "diff": pv.diff,
+        "hint": pv.hint,
+        "programs": pv.programs,
+    })
+}
+
+/// `POST /v1/compose/up/preview` — the zero-side-effect half of the protocol
+/// (add-compose-up D3). Rendering + comparison + classification happen HERE on
+/// the HTTP thread (all reads); a validation failure is a 400 and any of the
+/// five classifications is a 200 with the details attached.
+fn respond_compose_preview(sup: &Arc<Supervisor>, body: &[u8]) -> Vec<u8> {
+    let req = match parse_compose_request(body) {
+        Ok(r) => r,
+        Err(m) => return err_bytes(400, &m),
+    };
+    let rendered = match crate::config::render_declaration(
+        &req.content,
+        &req.base_dir,
+        &req.name,
+        req.caller_path.as_deref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return err_bytes(400, &format!("{e:#}")),
+    };
+    let pv = sup.compose_preview(&req.name, &rendered);
+    json_bytes(200, compose_preview_json(&pv))
+}
+
+/// `POST /v1/compose/up` — the execute half (add-compose-up D3/D4). The
+/// classification decision runs in the command handler (MUST NOT rely on a
+/// client pre-check); the pipeline streams NDJSON progress frames over a
+/// chunked response (the `/v1/run` transport mode):
+///
+/// ```text
+/// {"phase":"staged","app":"shop","programs":["web","worker"],"skipped":[]}
+/// {"phase":"starting","program":"web"}
+/// {"phase":"starting","program":"worker"}
+/// {"phase":"started","program":"web","pid":123}
+/// {"phase":"started","program":"worker","pid":124}
+/// {"ok":true,"app":"shop","config_path":"...","programs":[...]}
+/// ```
+///
+/// The multi-program startup wait runs HERE on the connection thread (each
+/// program against its own deadline); only when ALL pass is the record
+/// committed. Any failure aborts server-side: the spawned programs are
+/// stopped in reverse, the placeholder is discarded, and the structured
+/// error names the failed phase and program.
+fn respond_compose_up(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Write>) {
+    let req = match parse_compose_request(body) {
+        Ok(r) => r,
+        Err(m) => {
+            let _ = writer.write_all(&err_bytes(400, &m));
+            return;
+        }
+    };
+    // Phase 1: the fast turn (validate → classify → stage → spawn) on the
+    // supervision loop. Refusals answer proper status codes BEFORE the chunked
+    // head, with the preview details attached for the conflict classes.
+    let (tx, rx) = mpsc::channel();
+    sup.enqueue(Command::ComposeUp { req, reply: tx });
+    let staged = match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            let status = e.http_status();
+            match e.preview() {
+                Some(pv) => {
+                    let mut body = compose_preview_json(pv);
+                    body["error"] = serde_json::Value::String(e.to_string());
+                    body["phase"] = serde_json::Value::String(e.phase().into());
+                    let _ = writer.write_all(&json_bytes(status, body));
+                }
+                None => {
+                    let body = serde_json::json!({ "error": e.to_string(), "phase": e.phase() });
+                    let _ = writer.write_all(&json_bytes(status, body));
+                }
+            }
+            return;
+        }
+        Err(_) => {
+            let _ = writer.write_all(&err_bytes(500, "supervisor did not answer in time"));
+            return;
+        }
+    };
+
+    // From here on the response is a chunked NDJSON stream.
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if writer.write_all(head.as_bytes()).is_err() || writer.flush().is_err() {
+        return;
+    }
+
+    let max_estimate = staged
+        .waits
+        .iter()
+        .map(|w| w.estimate_secs)
+        .fold(0.0_f64, f64::max);
+
+    // `identical` with nothing to pull up: the no-operation result (D5).
+    if staged.identical && staged.unchanged {
+        let _ = write_ndjson_chunk(
+            &mut writer,
+            &serde_json::json!({
+                "ok": true,
+                "app": staged.app,
+                "config_path": staged.config_path,
+                "unchanged": true,
+                "identical": true,
+                "programs": [],
+                "skipped": staged.skipped,
+            }),
+        );
+        finish_chunked(&mut writer);
+        return;
+    }
+
+    let _ = write_ndjson_chunk(
+        &mut writer,
+        &serde_json::json!({
+            "phase": if staged.identical { "ensuring" } else { "staged" },
+            "app": staged.app,
+            "estimate_secs": max_estimate,
+            "programs": staged.waits.iter().map(|w| w.program.clone()).collect::<Vec<_>>(),
+            "skipped": staged.skipped,
+        }),
+    );
+    for w in &staged.waits {
+        let _ = write_ndjson_chunk(
+            &mut writer,
+            &serde_json::json!({ "phase": "starting", "program": w.program }),
+        );
+    }
+
+    // Phase 2: wait for every startup judgement (per-program deadlines).
+    let mut tracker = crate::supervisor::ComposeWaitTracker::new(&staged.waits);
+    let mut failure: Option<(String, crate::supervisor::StartupOutcome)> = None;
+    let mut started: Vec<serde_json::Value> = Vec::new();
+    while !tracker.finished() {
+        for (program, outcome) in tracker.poll(sup) {
+            match outcome {
+                crate::supervisor::StartupOutcome::Started { pid } => {
+                    let _ = write_ndjson_chunk(
+                        &mut writer,
+                        &serde_json::json!({
+                            "phase": "started",
+                            "program": program,
+                            "pid": pid,
+                        }),
+                    );
+                    started.push(serde_json::json!({ "program": program, "pid": pid }));
+                }
+                crate::supervisor::StartupOutcome::Failed { phase, reason } => {
+                    failure = Some((
+                        program,
+                        crate::supervisor::StartupOutcome::Failed { phase, reason },
+                    ));
+                }
+                crate::supervisor::StartupOutcome::TimedOut { waited_secs } => {
+                    failure = Some((
+                        program,
+                        crate::supervisor::StartupOutcome::Failed {
+                            phase: "timeout",
+                            reason: format!(
+                                "startup was not confirmed within {waited_secs:.1}s (estimated upper bound)"
+                            ),
+                        },
+                    ));
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        std::thread::sleep(crate::supervisor::STARTUP_POLL);
+    }
+
+    if let Some((program, outcome)) = failure {
+        let crate::supervisor::StartupOutcome::Failed { phase, reason } = outcome else {
+            unreachable!("failure is only set to Failed above");
+        };
+        // Server-side abort (D4): stop what this round spawned (reverse order
+        // — the shared staged abort) and discard the placeholder. An
+        // `identical` submission staged nothing, so there is nothing to abort.
+        if !staged.identical {
+            let _ = abort_via_command(sup, &staged.app);
+        }
+        let _ = write_ndjson_chunk(
+            &mut writer,
+            &serde_json::json!({
+                "ok": false,
+                "phase": phase,
+                "program": program,
+                "error": reason,
+            }),
+        );
+        finish_chunked(&mut writer);
+        return;
+    }
+
+    if staged.identical {
+        // Ensure-running finished: the record was never touched.
+        let _ = write_ndjson_chunk(
+            &mut writer,
+            &serde_json::json!({
+                "ok": true,
+                "app": staged.app,
+                "config_path": staged.config_path,
+                "unchanged": false,
+                "identical": true,
+                "programs": started,
+                "skipped": staged.skipped,
+            }),
+        );
+        finish_chunked(&mut writer);
+        return;
+    }
+
+    // Phase 3: all judgements passed — commit (placeholder → record).
+    match commit_via_command(sup, &staged.app) {
+        Ok(c) => {
+            let _ = write_ndjson_chunk(
+                &mut writer,
+                &serde_json::json!({
+                    "ok": !c.partial,
+                    "app": c.app,
+                    "config_path": c.config_path,
+                    "unchanged": c.unchanged,
+                    "partial": c.partial,
+                    "error": if c.partial { c.partial_reason.clone() } else { String::new() },
+                    "programs": started,
+                    "skipped": staged.skipped,
+                }),
+            );
+        }
+        Err(e) => {
+            let _ = write_ndjson_chunk(
+                &mut writer,
+                &serde_json::json!({
+                    "ok": false,
+                    "phase": "commit",
+                    "error": format!("{e:#}"),
+                }),
+            );
+        }
+    }
+    finish_chunked(&mut writer);
+}
+
 fn respond_logs(sup: &Arc<Supervisor>, name: &str, query: &str, mut writer: Box<dyn Write>) {
     let mut stream = "out";
     let mut tail = 100usize;
@@ -1866,7 +2176,7 @@ mod tests {
         assert!(last["pid"].as_u64().unwrap() > 0);
         assert!(last["config_path"].as_str().unwrap().ends_with("web.toml"));
         assert!(
-            dir.join("app.d").join("web.toml").exists(),
+            dir.join("app.d").join("adhoc").join("web.toml").exists(),
             "record written"
         );
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
@@ -1913,7 +2223,7 @@ mod tests {
         let last = frames.last().unwrap();
         assert_eq!(last["ok"], true, "{frames:?}");
         assert!(last["pid"].as_u64().unwrap() > 0, "{last}");
-        assert!(dir.join("app.d").join("web.toml").exists());
+        assert!(dir.join("app.d").join("adhoc").join("web.toml").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1943,7 +2253,7 @@ mod tests {
         assert_eq!(frames.len(), 1, "only the terminal frame: {frames:?}");
         assert_eq!(frames[0]["ok"], true);
         assert!(frames[0]["pid"].is_null(), "pid null on register-only");
-        assert!(dir.join("app.d").join("web.toml").exists());
+        assert!(dir.join("app.d").join("adhoc").join("web.toml").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1982,7 +2292,7 @@ mod tests {
             }),
         );
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
         let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
         assert!(start.starts_with("HTTP/1.1 200"), "{start}");
@@ -2021,7 +2331,7 @@ mod tests {
             }),
         );
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
         let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
 
@@ -2082,7 +2392,7 @@ mod tests {
             }),
         );
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
         // Different args, register-only: the record is rewritten and nothing is
         // started (pid null), no staged entry is left behind.
@@ -2203,7 +2513,7 @@ mod tests {
         if let Some(p1) = pid1 {
             assert_ne!(pid2 as u32, p1, "restarted with a new pid");
         }
-        assert!(dir.join("app.d").join("web.toml").exists());
+        assert!(dir.join("app.d").join("adhoc").join("web.toml").exists());
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2447,7 +2757,7 @@ mod tests {
             }),
         );
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        dir.join("app.d").join(format!("{name}.toml"))
+        dir.join("app.d").join("adhoc").join(format!("{name}.toml"))
     }
 
     /// 2.1: a stopped app is removed immediately with the structured result;
@@ -2505,7 +2815,10 @@ mod tests {
             "{resp}"
         );
         assert!(resp.contains("ak stop web"), "{resp}");
-        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+        assert!(
+            dir.join("app.d/adhoc/web.toml").exists(),
+            "record untouched"
+        );
         let status = ep.get("/v1/status");
         assert!(status.contains("\"web\""), "program still projected");
         sup.request_shutdown();
@@ -2593,14 +2906,14 @@ mod tests {
         // No token → 401, and the record survives.
         let denied = ep.post_auth("/v1/apps/web/remove", &serde_json::json!({}), None);
         assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
-        assert!(dir.join("app.d/web.toml").exists());
+        assert!(dir.join("app.d/adhoc/web.toml").exists());
         let ok = ep.post_auth(
             "/v1/apps/web/remove",
             &serde_json::json!({}),
             Some("secret-1"),
         );
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
-        assert!(!dir.join("app.d/web.toml").exists());
+        assert!(!dir.join("app.d/adhoc/web.toml").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2829,6 +3142,391 @@ mod tests {
             !resp.starts_with("HTTP/1.1 401"),
             "no 401 for an ignored header: {resp}"
         );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- compose up endpoints (add-compose-up section 3) ----------------------
+
+    /// A two-program declaration (startsecs 0, always) whose programs start
+    /// instantly.
+    fn compose_decl() -> String {
+        let (cmd, args) = sleep_cmd();
+        let a0: Vec<String> = args.clone();
+        let a1: Vec<String> = args.to_vec();
+        format!(
+            "[program.web]\ncommand = '{cmd}'\nargs = {a0:?}\nstartsecs = 0.0\nrestart = 'always'\n\n\
+             [program.worker]\ncommand = '{cmd}'\nargs = {a1:?}\nstartsecs = 0.0\nrestart = 'always'\ndepends_on = ['web']\n"
+        )
+        .replace('"', "'")
+    }
+
+    /// The request body; the base_dir is the harness dir (it exists, and the
+    /// undeclared work_dir lands there — the spawn cwd must be real).
+    fn compose_body(
+        dir: &Path,
+        name: &str,
+        content: &str,
+        extra: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "name": name,
+            "content": content,
+            "base_dir": dir.display().to_string(),
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        v
+    }
+
+    fn frames_of(resp: &str) -> Vec<serde_json::Value> {
+        let body = dechunk(resp.split("\r\n\r\n").nth(1).unwrap_or(""));
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// 3.1: the preview classifies all five situations with zero side effects.
+    #[test]
+    fn compose_preview_classifies_all_five() {
+        let (sup, dir, ep) = serve_harness("compose-preview");
+        let decl = compose_decl();
+
+        // fresh: no record anywhere.
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "shop", &decl, serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "fresh", "{v}");
+        assert!(v["programs"].as_array().unwrap().is_empty(), "{v}");
+        assert!(
+            !dir.join("app.d").join("shop.toml").exists(),
+            "zero side effects"
+        );
+        assert!(!dir.join("app.d").join("shop.toml.pending").exists());
+
+        // needs-update: a differing top-level record with a diff summary.
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join("shop.toml"),
+            "[program.web]\ncommand = 'old'\n",
+        )
+        .unwrap();
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "shop", &decl, serde_json::json!({})),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "needs-update", "{v}");
+        assert!(!v["diff"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("app.d").join("shop.toml")).unwrap(),
+            "[program.web]\ncommand = 'old'\n",
+            "preview does not rewrite"
+        );
+
+        // identical: the record IS the rendered snapshot.
+        let rendered = crate::config::render_declaration(&decl, &dir, "shop", None).unwrap();
+        std::fs::write(dir.join("app.d").join("shop.toml"), &rendered).unwrap();
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "shop", &decl, serde_json::json!({})),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "identical", "{v}");
+
+        // adhoc-takeover: a run product in app_dir/adhoc/.
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join("adhoc").join("take.toml"),
+            "[program.t]\ncommand = 'x'\n",
+        )
+        .unwrap();
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "take", &decl, serde_json::json!({})),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "adhoc-takeover", "{v}");
+
+        // external-refused: a symlink record (top level).
+        let body = dir.join("external.toml");
+        std::fs::write(&body, "[program.e]\ncommand = 'x'\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&body, dir.join("app.d").join("ext.toml")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&body, dir.join("app.d").join("ext.toml")).unwrap();
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "ext", &decl, serde_json::json!({})),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "external-refused", "{v}");
+        assert!(v["hint"].as_str().unwrap().contains("ak remove"), "{v}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1: validation failures answer 400 with zero side effects; a body
+    /// without the declaration content is a 400 (a file path is not accepted).
+    #[test]
+    fn compose_preview_rejects_invalid_requests() {
+        let (sup, dir, ep) = serve_harness("compose-preview-bad");
+        // Unknown field in the declaration.
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(
+                &dir,
+                "shop",
+                "[program.web]\ncommand = 'x'\nbogus = 1\n",
+                serde_json::json!({}),
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        // Reserved app name.
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "all", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("reserved"), "{resp}");
+        // A file path instead of content is refused by contract (the body
+        // carries the declaration TEXT; a path would not round-trip over tcp).
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &serde_json::json!({
+                "name": "shop",
+                "content": "/opt/shop/.appkeeper.toml",
+                "base_dir": "/opt/shop"
+            }),
+        );
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(!dir.join("app.d").join("shop.toml").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.5: a fresh multi-program submission streams the staged/starting
+    /// frames, one started frame per program, and lands the record only after
+    /// every judgement passed.
+    #[test]
+    fn compose_up_streams_frames_and_commits() {
+        let (sup, dir, ep) = serve_harness("compose-up-ok");
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(&dir, "shop", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("Transfer-Encoding: chunked"), "{resp}");
+        let frames = frames_of(&resp);
+        let phases: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| f.get("phase").and_then(|p| p.as_str()))
+            .collect();
+        assert_eq!(phases[0], "staged", "{frames:?}");
+        assert_eq!(
+            phases.iter().filter(|p| **p == "starting").count(),
+            2,
+            "{frames:?}"
+        );
+        assert_eq!(
+            phases.iter().filter(|p| **p == "started").count(),
+            2,
+            "{frames:?}"
+        );
+        let last = frames.last().unwrap();
+        assert_eq!(last["ok"], true, "{frames:?}");
+        assert_eq!(last["app"], "shop");
+        assert_eq!(last["unchanged"], false);
+        assert!(last["config_path"].as_str().unwrap().ends_with("shop.toml"));
+        assert_eq!(last["programs"].as_array().unwrap().len(), 2, "{last}");
+        // The record landed; no placeholder residue; the snapshot is exact.
+        assert!(dir.join("app.d").join("shop.toml").exists());
+        assert!(!dir.join("app.d").join("shop.toml.pending").exists());
+        let rendered =
+            crate::config::render_declaration(&compose_decl(), &dir, "shop", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("app.d").join("shop.toml")).unwrap(),
+            rendered
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: a needs-update submission without force is a 409 carrying the
+    /// preview; with force it stops the old, lands the new and streams the
+    /// pull-up.
+    #[test]
+    fn compose_up_needs_update_gate_then_force() {
+        let (sup, dir, ep) = serve_harness("compose-up-update");
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join("shop.toml"),
+            "[program.web]\ncommand = 'old'\n",
+        )
+        .unwrap();
+
+        // Without force: 409 with the classification and preview attached.
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(&dir, "shop", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "needs-update", "{v}");
+        assert_eq!(v["phase"], "conflict", "{v}");
+        assert!(!v["diff"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("app.d").join("shop.toml")).unwrap(),
+            "[program.web]\ncommand = 'old'\n",
+            "nothing written on refusal"
+        );
+        assert!(
+            sup.state.lock().unwrap().programs.is_empty(),
+            "nothing started"
+        );
+
+        // With force: the whole pipeline runs.
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(
+                &dir,
+                "shop",
+                &compose_decl(),
+                serde_json::json!({ "force": true }),
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let frames = frames_of(&resp);
+        let last = frames.last().unwrap();
+        assert_eq!(last["ok"], true, "{frames:?}");
+        assert!(dir.join("app.d").join("shop.toml").exists());
+        assert!(
+            !dir.join("app.d").join("shop.toml.pending").exists(),
+            "no placeholder residue"
+        );
+        let after = std::fs::read_to_string(dir.join("app.d").join("shop.toml")).unwrap();
+        assert!(
+            after.contains("[program.worker]"),
+            "the new definition landed: {after}"
+        );
+        assert!(sup.state.lock().unwrap().programs.contains_key("web"));
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: an external deployment link is refused with a 409 even when
+    /// `force` is set, and nothing is touched.
+    #[test]
+    fn compose_up_refuses_external_record_even_with_force() {
+        let (sup, dir, ep) = serve_harness("compose-up-ext");
+        let body = dir.join("external.toml");
+        std::fs::write(&body, "[program.web]\ncommand = 'old'\n").unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&body, dir.join("app.d").join("shop.toml")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&body, dir.join("app.d").join("shop.toml")).unwrap();
+
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(
+                &dir,
+                "shop",
+                &compose_decl(),
+                serde_json::json!({ "force": true }),
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["classification"], "external-refused", "{v}");
+        assert!(v["hint"].as_str().unwrap().contains("ak remove"), "{v}");
+        assert!(
+            std::fs::read_to_string(&body)
+                .unwrap()
+                .contains("[program.web]"),
+            "the external config is untouched"
+        );
+        assert!(sup.state.lock().unwrap().programs.is_empty());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3/3.5: an identical submission with everything running answers the
+    /// single `unchanged` frame — no write, no spawn.
+    #[test]
+    fn compose_up_identical_all_running_answers_unchanged() {
+        let (sup, dir, ep) = serve_harness("compose-up-idem");
+        // Land a real app first.
+        let first = ep.post(
+            "/v1/compose/up",
+            &compose_body(&dir, "shop", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let record = dir.join("app.d").join("shop.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(&dir, "shop", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let frames = frames_of(&resp);
+        assert_eq!(
+            frames.len(),
+            1,
+            "the no-op is one terminal frame: {frames:?}"
+        );
+        assert_eq!(frames[0]["ok"], true, "{frames:?}");
+        assert_eq!(frames[0]["unchanged"], true, "{frames:?}");
+        assert_eq!(frames[0]["identical"], true, "{frames:?}");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.5: a failing startup judgement aborts server-side — a structured
+    /// failure frame, every spawned program stopped, zero record residue.
+    #[test]
+    fn compose_up_failure_frame_and_zero_residue() {
+        let (sup, dir, ep) = serve_harness("compose-up-fail");
+        let mut decl = compose_decl();
+        #[cfg(unix)]
+        decl.push_str("\n[program.bad]\ncommand = '/bin/sh'\nargs = ['-c', 'exit 3']\nstartsecs = 0.05\nrestart = 'always'\n");
+        #[cfg(windows)]
+        decl.push_str("\n[program.bad]\ncommand = 'cmd'\nargs = ['/c', 'exit 3']\nstartsecs = 0.05\nrestart = 'always'\n");
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(&dir, "shop", &decl, serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let frames = frames_of(&resp);
+        let last = frames.last().unwrap();
+        assert_eq!(last["ok"], false, "{frames:?}");
+        assert_eq!(last["phase"], "startup", "{frames:?}");
+        assert_eq!(last["program"], "bad", "{frames:?}");
+        // Zero residue: no record, no placeholder, no programs left.
+        assert!(!dir.join("app.d").join("shop.toml").exists());
+        assert!(!dir.join("app.d").join("shop.toml.pending").exists());
+        let st = sup.state.lock().unwrap();
+        assert!(!st.staged.contains_key("shop"));
+        assert!(
+            st.programs.is_empty(),
+            "every program was dropped: {:?}",
+            st.programs.keys().collect::<Vec<_>>()
+        );
+        drop(st);
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

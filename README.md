@@ -56,7 +56,7 @@ ak start web                                          # 5. 再启动
 | --- | --- |
 | `ak run --cmd "python -m http.server 8000" --app web` | 注册一条命令行并立即启动（成功才落盘） |
 | `ak run -- python -m http.server 8000 --app web` | 等价的 `--` 写法（脚手架旗标放在命令之后） |
-| `ak run --force -- python -m http.server 9000 --app web` | 覆盖已注册的同名 app（有差异则重写并重启，无差异仅提示） |
+| `ak run --force -- python -m http.server 9000 --app web` | 覆盖已注册的同名 app（有差异则重写并重启，无差异仅提示；仅限 `app_dir/adhoc/` 内的自家记录，见下） |
 | `ak run … --json` | 机器可读输出：`name / config_path / pid / status` |
 
 `ak run` 只承载 ad-hoc 注册；启动/停止已注册的 app 或程序请用
@@ -68,7 +68,9 @@ ak start web                                          # 5. 再启动
 冲突错误退出（守护进程 409，不写盘、不启停任何进程）。带 `--force` 时逐字节
 比较新旧配置：有差异则原子重写记录并停旧启新，无差异则输出「配置无修改，
 不做任何动作」并以 0 退出。`--force` 不放行跨应用程序名冲突，也不覆盖指向
-外部部署配置的注册记录。
+外部部署配置的注册记录。`--force` 只覆盖 `app_dir/adhoc/` 内的 run 产物：
+同名记录位于 `app_dir` 顶层（compose 快照、脚手架生成文件或外部链接）时被
+拒绝并提示先 `ak remove <名>` 或改用 `ak compose up`。
 
 **日常控制**
 
@@ -91,6 +93,7 @@ ak start web                                          # 5. 再启动
 
 | 命令 | 意图 |
 | --- | --- |
+| `ak compose up [目录]` | **声明式一条命令**：读取 `<目录>/.appkeeper.toml`，整组注册并启动（见下「开发场景速览」） |
 | `ak compose <目录\|.toml\|可执行>` | 注册 app：目录/配置→`app_dir` 链接；可执行→脚手架生成配置 |
 | `ak compose … --apply` | 注册后立即生效（守护离线时自动后台拉起） |
 | `ak remove <app>` | 注销：守护进程一次完成，立即清除注册与内存投影，**无需 apply**；要求该 app 无 `running/starting/stopping/backoff` 程序，否则 409 列出阻塞项并提示先 `ak stop <app>`（守护离线退出 3，不做本地直删） |
@@ -104,6 +107,60 @@ ak start web                                          # 5. 再启动
 `start|stop|restart` 同样是 `<app> [<program>]` 双位置参数）。
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置/用法错误、`3` 守护进程不可达。
+
+### `ak compose up`：声明式一条命令
+
+在项目根放一份 `.appkeeper.toml`（就是普通的 app 配置：`[program.<名>]` 表
+至少一个，`[app]` 表可选，未知字段拒绝），然后一条命令完成「声明 → 守护进程
+启动 → 注册」：
+
+```toml
+[program.web]
+command = "python -m http.server 8000"
+restart = "always"
+startsecs = 1.0
+
+[program.worker]
+command = "python worker.py"
+restart = "always"
+depends_on = ["web"]
+```
+
+```bash
+ak compose up            # 当前目录；守护离线时自动后台拉起后继续
+```
+
+规则一览：
+
+- **发现**：只在 `dir`（缺省 `.`）下找 `.appkeeper.toml`，**不向上级递归**；
+  找不到即报错并列出查找路径。`-f/--file <路径>` 显式指定声明文件（文件名
+  不受限，目录恰好叫 `up` 时用 `-f` 绕开保留字）。
+- **命名**：应用名缺省取声明文件所在目录名，`--name` 覆盖；保留字 `all`
+  拒绝。同一份声明可以用不同 `--name` 部署多份。
+- **旗标**：仅 `-f/--file`、`--name`、`--force`、`--json` 四个。内容微调
+  旗标（`--restart`、`--priority` 等）以用法错误拒绝——声明文件是唯一内容
+  事实源。
+- **执行**（daemon-first）：按 priority 与 depends_on 拉起全部声明的程序，
+  逐个等启动判定通过后注册记录才落盘 `app_dir` 顶层；任一失败则停掉本轮已
+  拉起的程序、清理占位，零残留非零退出。进度逐程序流式打印，`--json` 直通
+  帧流。
+- **同名撞名**：提交前守护进程先做无副作用预览比对。渲染结果与注册记录
+  逐字节一致 → 无操作（未运行的按守护启动规则补拉起）；有差异或同名记录是
+  `ak run` 的产物（`app_dir/adhoc/`）→ TTY 交互确认后停旧、重写、按新配置
+  拉起（收编分支先删 adhoc 记录）；同名记录是外部部署链接 → 一律拒绝并提示
+  先 `ak remove <名>`，`--force` 也不放行。
+- **非交互形态**（管道 / CI）：需确认的分类默认拒绝——零副作用、非零退出、
+  提示加 `--force`；`--force` 即交互答「是」的直通版。
+
+### 注册表分区：顶层与 `adhoc/`
+
+`app_dir` 按注册产物来源分区，从路径即可区分：`ak run` 的 ad-hoc 产物落
+`app_dir/adhoc/<名>.toml`（真实文件），compose 家族（脚手架生成、
+`compose up` 快照）与外部部署链接在顶层。应用名跨两区唯一；覆盖权限按位置
+判定（`run --force` 只写 `adhoc/`，顶层只归 compose 家族，链接永不改写）；
+`ak remove` 对两区内的本工具生成文件都连带删除。`ak ps --all` 表格与离线
+清单按位置标注来源列（`compose` / `run`）。分区前已存在的顶层 run 生成
+文件不迁移、照常工作（来源按位置标注为 `compose`）。
 
 ## 三个核心概念
 
@@ -123,6 +180,29 @@ CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置/用法错误、`3` �
 - **restart 策略**（docker 字面量）：`no` / `on-failure` / `always` /
   `unless-stopped`。优先级 `[program.*]` > `[app]` > daemon `[app-default]` >
   内置默认 `no`。
+
+## 开发场景速览
+
+把本地开发栈（web / worker / 数据库…）写成一份 `.appkeeper.toml`，appkeeper
+就是 dev 的一条命令：
+
+```bash
+ak compose up      # 守护进程离线时自动后台拉起，然后整组注册并按序启动
+ak ps              # 随时看状态；ak log -f <程序> 跟日志
+# …改完代码重新 up：声明有差异时 TTY 确认即停旧启新
+```
+
+- **防复活**：dev 栈不希望关掉后又自己爬起来——声明里用
+  `restart = "unless-stopped"`（或 `no`），收工时 `ak stop <app>`。用户停止
+  记录持久化在 `state_dir`、跨守护进程重启生效，之后无论 `compose up` 还是
+  重启机器都不会复活它；想拉起时 `ak start <app> <程序>`。
+- **Windows**：`compose up` 依赖守护进程在线，而后台拉起在 Windows 上建议
+  先 `ak daemon start --foreground` 显式起守护（再开一个终端跑
+  `compose up`）——关掉那个前台终端不影响后台守护；前台守护自身不响应
+  SIGHUP 的既有语义不变。
+- **Web 控制台**（可选，一次性配置）：
+  `ak config --set webui.listen=127.0.0.1:9877 && ak config --reload` 热开启，
+  浏览器访问 `http://127.0.0.1:9877` 看 dev 栈状态（建议本机回环绑定）。
 
 ## 安装
 
@@ -257,6 +337,14 @@ ak config --delete webui                              # 删段 = 关闭
 - `run` ad-hoc 全形态 daemon-first：离线退出 3；先启动成功再落盘（失败不留残留）。
   同名重复提交改为默认拒绝（409，零副作用）；需显式 `--force` 覆盖，无差异时为空操作
   （输出「配置无修改，不做任何动作」并以 0 退出，不再隐式再生/重启）。
+- 注册表分区（BREAKING）：`app_dir/adhoc/` 为 run 产物专属区域，新 run 记录
+  落该区（无需迁移动作）；`run --force` 不再覆盖 `app_dir` 顶层的记录
+  （compose 快照、脚手架生成文件、外部链接）——报错提示先 `ak remove <名>`
+  或改用 `ak compose up`。顶层既有 run 生成文件不迁移、照常工作。回滚旧版
+  二进制前，把仍需要的 `adhoc/<名>.toml` 移回顶层（run 产物可由命令重建）。
+- 新增 `ak compose up [目录]`：`.appkeeper.toml` 声明 → 一条命令注册并启动
+  （daemon-first，守护离线自动后台拉起；同名差异 TTY 确认、非交互以
+  `--force` 直通）。`up` 为 `ak compose` 的保留第一参数。
 - v0.1 单文件配置：`ak compose <旧文件>` 自动识别转换。
 - 标识符（app/程序/动作名）仅允许 `[A-Za-z0-9_-]`。
 - `ak remove <app>` 不再是本地直删 + 事后 sync：改为守护进程执行的原子动作

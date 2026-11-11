@@ -605,20 +605,24 @@ pub(crate) fn print_status(c: &Client) -> Result<()> {
 }
 
 /// One registered app as the CLI sees it locally (`registry::list`): the
-/// name, the config object the registration record points at, and the
-/// description. Used by `ps --all` (join with the projection / offline
-/// degradation listing).
+/// name, the config object the registration record points at, the
+/// description and the registration origin (add-compose-up task 1.5: 顶层
+/// 记录为 compose，`adhoc/` 记录为 run — display only). Used by `ps --all`
+/// (join with the projection / offline degradation listing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryRow {
     pub name: String,
     /// The config object the registration record points at (link target).
     pub path: String,
     pub description: Option<String>,
+    /// Registration origin derived from the record's location (compose/run).
+    pub origin: crate::registry::Origin,
 }
 
 /// One rendered status row. The projection feeds the first six fields; the
-/// pending marker comes from `StatusDoc.pending`, the last two from the local
-/// registry (`ak ps` only).
+/// pending marker comes from `StatusDoc.pending`; config/description come
+/// from the projection and the local registry (`ak ps`); the origin marker
+/// joins from the registry by app name (`ak ps --all` only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusRow {
     name: String,
@@ -630,6 +634,9 @@ struct StatusRow {
     pending: String,
     config: String,
     description: String,
+    /// The registration origin marker ("compose"/"run"); "-" when the local
+    /// registry has no row for the app. Rendered by `ps --all` only.
+    origin: String,
 }
 
 const PS_HEADER: [&str; 9] = [
@@ -643,6 +650,30 @@ const PS_HEADER: [&str; 9] = [
     "CONFIG",
     "DESCRIPTION",
 ];
+
+/// `ps --all` appends the registry ORIGIN marker (add-compose-up task 1.5:
+/// the marker is a registry-layer fact, never a status projection field).
+const PS_ALL_HEADER: [&str; 10] = [
+    "NAME",
+    "APP",
+    "STATE",
+    "PID",
+    "RESTARTS",
+    "UNHEALTHY",
+    "PENDING",
+    "CONFIG",
+    "DESCRIPTION",
+    "ORIGIN",
+];
+
+/// Which column set a table renders: the shell's status prefix, the full `ps`
+/// set, or `ps --all` (which adds the ORIGIN marker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsColumns {
+    Shell,
+    Status,
+    All,
+}
 
 /// The shell table columns (the shared prefix of [`PS_HEADER`]).
 const STATUS_WIDTH: usize = 7;
@@ -765,6 +796,7 @@ fn program_rows(
                             .filter(|d| !d.is_empty())
                             .cloned()
                             .unwrap_or_else(|| "-".into()),
+                        origin: "-".into(),
                     }
                 })
                 .collect()
@@ -801,6 +833,8 @@ pub(crate) fn render_ps_table(
 /// Pure renderer for `ak ps --all` (online): the projection is authoritative;
 /// registry apps it does not cover are appended and labelled not applied. A
 /// registry-only app that is also pending-added carries the `new` marker.
+/// Every row carries the registry ORIGIN marker joined by app name
+/// (add-compose-up task 1.5).
 pub(crate) fn render_ps_all_table(
     v: &serde_json::Value,
     descriptions: &std::collections::BTreeMap<String, String>,
@@ -809,6 +843,15 @@ pub(crate) fn render_ps_all_table(
     let pending = PendingView::from_status(v);
     let mut rows = program_rows(v, descriptions);
     mark_pending(&mut rows, &pending);
+    let origins: std::collections::BTreeMap<&str, &str> = registry
+        .iter()
+        .map(|a| (a.name.as_str(), a.origin.as_str()))
+        .collect();
+    for row in rows.iter_mut() {
+        if let Some(o) = origins.get(row.app.as_str()) {
+            row.origin = (*o).to_string();
+        }
+    }
     let known: std::collections::BTreeSet<String> = rows.iter().map(|r| r.app.clone()).collect();
     for app in registry.iter().filter(|a| !known.contains(&a.name)) {
         rows.push(StatusRow {
@@ -825,18 +868,19 @@ pub(crate) fn render_ps_all_table(
             },
             config: app.path.clone(),
             description: app.description.clone().unwrap_or_else(|| "-".to_string()),
+            origin: app.origin.as_str().to_string(),
         });
     }
     if rows.is_empty() {
         return ps_empty_hint();
     }
     sort_rows(&mut rows);
-    render_ps_rows(&rows, &pending.summary)
+    render_table(&rows, &PS_ALL_HEADER, &pending.summary, PsColumns::All)
 }
 
 /// Pure renderer for the offline `ps --all` degradation: a daemon-offline
 /// note followed by the local registry listing (name / config path /
-/// description). Exit code is 0 by contract.
+/// description / origin marker). Exit code is 0 by contract.
 pub(crate) fn render_registry_listing(registry: &[RegistryRow], offline: bool) -> String {
     let mut flat: Vec<RegistryRow> = registry.to_vec();
     flat.sort_by(|a, b| a.name.cmp(&b.name));
@@ -848,18 +892,19 @@ pub(crate) fn render_registry_listing(registry: &[RegistryRow], offline: bool) -
         out.push_str(&ps_empty_hint());
         return out;
     }
-    let header = ["NAME", "CONFIG", "DESCRIPTION"];
-    let table: Vec<[String; 3]> = flat
+    let header = ["NAME", "CONFIG", "DESCRIPTION", "ORIGIN"];
+    let table: Vec<[String; 4]> = flat
         .iter()
         .map(|a| {
             [
                 a.name.clone(),
                 a.path.clone(),
                 a.description.clone().unwrap_or_else(|| "-".to_string()),
+                a.origin.as_str().to_string(),
             ]
         })
         .collect();
-    let mut width = [0usize; 3];
+    let mut width = [0usize; 4];
     for (i, h) in header.iter().enumerate() {
         width[i] = h.len();
     }
@@ -889,13 +934,18 @@ fn sort_rows(rows: &mut [StatusRow]) {
 
 /// Render the `ps` column set, then the pending summary lines (if any).
 fn render_ps_rows(rows: &[StatusRow], summary: &[String]) -> String {
-    render_table(rows, &PS_HEADER, summary, true)
+    render_table(rows, &PS_HEADER, summary, PsColumns::Status)
 }
 
-/// Render a table over the shared column set. `full` selects the `ps`
-/// columns (all nine); otherwise the shell's status columns (the first seven)
-/// are used.
-fn render_table(rows: &[StatusRow], header: &[&str], summary: &[String], full: bool) -> String {
+/// Render a table over the shared column set. [`PsColumns::Shell`] keeps the
+/// first seven columns, [`PsColumns::Status`] the full `ps` nine, and
+/// [`PsColumns::All`] adds the registry ORIGIN marker.
+fn render_table(
+    rows: &[StatusRow],
+    header: &[&str],
+    summary: &[String],
+    cols: PsColumns,
+) -> String {
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|r| {
@@ -909,11 +959,12 @@ fn render_table(rows: &[StatusRow], header: &[&str], summary: &[String], full: b
                 r.pending.clone(),
                 r.config.clone(),
                 r.description.clone(),
+                r.origin.clone(),
             ];
-            if full {
-                all
-            } else {
-                all[..STATUS_WIDTH].to_vec()
+            match cols {
+                PsColumns::Shell => all[..STATUS_WIDTH].to_vec(),
+                PsColumns::Status => all[..9].to_vec(),
+                PsColumns::All => all,
             }
         })
         .collect();
@@ -988,7 +1039,7 @@ pub(crate) fn render_status_table(v: &serde_json::Value) -> String {
         "UNHEALTHY",
         "PENDING",
     ];
-    render_table(&rows, &header, &pending.summary, false)
+    render_table(&rows, &header, &pending.summary, PsColumns::Shell)
 }
 
 fn str_field(v: &serde_json::Value, key: &str) -> String {
@@ -1505,6 +1556,7 @@ mod tests {
 
     /// 4.3: `ps --all` online — the projection is authoritative and the
     /// registry only fills in apps it does not cover, labelled not applied.
+    /// 1.5: every row carries the ORIGIN marker joined by app name.
     #[test]
     fn ps_all_joins_registry_only_for_missing_apps() {
         let desc = std::collections::BTreeMap::new();
@@ -1513,17 +1565,23 @@ mod tests {
                 name: "demo".to_string(),
                 path: "/opt/demo/appkeeper.toml".to_string(),
                 description: Some("the demo app".to_string()),
+                origin: crate::registry::Origin::Compose,
             },
             RegistryRow {
                 name: "pending-app".to_string(),
                 path: "/opt/pending/appkeeper.toml".to_string(),
                 description: Some("registered but not applied".to_string()),
+                origin: crate::registry::Origin::Run,
             },
         ];
         let out = render_ps_all_table(&projection(), &desc, &registry);
         let lines: Vec<&str> = out.lines().collect();
         // header + separator + 3 programs + 1 registry-only app.
         assert_eq!(lines.len(), 6, "{out}");
+        assert!(
+            lines[0].contains("ORIGIN"),
+            "the origin column is on: {out}"
+        );
         assert_eq!(
             lines.iter().filter(|l| l.contains("pending-app")).count(),
             1,
@@ -1535,23 +1593,40 @@ mod tests {
             added.contains("/opt/pending/appkeeper.toml"),
             "the config object path is shown: {added}"
         );
-        // The already-loaded app is not duplicated from the registry.
+        assert!(
+            added.ends_with("run"),
+            "the adhoc/ origin reads run: {added}"
+        );
+        // The already-loaded app is not duplicated from the registry, and its
+        // rows inherit the registry origin.
         assert_eq!(
             lines.iter().filter(|l| l.contains("web")).count(),
             1,
             "no duplicate row for the applied app: {out}"
         );
+        let web = lines.iter().find(|l| l.contains("web")).unwrap();
+        assert!(web.ends_with("compose"), "demo is a compose record: {web}");
+        // An app with no registry row renders the placeholder origin.
+        let api = lines.iter().find(|l| l.contains("api")).unwrap();
+        assert!(api.ends_with("-"), "no registry row: {api}");
     }
 
-    /// 4.3: `ps --all` online with an empty registry is just the projection.
+    /// 4.3 + 1.5: `ps --all` online with an empty registry is the projection
+    /// plus the ORIGIN placeholder column.
     #[test]
     fn ps_all_without_registry_matches_plain_ps() {
         let desc = std::collections::BTreeMap::new();
         let v = projection();
-        assert_eq!(
-            render_ps_all_table(&v, &desc, &[]),
-            render_ps_table(&v, &desc)
-        );
+        let all = render_ps_all_table(&v, &desc, &[]);
+        let plain = render_ps_table(&v, &desc);
+        // The ORIGIN column is appended; every other cell is identical.
+        for (a, p) in all.lines().zip(plain.lines()) {
+            assert!(
+                a.starts_with(p.trim_end()),
+                "ps --all row extends the ps row:\n  all:  {a:?}\n  ps:   {p:?}"
+            );
+        }
+        assert!(all.contains("ORIGIN") && !plain.contains("ORIGIN"));
     }
 
     /// `ps` PENDING column: a program whose disk definition differs carries a
@@ -1601,6 +1676,7 @@ mod tests {
             name: "pending-app".to_string(),
             path: "/opt/pending/appkeeper.toml".to_string(),
             description: None,
+            origin: crate::registry::Origin::Compose,
         }];
         let out = render_ps_all_table(&v, &desc, &registry);
         let row = out
@@ -1633,8 +1709,9 @@ mod tests {
         assert!(api.contains("changed"), "{api}");
     }
 
-    /// 4.3: the offline degradation is a daemon-offline note plus the local
-    /// registry listing (name / config path / description), exit code 0.
+    /// 4.3 + 1.5: the offline degradation is a daemon-offline note plus the
+    /// local registry listing (name / config path / description / origin),
+    /// exit code 0.
     #[test]
     fn registry_listing_offline_note_and_columns() {
         let registry = vec![
@@ -1642,11 +1719,13 @@ mod tests {
                 name: "zeta".to_string(),
                 path: "/opt/zeta/appkeeper.toml".to_string(),
                 description: None,
+                origin: crate::registry::Origin::Run,
             },
             RegistryRow {
                 name: "alpha".to_string(),
                 path: "/opt/alpha/appkeeper.toml".to_string(),
                 description: Some("alpha app".to_string()),
+                origin: crate::registry::Origin::Compose,
             },
         ];
         let out = render_registry_listing(&registry, true);
@@ -1654,13 +1733,19 @@ mod tests {
         assert!(lines[0].contains("daemon offline"), "{out}");
         assert!(lines[1].starts_with("NAME"), "{out}");
         assert!(lines[1].contains("CONFIG") && lines[1].contains("DESCRIPTION"));
+        assert!(lines[1].contains("ORIGIN"), "{out}");
         assert!(lines[2].starts_with("----"), "{out}");
         // Sorted by name.
         assert!(
             lines[3].contains("alpha") && lines[3].contains("alpha app"),
             "{out}"
         );
+        assert!(
+            lines[3].ends_with("compose"),
+            "alpha is a compose record: {out}"
+        );
         assert!(lines[4].contains("zeta") && lines[4].contains("-"), "{out}");
+        assert!(lines[4].ends_with("run"), "zeta is a run record: {out}");
         assert_eq!(lines.len(), 5, "{out}");
 
         // Without the offline flag there is no note (the online empty case).

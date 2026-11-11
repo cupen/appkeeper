@@ -2,6 +2,7 @@
 //! the daemon-configured `app_dir`. add/remove/list manage those links; the
 //! linked deployment file is always the source of truth.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +13,34 @@ use crate::config::{
     resolve_app, split_command, validate_all,
 };
 
+/// Where a registration record lives (add-compose-up D1): the `app_dir` top
+/// level holds the compose family's products (scaffold generations, `compose
+/// up` snapshots) plus the external-deployment links; the `app_dir/adhoc/`
+/// sub-area holds the run ad-hoc products. The location is the
+/// write-permission criterion ([`guard_scaffold_overwrite`]) and the `ak ps
+/// --all` origin marker — it is a registry-layer fact and never enters the
+/// `/v1`/`/api`/WS projections (add-compose-up D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// `app_dir` top level: compose products and external links.
+    Compose,
+    /// `app_dir/adhoc/`: run ad-hoc products.
+    Run,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Compose => "compose",
+            Origin::Run => "run",
+        }
+    }
+}
+
+/// The run-product sub-area inside `app_dir` (add-compose-up D1). Only real
+/// files live here — no link semantics.
+pub const ADHOC_SUBDIR: &str = "adhoc";
+
 #[derive(Debug, Clone)]
 pub struct ListedApp {
     pub name: String,
@@ -20,6 +49,12 @@ pub struct ListedApp {
     /// Set when the config file exists but is broken (parse/read failure).
     /// Detection isolates such apps instead of treating them as removed.
     pub broken: Option<String>,
+    /// Registration origin, derived from the record's location: a record in
+    /// `app_dir/adhoc/` is a run product, anything at the top level
+    /// (including links and pre-partition run files) is `compose`. Display
+    /// only — it never enters the status projections (read by the `ak ps
+    /// --all` table and the offline registry listing).
+    pub origin: Origin,
 }
 
 impl ListedApp {
@@ -29,7 +64,7 @@ impl ListedApp {
     }
 }
 
-/// `<app_dir>/<name>.toml` for a given app name.
+/// `<app_dir>/<name>.toml` — the top-level (compose family) record path.
 pub fn link_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
     crate::config::resolve_path(&config.daemon.app_dir, config_dir).join(format!("{name}.toml"))
 }
@@ -37,6 +72,45 @@ pub fn link_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBu
 /// The resolved `app_dir` directory.
 pub fn app_dir(config: &DaemonConfig, config_dir: &Path) -> PathBuf {
     crate::config::resolve_path(&config.daemon.app_dir, config_dir)
+}
+
+/// `app_dir/adhoc` — the run-product area, created lazily by the run-side
+/// staging (task 1.1).
+pub fn adhoc_dir(config: &DaemonConfig, config_dir: &Path) -> PathBuf {
+    app_dir(config, config_dir).join(ADHOC_SUBDIR)
+}
+
+/// `app_dir/adhoc/<name>.toml` — the run ad-hoc record path (a real file,
+/// never a link).
+pub fn adhoc_link_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
+    adhoc_dir(config, config_dir).join(format!("{name}.toml"))
+}
+
+/// The record path for `origin`: top level (compose) or `adhoc/` (run).
+pub fn record_path(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+    origin: Origin,
+) -> PathBuf {
+    match origin {
+        Origin::Compose => link_path(config, config_dir, name),
+        Origin::Run => adhoc_link_path(config, config_dir, name),
+    }
+}
+
+/// True when `target` is a record the compose family must never rewrite: a
+/// symlink (external deployment) or a multi-link hard link (the Windows
+/// `make_link` fallback — its other name may be an external config). Used by
+/// the overwrite guard and the compose-up classification.
+pub fn is_external_record(target: &Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(target) else {
+        return false;
+    };
+    if md.is_symlink() {
+        return true;
+    }
+    md.is_file() && file_link_count(target, &md) > 1
 }
 
 /// Derive the app name from a config path's parent directory.
@@ -48,66 +122,89 @@ pub fn name_from_dir(path: &Path) -> String {
         .unwrap_or_else(|| "app".to_string())
 }
 
-/// Scan `app_dir` and list every registered app. Dangling links are warned
-/// about and skipped.
+/// Scan `app_dir` (top level) and `app_dir/adhoc/` and list every registered
+/// app (add-compose-up task 1.2). Dangling links are warned about and
+/// skipped; a missing `adhoc/` sub-area counts as empty. Names are unique
+/// across both areas — the areas are write-partitioned, so a duplicate can
+/// only be a hand-made anomaly: the top-level record wins and the `adhoc/`
+/// one is ignored with a warning.
 pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> {
     let dir = app_dir(config, config_dir);
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
     }
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "toml").unwrap_or(false))
-        .collect();
-    entries.sort();
-    for link in entries {
-        let name = link
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let real = std::fs::canonicalize(&link).with_context(|| {
-            format!(
-                "dangling registration link {} (run `ak remove {name}`)",
-                link.display()
-            )
-        });
-        let real = match real {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("{e:#}");
+    let mut seen: HashSet<String> = HashSet::new();
+    for (area, origin) in [
+        (dir.clone(), Origin::Compose),
+        (dir.join(ADHOC_SUBDIR), Origin::Run),
+    ] {
+        if !area.is_dir() {
+            continue;
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(&area)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "toml").unwrap_or(false))
+            .collect();
+        entries.sort();
+        for link in entries {
+            let name = link
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !seen.insert(name.clone()) {
+                warn!(
+                    "duplicate registration {name:?} in {} is ignored (the top-level record wins)",
+                    area.display()
+                );
                 continue;
             }
-        };
-        match std::fs::read_to_string(&real) {
-            Ok(text) => match toml::from_str::<crate::config::AppRaw>(&text) {
-                Ok(raw) => out.push(ListedApp {
-                    description: raw.app.as_ref().and_then(|m| m.description.clone()),
-                    name,
-                    path: real,
-                    broken: None,
-                }),
-                // Keep the entry so the supervisor can isolate it explicitly
-                // (broken file ≠ unregistered); non-supervisor callers filter.
+            let real = std::fs::canonicalize(&link).with_context(|| {
+                format!(
+                    "dangling registration link {} (run `ak remove {name}`)",
+                    link.display()
+                )
+            });
+            let real = match real {
+                Ok(r) => r,
                 Err(e) => {
-                    warn!("registered app {name:?} fails to parse: {e}");
+                    warn!("{e:#}");
+                    continue;
+                }
+            };
+            match std::fs::read_to_string(&real) {
+                Ok(text) => match toml::from_str::<crate::config::AppRaw>(&text) {
+                    Ok(raw) => out.push(ListedApp {
+                        description: raw.app.as_ref().and_then(|m| m.description.clone()),
+                        name,
+                        path: real,
+                        broken: None,
+                        origin,
+                    }),
+                    // Keep the entry so the supervisor can isolate it explicitly
+                    // (broken file ≠ unregistered); non-supervisor callers filter.
+                    Err(e) => {
+                        warn!("registered app {name:?} fails to parse: {e}");
+                        out.push(ListedApp {
+                            description: None,
+                            name,
+                            path: real,
+                            broken: Some(format!("app config fails to parse: {e}")),
+                            origin,
+                        })
+                    }
+                },
+                Err(e) => {
+                    warn!("registered app {name:?} cannot be read: {e}");
                     out.push(ListedApp {
                         description: None,
                         name,
                         path: real,
-                        broken: Some(format!("app config fails to parse: {e}")),
+                        broken: Some(format!("app config cannot be read: {e}")),
+                        origin,
                     })
                 }
-            },
-            Err(e) => {
-                warn!("registered app {name:?} cannot be read: {e}");
-                out.push(ListedApp {
-                    description: None,
-                    name,
-                    path: real,
-                    broken: Some(format!("app config cannot be read: {e}")),
-                })
             }
         }
     }
@@ -303,44 +400,60 @@ pub struct ScaffoldSpec {
     pub health_check: Option<String>,
 }
 
-/// Refuse to scaffold over a registration that is not our own generated file
-/// in `app_dir`: a link to an external deployment config, a stale/dangling
-/// link, or a multi-link (hard link) file would clobber a file the user owns.
-/// A plain single-link file inside `app_dir` is our own prior generation and
-/// is the intended regeneration target.
+/// Refuse to write a generated registration over a record the caller does not
+/// own. The criterion is the PATH, not the file shape (add-compose-up D1 /
+/// task 1.3): run products may only live in `app_dir/adhoc/`, compose
+/// products only at the `app_dir` top level, and neither flow may ever
+/// rewrite a link — a symlink to an external deployment config or a
+/// multi-link (hard link) file would clobber a file the user owns.
 ///
+/// `origin` names which family is writing and thus which area the target
+/// must be in; a misrouted target is refused before any file-shape probing.
 /// Shared by [`add_scaffold`] and the daemon-side `ak run --force` overwrite
 /// (refuse-run-existing-app D8: `--force` never bypasses this guard).
-pub fn guard_scaffold_overwrite(target: &Path, app_dir: &Path, name: &str) -> Result<()> {
+pub fn guard_scaffold_overwrite(
+    target: &Path,
+    app_dir: &Path,
+    name: &str,
+    origin: Origin,
+) -> Result<()> {
+    // Region check (path criterion, platform independent): run writes only
+    // inside `adhoc/`, compose only at the top level.
+    let in_region = match origin {
+        Origin::Run => target.parent() == Some(&app_dir.join(ADHOC_SUBDIR)),
+        Origin::Compose => target.parent() == Some(app_dir),
+    };
+    if !in_region {
+        bail!(
+            "app {name:?} would be written to {} which is outside the {} area \
+             (run products live in {}/<name>.toml, compose products at the app_dir top level)",
+            target.display(),
+            origin.as_str(),
+            ADHOC_SUBDIR,
+        )
+    }
     let Ok(md) = std::fs::symlink_metadata(target) else {
         return Ok(()); // nothing there: a fresh generation
     };
     if md.is_symlink() {
-        let dir_canon = app_dir.canonicalize().ok();
-        match target.canonicalize() {
-            // Our own generation (the record is a real file inside app_dir).
-            Ok(real) if dir_canon.as_deref() == real.parent() => Ok(()),
-            Ok(real) => bail!(
-                "app {name:?} is already registered from {} — run `ak remove {name}` \
-                 first (scaffolding would overwrite that file)",
-                real.display()
-            ),
-            Err(_) => bail!(
-                "stale registration {} cannot be resolved — run `ak remove {name}` first",
-                target.display()
-            ),
-        }
-    } else if md.is_file() && file_link_count(target, &md) > 1 {
-        // A plain multi-link file in app_dir is a hard link (the Windows
-        // `make_link` fallback) — its other name may be an external config
-        // the write would clobber.
+        // A link is never our own generation: it points at an external
+        // deployment config (or is stale). Either way, never write through it.
+        bail!(
+            "app {name:?} is registered via a link at {} — run `ak remove {name}` first \
+             (scaffolding would overwrite that file)",
+            target.display()
+        );
+    }
+    if md.is_file() && file_link_count(target, &md) > 1 {
+        // A plain multi-link file is a hard link (the Windows `make_link`
+        // fallback) — its other name may be an external config the write
+        // would clobber.
         bail!(
             "app {name:?} is registered via a hard link (possibly to an external config) — \
              run `ak remove {name}` before scaffolding over it"
         )
-    } else {
-        Ok(())
     }
+    Ok(())
 }
 
 /// Scaffold flow: render a single-program app config from an executable and
@@ -374,8 +487,8 @@ fn add_scaffold(
     let target = link_path(config, config_dir, &name);
     // Never write through a registration that lives outside app_dir: a
     // link pointing at an external deployment file would clobber that file
-    // on regeneration.
-    guard_scaffold_overwrite(&target, &dir, &name)?;
+    // on regeneration. The scaffold is a compose product: the top level only.
+    guard_scaffold_overwrite(&target, &dir, &name, Origin::Compose)?;
 
     // Working directory: explicit --workdir wins, else the directory the
     // add command ran in; always written as an absolute path.
@@ -446,83 +559,14 @@ fn add_scaffold(
 }
 
 /// Resolve a command's first token into an absolute executable path
-/// (design D7): a token containing a path separator is canonicalized (with an
-/// existence check), a bare name is looked up on the caller's `PATH` (unix:
-/// first entry with an execute bit; windows: as-is then `PATHEXT` expansion).
-/// The resolved absolute path is what gets frozen into the generated config,
-/// so the daemon's spawn environment cannot change the meaning.
+/// (cli-revamp D7, shared body in [`crate::config::resolve_command_on`]): a
+/// token containing a path separator is canonicalized (with an existence
+/// check), a bare name is looked up on the process `PATH` (unix: first entry
+/// with an execute bit; windows: as-is then `PATHEXT` expansion). The resolved
+/// absolute path is what gets frozen into the generated config, so the
+/// daemon's spawn environment cannot change the meaning.
 pub fn resolve_command(first: &str) -> Result<PathBuf> {
-    if first.trim().is_empty() {
-        bail!("the command is empty");
-    }
-    let has_sep = first.contains('/') || first.contains(std::path::MAIN_SEPARATOR);
-    if has_sep {
-        let p = Path::new(first);
-        return p
-            .canonicalize()
-            .map(display_absolute)
-            .with_context(|| format!("cannot resolve command {first:?} (no such executable)"));
-    }
-    resolve_on_path(first).with_context(|| {
-        format!(
-            "cannot find {first:?} on PATH (use an absolute or relative path, \
-             or make sure it is installed)"
-        )
-    })
-}
-
-/// Look a bare command name up on `PATH`.
-#[cfg(unix)]
-fn resolve_on_path(name: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let cand = dir.join(name);
-        let Ok(md) = std::fs::metadata(&cand) else {
-            continue;
-        };
-        if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-            return Ok(display_absolute(cand));
-        }
-    }
-    bail!("{name:?} was not found on PATH")
-}
-
-/// Windows: try the name verbatim, then each `PATHEXT` extension.
-#[cfg(windows)]
-fn resolve_on_path(name: &str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    let has_ext = Path::new(name)
-        .extension()
-        .map(|e| !e.is_empty())
-        .unwrap_or(false);
-    for dir in std::env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let direct = dir.join(name);
-        if direct.is_file() {
-            return Ok(display_absolute(direct));
-        }
-        if !has_ext {
-            for ext in &exts {
-                let cand = dir.join(format!("{name}{ext}"));
-                if cand.is_file() {
-                    return Ok(display_absolute(cand));
-                }
-            }
-        }
-    }
-    bail!("{name:?} was not found on PATH")
+    crate::config::resolve_command_on(None, first)
 }
 
 /// `p` joined onto the current directory when relative.
@@ -564,22 +608,10 @@ fn file_link_count(target: &Path, _md: &std::fs::Metadata) -> u64 {
     }
 }
 
-/// Windows `canonicalize` yields verbatim (`\\?\C:\...`) paths; strip the
-/// prefix from plain drive paths so generated configs stay readable (the
-/// result is still absolute).
-fn display_absolute(p: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let s = p.as_os_str().to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            let bytes = rest.as_bytes();
-            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-                return PathBuf::from(rest.to_string());
-            }
-        }
-    }
-    p
-}
+/// Windows `canonicalize` yields verbatim (`\\?\C:\...`) paths; the prefix is
+/// stripped by [`crate::config::display_absolute`] — re-exported here for the
+/// scaffold renderer and its tests.
+use crate::config::display_absolute;
 
 /// unix: a scaffolded program without any execute bit is almost certainly a
 /// start failure waiting to happen — warn (add still succeeds; Windows has
@@ -611,7 +643,10 @@ fn warn_if_not_executable(_exe: &Path) {}
 pub fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result<String> {
     let command_str = spec.command.display().to_string();
     let (command, args) = if command_str.contains(char::is_whitespace) {
-        (render_command_line(&command_str, &spec.args)?, None)
+        (
+            crate::config::render_single_line_command(&command_str, &spec.args)?,
+            None,
+        )
     } else {
         (
             command_str,
@@ -653,26 +688,8 @@ pub fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Re
     ))
 }
 
-/// Render `command args...` as one single-line command the quote-aware
-/// splitter turns back into the same argv (paths/args containing whitespace
-/// get double-quoted; embedded quotes cannot be represented).
-fn render_command_line(command: &str, args: &[String]) -> Result<String> {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    for s in std::iter::once(command).chain(args.iter().map(|s| s.as_str())) {
-        if s.contains('"') {
-            bail!(
-                "cannot represent {s:?} in a single-line command (quote character); \
-                 edit the generated config by hand"
-            );
-        }
-        if s.chars().any(|c| c.is_whitespace()) {
-            parts.push(format!("\"{s}\""));
-        } else {
-            parts.push(s.to_string());
-        }
-    }
-    Ok(parts.join(" "))
-}
+// (The single-line command rendering moved to `config::render_single_line_command`
+// so the declaration renderer and this scaffold renderer share one body.)
 
 // ---------------------------------------------------------------------------
 // daemon-side commit engine (run-daemon-first: 「启动成功后再落盘」)
@@ -687,30 +704,56 @@ pub const PENDING_SUFFIX: &str = "toml.pending";
 /// Bounded retry budget for the atomic rename (transient IO tolerance).
 pub const COMMIT_RETRIES: u32 = 3;
 
-/// `app_dir/<name>.toml.pending` — the placeholder path for `name`.
+/// `app_dir/<name>.toml.pending` — the top-level placeholder path for `name`
+/// (compose family).
 pub fn pending_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
     crate::config::resolve_path(&config.daemon.app_dir, config_dir)
         .join(format!("{name}.{PENDING_SUFFIX}"))
 }
 
-/// Establish the placeholder for `name`: write `text` into
-/// `app_dir/<name>.toml.pending` (creating `app_dir` if needed) and fsync it.
-/// Returning Ok proves write access and disk availability **before** any
-/// process is started (app-registry spec: 无法建立占位时不启动进程).
+/// `app_dir/adhoc/<name>.toml.pending` — the run-side placeholder path.
+pub fn adhoc_pending_path(config: &DaemonConfig, config_dir: &Path, name: &str) -> PathBuf {
+    adhoc_dir(config, config_dir).join(format!("{name}.{PENDING_SUFFIX}"))
+}
+
+/// The placeholder path for `origin`.
+pub fn pending_path_for(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+    origin: Origin,
+) -> PathBuf {
+    match origin {
+        Origin::Compose => pending_path(config, config_dir, name),
+        Origin::Run => adhoc_pending_path(config, config_dir, name),
+    }
+}
+
+/// Establish the placeholder for `name` in the record area `origin`: write
+/// `text` into `app_dir[/adhoc]/<name>.toml.pending` (creating the area if
+/// needed) and fsync it. Returning Ok proves write access and disk
+/// availability **before** any process is started (app-registry spec:
+/// 无法建立占位时不启动进程).
 pub fn stage_placeholder(
     config: &DaemonConfig,
     config_dir: &Path,
     name: &str,
     text: &str,
+    origin: Origin,
 ) -> Result<PathBuf> {
-    let dir = app_dir(config, config_dir);
+    let dir = match origin {
+        Origin::Compose => app_dir(config, config_dir),
+        Origin::Run => adhoc_dir(config, config_dir),
+    };
     std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create app_dir {}", dir.display()))?;
-    let ph = pending_path(config, config_dir, name);
+        .with_context(|| format!("failed to create {} {}", origin.as_str(), dir.display()))?;
+    let ph = pending_path_for(config, config_dir, name, origin);
     write_synced(&ph, text).with_context(|| {
         format!(
-            "cannot write the registration placeholder {} — fix write access to app_dir {}",
+            "cannot write the registration placeholder {} — fix write access to the {} \
+             record area of app_dir {}",
             ph.display(),
+            origin.as_str(),
             dir.display()
         )
     })?;
@@ -775,10 +818,11 @@ impl std::fmt::Display for CommitFailure {
     }
 }
 
-/// Commit a staged definition: if the target `<name>.toml` already holds
-/// byte-identical content, do nothing and report no change; otherwise rename
-/// the placeholder onto the target, retrying a bounded number of times on
-/// transient IO errors (app-registry spec: 目标已存在且内容一致时幂等成功).
+/// Commit a staged definition: if the target record (`origin` decides the
+/// area) already holds byte-identical content, do nothing and report no
+/// change; otherwise rename the placeholder onto the target, retrying a
+/// bounded number of times on transient IO errors (app-registry spec:
+/// 目标已存在且内容一致时幂等成功).
 ///
 /// The caller must have established the placeholder first
 /// ([`stage_placeholder`]); the rename is same-directory and therefore atomic
@@ -788,12 +832,14 @@ pub fn commit_staged(
     config_dir: &Path,
     name: &str,
     text: &str,
+    origin: Origin,
 ) -> std::result::Result<CommitOutcome, CommitFailure> {
     commit_with(
         config,
         config_dir,
         name,
         text,
+        origin,
         COMMIT_RETRIES,
         |from, to| std::fs::rename(from, to),
     )
@@ -806,18 +852,19 @@ fn commit_with(
     config_dir: &Path,
     name: &str,
     text: &str,
+    origin: Origin,
     retries: u32,
     rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::result::Result<CommitOutcome, CommitFailure> {
-    let target = link_path(config, config_dir, name);
+    let target = record_path(config, config_dir, name, origin);
     // Idempotency: identical content already on disk → no write, no rename.
     // (Checked before the placeholder matters: the caller may have staged
     // and this short-circuits the swap.)
     if matches!(std::fs::read_to_string(&target), Ok(old) if old == text) {
-        let _ = std::fs::remove_file(pending_path(config, config_dir, name));
+        let _ = std::fs::remove_file(pending_path_for(config, config_dir, name, origin));
         return Ok(CommitOutcome::Unchanged { path: target });
     }
-    let ph = pending_path(config, config_dir, name);
+    let ph = pending_path_for(config, config_dir, name, origin);
     if !ph.exists() {
         return Err(CommitFailure::Stage(format!(
             "placeholder {} is missing (nothing was staged)",
@@ -849,9 +896,10 @@ fn commit_with(
 }
 
 /// Remove a placeholder left behind by an aborted or failed staging
-/// (startup judgement failed, user declined, …). Missing is fine.
-pub fn discard_placeholder(config: &DaemonConfig, config_dir: &Path, name: &str) {
-    let _ = std::fs::remove_file(pending_path(config, config_dir, name));
+/// (startup judgement failed, user declined, …). Missing is fine. `origin`
+/// decides the area the placeholder was staged in.
+pub fn discard_placeholder(config: &DaemonConfig, config_dir: &Path, name: &str, origin: Origin) {
+    let _ = std::fs::remove_file(pending_path_for(config, config_dir, name, origin));
 }
 
 /// What one `registry::remove` call did.
@@ -867,7 +915,9 @@ pub struct RemovedApp {
     pub deleted_file: bool,
 }
 
-/// True when a registration record exists at `app_dir/<name>.toml`.
+/// True when a registration record exists for `name` — at `app_dir/<name>.toml`
+/// or in `app_dir/adhoc/` (add-compose-up task 1.2: existence probes cover
+/// both areas).
 ///
 /// Uses the same existence probe as [`remove`], so the two cannot drift: a
 /// caller that needs "nothing left to delete" (the daemon Remove command, whose
@@ -875,28 +925,41 @@ pub struct RemovedApp {
 /// [`remove`]'s error text.
 pub fn is_registered(config: &DaemonConfig, config_dir: &Path, name: &str) -> bool {
     link_path(config, config_dir, name).exists()
+        || adhoc_link_path(config, config_dir, name).exists()
 }
 
-/// Remove an app registration: delete the `app_dir` record. A link record
-/// is removed while the external deployment file is kept; a record that is
-/// a real file inside `app_dir` (scaffold-generated) is deleted with the
-/// registration. The criterion is the path, not the link kind — Windows
-/// `make_link` falls back to hard links, which symlink probes can't see.
+/// Remove an app registration: delete the record — at the `app_dir` top level
+/// first, then in `app_dir/adhoc/` (the areas are name-disjoint, so at most
+/// one exists). A link record is removed while the external deployment file is
+/// kept; a record that is a real file inside `app_dir` or `app_dir/adhoc/`
+/// (scaffold-generated / run product) is deleted with the registration. The
+/// criterion is the path, not the link kind — Windows `make_link` falls back
+/// to hard links, which symlink probes can't see (task 1.4: the `deleted_file`
+/// criterion is "the record body's parent is the top level or `adhoc/`").
 pub fn remove(config: &DaemonConfig, config_dir: &Path, name: &str) -> Result<RemovedApp> {
-    let link = link_path(config, config_dir, name);
-    if !link.exists() {
+    let top = link_path(config, config_dir, name);
+    let adhoc = adhoc_link_path(config, config_dir, name);
+    let link = if top.exists() {
+        top
+    } else if adhoc.exists() {
+        adhoc
+    } else {
         bail!(
-            "app {name:?} is not registered (no link at {})",
-            link.display()
+            "app {name:?} is not registered (no record at {} or {})",
+            top.display(),
+            adhoc.display()
         );
-    }
+    };
     let real_canon = std::fs::canonicalize(&link).unwrap_or_else(|_| link.clone());
     std::fs::remove_file(&link)
         .with_context(|| format!("failed to remove registration link {}", link.display()))?;
     let dir_canon = app_dir(config, config_dir).canonicalize().ok();
-    let deleted_file = dir_canon
-        .map(|d| real_canon.parent() == Some(&d))
-        .unwrap_or(false);
+    let adhoc_canon = dir_canon.as_ref().map(|d| d.join(ADHOC_SUBDIR));
+    let deleted_file = match (&dir_canon, &adhoc_canon) {
+        (Some(d), Some(a)) => real_canon.parent() == Some(d) || real_canon.parent() == Some(a),
+        (Some(d), None) => real_canon.parent() == Some(d),
+        _ => false,
+    };
     let real = display_absolute(real_canon);
     if deleted_file {
         debug!(
@@ -1025,6 +1088,19 @@ mod tests {
             out.push(c.as_os_str());
         }
         out
+    }
+
+    /// Register `target` at `link` for tests, mirroring `make_link` (symlink;
+    /// hard-link fallback where symlinks need privileges).
+    fn link_for_test(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(target, link).is_err() {
+                std::fs::hard_link(target, link).unwrap();
+            }
+        }
     }
 
     fn opts(name: &str) -> AddOptions {
@@ -1723,7 +1799,7 @@ mod tests {
         let tmp = tmp_dir("commit");
         let config = DaemonConfig::default();
         let text = "# generated\n[program.web]\ncommand = 'true'\n";
-        let ph = stage_placeholder(&config, &tmp, "web", text).unwrap();
+        let ph = stage_placeholder(&config, &tmp, "web", text, Origin::Compose).unwrap();
         assert!(ph.exists(), "placeholder written");
         assert_eq!(ph.file_name().unwrap(), "web.toml.pending");
         assert_ne!(
@@ -1736,7 +1812,7 @@ mod tests {
             "placeholder is not a registration record"
         );
 
-        let outcome = commit_staged(&config, &tmp, "web", text).unwrap();
+        let outcome = commit_staged(&config, &tmp, "web", text, Origin::Compose).unwrap();
         assert!(matches!(outcome, CommitOutcome::Committed { .. }));
         assert!(!ph.exists(), "placeholder consumed by the rename");
         let target = tmp.join("app.d").join("web.toml");
@@ -1762,8 +1838,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let config = DaemonConfig::default();
-        let err =
-            stage_placeholder(&config, &tmp, "web", "[program.web]\ncommand='true'\n").unwrap_err();
+        let err = stage_placeholder(
+            &config,
+            &tmp,
+            "web",
+            "[program.web]\ncommand='true'\n",
+            Origin::Compose,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("app_dir"), "{err:#}");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
@@ -1781,13 +1863,13 @@ mod tests {
         let tmp = tmp_dir("rename-fail");
         let config = DaemonConfig::default();
         let text = "[program.web]\ncommand = 'true'\n";
-        stage_placeholder(&config, &tmp, "web", text).unwrap();
+        stage_placeholder(&config, &tmp, "web", text, Origin::Compose).unwrap();
         let attempts = std::cell::Cell::new(0u32);
         let fail = |_from: &Path, _to: &Path| -> std::io::Result<()> {
             attempts.set(attempts.get() + 1);
             Err(std::io::Error::other("boom"))
         };
-        let err = commit_with(&config, &tmp, "web", text, 2, fail).unwrap_err();
+        let err = commit_with(&config, &tmp, "web", text, Origin::Compose, 2, fail).unwrap_err();
         match err {
             CommitFailure::Rename { target, error } => {
                 assert_eq!(target, tmp.join("app.d").join("web.toml"));
@@ -1814,15 +1896,15 @@ mod tests {
         let tmp = tmp_dir("idem");
         let config = DaemonConfig::default();
         let text = "[program.web]\ncommand = 'true'\n";
-        stage_placeholder(&config, &tmp, "web", text).unwrap();
-        commit_staged(&config, &tmp, "web", text).unwrap();
+        stage_placeholder(&config, &tmp, "web", text, Origin::Compose).unwrap();
+        commit_staged(&config, &tmp, "web", text, Origin::Compose).unwrap();
         let target = tmp.join("app.d").join("web.toml");
         let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
 
         // A second run stages again (the caller always stages), then commits
         // the same text: no write, no rename.
-        stage_placeholder(&config, &tmp, "web", text).unwrap();
-        let outcome = commit_staged(&config, &tmp, "web", text).unwrap();
+        stage_placeholder(&config, &tmp, "web", text, Origin::Compose).unwrap();
+        let outcome = commit_staged(&config, &tmp, "web", text, Origin::Compose).unwrap();
         assert!(outcome.unchanged(), "identical content → unchanged");
         assert_eq!(outcome.path(), target);
         assert_eq!(
@@ -1843,11 +1925,231 @@ mod tests {
     fn discard_placeholder_is_idempotent() {
         let tmp = tmp_dir("discard");
         let config = DaemonConfig::default();
-        stage_placeholder(&config, &tmp, "web", "x").unwrap();
+        stage_placeholder(&config, &tmp, "web", "x", Origin::Compose).unwrap();
         assert!(pending_path(&config, &tmp, "web").exists());
-        discard_placeholder(&config, &tmp, "web");
+        discard_placeholder(&config, &tmp, "web", Origin::Compose);
         assert!(!pending_path(&config, &tmp, "web").exists());
-        discard_placeholder(&config, &tmp, "web"); // no panic / no error
+        discard_placeholder(&config, &tmp, "web", Origin::Compose); // no panic / no error
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- add-compose-up section 1: registry partition ------------------------
+
+    /// 1.1: run products stage into `app_dir/adhoc/` (a real file, no link);
+    /// the sub-area is created lazily and the record is listed from it.
+    #[test]
+    fn run_products_stage_into_adhoc_subdir() {
+        let tmp = tmp_dir("adhoc-area");
+        let config = DaemonConfig::default();
+        let text = "[program.web]\ncommand = 'true'\n";
+        let ph = stage_placeholder(&config, &tmp, "web", text, Origin::Run).unwrap();
+        assert_eq!(
+            ph,
+            tmp.join("app.d").join("adhoc").join("web.toml.pending"),
+            "the placeholder lives in the adhoc area"
+        );
+        assert!(ph.exists(), "the adhoc area is created lazily by staging");
+
+        let outcome = commit_staged(&config, &tmp, "web", text, Origin::Run).unwrap();
+        let record = tmp.join("app.d").join("adhoc").join("web.toml");
+        assert_eq!(outcome.path(), record);
+        let md = std::fs::symlink_metadata(&record).unwrap();
+        assert!(md.is_file(), "the run record is a real file, not a link");
+        assert!(!ph.exists(), "placeholder consumed by the rename");
+
+        let listed = list(&config, &tmp).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "web");
+        assert_eq!(listed[0].origin, Origin::Run, "adhoc record → origin run");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.2: `list` merges the top level and `adhoc/`; a missing `adhoc/`
+    /// directory counts as empty; a pre-partition run file at the top level
+    /// keeps working and is reported as `compose` (position-derived).
+    #[test]
+    fn list_merges_both_areas_and_marks_origin() {
+        let tmp = tmp_dir("list-merge");
+        let config = DaemonConfig::default();
+
+        // No app_dir at all → empty.
+        assert!(list(&config, &tmp).unwrap().is_empty());
+
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No adhoc/ sub-area yet.
+        assert!(list(&config, &tmp).unwrap().is_empty());
+
+        // Top-level external link (compose) + top-level legacy real file.
+        let body = tmp.join("deploy.toml");
+        std::fs::write(&body, "[program.a]\ncommand = 'true'\n").unwrap();
+        link_for_test(&body, &dir.join("linked.toml"));
+        std::fs::write(dir.join("legacy.toml"), "[program.b]\ncommand = 'true'\n").unwrap();
+
+        // adhoc/ run product.
+        std::fs::create_dir_all(dir.join("adhoc")).unwrap();
+        std::fs::write(
+            dir.join("adhoc").join("adhoc-app.toml"),
+            "[program.c]\ncommand = 'true'\n",
+        )
+        .unwrap();
+
+        let listed = list(&config, &tmp).unwrap();
+        let by_name: BTreeMap<&str, &ListedApp> =
+            listed.iter().map(|l| (l.name.as_str(), l)).collect();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert_eq!(by_name["linked"].origin, Origin::Compose);
+        assert_eq!(
+            by_name["legacy"].origin,
+            Origin::Compose,
+            "top level is compose"
+        );
+        assert_eq!(by_name["adhoc-app"].origin, Origin::Run);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.2: name uniqueness spans both areas — a hand-made duplicate is
+    /// resolved in favor of the top-level record (the areas are
+    /// write-partitioned, so a duplicate can only be an anomaly).
+    #[test]
+    fn list_uniqueness_spans_both_areas() {
+        let tmp = tmp_dir("list-unique");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join("adhoc")).unwrap();
+        std::fs::write(dir.join("web.toml"), "[program.w]\ncommand = 'true'\n").unwrap();
+        std::fs::write(
+            dir.join("adhoc").join("web.toml"),
+            "[program.w]\ncommand = 'nope'\n",
+        )
+        .unwrap();
+
+        let listed = list(&config, &tmp).unwrap();
+        assert_eq!(listed.len(), 1, "the top-level record wins: {listed:?}");
+        assert_eq!(listed[0].origin, Origin::Compose);
+        assert!(
+            listed[0].path.parent() == Some(&dir),
+            "the listed path is the top-level record"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.2: `is_registered` probes both areas.
+    #[test]
+    fn is_registered_probes_both_areas() {
+        let tmp = tmp_dir("is-reg");
+        let config = DaemonConfig::default();
+        assert!(!is_registered(&config, &tmp, "web"));
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join("adhoc")).unwrap();
+        std::fs::write(dir.join("adhoc").join("web.toml"), "x").unwrap();
+        assert!(is_registered(&config, &tmp, "web"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.3: the overwrite guard is positional — run may write only in
+    /// `adhoc/`, compose only at the top level; symlinks, hard links and
+    /// dangling links are never writable, from either side.
+    #[test]
+    fn guard_scaffold_overwrite_path_criteria() {
+        let tmp = tmp_dir("guard");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join("adhoc")).unwrap();
+
+        // 1. adhoc target with an existing run record: writable by run.
+        std::fs::write(dir.join("adhoc").join("web.toml"), "old").unwrap();
+        guard_scaffold_overwrite(
+            &dir.join("adhoc").join("web.toml"),
+            &dir,
+            "web",
+            Origin::Run,
+        )
+        .unwrap();
+        // ...but the same existing file is outside the compose area.
+        let err = guard_scaffold_overwrite(
+            &dir.join("adhoc").join("web.toml"),
+            &dir,
+            "web",
+            Origin::Compose,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("outside"), "{err:#}");
+
+        // 2. top-level generated file: writable by compose.
+        std::fs::write(dir.join("scaf.toml"), "old").unwrap();
+        guard_scaffold_overwrite(&dir.join("scaf.toml"), &dir, "scaf", Origin::Compose).unwrap();
+        // ...but not by run (a top-level record belongs to the compose family).
+        let err = guard_scaffold_overwrite(&dir.join("scaf.toml"), &dir, "scaf", Origin::Run)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("outside"), "{err:#}");
+
+        // 3. symlink (external deployment): refused for the only origin that
+        // may even target the top level (run is refused by the region check).
+        let body = tmp.join("external.toml");
+        std::fs::write(&body, "[program.x]\ncommand = 'true'\n").unwrap();
+        link_for_test(&body, &dir.join("linked.toml"));
+        let err =
+            guard_scaffold_overwrite(&dir.join("linked.toml"), &dir, "linked", Origin::Compose)
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("remove"), "{err:#}");
+
+        // 4. hard link (multi-link file): refused (possibly an external config).
+        #[cfg(unix)]
+        {
+            std::fs::hard_link(&body, dir.join("hard.toml")).unwrap();
+            let err =
+                guard_scaffold_overwrite(&dir.join("hard.toml"), &dir, "hard", Origin::Compose)
+                    .unwrap_err();
+            assert!(format!("{err:#}").contains("hard link"), "{err:#}");
+        }
+
+        // 5. nothing there: a fresh generation, writable in either area.
+        guard_scaffold_overwrite(&dir.join("fresh.toml"), &dir, "fresh", Origin::Compose).unwrap();
+        guard_scaffold_overwrite(
+            &dir.join("adhoc").join("fresh.toml"),
+            &dir,
+            "fresh",
+            Origin::Run,
+        )
+        .unwrap();
+
+        // 6. dangling link: refused (it cannot be resolved, so a write through
+        // it would follow wherever it points once the target reappears).
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.join("gone.toml"), dir.join("dangling.toml")).unwrap();
+            let err = guard_scaffold_overwrite(
+                &dir.join("dangling.toml"),
+                &dir,
+                "dangling",
+                Origin::Compose,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("remove"), "{err:#}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.4: removing an `adhoc/` record deletes the file and reports its path.
+    #[test]
+    fn remove_deletes_adhoc_record_file() {
+        let tmp = tmp_dir("remove-adhoc");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join("adhoc")).unwrap();
+        let record = dir.join("adhoc").join("web.toml");
+        std::fs::write(&record, "[program.web]\ncommand = 'true'\n").unwrap();
+
+        let removed = remove(&config, &tmp, "web").unwrap();
+        assert!(removed.deleted_file, "the adhoc record is deleted with it");
+        assert_eq!(removed.path, record, "the deleted record path is reported");
+        assert!(!record.exists());
+        assert!(!is_registered(&config, &tmp, "web"));
+
+        // Unknown app: both areas are named in the error.
+        let err = remove(&config, &tmp, "nope").unwrap_err();
+        assert!(format!("{err:#}").contains("not registered"), "{err:#}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

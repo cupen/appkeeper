@@ -51,20 +51,27 @@ pub struct AdhocSpec {
     pub force: bool,
 }
 
-/// A staged (started but not yet persisted) ad-hoc app (run-daemon-first D1).
+/// A staged (started but not yet persisted) app (run-daemon-first D1;
+/// add-compose-up D4 extends it to the multi-program compose pipeline).
 #[derive(Debug, Clone)]
 pub struct StagedApp {
     pub app: String,
-    pub program: String,
+    /// The programs spawned for this staged app, in spawn order (run stages
+    /// exactly one; `compose up` stages the whole declaration). Abort stops
+    /// them in reverse.
+    pub programs: Vec<String>,
     /// Rendered config text, ready to be written to the target record.
     pub text: String,
-    /// The target registration file (`app_dir/<name>.toml`).
+    /// The target registration file (`app_dir[/adhoc]/<name>.toml`).
     pub target: PathBuf,
-    /// The placeholder written at stage time (`app_dir/<name>.toml.pending`).
-    /// Kept for diagnosis on partial failure and used by tests to assert the
-    /// staged path.
+    /// The placeholder written at stage time. Kept for diagnosis on partial
+    /// failure and used by tests to assert the staged path.
     #[allow(dead_code)]
     pub placeholder: PathBuf,
+    /// Which record area this staging commits into — the commit/abort paths
+    /// are shared by the run and compose pipelines and pick the placeholder
+    /// and target paths from it.
+    pub origin: registry::Origin,
     /// Resolved definition, merged into detection so the program survives
     /// periodic rescans while staged.
     pub resolved: ResolvedApp,
@@ -170,6 +177,173 @@ pub struct AdhocCommitResult {
     pub config_text: String,
 }
 
+// -- compose up (add-compose-up D2/D3/D4) ------------------------------------
+
+pub type ComposeUpReply =
+    std::sync::mpsc::Sender<std::result::Result<ComposeUpStaged, ComposeUpError>>;
+
+/// The `POST /v1/compose/up` payload (add-compose-up D2): the declaration
+/// CONTENT (never a file path — a tcp:// client and the daemon may live on
+/// different machines), the base directory relative paths render against, the
+/// caller's PATH for bare-command resolution, the app name and the force flag.
+#[derive(Debug, Clone)]
+pub struct ComposeUpRequest {
+    pub name: String,
+    pub content: String,
+    pub base_dir: PathBuf,
+    pub caller_path: Option<std::ffi::OsString>,
+    pub force: bool,
+}
+
+/// The five compose-up classifications (add-compose-up D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeClass {
+    /// No same-name record: a full register-and-start.
+    Fresh,
+    /// The rendered snapshot is byte-identical to the top-level record.
+    Identical,
+    /// A same-name compose record (top level) differs from the snapshot.
+    NeedsUpdate,
+    /// The same-name record lives in `app_dir/adhoc/` (a run product).
+    AdhocTakeover,
+    /// The same-name record is an external deployment link (or hard link).
+    ExternalRefused,
+}
+
+impl ComposeClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComposeClass::Fresh => "fresh",
+            ComposeClass::Identical => "identical",
+            ComposeClass::NeedsUpdate => "needs-update",
+            ComposeClass::AdhocTakeover => "adhoc-takeover",
+            ComposeClass::ExternalRefused => "external-refused",
+        }
+    }
+}
+
+/// One existing program of the same-name app, as the preview reports it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposeProgramInfo {
+    pub program: String,
+    pub state: String,
+    pub pid: Option<u32>,
+    /// True when the program has a user stop record (in memory or persisted).
+    pub user_stopped: bool,
+}
+
+/// The read-only preview a classification carries (add-compose-up D3).
+#[derive(Debug, Clone)]
+pub struct ComposePreview {
+    pub class: ComposeClass,
+    /// The existing record's path — or, for `fresh`, the target the commit
+    /// would land on.
+    pub record_path: PathBuf,
+    /// The declared program names (sorted).
+    pub declared: Vec<String>,
+    /// needs-update only: a compact per-program difference summary.
+    pub diff: Vec<String>,
+    /// external-refused only: the `ak remove` guidance.
+    pub hint: String,
+    /// The existing app's program states (empty for `fresh`).
+    pub programs: Vec<ComposeProgramInfo>,
+}
+
+/// Why a compose-up submission was refused without touching anything.
+#[derive(Debug)]
+pub enum ComposeUpError {
+    /// Rendering/validation failed (invalid name, bad declaration,
+    /// cross-app program-name conflict), or a staged same-name app is in the
+    /// way. Zero side effects.
+    Validation(String),
+    /// `needs-update` / `adhoc-takeover` without `force`, or `external-refused`
+    /// (always). Carries the preview so non-interactive clients can render the
+    /// guidance (control-plane spec). Zero side effects: nothing written,
+    /// nothing started or stopped.
+    Conflict(Box<ComposePreview>),
+    /// The placeholder could not be established / the takeover record could
+    /// not be removed: nothing started (D2).
+    Stage(String),
+}
+
+impl std::fmt::Display for ComposeUpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComposeUpError::Validation(m) | ComposeUpError::Stage(m) => f.write_str(m),
+            ComposeUpError::Conflict(p) => {
+                write!(f, "{} (classification {})", p.hint, p.class.as_str())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ComposeUpError {}
+
+impl ComposeUpError {
+    /// The HTTP status: invalid definitions are 400, state conflicts (the
+    /// confirmation-required classifications and external records) are 409,
+    /// staging failures are 500.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            ComposeUpError::Validation(_) => 400,
+            ComposeUpError::Conflict(_) => 409,
+            ComposeUpError::Stage(_) => 500,
+        }
+    }
+
+    /// The startup phase that failed, for the structured error reply.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            ComposeUpError::Validation(_) => "validation",
+            ComposeUpError::Conflict(_) => "conflict",
+            ComposeUpError::Stage(_) => "stage",
+        }
+    }
+
+    /// The preview a conflict carries (empty for the other variants).
+    pub fn preview(&self) -> Option<&ComposePreview> {
+        match self {
+            ComposeUpError::Conflict(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// One program the compose-up pipeline waits on (add-compose-up D4).
+#[derive(Debug, Clone)]
+pub struct ComposeWait {
+    pub program: String,
+    /// Upper bound (seconds) the caller should wait for THIS program's
+    /// startup judgement (startsecs / health budget, per-program timing).
+    pub estimate_secs: f64,
+}
+
+/// One program deliberately not pulled up, with the reason (notice).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComposeSkip {
+    pub program: String,
+    pub reason: String,
+}
+
+/// Successful `ComposeUp` (the fast validate/classify/stage/spawn turn): the
+/// programs to wait on and the ones skipped. On the execute path the record
+/// is only a placeholder at this point — the caller waits for every startup
+/// judgement and then commits or aborts through the shared staged machinery.
+#[derive(Debug, Clone)]
+pub struct ComposeUpStaged {
+    pub app: String,
+    /// The registration file the commit will produce (the existing record for
+    /// an `identical` submission).
+    pub config_path: String,
+    /// True when the classification was `identical`: nothing is staged and no
+    /// commit follows — the waits are ensure-running pull-ups only (D5).
+    pub identical: bool,
+    /// True when nothing needed starting (everything already up).
+    pub unchanged: bool,
+    pub waits: Vec<ComposeWait>,
+    pub skipped: Vec<ComposeSkip>,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Start {
@@ -229,6 +403,15 @@ pub enum Command {
     AdhocAbort {
         name: String,
         reply: AdhocAbortReply,
+    },
+    /// add-compose-up D3/D4: the compose-up fast turn — render + validate +
+    /// classify + (on the execute path) stage the placeholder and spawn the
+    /// whole declaration. Fast and synchronous; the caller (the HTTP
+    /// connection thread) does the multi-program startup wait and then
+    /// commits or aborts through the shared staged machinery.
+    ComposeUp {
+        req: ComposeUpRequest,
+        reply: ComposeUpReply,
     },
     /// guard-remove-until-stopped D1: unregister one app atomically — the
     /// liveness guard, the registration deletion and the state cleanup all run
@@ -1187,6 +1370,9 @@ impl Supervisor {
             Command::AdhocAbort { name, reply } => {
                 let _ = reply.send(self.cmd_adhoc_abort(&name));
             }
+            Command::ComposeUp { req, reply } => {
+                let _ = reply.send(self.cmd_compose_up(&req));
+            }
             Command::Reload { reply } => answer(reply, self.cmd_reload()),
             Command::Remove { app, reply } => {
                 let _ = reply.send(self.cmd_remove(&app));
@@ -1457,18 +1643,26 @@ impl Supervisor {
         // the record was already absent. Reporting `Delete`/500 here would be
         // both wrong (nothing failed) and misleading (apply is not the fix:
         // the cleanup below is).
-        let (deleted_file, already_unregistered, kept_config) =
+        let (deleted_file, already_unregistered, kept_config, record_path) =
             if registry::is_registered(&config, &config_dir, app) {
                 let removed = registry::remove(&config, &config_dir, app)
                     .map_err(|e| RemoveError::Delete(format!("{e:#}")))?;
+                let path = removed.path.clone();
                 let kept = if removed.deleted_file {
                     None
                 } else {
                     Some(removed.path.display().to_string())
                 };
-                (removed.deleted_file, false, kept)
+                (removed.deleted_file, false, kept, path)
             } else {
-                (false, true, None)
+                // Best-effort guess for the report: the top-level record path
+                // (the only possible location before the adhoc partition).
+                (
+                    false,
+                    true,
+                    None,
+                    registry::link_path(&config, &config_dir, app),
+                )
             };
         let mut dropped: Vec<String> = Vec::new();
         {
@@ -1498,10 +1692,9 @@ impl Supervisor {
         if let Err(e) = self.detect(true) {
             warn!("app[{app}]: removal succeeded but the pending rescan failed: {e:#}");
         }
-        let record = registry::link_path(&config, &config_dir, app);
         Ok(RemoveOutcome {
             app: app.to_string(),
-            config_path: record.display().to_string(),
+            config_path: record_path.display().to_string(),
             deleted_file,
             kept_config,
             already_unregistered,
@@ -1788,7 +1981,8 @@ impl Supervisor {
         let raw: crate::config::AppRaw = toml::from_str(&text).map_err(|e| {
             AdhocUpError::Validation(format!("rendered config is not valid TOML: {e}"))
         })?;
-        let target = registry::link_path(&config, &config_dir, name);
+        // Run products live in `app_dir/adhoc/` (add-compose-up D1).
+        let target = registry::adhoc_link_path(&config, &config_dir, name);
         let resolved = config::resolve_app(name, &target, &raw, config.app_default.as_ref())
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         let existing = registry::list(&config, &config_dir)
@@ -1829,15 +2023,18 @@ impl Supervisor {
         {
             let st = self.state.lock().unwrap();
             if let Some(s) = st.staged.get(&name) {
-                let pid = st.programs.get(&s.program).and_then(|p| p.pid());
+                let pid = st
+                    .programs
+                    .get(s.programs.first().map(String::as_str).unwrap_or_default())
+                    .and_then(|p| p.pid());
                 let has_health = st
                     .programs
-                    .get(&s.program)
+                    .get(s.programs.first().map(String::as_str).unwrap_or_default())
                     .map(|p| p.def.health.is_some())
                     .unwrap_or(false);
                 return Ok(AdhocUpResult {
                     app: s.app.clone(),
-                    program: s.program.clone(),
+                    program: s.programs.first().cloned().unwrap_or_default(),
                     config_path: s.target.display().to_string(),
                     pid,
                     estimate_secs: 0.0,
@@ -1867,14 +2064,15 @@ impl Supervisor {
             (st.config.clone(), st.config_dir.clone())
         };
         // Write the placeholder BEFORE spawning: a failure here must not start
-        // any process (app-registry spec).
-        let placeholder = registry::stage_placeholder(&config, &config_dir, &name, &text)
-            .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
+        // any process (app-registry spec). Run products stage into `adhoc/`.
+        let placeholder =
+            registry::stage_placeholder(&config, &config_dir, &name, &text, registry::Origin::Run)
+                .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
         // Register-only (`--restart=no`, D8): no startup judgement, no spawn.
         let raw: crate::config::AppRaw = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
-                registry::discard_placeholder(&config, &config_dir, &name);
+                registry::discard_placeholder(&config, &config_dir, &name, registry::Origin::Run);
                 return Err(AdhocUpError::Validation(format!("{e}")));
             }
         };
@@ -1882,7 +2080,7 @@ impl Supervisor {
         {
             Ok(r) => r,
             Err(e) => {
-                registry::discard_placeholder(&config, &config_dir, &name);
+                registry::discard_placeholder(&config, &config_dir, &name, registry::Origin::Run);
                 return Err(AdhocUpError::Validation(format!("{e:#}")));
             }
         };
@@ -1890,10 +2088,11 @@ impl Supervisor {
         let program = resolved.programs[0].name.clone();
         let staged = StagedApp {
             app: name.clone(),
-            program: program.clone(),
+            programs: vec![program.clone()],
             text,
             target: target.clone(),
             placeholder: placeholder.clone(),
+            origin: registry::Origin::Run,
             resolved: resolved.clone(),
             committed: false,
         };
@@ -1943,10 +2142,18 @@ impl Supervisor {
             let st = self.state.lock().unwrap();
             (st.config.clone(), st.config_dir.clone())
         };
-        if let Ok(md) = std::fs::symlink_metadata(registry::link_path(&config, &config_dir, name))
-            && (md.is_file() || md.file_type().is_symlink())
-        {
-            return true;
+        // Name uniqueness spans both record areas (add-compose-up task 1.2):
+        // a record at the top level (a compose product or an external link)
+        // and a run product in `adhoc/` both make the name taken.
+        for path in [
+            registry::link_path(&config, &config_dir, name),
+            registry::adhoc_link_path(&config, &config_dir, name),
+        ] {
+            if let Ok(md) = std::fs::symlink_metadata(&path)
+                && (md.is_file() || md.file_type().is_symlink())
+            {
+                return true;
+            }
         }
         let st = self.state.lock().unwrap();
         st.apps.iter().any(|a| a.name == name)
@@ -1981,9 +2188,26 @@ impl Supervisor {
             let st = self.state.lock().unwrap();
             (st.config.clone(), st.config_dir.clone())
         };
-        // An external/hand-written record is never clobbered, `--force` or not.
+        // Registry partition (add-compose-up D1 / BREAKING): `--force` may only
+        // rewrite the run's own product area. A same-name record at the
+        // app_dir top level — a compose snapshot, a scaffold generation or an
+        // external deployment link — is refused no matter its shape; the fix
+        // is `ak remove <name>` or `ak compose up`.
+        let top = registry::link_path(&config, &config_dir, name);
+        if let Ok(md) = std::fs::symlink_metadata(&top)
+            && (md.is_file() || md.file_type().is_symlink())
+        {
+            return Err(AdhocUpError::Validation(format!(
+                "app {name:?} is registered at the app_dir top level ({}) — run \
+                 `ak remove {name}` first or use `ak compose up`; `--force` only \
+                 covers the run products in app_dir/adhoc/",
+                top.display()
+            )));
+        }
+        // An external/hand-written record inside the adhoc area is never
+        // clobbered either, `--force` or not.
         let dir = registry::app_dir(&config, &config_dir);
-        registry::guard_scaffold_overwrite(&target, &dir, name)
+        registry::guard_scaffold_overwrite(&target, &dir, name, registry::Origin::Run)
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         // Byte comparison against the record on disk (a missing or unreadable
         // record counts as "different": there is nothing to preserve).
@@ -2008,24 +2232,25 @@ impl Supervisor {
             });
         }
         // Different: land the new record atomically (placeholder + rename)
-        // before touching any process.
-        let _placeholder = registry::stage_placeholder(&config, &config_dir, name, &text)
-            .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
+        // before touching any process. Run products stage into `adhoc/`.
+        let _placeholder =
+            registry::stage_placeholder(&config, &config_dir, name, &text, registry::Origin::Run)
+                .map_err(|e| AdhocUpError::Stage(format!("{e:#}")))?;
         let raw: crate::config::AppRaw = match toml::from_str(&text) {
             Ok(r) => r,
             Err(e) => {
-                registry::discard_placeholder(&config, &config_dir, name);
+                registry::discard_placeholder(&config, &config_dir, name, registry::Origin::Run);
                 return Err(AdhocUpError::Validation(format!("{e}")));
             }
         };
         let resolved = match config::resolve_app(name, &target, &raw, config.app_default.as_ref()) {
             Ok(r) => r,
             Err(e) => {
-                registry::discard_placeholder(&config, &config_dir, name);
+                registry::discard_placeholder(&config, &config_dir, name, registry::Origin::Run);
                 return Err(AdhocUpError::Validation(format!("{e:#}")));
             }
         };
-        match registry::commit_staged(&config, &config_dir, name, &text) {
+        match registry::commit_staged(&config, &config_dir, name, &text, registry::Origin::Run) {
             // A racing writer landed identical content: treat as unchanged.
             Ok(o) if o.unchanged() => {
                 let st = self.state.lock().unwrap();
@@ -2045,7 +2270,7 @@ impl Supervisor {
             }
             Ok(_) => {}
             Err(e) => {
-                registry::discard_placeholder(&config, &config_dir, name);
+                registry::discard_placeholder(&config, &config_dir, name, registry::Origin::Run);
                 return Err(AdhocUpError::Stage(format!("{e:#}")));
             }
         }
@@ -2101,20 +2326,20 @@ impl Supervisor {
     /// Upper bound (seconds) a caller should wait for the startup judgement
     /// (D5): `startsecs` alone without a health check; otherwise
     /// `startsecs + health_start_period + health_interval × health_retries`.
+    /// The app-level value is the max over its programs.
     fn startup_estimate_secs(&self, resolved: &ResolvedApp) -> f64 {
         resolved
             .programs
             .iter()
-            .map(|p| match &p.health {
-                None => p.startsecs,
-                Some(h) => p.startsecs + h.start_period + h.interval * f64::from(h.retries),
-            })
+            .map(program_estimate_secs)
             .fold(0.0_f64, f64::max)
     }
 
     /// `AdhocCommit`: rename the placeholder onto the record, drop the staged
     /// entry and add the app to `apps`. On a rename failure the process is
-    /// kept running and a partial-failure result is returned (D4).
+    /// kept running and a partial-failure result is returned (D4). Shared by
+    /// the run and the compose-up pipelines — the staged entry carries the
+    /// record area ([`StagedApp::origin`]).
     fn cmd_adhoc_commit(&self, name: &str) -> Result<AdhocCommitResult> {
         let (config, config_dir, staged) = {
             let st = self.state.lock().unwrap();
@@ -2125,9 +2350,14 @@ impl Supervisor {
         };
         let pid = {
             let st = self.state.lock().unwrap();
-            st.programs.get(&staged.program).and_then(|p| p.pid())
+            staged
+                .programs
+                .first()
+                .and_then(|p| st.programs.get(p))
+                .and_then(|p| p.pid())
         };
-        let outcome = registry::commit_staged(&config, &config_dir, name, &staged.text);
+        let outcome =
+            registry::commit_staged(&config, &config_dir, name, &staged.text, staged.origin);
         let (partial, partial_reason, unchanged) = match outcome {
             Ok(o) => {
                 // Persisted: clear the staged entry and register the app record.
@@ -2154,7 +2384,7 @@ impl Supervisor {
         };
         Ok(AdhocCommitResult {
             app: staged.app.clone(),
-            program: staged.program.clone(),
+            program: staged.programs.first().cloned().unwrap_or_default(),
             config_path: staged.target.display().to_string(),
             pid,
             unchanged,
@@ -2164,8 +2394,10 @@ impl Supervisor {
         })
     }
 
-    /// `AdhocAbort`: stop and drop the program, delete the placeholder, clear
-    /// the staged entry. Used when the startup judgement fails.
+    /// `AdhocAbort`: stop and drop the staged programs (in reverse spawn order
+    /// — add-compose-up D4's rollback rule; a run stages exactly one), delete
+    /// the placeholder, clear the staged entry. Used when a startup judgement
+    /// fails.
     fn cmd_adhoc_abort(&self, name: &str) -> Result<String> {
         let (config, config_dir, staged) = {
             let st = self.state.lock().unwrap();
@@ -2176,17 +2408,421 @@ impl Supervisor {
         };
         {
             let mut st = self.state.lock().unwrap();
-            if let Some(mut p) = st.programs.remove(&staged.program) {
-                p.stop();
+            for program in staged.programs.iter().rev() {
+                if let Some(mut p) = st.programs.remove(program) {
+                    p.stop();
+                }
             }
             st.staged.remove(name);
         }
-        registry::discard_placeholder(&config, &config_dir, name);
+        registry::discard_placeholder(&config, &config_dir, name, staged.origin);
         self.sync_health_tasks();
         Ok(format!(
             "program {} aborted (not registered)",
-            staged.program
+            staged
+                .programs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
         ))
+    }
+
+    // -- compose up (add-compose-up D2/D3/D4/D5) ------------------------------
+
+    /// The read-only compose-up preview (add-compose-up D3): classify the
+    /// same-name situation for `rendered`. Called on HTTP threads — it only
+    /// locks the state briefly and reads the registry; nothing is written and
+    /// no process is touched.
+    pub fn compose_preview(&self, name: &str, rendered: &str) -> ComposePreview {
+        let declared: Vec<String> = toml::from_str::<crate::config::AppRaw>(rendered)
+            .map(|r| r.program.into_keys().collect())
+            .unwrap_or_default();
+        self.classify_compose(name, rendered, declared)
+    }
+
+    /// Classify a same-name compose-up submission against the registry (D3).
+    /// Read-only; the authoritative use is inside the `ComposeUp` command
+    /// handler (control-plane spec: 同名判定 SHALL 在守护进程命令处理路径完成 —
+    /// the preview is advisory only, this re-judgment closes the race with
+    /// apply/rescan).
+    ///
+    /// - top-level symlink or multi-link hard link → `external-refused`
+    ///   (never rewritten, `--force` included);
+    /// - top-level real file → `identical` (byte-equal) or `needs-update`
+    ///   (diff summary attached);
+    /// - a record in `adhoc/` → `adhoc-takeover` (a link there is still
+    ///   external and refused);
+    /// - nothing → `fresh`.
+    fn classify_compose(
+        &self,
+        name: &str,
+        rendered: &str,
+        declared: Vec<String>,
+    ) -> ComposePreview {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let top = registry::link_path(&config, &config_dir, name);
+        let adhoc = registry::adhoc_link_path(&config, &config_dir, name);
+        let top_is_record = std::fs::symlink_metadata(&top)
+            .map(|md| md.is_file() || md.file_type().is_symlink())
+            .unwrap_or(false);
+        let (class, record_path, diff, hint) = if top_is_record {
+            if registry::is_external_record(&top) {
+                (
+                    ComposeClass::ExternalRefused,
+                    top.clone(),
+                    Vec::new(),
+                    format!(
+                        "app {name:?} is registered from an external deployment config — run \
+                         `ak remove {name}` first; `--force` is not honored for external records"
+                    ),
+                )
+            } else {
+                let old = std::fs::read_to_string(&top).ok();
+                if old.as_deref() == Some(rendered) {
+                    (
+                        ComposeClass::Identical,
+                        top.clone(),
+                        Vec::new(),
+                        String::new(),
+                    )
+                } else {
+                    let d = diff_summary(old.as_deref(), rendered);
+                    (ComposeClass::NeedsUpdate, top.clone(), d, String::new())
+                }
+            }
+        } else if std::fs::symlink_metadata(&adhoc).is_ok() {
+            if registry::is_external_record(&adhoc) {
+                (
+                    ComposeClass::ExternalRefused,
+                    adhoc.clone(),
+                    Vec::new(),
+                    format!(
+                        "app {name:?} is registered via a link in app_dir/adhoc/ — run \
+                         `ak remove {name}` first; `--force` is not honored for external records"
+                    ),
+                )
+            } else {
+                (
+                    ComposeClass::AdhocTakeover,
+                    adhoc.clone(),
+                    Vec::new(),
+                    String::new(),
+                )
+            }
+        } else {
+            (ComposeClass::Fresh, top.clone(), Vec::new(), String::new())
+        };
+        let programs = {
+            let st = self.state.lock().unwrap();
+            let mut ps: Vec<ComposeProgramInfo> = st
+                .programs
+                .values()
+                .filter(|p| p.def.app == name)
+                .map(|p| ComposeProgramInfo {
+                    program: p.def.name.clone(),
+                    state: p.state().to_string(),
+                    pid: p.pid(),
+                    user_stopped: p.user_stopped() || st.user_stopped.contains(&p.def.name),
+                })
+                .collect();
+            ps.sort_by(|a, b| a.program.cmp(&b.program));
+            ps
+        };
+        ComposePreview {
+            class,
+            record_path,
+            declared,
+            diff,
+            hint,
+            programs,
+        }
+    }
+
+    /// `ComposeUp`: the fast turn — render + validate + classify, then either
+    /// refuse (zero side effects), ensure-running (`identical`, D5) or stage +
+    /// spawn the whole declaration (execute path, D4). Never waits: the caller
+    /// polls every program ([`ComposeWaitTracker`]) and then commits/aborts
+    /// through the shared staged machinery.
+    fn cmd_compose_up(
+        &self,
+        req: &ComposeUpRequest,
+    ) -> std::result::Result<ComposeUpStaged, ComposeUpError> {
+        // 1. Render + validate the declaration — the same pure function the
+        //    preview uses (naming, reserved words, schema, relative paths,
+        //    bare-command resolution against the CALLER's PATH).
+        let rendered = config::render_declaration(
+            &req.content,
+            &req.base_dir,
+            &req.name,
+            req.caller_path.as_deref(),
+        )
+        .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+        let name = req.name.clone();
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        {
+            let st = self.state.lock().unwrap();
+            if st.staged.contains_key(&name) {
+                return Err(ComposeUpError::Validation(format!(
+                    "app {name:?} is staged but not committed — finish or abort the pending \
+                     registration first (`ak run` reports it as residual)"
+                )));
+            }
+        }
+        let target = registry::link_path(&config, &config_dir, &name);
+        // 2. Cross-app validation against the live registry: the same-name
+        //    record is replaced, every other app must accept the new program
+        //    names (the same gate `ak run` renders through).
+        let raw: crate::config::AppRaw = toml::from_str(&rendered)
+            .map_err(|e| ComposeUpError::Validation(format!("rendered snapshot: {e}")))?;
+        let resolved = config::resolve_app(&name, &target, &raw, config.app_default.as_ref())
+            .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+        let existing = registry::list(&config, &config_dir)
+            .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+        let mut all = Vec::new();
+        for l in &existing {
+            if l.name == name {
+                continue; // replaced by the new definition
+            }
+            let (r, _) = crate::config::AppRaw::load(&l.path)
+                .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+            all.push(
+                config::resolve_app(&l.name, &l.path, &r, config.app_default.as_ref())
+                    .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?,
+            );
+        }
+        all.push(resolved.clone());
+        config::validate_all(&all).map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+
+        // 3. Classify (authoritative — see [`Self::classify_compose`]).
+        let declared = resolved.programs.iter().map(|p| p.name.clone()).collect();
+        let preview = self.classify_compose(&name, &rendered, declared);
+        match preview.class {
+            ComposeClass::ExternalRefused => {
+                return Err(ComposeUpError::Conflict(Box::new(preview)));
+            }
+            c if matches!(c, ComposeClass::NeedsUpdate | ComposeClass::AdhocTakeover)
+                && !req.force =>
+            {
+                return Err(ComposeUpError::Conflict(Box::new(preview)));
+            }
+            ComposeClass::Identical => {
+                // D5: no disk write; pull up what the daemon start rules pull
+                // up; user stop records are never touched by `up`.
+                let (waits, skipped) = self.ensure_running_app(&name)?;
+                return Ok(ComposeUpStaged {
+                    config_path: target.display().to_string(),
+                    app: name,
+                    identical: true,
+                    unchanged: waits.is_empty(),
+                    waits,
+                    skipped,
+                });
+            }
+            _ => {}
+        }
+        // 4. Execute: fresh / needs-update+force / adhoc-takeover+force.
+        self.compose_execute(req, &name, &rendered, resolved, &preview, &target)
+    }
+
+    /// The execute path (D4): stop the same-name app's programs (takeover also
+    /// deletes the `adhoc/` record first), stage the top-level placeholder,
+    /// spawn the whole declaration in dependency order and report the waits.
+    fn compose_execute(
+        &self,
+        _req: &ComposeUpRequest,
+        name: &str,
+        rendered: &str,
+        resolved: ResolvedApp,
+        preview: &ComposePreview,
+        target: &Path,
+    ) -> std::result::Result<ComposeUpStaged, ComposeUpError> {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        // Takeover: delete the run product's record BEFORE anything new is
+        // staged (control-plane spec: 收编分支先删除 adhoc/ 记录).
+        if preview.class == ComposeClass::AdhocTakeover {
+            registry::remove(&config, &config_dir, name)
+                .map_err(|e| ComposeUpError::Stage(format!("{e:#}")))?;
+        }
+        // Stop and drop every process of the same-name app (needs-update and
+        // takeover both replace the whole definition).
+        {
+            let mut st = self.state.lock().unwrap();
+            let stale: Vec<String> = st
+                .programs
+                .iter()
+                .filter(|(k, p)| k.as_str() == name || p.def.app == name)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in stale.iter().rev() {
+                if let Some(mut old) = st.programs.remove(key) {
+                    old.stop();
+                }
+            }
+        }
+        self.sync_health_tasks();
+        // Stage the placeholder BEFORE spawning: a failure here must not start
+        // any process (app-registry spec). Compose products land at the top
+        // level.
+        let placeholder = registry::stage_placeholder(
+            &config,
+            &config_dir,
+            name,
+            rendered,
+            registry::Origin::Compose,
+        )
+        .map_err(|e| ComposeUpError::Stage(format!("{e:#}")))?;
+        // Spawn ALL eligible programs in dependency order — the batch
+        // semantics of the daemon start (start_eligible) with the compose
+        // skip rules: `no` is never pulled up; `unless-stopped` honors the
+        // user stop record. Programs are created even when skipped so the
+        // projection shows the whole app.
+        let mut waits = Vec::new();
+        let mut skipped = Vec::new();
+        let mut staged_programs = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            let log_dir = config::resolve_path(&st.config.daemon.log_dir, &st.config_dir);
+            let ring_cap = st.config.daemon.log_buffer_lines;
+            for pname in declaration_order(&resolved.programs) {
+                let Some(def) = resolved.programs.iter().find(|p| p.name == pname) else {
+                    continue;
+                };
+                let user_stopped = st.user_stopped.contains(&pname);
+                if !def.restart.pulls_up(user_stopped) {
+                    let reason = if def.restart == crate::config::RestartPolicy::No {
+                        format!(
+                            "restart=no: not pulled up (start it with `ak start {name} {pname}`)"
+                        )
+                    } else {
+                        format!(
+                            "user stop record kept it stopped (`ak start {name} {pname}` pulls it up)"
+                        )
+                    };
+                    skipped.push(ComposeSkip {
+                        program: pname.clone(),
+                        reason,
+                    });
+                    st.programs.insert(
+                        pname.clone(),
+                        ManagedProgram::new(def.clone(), log_dir.clone(), ring_cap),
+                    );
+                    staged_programs.push(pname);
+                    continue;
+                }
+                let mut mp = ManagedProgram::new(def.clone(), log_dir.clone(), ring_cap);
+                mp.spawn();
+                waits.push(ComposeWait {
+                    program: pname.clone(),
+                    estimate_secs: program_estimate_secs(def),
+                });
+                st.programs.insert(pname.clone(), mp);
+                staged_programs.push(pname);
+            }
+            st.staged.insert(
+                name.to_string(),
+                StagedApp {
+                    app: name.to_string(),
+                    programs: staged_programs,
+                    text: rendered.to_string(),
+                    target: target.to_path_buf(),
+                    placeholder: placeholder.clone(),
+                    origin: registry::Origin::Compose,
+                    resolved: resolved.clone(),
+                    committed: false,
+                },
+            );
+        }
+        self.sync_health_tasks();
+        Ok(ComposeUpStaged {
+            app: name.to_string(),
+            config_path: target.display().to_string(),
+            identical: false,
+            unchanged: false,
+            waits,
+            skipped,
+        })
+    }
+
+    /// `identical` submission (D5): no disk write; pull up the app's programs
+    /// that the daemon start rules pull up — `no` never, `unless-stopped` only
+    /// without a user stop record (reported as a notice), `always`/
+    /// `on-failure` always. The user stop records themselves are never
+    /// written or cleared by `up` (it is a deployment convergence, not a
+    /// program-level start).
+    fn ensure_running_app(
+        &self,
+        name: &str,
+    ) -> std::result::Result<(Vec<ComposeWait>, Vec<ComposeSkip>), ComposeUpError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.apps.iter().any(|a| a.name == name) {
+            return Err(ComposeUpError::Validation(format!(
+                "app {name:?} is registered but not loaded — run `ak config --reload` first"
+            )));
+        }
+        let order = Self::app_program_order(&st, name).map_err(ComposeUpError::Validation)?;
+        let mut waits = Vec::new();
+        let mut skipped = Vec::new();
+        for pname in order {
+            let Some(p) = st.programs.get(&pname) else {
+                continue;
+            };
+            match p.state() {
+                // Already up (or on its way there).
+                ProgramState::Running | ProgramState::Starting => {}
+                ProgramState::Backoff => skipped.push(ComposeSkip {
+                    program: pname.clone(),
+                    reason: "auto-restart pending (backoff)".into(),
+                }),
+                // The daemon start rules only pull `stopped` programs.
+                ProgramState::Exited | ProgramState::Fatal | ProgramState::Stopping => skipped
+                    .push(ComposeSkip {
+                        program: pname.clone(),
+                        reason: format!(
+                            "program is {} (the daemon start rules do not pull it up)",
+                            p.state()
+                        ),
+                    }),
+                ProgramState::Stopped => {
+                    let record_kept = p.user_stopped() || st.user_stopped.contains(&pname);
+                    if record_kept {
+                        skipped.push(ComposeSkip {
+                            program: pname.clone(),
+                            reason: format!(
+                                "user stop record kept it stopped (`ak start {name} {pname}` pulls it up)"
+                            ),
+                        });
+                        continue;
+                    }
+                    if !p.def.restart.pulls_up(st.user_stopped.contains(&pname)) {
+                        skipped.push(ComposeSkip {
+                            program: pname.clone(),
+                            reason: format!(
+                                "restart=no: not pulled up (start it with `ak start {name} {pname}`)"
+                            ),
+                        });
+                        continue;
+                    }
+                    let estimate = program_estimate_secs(&p.def);
+                    let p = st.programs.get_mut(&pname).unwrap();
+                    p.clear_fatal();
+                    p.spawn();
+                    waits.push(ComposeWait {
+                        program: pname,
+                        estimate_secs: estimate,
+                    });
+                }
+            }
+        }
+        Ok((waits, skipped))
     }
 
     /// `reload` now only detects: rescan and publish the pending preview.
@@ -3068,55 +3704,8 @@ fn wait_startup_with(
     loop {
         {
             let st = sup.state.lock().unwrap();
-            match st.programs.get(program) {
-                None => {
-                    return StartupOutcome::Failed {
-                        phase: "startup",
-                        reason: format!("program {program:?} disappeared before it started"),
-                    };
-                }
-                Some(p) => match p.state() {
-                    ProgramState::Running if p.health_confirmed() => {
-                        return StartupOutcome::Started { pid: p.pid() };
-                    }
-                    ProgramState::Running | ProgramState::Starting | ProgramState::Stopping => {}
-                    ProgramState::Fatal => {
-                        return StartupOutcome::Failed {
-                            phase: "startup",
-                            reason: p
-                                .fatal_reason()
-                                .map(String::from)
-                                .unwrap_or_else(|| "program entered the fatal state".into()),
-                        };
-                    }
-                    ProgramState::Exited => {
-                        return StartupOutcome::Failed {
-                            phase: "startup",
-                            reason: p
-                                .last_exit()
-                                .map(|e| format!("program exited before startsecs: {e}"))
-                                .unwrap_or_else(|| "program exited before startsecs".into()),
-                        };
-                    }
-                    ProgramState::Backoff => {
-                        // The start failed and a retry is scheduled: the first
-                        // failed start IS the failure (process-management spec:
-                        // 稳定运行前退出计入启动失败).
-                        return StartupOutcome::Failed {
-                            phase: "startup",
-                            reason: p
-                                .last_exit()
-                                .map(|e| format!("program exited before startsecs: {e}"))
-                                .unwrap_or_else(|| "program exited before startsecs".into()),
-                        };
-                    }
-                    ProgramState::Stopped => {
-                        return StartupOutcome::Failed {
-                            phase: "startup",
-                            reason: "program was stopped before it started".into(),
-                        };
-                    }
-                },
+            if let Some(outcome) = poll_startup(&st, program) {
+                return outcome;
             }
         }
         let now = Instant::now();
@@ -3127,6 +3716,203 @@ fn wait_startup_with(
         }
         std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
     }
+}
+
+/// One poll of `program`'s startup judgement: `None` while still in flight
+/// (`Running`/`Starting`/`Stopping` without a confirmed health check), the
+/// verdict otherwise. Shared by [`wait_startup`] (single program) and the
+/// compose-up multi-program wait (add-compose-up D4).
+fn poll_startup(st: &SupervisorState, program: &str) -> Option<StartupOutcome> {
+    match st.programs.get(program) {
+        None => Some(StartupOutcome::Failed {
+            phase: "startup",
+            reason: format!("program {program:?} disappeared before it started"),
+        }),
+        Some(p) => match p.state() {
+            ProgramState::Running if p.health_confirmed() => {
+                Some(StartupOutcome::Started { pid: p.pid() })
+            }
+            ProgramState::Running | ProgramState::Starting | ProgramState::Stopping => None,
+            ProgramState::Fatal => Some(StartupOutcome::Failed {
+                phase: "startup",
+                reason: p
+                    .fatal_reason()
+                    .map(String::from)
+                    .unwrap_or_else(|| "program entered the fatal state".into()),
+            }),
+            ProgramState::Exited => Some(StartupOutcome::Failed {
+                phase: "startup",
+                reason: p
+                    .last_exit()
+                    .map(|e| format!("program exited before startsecs: {e}"))
+                    .unwrap_or_else(|| "program exited before startsecs".into()),
+            }),
+            ProgramState::Backoff => {
+                // The start failed and a retry is scheduled: the first
+                // failed start IS the failure (process-management spec:
+                // 稳定运行前退出计入启动失败).
+                Some(StartupOutcome::Failed {
+                    phase: "startup",
+                    reason: p
+                        .last_exit()
+                        .map(|e| format!("program exited before startsecs: {e}"))
+                        .unwrap_or_else(|| "program exited before startsecs".into()),
+                })
+            }
+            ProgramState::Stopped => Some(StartupOutcome::Failed {
+                phase: "startup",
+                reason: "program was stopped before it started".into(),
+            }),
+        },
+    }
+}
+
+/// Per-program upper bound of the startup judgement (the app-level max lives
+/// in [`Supervisor::startup_estimate_secs`]): `startsecs` without a health
+/// check; otherwise `startsecs + start_period + interval × retries`.
+fn program_estimate_secs(p: &ResolvedProgram) -> f64 {
+    match &p.health {
+        None => p.startsecs,
+        Some(h) => p.startsecs + h.start_period + h.interval * f64::from(h.retries),
+    }
+}
+
+/// Parallel waiter for the compose-up pipeline's startup judgements
+/// (add-compose-up D4): every program is polled against its OWN deadline, so
+/// the total wall time is ≈ max(estimate) instead of Σ. The caller drives it
+/// from the HTTP connection thread and streams one frame per settled program.
+pub struct ComposeWaitTracker {
+    /// (program, deadline) still in flight.
+    pending: Vec<(String, Instant)>,
+    start: Instant,
+}
+
+impl ComposeWaitTracker {
+    /// Deadlines are the per-program estimates plus a slack margin (the same
+    /// margin the single-program wait uses).
+    pub fn new(waits: &[ComposeWait]) -> Self {
+        let now = Instant::now();
+        Self {
+            pending: waits
+                .iter()
+                .map(|w| {
+                    (
+                        w.program.clone(),
+                        now + Duration::from_secs_f64(w.estimate_secs.max(0.1) + 5.0),
+                    )
+                })
+                .collect(),
+            start: now,
+        }
+    }
+
+    pub fn finished(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// One poll pass: settle every program whose verdict (or own deadline) has
+    /// arrived and return the newly settled outcomes in wait order. Programs
+    /// still in flight stay pending.
+    pub fn poll(&mut self, sup: &Supervisor) -> Vec<(String, StartupOutcome)> {
+        let mut settled = Vec::new();
+        let now = Instant::now();
+        self.pending.retain(|(program, deadline)| {
+            let verdict = {
+                let st = sup.state.lock().unwrap();
+                poll_startup(&st, program)
+            };
+            let Some(verdict) = verdict else {
+                if now >= *deadline {
+                    settled.push((
+                        program.clone(),
+                        StartupOutcome::TimedOut {
+                            waited_secs: now.duration_since(self.start).as_secs_f64(),
+                        },
+                    ));
+                    return false;
+                }
+                return true; // still in flight
+            };
+            settled.push((program.clone(), verdict));
+            false
+        });
+        settled
+    }
+}
+
+/// Dependency order over a declaration's programs — dependencies first, name
+/// tie-break (the same effective ordering the app fan-out uses). Dependencies
+/// on programs outside the declaration don't constrain the order (they are
+/// validated against the live registry, and a failed dependency fails the
+/// round anyway). Deterministic: the ready set is always name-sorted.
+fn declaration_order(programs: &[ResolvedProgram]) -> Vec<String> {
+    let mut remaining: std::collections::BTreeMap<String, &ResolvedProgram> =
+        programs.iter().map(|p| (p.name.clone(), p)).collect();
+    let mut emitted = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let ready: Vec<String> = remaining
+            .values()
+            .filter(|p| p.depends_on.iter().all(|d| !remaining.contains_key(d)))
+            .map(|p| p.name.clone())
+            .collect();
+        if ready.is_empty() {
+            // A cycle cannot reach this point (validate_all rejects one), but
+            // degrade to sorted order instead of looping forever.
+            emitted.extend(remaining.into_keys());
+            break;
+        }
+        for n in ready {
+            remaining.remove(&n);
+            emitted.push(n);
+        }
+    }
+    emitted
+}
+
+/// A compact difference summary between the record on disk and the rendered
+/// snapshot (add-compose-up D3 "附差异摘要"): `[app]`-level note plus one line
+/// per added/removed/changed program. The granularity is presentational and
+/// does not affect the endpoint contract.
+fn diff_summary(old: Option<&str>, new: &str) -> Vec<String> {
+    let parse = |t: &str| -> Option<toml::Table> { t.parse().ok() };
+    let Some(old_t) = old.and_then(parse) else {
+        return vec![match old {
+            Some(_) => "existing record is unreadable and will be replaced".into(),
+            None => "no existing record content".into(),
+        }];
+    };
+    let Some(new_t) = parse(new) else {
+        return vec!["rendered snapshot is not a TOML table".into()];
+    };
+    let mut out = Vec::new();
+    if old_t.get("app") != new_t.get("app") {
+        out.push("[app] defaults differ".into());
+    }
+    let empty = toml::Table::new();
+    let oldp = old_t
+        .get("program")
+        .and_then(|v| v.as_table())
+        .unwrap_or(&empty);
+    let newp = new_t
+        .get("program")
+        .and_then(|v| v.as_table())
+        .unwrap_or(&empty);
+    for (pname, nv) in newp {
+        match oldp.get(pname) {
+            None => out.push(format!("program {pname:?} added")),
+            Some(ov) if ov != nv => out.push(format!("program {pname:?} changed")),
+            Some(_) => {}
+        }
+    }
+    for pname in oldp.keys() {
+        if !newp.contains_key(pname) {
+            out.push(format!("program {pname:?} removed"));
+        }
+    }
+    if out.is_empty() {
+        out.push("file bytes differ".into());
+    }
+    out
 }
 
 // -- human-readable rendering ---------------------------------------------
@@ -5417,11 +6203,14 @@ mod tests {
             let st = sup.state.lock().unwrap();
             let s = st.staged.get("web").expect("staged entry");
             assert_eq!(s.app, "web");
-            assert_eq!(s.program, "web");
+            assert_eq!(s.programs, vec!["web".to_string()]);
             assert!(!s.committed);
             assert!(s.text.contains("[program.web]"), "{}", s.text);
-            assert_eq!(s.target, dir.join("app.d").join("web.toml"));
-            assert_eq!(s.placeholder, dir.join("app.d").join("web.toml.pending"));
+            assert_eq!(s.target, dir.join("app.d").join("adhoc").join("web.toml"));
+            assert_eq!(
+                s.placeholder,
+                dir.join("app.d").join("adhoc").join("web.toml.pending")
+            );
             assert!(s.placeholder.exists(), "placeholder staged");
             assert_eq!(s.resolved.programs[0].name, "web");
         }
@@ -5553,7 +6342,7 @@ mod tests {
         let first = adhoc_up(&sup, spec()).unwrap();
         let pid = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
 
         let err = adhoc_up(&sup, spec()).unwrap_err();
@@ -5607,7 +6396,7 @@ mod tests {
         };
         adhoc_up(&sup, register_only).unwrap();
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
         // Same definition again: no "idempotent success with the old pid".
         let err = adhoc_up(
@@ -5640,7 +6429,7 @@ mod tests {
         assert!(!first.unchanged && !first.residual);
         let pid = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         assert!(record.exists());
         let before_text = std::fs::read_to_string(&record).unwrap();
         let before_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
@@ -5658,7 +6447,12 @@ mod tests {
             before_mtime,
             "mtime unchanged"
         );
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         {
             let st = sup.state.lock().unwrap();
             assert!(
@@ -5697,7 +6491,7 @@ mod tests {
         .unwrap();
         let pid1 = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let text1 = std::fs::read_to_string(&record).unwrap();
         assert!(text1.contains("30"), "{text1}");
 
@@ -5717,7 +6511,12 @@ mod tests {
         // The record was rewritten in place; no placeholder residue.
         let text2 = std::fs::read_to_string(&record).unwrap();
         assert!(text2.contains("60") && !text2.contains("\"30\""), "{text2}");
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         {
             let st = sup.state.lock().unwrap();
             assert_eq!(st.programs["web"].pid(), Some(pid2));
@@ -5745,7 +6544,7 @@ mod tests {
         .unwrap();
         let pid = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
 
         let again = adhoc_up(
             &sup,
@@ -5806,7 +6605,7 @@ mod tests {
         assert_eq!(err.http_status(), 400);
         assert!(err.to_string().contains("already registered"), "{err}");
         assert!(
-            !dir.join("app.d").join("web.toml").exists(),
+            !dir.join("app.d").join("adhoc").join("web.toml").exists(),
             "nothing was written"
         );
         stop_adhoc(&sup, h);
@@ -5822,6 +6621,8 @@ mod tests {
         let outside_text = "[program.web]\ncommand = 'sleep 5'\n";
         std::fs::write(&outside, outside_text).unwrap();
         std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        // The external registration sits at the app_dir TOP LEVEL — exactly
+        // the record the partitioned `--force` must refuse (add-compose-up D1).
         link_for_test(&outside, &dir.join("app.d").join("web.toml"));
 
         let err = adhoc_up(
@@ -5840,7 +6641,12 @@ mod tests {
             outside_text,
             "the external config is untouched"
         );
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5923,7 +6729,7 @@ mod tests {
         .unwrap();
         let pid = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
 
         // A definition whose rendered config fails validation (negative
@@ -5948,7 +6754,12 @@ mod tests {
             before,
             "record untouched"
         );
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         assert_eq!(
             sup.state.lock().unwrap().programs["web"].pid(),
             Some(pid),
@@ -5974,7 +6785,7 @@ mod tests {
         .unwrap();
         let pid = first.pid.expect("spawned");
         adhoc_commit(&sup, "web").unwrap();
-        let record = dir.join("app.d").join("web.toml");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
         let before = std::fs::read_to_string(&record).unwrap();
 
         let err = adhoc_up(
@@ -5992,7 +6803,12 @@ mod tests {
             before,
             "record untouched"
         );
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         assert_eq!(
             sup.state.lock().unwrap().programs["web"].pid(),
             Some(pid),
@@ -6020,10 +6836,19 @@ mod tests {
         assert_eq!(out.app, "web");
         assert_eq!(
             out.config_path,
-            dir.join("app.d").join("web.toml").display().to_string()
+            dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml")
+                .display()
+                .to_string()
         );
         assert!(out.pid.is_some());
-        assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        assert!(
+            !dir.join("app.d")
+                .join("adhoc")
+                .join("web.toml.pending")
+                .exists()
+        );
         {
             let st = sup.state.lock().unwrap();
             assert!(!st.staged.contains_key("web"), "staged cleared");
@@ -6057,10 +6882,24 @@ mod tests {
         }
         let app_dir = dir.join("app.d");
         if app_dir.exists() {
-            assert!(
-                std::fs::read_dir(&app_dir).unwrap().next().is_none(),
-                "no residue after abort"
-            );
+            // The run staging lazily created the (now empty) adhoc area; no
+            // record or placeholder may survive the abort.
+            let residue: Vec<_> = std::fs::read_dir(&app_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .flat_map(|e| {
+                    if e.path().is_dir() {
+                        std::fs::read_dir(e.path())
+                            .unwrap()
+                            .filter_map(|x| x.ok())
+                            .map(|x| x.path())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![e.path()]
+                    }
+                })
+                .collect();
+            assert!(residue.is_empty(), "no residue after abort: {residue:?}");
         }
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6092,7 +6931,7 @@ mod tests {
         let out = adhoc_commit(&sup, "web").unwrap();
         assert_eq!(out.pid, None);
         assert!(
-            dir.join("app.d").join("web.toml").exists(),
+            dir.join("app.d").join("adhoc").join("web.toml").exists(),
             "record written"
         );
         stop_adhoc(&sup, h);
@@ -6246,9 +7085,24 @@ mod tests {
         sup.cmd_adhoc_abort("bad").unwrap();
         let app_dir = dir.join("app.d");
         if app_dir.exists() {
+            let residue: Vec<_> = std::fs::read_dir(&app_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .flat_map(|e| {
+                    if e.path().is_dir() {
+                        std::fs::read_dir(e.path())
+                            .unwrap()
+                            .filter_map(|x| x.ok())
+                            .map(|x| x.path())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![e.path()]
+                    }
+                })
+                .collect();
             assert!(
-                std::fs::read_dir(&app_dir).unwrap().next().is_none(),
-                "no .toml or .pending residue"
+                residue.is_empty(),
+                "no .toml or .pending residue: {residue:?}"
             );
         }
         stop_adhoc(&sup, h);
@@ -6276,8 +7130,9 @@ mod tests {
         .unwrap();
         let pid = sup.state.lock().unwrap().programs["web"].pid();
         assert!(pid.is_some());
-        // Make the app_dir read-only so the rename cannot complete.
-        let app_dir = dir.join("app.d");
+        // Make the record area read-only so the rename cannot complete (the
+        // run record and its placeholder both live in app_dir/adhoc/).
+        let app_dir = dir.join("app.d").join("adhoc");
         std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let out = adhoc_commit(&sup, "web").unwrap();
         std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -6314,7 +7169,9 @@ mod tests {
         )
         .unwrap();
         let pid = sup.state.lock().unwrap().programs["web"].pid();
-        let app_dir = dir.join("app.d");
+        // The run record and its placeholder both live in app_dir/adhoc/ —
+        // that is the directory whose write access the rename needs.
+        let app_dir = dir.join("app.d").join("adhoc");
         std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let partial = adhoc_commit(&sup, "web").unwrap();
         assert!(partial.partial);
@@ -6333,7 +7190,7 @@ mod tests {
         let done = adhoc_commit(&sup, "web").unwrap();
         assert!(!done.partial, "second commit lands");
         assert_eq!(done.pid, pid, "process reused");
-        assert!(dir.join("app.d").join("web.toml").exists());
+        assert!(dir.join("app.d").join("adhoc").join("web.toml").exists());
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6519,5 +7376,525 @@ mod tests {
         drop(st);
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- compose up (add-compose-up section 3) --------------------------------
+
+    /// A two-program declaration whose programs start instantly (startsecs 0)
+    /// and are pulled up by the daemon start rules.
+    fn compose_decl(extra: &str) -> String {
+        let sleep = sleep_bin().to_str().unwrap().replace('\\', "/");
+        format!(
+            "[app]\ndescription = 'compose up test'\n\n\
+             [program.web]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\n\
+             restart = 'always'\n{extra}\n\
+             [program.worker]\ncommand = '{sleep}'\nargs = ['31']\nstartsecs = 0.0\n\
+             restart = 'always'\ndepends_on = ['web']\n"
+        )
+    }
+
+    /// The declaration base dir: created once per test and REUSED for every
+    /// submission — it is pinned into the snapshot as the work_dir, so a
+    /// changing base dir would flip the classification to needs-update.
+    fn compose_base(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("ak-compose-base-{tag}-{}", unique_tag()));
+        // The base dir becomes the programs' work_dir: it must exist for the
+        // spawn to succeed.
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn compose_req(base: &Path, name: &str, content: &str, force: bool) -> ComposeUpRequest {
+        ComposeUpRequest {
+            name: name.to_string(),
+            content: content.to_string(),
+            base_dir: base.to_path_buf(),
+            caller_path: None,
+            force,
+        }
+    }
+
+    fn compose_up(
+        sup: &Supervisor,
+        req: &ComposeUpRequest,
+    ) -> std::result::Result<ComposeUpStaged, ComposeUpError> {
+        sup.cmd_compose_up(req)
+    }
+
+    /// Poll the shared wait tracker until every wait settles (the same loop
+    /// the endpoint runs on its connection thread).
+    fn wait_compose(sup: &Supervisor, staged: &ComposeUpStaged) {
+        let mut tracker = ComposeWaitTracker::new(&staged.waits);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !tracker.finished() {
+            for (program, outcome) in tracker.poll(sup) {
+                assert!(
+                    matches!(outcome, StartupOutcome::Started { .. }),
+                    "program {program} failed its judgement: {outcome:?}"
+                );
+            }
+            assert!(Instant::now() < deadline, "compose waits did not settle");
+            std::thread::sleep(STARTUP_POLL);
+        }
+    }
+
+    /// 3.2 success: a fresh declaration spawns every program in dependency
+    /// order, all judgements pass and the commit lands ONE top-level record;
+    /// the staged entry is gone afterwards.
+    #[test]
+    fn compose_up_fresh_spawns_all_then_lands_record() {
+        let (sup, dir, h) = adhoc_harness("compose-fresh");
+        let base = compose_base("fresh");
+        let req = compose_req(&base, "shop", &compose_decl(""), false);
+        let staged = compose_up(&sup, &req).unwrap();
+        assert!(!staged.identical && !staged.unchanged);
+        assert_eq!(staged.waits.len(), 2, "both programs pulled: {staged:?}");
+        assert!(staged.skipped.is_empty(), "{staged:?}");
+        // Spawn order is dependency-first (declaration_order).
+        assert_eq!(staged.waits[0].program, "web");
+        assert_eq!(staged.waits[1].program, "worker");
+        // Nothing is on disk yet — only the invisible placeholder.
+        assert!(!dir.join("app.d").join("shop.toml").exists());
+        assert!(
+            dir.join("app.d").join("shop.toml.pending").exists(),
+            "placeholder staged at the top level"
+        );
+
+        wait_compose(&sup, &staged);
+        let out = adhoc_commit(&sup, "shop").unwrap();
+        assert!(!out.partial);
+        let record = dir.join("app.d").join("shop.toml");
+        assert!(record.exists(), "the record landed at the top level");
+        assert!(!dir.join("app.d").join("shop.toml.pending").exists());
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            text.contains("[program.web]") && text.contains("[program.worker]"),
+            "{text}"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.apps.iter().any(|a| a.name == "shop"));
+            assert!(!st.staged.contains_key("shop"), "staged cleared by commit");
+            assert_eq!(st.programs["web"].state(), ProgramState::Running);
+            assert_eq!(st.programs["worker"].state(), ProgramState::Running);
+        }
+        // The landed snapshot is exactly what a re-render produces.
+        let rendered =
+            config::render_declaration(&req.content, &req.base_dir, &req.name, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), rendered);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2 failure recovery: one program failing its startup judgement aborts
+    /// the round server-side — the spawned programs are stopped, the
+    /// placeholder is discarded and no record residue remains.
+    #[test]
+    fn compose_up_failed_judgement_rolls_back() {
+        let (sup, dir, h) = adhoc_harness("compose-fail");
+        let base = compose_base("fail");
+        #[cfg(unix)]
+        let bad = "\n[program.bad]\ncommand = '/bin/sh'\nargs = ['-c', 'exit 3']\nstartsecs = 0.05\nrestart = 'always'\n";
+        #[cfg(windows)]
+        let bad = "\n[program.bad]\ncommand = 'cmd'\nargs = ['/c', 'exit 3']\nstartsecs = 0.05\nrestart = 'always'\n";
+        let req = compose_req(&base, "shop", &compose_decl(bad), false);
+        let staged = compose_up(&sup, &req).unwrap();
+        assert_eq!(staged.waits.len(), 3, "{staged:?}");
+
+        let mut tracker = ComposeWaitTracker::new(&staged.waits);
+        let mut failed: Option<(String, StartupOutcome)> = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !tracker.finished() && failed.is_none() {
+            for (program, outcome) in tracker.poll(&sup) {
+                if !matches!(outcome, StartupOutcome::Started { .. }) {
+                    failed = Some((program, outcome));
+                }
+            }
+            assert!(Instant::now() < deadline, "waits did not settle");
+            std::thread::sleep(STARTUP_POLL);
+        }
+        let (program, outcome) = failed.expect("the failing program must be reported");
+        assert_eq!(program, "bad");
+        assert!(
+            matches!(
+                outcome,
+                StartupOutcome::Failed {
+                    phase: "startup",
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        // The endpoint aborts through the shared staged machinery.
+        sup.cmd_adhoc_abort("shop").unwrap();
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(!st.staged.contains_key("shop"));
+            assert!(
+                !st.programs.contains_key("web")
+                    && !st.programs.contains_key("worker")
+                    && !st.programs.contains_key("bad"),
+                "every program of the round is dropped"
+            );
+        }
+        assert!(!dir.join("app.d").join("shop.toml").exists(), "no record");
+        assert!(
+            !dir.join("app.d").join("shop.toml.pending").exists(),
+            "no placeholder residue"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2 skip rules: `restart=no` programs and `unless-stopped` programs
+    /// with a user stop record are created but not pulled up, with the notice
+    /// attached; the rest of the declaration proceeds.
+    #[test]
+    fn compose_up_skips_no_policy_and_user_stopped() {
+        let (sup, dir, h) = adhoc_harness("compose-skip");
+        let base = compose_base("skip");
+        let sleep = sleep_bin().to_str().unwrap().replace('\\', "/");
+        let decl = format!(
+            "[program.no]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\nrestart = 'no'\n\n\
+             [program.held]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\n\
+             restart = 'unless-stopped'\n\n\
+             [program.up]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\nrestart = 'always'\n"
+        );
+        // A pre-existing user stop record for `held` (persisted-set level).
+        sup.state.lock().unwrap().user_stopped.insert("held".into());
+
+        let req = compose_req(&base, "shop", &decl, false);
+        let staged = compose_up(&sup, &req).unwrap();
+        assert_eq!(staged.waits.len(), 1, "only `up` is pulled: {staged:?}");
+        assert_eq!(staged.waits[0].program, "up");
+        let skips: std::collections::BTreeMap<_, _> = staged
+            .skipped
+            .iter()
+            .map(|s| (s.program.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(skips.len(), 2, "{staged:?}");
+        assert!(skips["no"].contains("restart=no"), "{skips:?}");
+        assert!(skips["held"].contains("user stop record"), "{skips:?}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["no"].state(), ProgramState::Stopped);
+            assert_eq!(st.programs["held"].state(), ProgramState::Stopped);
+        }
+        // The user stop record was NOT consumed by the round.
+        assert!(sup.state.lock().unwrap().user_stopped.contains("held"));
+        wait_compose(&sup, &staged);
+        adhoc_commit(&sup, "shop").unwrap();
+        assert!(dir.join("app.d").join("shop.toml").exists());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3, branch 1: a byte-identical resubmission with everything running is
+    /// the `unchanged` no-operation — no write, no spawn, no staged entry.
+    #[test]
+    fn compose_identical_all_running_is_unchanged() {
+        let (sup, dir, h) = adhoc_harness("compose-idem");
+        let base = compose_base("idem");
+        let content = compose_decl("");
+        let first = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        wait_compose(&sup, &first);
+        adhoc_commit(&sup, "shop").unwrap();
+        let record = dir.join("app.d").join("shop.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        let mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
+        let pids: Vec<(Option<u32>, Option<u32>)> = {
+            let st = sup.state.lock().unwrap();
+            vec![(st.programs["web"].pid(), st.programs["worker"].pid())]
+        };
+
+        let again = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        assert!(again.identical, "{again:?}");
+        assert!(again.unchanged, "everything is running: {again:?}");
+        assert!(
+            again.waits.is_empty() && again.skipped.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "no write"
+        );
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().modified().unwrap(),
+            mtime,
+            "mtime untouched"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["web"].pid(), pids[0].0, "no restart");
+            assert_eq!(st.programs["worker"].pid(), pids[0].1);
+            assert!(!st.staged.contains_key("shop"), "identical stages nothing");
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3, branch 2: identical content with a program stopped but free of a
+    /// user stop record pulls it up — ensure-running — without rewriting the
+    /// record. (The stopped-without-record state is reached the same way the
+    /// daemon produces it: the program was skipped at spawn time and its stop
+    /// record was later cleared by an explicit start elsewhere.)
+    #[test]
+    fn compose_identical_pulls_up_stopped_programs() {
+        let (sup, dir, h) = adhoc_harness("compose-ensure");
+        let base = compose_base("ensure");
+        let sleep = sleep_bin().to_str().unwrap().replace('\\', "/");
+        // The worker is `unless-stopped` and seeded with a stop record, so the
+        // fresh round creates it WITHOUT spawning (no in-memory user-stopped
+        // flag — unlike ManagedProgram::stop()).
+        let content = format!(
+            "[program.web]\ncommand = '{sleep}'\nargs = ['30']\nstartsecs = 0.0\nrestart = 'always'\n\n\
+             [program.worker]\ncommand = '{sleep}'\nargs = ['31']\nstartsecs = 0.0\n\
+             restart = 'unless-stopped'\n"
+        );
+        sup.state
+            .lock()
+            .unwrap()
+            .user_stopped
+            .insert("worker".into());
+        let first = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        assert!(
+            first.waits.iter().all(|w| w.program != "worker"),
+            "{first:?}"
+        );
+        wait_compose(&sup, &first);
+        adhoc_commit(&sup, "shop").unwrap();
+        // The record is gone: the program is now a plain stopped program the
+        // daemon start rules would pull up.
+        sup.state.lock().unwrap().user_stopped.remove("worker");
+        assert_eq!(
+            sup.state.lock().unwrap().programs["worker"].state(),
+            ProgramState::Stopped
+        );
+        let record = dir.join("app.d").join("shop.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+
+        let again = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        assert!(again.identical && !again.unchanged, "{again:?}");
+        assert_eq!(again.waits.len(), 1);
+        assert_eq!(again.waits[0].program, "worker");
+        wait_compose(&sup, &again);
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["worker"].state(), ProgramState::Running);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            before,
+            "the record is not rewritten by ensure-running"
+        );
+        // Committing without a staged entry is an error — the endpoint simply
+        // never commits this branch.
+        assert!(adhoc_commit(&sup, "shop").is_err());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3, branch 3: a user stop record keeps the program stopped (with the
+    /// notice) and the record itself is never cleared by `up`.
+    #[test]
+    fn compose_identical_respects_user_stop_records() {
+        let (sup, dir, h) = adhoc_harness("compose-hold");
+        let base = compose_base("hold");
+        let content = compose_decl("");
+        let first = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        wait_compose(&sup, &first);
+        adhoc_commit(&sup, "shop").unwrap();
+        // An explicit stop writes the persisted user stop record.
+        sup.cmd_stop("worker").unwrap();
+        assert!(sup.state.lock().unwrap().user_stopped.contains("worker"));
+
+        let again = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        assert!(
+            again.identical && again.unchanged,
+            "nothing pulled: {again:?}"
+        );
+        assert!(again.waits.is_empty(), "{again:?}");
+        assert_eq!(again.skipped.len(), 1, "{again:?}");
+        assert_eq!(again.skipped[0].program, "worker");
+        assert!(
+            again.skipped[0].reason.contains("user stop record"),
+            "{again:?}"
+        );
+        assert_eq!(
+            sup.state.lock().unwrap().programs["worker"].state(),
+            ProgramState::Stopped
+        );
+        // The record survives `up`.
+        assert!(sup.state.lock().unwrap().user_stopped.contains("worker"));
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: a differing top-level record without `force` is a conflict that
+    /// carries the preview and changes nothing; with `force` the old programs
+    /// are stopped, the record is rewritten and the new definition is spawned.
+    #[test]
+    fn compose_needs_update_gate_and_force_update() {
+        let (sup, dir, h) = adhoc_harness("compose-update");
+        let base = compose_base("upd");
+        let content = compose_decl("");
+        let first = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap();
+        wait_compose(&sup, &first);
+        adhoc_commit(&sup, "shop").unwrap();
+        let record = dir.join("app.d").join("shop.toml");
+        let before = std::fs::read_to_string(&record).unwrap();
+        let pid = sup.state.lock().unwrap().programs["web"].pid();
+
+        // A changed declaration without force: conflict, zero side effects.
+        let changed = compose_decl("").replace("args = ['30']", "args = ['45']");
+        let err = compose_up(&sup, &compose_req(&base, "shop", &changed, false)).unwrap_err();
+        let ComposeUpError::Conflict(pv) = &err else {
+            panic!("expected a conflict, got {err:?}");
+        };
+        assert_eq!(pv.class, ComposeClass::NeedsUpdate);
+        assert!(!pv.diff.is_empty(), "the preview carries a diff: {pv:?}");
+        assert!(pv.programs.iter().any(|p| p.program == "web"), "{pv:?}");
+        assert_eq!(err.http_status(), 409);
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+        assert_eq!(sup.state.lock().unwrap().programs["web"].pid(), pid);
+
+        // With force: stop old → land new → spawn new.
+        let staged = compose_up(&sup, &compose_req(&base, "shop", &changed, true)).unwrap();
+        assert!(!staged.identical);
+        wait_compose(&sup, &staged);
+        adhoc_commit(&sup, "shop").unwrap();
+        let after = std::fs::read_to_string(&record).unwrap();
+        assert_ne!(after, before);
+        assert!(after.contains("\"45\""), "{after}");
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["web"].state(), ProgramState::Running);
+            assert_ne!(
+                st.programs["web"].pid(),
+                pid,
+                "the old process was replaced"
+            );
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4 takeover: a same-name run product in `adhoc/` is classified, and a
+    /// forced submission stops the run program, DELETES the adhoc record and
+    /// lands the compose record at the top level.
+    #[test]
+    fn compose_takeover_absorbs_adhoc_record() {
+        let (sup, dir, h) = adhoc_harness("compose-takeover");
+        let base = compose_base("take");
+        // The run product: an ad-hoc app registered (and running) as `shop`.
+        let spec = AdhocSpec {
+            name: Some("shop".into()),
+            restart: Some(crate::config::RestartPolicy::Always),
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        adhoc_up(&sup, spec).unwrap();
+        adhoc_commit(&sup, "shop").unwrap();
+        let adhoc_record = dir.join("app.d").join("adhoc").join("shop.toml");
+        assert!(adhoc_record.exists());
+        let old_pid = sup.state.lock().unwrap().programs["shop"].pid();
+        assert!(old_pid.is_some());
+
+        let content = compose_decl("");
+        // Classification first (no force): conflict with the takeover preview.
+        let err = compose_up(&sup, &compose_req(&base, "shop", &content, false)).unwrap_err();
+        let ComposeUpError::Conflict(pv) = &err else {
+            panic!("expected a conflict, got {err:?}");
+        };
+        assert_eq!(pv.class, ComposeClass::AdhocTakeover);
+        assert_eq!(pv.record_path, adhoc_record);
+        assert!(adhoc_record.exists(), "no force → nothing touched");
+
+        // Forced: takeover.
+        let staged = compose_up(&sup, &compose_req(&base, "shop", &content, true)).unwrap();
+        assert!(!staged.identical);
+        assert!(!adhoc_record.exists(), "the adhoc record was deleted");
+        wait_compose(&sup, &staged);
+        adhoc_commit(&sup, "shop").unwrap();
+        let top = dir.join("app.d").join("shop.toml");
+        assert!(top.exists(), "the compose record landed at the top level");
+        assert!(
+            !dir.join("app.d").join("adhoc").join("shop.toml").exists(),
+            "still no adhoc record"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(st.programs["web"].state(), ProgramState::Running);
+            assert_ne!(
+                st.programs["web"].pid(),
+                old_pid,
+                "the run program was stopped and replaced"
+            );
+            assert!(!st.programs.contains_key("shop"), "the old program is gone");
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: an external deployment link is refused with or without `force`
+    /// (the preview carries the `ak remove` guidance).
+    #[test]
+    fn compose_external_record_refused_even_with_force() {
+        let (sup, dir, h) = adhoc_harness("compose-external");
+        let base = compose_base("ext");
+        let outside = dir.join("outside.toml");
+        std::fs::write(&outside, "[program.web]\ncommand = 'sleep 5'\n").unwrap();
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        link_for_test(&outside, &dir.join("app.d").join("shop.toml"));
+
+        let content = compose_decl("");
+        for force in [false, true] {
+            let err = compose_up(&sup, &compose_req(&base, "shop", &content, force)).unwrap_err();
+            let ComposeUpError::Conflict(pv) = &err else {
+                panic!("expected a conflict, got {err:?}");
+            };
+            assert_eq!(pv.class, ComposeClass::ExternalRefused);
+            assert!(pv.hint.contains("ak remove"), "{pv:?}");
+            assert_eq!(err.http_status(), 409);
+            assert!(
+                std::fs::read_to_string(&outside)
+                    .unwrap()
+                    .contains("[program.web]"),
+                "the external config is untouched"
+            );
+        }
+        assert!(
+            sup.state.lock().unwrap().programs.is_empty(),
+            "nothing was ever spawned"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The compose dependency order is deps-first with a name tie-break,
+    /// regardless of declaration order.
+    #[test]
+    fn declaration_order_puts_dependencies_first() {
+        let app = config::resolve_app(
+            "shop",
+            Path::new("x.toml"),
+            &toml::from_str::<crate::config::AppRaw>(
+                "[program.c]\ncommand = 'true'\ndepends_on = ['b']\n\n\
+                 [program.b]\ncommand = 'true'\ndepends_on = ['a']\n\n\
+                 [program.a]\ncommand = 'true'\n\n\
+                 [program.solo]\ncommand = 'true'\n",
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        // Level-batched Kahn: level 1 is {a, solo} (no in-declaration deps,
+        // name order), then b, then c — every dependency precedes its
+        // dependents.
+        assert_eq!(
+            declaration_order(&app.programs),
+            vec!["a", "solo", "b", "c"]
+        );
     }
 }

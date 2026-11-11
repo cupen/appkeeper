@@ -210,6 +210,143 @@ pub fn split_command(line: &str) -> Vec<String> {
     out
 }
 
+/// Windows `canonicalize` yields verbatim (`\\?\C:\...`) paths; strip the
+/// prefix from plain drive paths so generated configs stay readable (the
+/// result is still absolute). Shared by the registry's scaffold renderer and
+/// the declaration renderer.
+pub(crate) fn display_absolute(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                return PathBuf::from(rest.to_string());
+            }
+        }
+    }
+    p
+}
+
+/// Resolve a command's first token into an absolute executable path
+/// (cli-revamp D7; add-compose-up D2 passes the CALLER's PATH): a token
+/// containing a path separator is canonicalized (with an existence check), a
+/// bare name is looked up on `caller_path` — `None` falls back to the process
+/// `PATH` (unix: first entry with an execute bit; windows: as-is then
+/// `PATHEXT` expansion). The resolved absolute path is what gets frozen into
+/// the generated config, so the daemon's spawn environment cannot change the
+/// meaning.
+pub fn resolve_command_on(caller_path: Option<&std::ffi::OsStr>, first: &str) -> Result<PathBuf> {
+    if first.trim().is_empty() {
+        bail!("the command is empty");
+    }
+    let has_sep = first.contains('/') || first.contains(std::path::MAIN_SEPARATOR);
+    if has_sep {
+        let p = Path::new(first);
+        return p
+            .canonicalize()
+            .map(display_absolute)
+            .with_context(|| format!("cannot resolve command {first:?} (no such executable)"));
+    }
+    lookup_on_path(caller_path, first).with_context(|| {
+        format!(
+            "cannot find {first:?} on PATH (use an absolute or relative path, \
+             or make sure it is installed)"
+        )
+    })
+}
+
+/// Look a bare command name up on the given `PATH` (`None` = the process env).
+#[cfg(unix)]
+fn lookup_on_path(caller_path: Option<&std::ffi::OsStr>, name: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let owned;
+    let path = match caller_path {
+        Some(p) => p,
+        None => {
+            owned = std::env::var_os("PATH").unwrap_or_default();
+            &owned
+        }
+    };
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(name);
+        let Ok(md) = std::fs::metadata(&cand) else {
+            continue;
+        };
+        if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+            return Ok(display_absolute(cand));
+        }
+    }
+    bail!("{name:?} was not found on PATH")
+}
+
+/// Windows: try the name verbatim, then each `PATHEXT` extension.
+#[cfg(windows)]
+fn lookup_on_path(caller_path: Option<&std::ffi::OsStr>, name: &str) -> Result<PathBuf> {
+    let owned;
+    let path = match caller_path {
+        Some(p) => p,
+        None => {
+            owned = std::env::var_os("PATH").unwrap_or_default();
+            &owned
+        }
+    };
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let has_ext = Path::new(name)
+        .extension()
+        .map(|e| !e.is_empty())
+        .unwrap_or(false);
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let direct = dir.join(name);
+        if direct.is_file() {
+            return Ok(display_absolute(direct));
+        }
+        if !has_ext {
+            for ext in &exts {
+                let cand = dir.join(format!("{name}{ext}"));
+                if cand.is_file() {
+                    return Ok(display_absolute(cand));
+                }
+            }
+        }
+    }
+    bail!("{name:?} was not found on PATH")
+}
+
+/// Render `command args...` as one single-line command the quote-aware
+/// splitter ([`split_command`]) turns back into the same argv (paths/args
+/// containing whitespace get double-quoted; embedded quotes cannot be
+/// represented). Shared by the scaffold renderer and the declaration renderer
+/// (add-compose-up D2) so both produce byte-identical snapshots.
+pub fn render_single_line_command(command: &str, args: &[String]) -> Result<String> {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    for s in std::iter::once(command).chain(args.iter().map(|s| s.as_str())) {
+        if s.contains('"') {
+            bail!(
+                "cannot represent {s:?} in a single-line command (quote character); \
+                 edit the generated config by hand"
+            );
+        }
+        if s.chars().any(|c| c.is_whitespace()) {
+            parts.push(format!("\"{s}\""));
+        } else {
+            parts.push(s.to_string());
+        }
+    }
+    Ok(parts.join(" "))
+}
+
 /// Parse human-friendly sizes: "10MB", "512KB", "1GB" or plain bytes.
 pub fn parse_size(s: &str) -> Result<u64> {
     let t = s.trim();
@@ -1612,6 +1749,99 @@ pub fn validate_all(apps: &[ResolvedApp]) -> Result<()> {
     } else {
         bail!("{}", errors.join("; "));
     }
+}
+
+// ---------------------------------------------------------------------------
+// declaration rendering (add-compose-up D2)
+// ---------------------------------------------------------------------------
+
+/// The project declaration file `ak compose up` reads. Its name is fixed so
+/// the discovery rule is one fact in one place (the CLI passes the file's
+/// CONTENT to the daemon — a tcp:// client and the daemon may live on
+/// different machines).
+pub const DECLARATION_FILE: &str = ".appkeeper.toml";
+
+/// App names that can never be used because they are CLI keywords. `all` is
+/// the apply-all keyword (apply-workflow spec); defined here so the
+/// declaration renderer enforces it without depending on upper layers.
+pub const RESERVED_APP_NAMES: [&str; 1] = ["all"];
+
+/// Render a `.appkeeper.toml` declaration into the canonical registration
+/// snapshot (add-compose-up task 2.1/2.2):
+///
+/// 1. parse (`AppRaw`, unknown fields rejected, at least one `[program.*]`);
+/// 2. validate with the same rules the registry applies — app name charset
+///    and reserved words, single-line-command/`args` mutual exclusion,
+///    dependency existence and intra-declaration cycles (`resolve_app` +
+///    `validate_all`; cross-app conflicts are the caller's job against the
+///    live registry);
+/// 3. absolutize relative `work_dir`s against `base_dir` (the declaration
+///    file's directory) and resolve each command's first token to an absolute
+///    path: a path-bearing token is canonicalized, a bare name is looked up on
+///    the CALLER's `PATH` (`caller_path`, `None` = the process env);
+/// 4. serialize the normalized snapshot (first token absolute + explicit
+///    `args` array — structurally identical to the run scaffold's product; a
+///    whitespaceful command path falls back to the quoted single-line form so
+///    the text round-trips through [`resolve_program`]).
+///
+/// Pure: no disk writes and no process changes; the same inputs always yield
+/// byte-identical output (BTreeMap key order), which is what makes the
+/// byte-comparison against an existing record meaningful. The rendered text
+/// is BOTH the comparison baseline and the bytes that land on disk.
+pub fn render_declaration(
+    text: &str,
+    base_dir: &Path,
+    name: &str,
+    caller_path: Option<&std::ffi::OsStr>,
+) -> Result<String> {
+    if !is_valid_name(name) {
+        bail!("app name {name:?} is invalid: {NAME_RULE}");
+    }
+    if RESERVED_APP_NAMES.contains(&name) {
+        bail!(
+            "app name {name:?} is reserved: `ak apply all` means apply-all; choose another --name"
+        );
+    }
+    let raw: AppRaw = toml::from_str(text)
+        .with_context(|| format!("failed to parse the declaration for app {name:?}"))?;
+    if raw.program.is_empty() {
+        bail!("the declaration for app {name:?} has no [program.*] tables");
+    }
+    // Synthetic path: only its parent (= base_dir) matters — `resolve_app`
+    // resolves relative program paths against the config file's directory.
+    // Nothing is ever read from or written to this path.
+    let synthetic = base_dir.join(DECLARATION_FILE);
+    let resolved = resolve_app(name, &synthetic, &raw, None)?;
+    // Dependency existence + cycles within the declaration.
+    validate_all(std::slice::from_ref(&resolved))?;
+
+    let mut programs = BTreeMap::new();
+    for rp in &resolved.programs {
+        let abs = resolve_command_on(caller_path, &rp.command)?;
+        let command_str = abs.display().to_string();
+        // A whitespaceful absolute path cannot round-trip as `command` +
+        // explicit `args` (the two are mutually exclusive on re-read), so it
+        // falls back to the quoted single-line form — the same shape the run
+        // scaffold uses for such paths.
+        let (command, args) = if command_str.contains(char::is_whitespace) {
+            (render_single_line_command(&command_str, &rp.args)?, None)
+        } else {
+            (command_str, (!rp.args.is_empty()).then(|| rp.args.clone()))
+        };
+        // Preserve every other declared field verbatim; the effective
+        // work_dir (base_dir when undeclared) is written explicitly so the
+        // snapshot is self-contained and deterministic.
+        let mut praw = raw.program.get(&rp.name).cloned().unwrap_or_default();
+        praw.command = Some(command);
+        praw.args = args;
+        praw.work_dir = Some(rp.work_dir.clone());
+        programs.insert(rp.name.clone(), praw);
+    }
+    let snapshot = AppRaw {
+        app: raw.app.clone(),
+        program: programs,
+    };
+    toml::to_string_pretty(&snapshot).context("failed to render the declaration snapshot")
 }
 
 // ---------------------------------------------------------------------------
@@ -3384,6 +3614,220 @@ mod tests {
         let raw: AppRaw = toml::from_str(&text).unwrap();
         assert!(raw.program.contains_key("web"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- declaration rendering (add-compose-up tasks 2.1/2.2) ----------------
+
+    /// A temp dir whose joined `bin` directory holds a fake executable, spelled
+    /// as a caller PATH value.
+    fn caller_path_with(tag: &str, exe_name: &str) -> (PathBuf, std::ffi::OsString) {
+        let dir = std::env::temp_dir().join(format!("ak-test-render-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join(exe_name);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(&exe, "").unwrap();
+        let path_env = std::env::join_paths(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .chain(std::iter::once(bin)),
+        )
+        .unwrap();
+        (dir, path_env)
+    }
+
+    /// Relative work_dir is absolutized against the base directory; the
+    /// absolute one is kept.
+    #[test]
+    fn render_declaration_absolutizes_work_dir() {
+        let (dir, path_env) = caller_path_with("wd", "sleeper");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let exe = dir.join("bin").join("sleeper");
+        let cmd = exe.display().to_string().replace('\\', "/");
+        let text =
+            format!("[program.web]\ncommand = \"{cmd}\"\nargs = [\"30\"]\nwork_dir = \"./data\"\n");
+        let out = render_declaration(&text, &dir, "shop", None).unwrap();
+        let raw: AppRaw = toml::from_str(&out).unwrap();
+        let wd = raw.program["web"].work_dir.as_ref().unwrap();
+        assert_eq!(
+            wd.canonicalize().unwrap(),
+            dir.join("data").canonicalize().unwrap(),
+            "relative work_dir rendered against the base dir: {wd:?}"
+        );
+
+        // Absolute work_dir passes through unchanged.
+        let text = format!(
+            "[program.web]\ncommand = \"{}\"\nwork_dir = {:?}\n",
+            cmd,
+            dir.join("bin").display().to_string().replace('\\', "/")
+        );
+        let out = render_declaration(&text, &dir, "shop", None).unwrap();
+        let raw: AppRaw = toml::from_str(&out).unwrap();
+        let wd = raw.program["web"].work_dir.as_ref().unwrap();
+        assert!(wd.is_absolute() && wd.ends_with("bin"), "{wd:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(path_env);
+    }
+
+    /// A single-line command with arguments is split (existing rules) into an
+    /// absolute first token plus the args array; a bare command name resolves
+    /// via the caller's PATH; a path-bearing token is canonicalized.
+    #[test]
+    fn render_declaration_splits_command_and_resolves_bare_names() {
+        let (dir, path_env) = caller_path_with("bare", "mytool");
+        // Bare name + single-line args (the spec scenario shape).
+        let text = "[program.web]\ncommand = \"mytool -m http.server 8000\"\n";
+        let out = render_declaration(text, &dir, "shop", Some(&path_env)).unwrap();
+        let raw: AppRaw = toml::from_str(&out).unwrap();
+        let prog = &raw.program["web"];
+        let cmd = prog.command.as_deref().unwrap();
+        assert!(
+            Path::new(cmd).is_absolute()
+                && cmd.ends_with("mytool")
+                && !cmd.contains(char::is_whitespace),
+            "bare first token resolved via the caller PATH: {cmd}"
+        );
+        assert_eq!(
+            prog.args.as_deref(),
+            Some(
+                &[
+                    "-m".to_string(),
+                    "http.server".to_string(),
+                    "8000".to_string()
+                ][..]
+            )
+        );
+
+        // A path-bearing token is canonicalized (no PATH lookup).
+        let exe = dir.join("bin").join("mytool");
+        let text = format!(
+            "[program.web]\ncommand = {:?}\nargs = [\"--x\"]\n",
+            exe.display().to_string().replace('\\', "/")
+        );
+        let out = render_declaration(&text, &dir, "shop", None).unwrap();
+        let raw: AppRaw = toml::from_str(&out).unwrap();
+        let cmd = raw.program["web"].command.as_deref().unwrap().to_string();
+        assert_eq!(
+            Path::new(&cmd),
+            display_absolute(exe.canonicalize().unwrap()),
+            "path-bearing token canonicalized: {cmd}"
+        );
+
+        // A bare name missing from the caller PATH is a validation error.
+        let err = render_declaration(
+            "[program.web]\ncommand = \"definitely-not-on-path-xyz\"\n",
+            &dir,
+            "shop",
+            Some(&path_env),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("PATH"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown fields, invalid names, the reserved `all`, missing program
+    /// tables and intra-declaration dependency cycles are all refused with
+    /// zero side effects.
+    #[test]
+    fn render_declaration_rejects_invalid_inputs() {
+        let dir = std::env::temp_dir().join(format!("ak-test-render-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Unknown field (deny_unknown_fields).
+        let err = render_declaration(
+            "[program.web]\ncommand = 'true'\nbogus = 1\n",
+            &dir,
+            "shop",
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("bogus"), "{err:#}");
+
+        // Invalid app name.
+        let err = render_declaration("[program.web]\ncommand = 'true'\n", &dir, "bad name", None)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid"), "{err:#}");
+
+        // Reserved keyword.
+        let err =
+            render_declaration("[program.web]\ncommand = 'true'\n", &dir, "all", None).unwrap_err();
+        assert!(format!("{err:#}").contains("reserved"), "{err:#}");
+
+        // No program tables.
+        let err =
+            render_declaration("[app]\ndescription = \"x\"\n", &dir, "shop", None).unwrap_err();
+        assert!(format!("{err:#}").contains("no [program.*]"), "{err:#}");
+
+        // Single-line command + explicit args are mutually exclusive.
+        let err = render_declaration(
+            "[program.web]\ncommand = 'run --x'\nargs = ['--y']\n",
+            &dir,
+            "shop",
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("mutually exclusive"), "{err:#}");
+
+        // Intra-declaration dependency cycle.
+        let err = render_declaration(
+            "[program.a]\ncommand = 'true'\ndepends_on = ['b']\n\n[program.b]\ncommand = 'true'\ndepends_on = ['a']\n",
+            &dir,
+            "shop",
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("cycle"), "{err:#}");
+
+        // Dependency on a program the declaration does not define.
+        let err = render_declaration(
+            "[program.a]\ncommand = 'true'\ndepends_on = ['ghost']\n",
+            &dir,
+            "shop",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("ghost"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.2: the same input renders byte-identically — BTreeMap key order and
+    /// the explicit work_dir make the snapshot a stable comparison baseline,
+    /// and the text round-trips through `resolve_app` unchanged.
+    #[test]
+    fn render_declaration_is_deterministic() {
+        let (dir, path_env) = caller_path_with("det", "tool");
+        let text = "[program.worker]\ncommand = 'tool --x 1'\nwork_dir = '.'\n\n\
+                    [program.web]\ncommand = 'tool'\nargs = ['--port', '8080']\n\
+                    [app]\ndescription = 'shop'\npriority = 5\n";
+        let a = render_declaration(text, &dir, "shop", Some(&path_env)).unwrap();
+        let b = render_declaration(text, &dir, "shop", Some(&path_env)).unwrap();
+        assert_eq!(a, b, "same input → byte-identical output");
+        assert!(
+            a.find("[program.web]").unwrap() < a.find("[program.worker]").unwrap(),
+            "BTreeMap key order: {a}"
+        );
+
+        // Round-trip: the rendered text parses and resolves to the same
+        // command/work_dir the resolution computed.
+        let raw: AppRaw = toml::from_str(&a).unwrap();
+        let resolved = resolve_app("shop", &dir.join(".appkeeper.toml"), &raw, None).unwrap();
+        let web = resolved.programs.iter().find(|p| p.name == "web").unwrap();
+        assert!(Path::new(&web.command).is_absolute());
+        assert_eq!(
+            web.work_dir, dir,
+            "undeclared work_dir pinned to the base dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

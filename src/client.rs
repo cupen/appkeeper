@@ -463,6 +463,63 @@ impl Client {
         Ok(last)
     }
 
+    // -- compose up (add-compose-up D3) ---------------------------------------
+
+    /// `POST /v1/compose/up/preview`: the zero-side-effect half of the compose
+    /// protocol — render + compare + classify on the daemon, nothing written.
+    /// The body carries the declaration CONTENT, the base directory, the
+    /// caller's PATH and the app name (never a file path — a tcp:// client and
+    /// the daemon may live on different machines).
+    pub fn compose_up_preview(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.send(
+            "POST",
+            "/v1/compose/up/preview",
+            body,
+            self.timeout,
+            Some("application/json"),
+        )
+    }
+
+    /// `POST /v1/compose/up`: execute half. Streams the NDJSON progress frames
+    /// to `on_frame` (same transport mode as [`Client::adhoc_run`]) and returns
+    /// the terminal frame. A non-2xx answer (validation 400 / conflict 409 with
+    /// the preview attached / stage failure 500) is an api error.
+    pub fn compose_up(
+        &self,
+        body: &serde_json::Value,
+        mut on_frame: impl FnMut(&serde_json::Value),
+    ) -> Result<serde_json::Value> {
+        let mut resp = self.request(
+            "POST",
+            "/v1/compose/up",
+            body,
+            STREAM_TIMEOUT,
+            Some("application/x-ndjson"),
+        )?;
+        if resp.status != 200 {
+            let status = resp.status;
+            let text = resp.read_body().unwrap_or_default();
+            let msg = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or(text);
+            anyhow::bail!("{:#}", api_error(status, &msg));
+        }
+        let mut last = serde_json::Value::Null;
+        resp.for_each_line(&mut |line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return true;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                on_frame(&v);
+                last = v;
+            }
+            true
+        })?;
+        Ok(last)
+    }
+
     /// Confirm re-landing of a residual (staged, unpersisted) app without
     /// restarting it (run-daemon-first D4).
     pub fn adhoc_commit(&self, name: &str) -> Result<serde_json::Value> {

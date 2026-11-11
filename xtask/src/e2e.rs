@@ -241,13 +241,14 @@ fn default_socket_matches(out: &str) -> bool {
     }
 }
 
-/// The `apps/web.toml` fragment as the CLI prints it: path separators differ
-/// per platform.
+/// The `apps/adhoc/web.toml` fragment as the CLI prints it (run products land
+/// in the `adhoc/` area, add-compose-up D1): path separators differ per
+/// platform.
 fn apps_web_seg() -> String {
     if cfg!(windows) {
-        r"apps\web.toml".to_string()
+        r"apps\adhoc\web.toml".to_string()
     } else {
-        "apps/web.toml".to_string()
+        "apps/adhoc/web.toml".to_string()
     }
 }
 
@@ -2877,7 +2878,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         out.contains("adhoc-a"),
         &format!("the report names the new program: {out:?}"),
     )?;
-    let a_cfg = ws.root.join("apps/adhoc-a.toml");
+    let a_cfg = ws.root.join("apps/adhoc/adhoc-a.toml");
     expect(a_cfg.is_file(), "adhoc-a.toml generated")?;
     let a_text = std::fs::read_to_string(&a_cfg)?;
     expect(
@@ -2900,7 +2901,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         out.contains("started"),
         &format!("--cmd registers too: {out:?}"),
     )?;
-    let b_text = std::fs::read_to_string(ws.root.join("apps/adhoc-b.toml"))?;
+    let b_text = std::fs::read_to_string(ws.root.join("apps/adhoc/adhoc-b.toml"))?;
     expect(
         a_text.replace("adhoc-a", "adhoc-X") == b_text.replace("adhoc-b", "adhoc-X"),
         "`--` and `--cmd` produce the same registration modulo the name",
@@ -2975,7 +2976,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             )?;
         }
         expect(
-            !ws.root.join("apps/adhoc-a.toml.pending").exists(),
+            !ws.root.join("apps/adhoc/adhoc-a.toml.pending").exists(),
             &format!("the refusal ({label}) left no placeholder"),
         )?;
         expect(
@@ -3011,7 +3012,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "--restart=no",
         ],
     )?;
-    let quiet = std::fs::read_to_string(ws.root.join("apps/adhoc-quiet.toml"))?;
+    let quiet = std::fs::read_to_string(ws.root.join("apps/adhoc/adhoc-quiet.toml"))?;
     expect(
         quiet.contains("restart = \"no\""),
         "the restart literal is written straight into the config",
@@ -3022,7 +3023,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     )?;
     // Refuse-run-existing-app 4.2: a registered-but-NOT-running app is refused
     // too — the record is not rewritten and no process is created.
-    let quiet_cfg = ws.root.join("apps/adhoc-quiet.toml");
+    let quiet_cfg = ws.root.join("apps/adhoc/adhoc-quiet.toml");
     let quiet_before = std::fs::read_to_string(&quiet_cfg)?;
     let (ok, code, combined) = cli_try(
         bin,
@@ -3046,7 +3047,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "the refused re-run started no process",
     )?;
     expect(
-        !ws.root.join("apps/adhoc-quiet.toml.pending").exists(),
+        !ws.root.join("apps/adhoc/adhoc-quiet.toml.pending").exists(),
         "the refused re-run left no placeholder",
     )?;
     // Reserved `all` is refused.
@@ -3284,7 +3285,8 @@ fn setup_runfirst_workspace() -> Result<Workspace> {
     })
 }
 
-/// The app_dir entries (sorted) — the raw material for residue assertions.
+/// The app_dir entries (sorted; `adhoc/` contents recursed with an
+/// `adhoc/` prefix) — the raw material for residue assertions.
 fn app_dir_files(ws: &Workspace) -> Vec<String> {
     let dir = ws.root.join("apps");
     let mut out: Vec<String> = std::fs::read_dir(&dir)
@@ -3294,23 +3296,39 @@ fn app_dir_files(ws: &Workspace) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
+    // The run-product area (add-compose-up D1) is part of the registry view.
+    let adhoc = dir.join("adhoc");
+    if adhoc.is_dir() {
+        for f in std::fs::read_dir(&adhoc)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+        {
+            out.push(format!(
+                "adhoc/{}",
+                f.file_name().to_string_lossy().into_owned()
+            ));
+        }
+    }
     out.sort();
     out
 }
 
-/// Assert no residue for `name`: neither the record nor its placeholder, and
-/// no stray `.toml.pending` anywhere in `app_dir` (app-registry spec: 失败
-/// 不留残留).
+/// Assert no residue for `name` in BOTH registry areas: neither the record nor
+/// its placeholder at the top level or in `adhoc/`, and no stray
+/// `.toml.pending` anywhere (app-registry spec: 失败不留残留).
 fn expect_no_residue(ws: &Workspace, name: &str) -> Result<()> {
     let dir = ws.root.join("apps");
-    expect(
-        !dir.join(format!("{name}.toml")).exists(),
-        &format!("no {name}.toml residue"),
-    )?;
-    expect(
-        !dir.join(format!("{name}.toml.pending")).exists(),
-        &format!("no {name}.toml.pending residue"),
-    )?;
+    for area in ["", "adhoc/"] {
+        expect(
+            !dir.join(format!("{area}{name}.toml")).exists(),
+            &format!("no {area}{name}.toml residue"),
+        )?;
+        expect(
+            !dir.join(format!("{area}{name}.toml.pending")).exists(),
+            &format!("no {area}{name}.toml.pending residue"),
+        )?;
+    }
     let stray: Vec<String> = app_dir_files(ws)
         .into_iter()
         .filter(|f| f.ends_with(".toml.pending"))
@@ -3463,7 +3481,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("run -- reports program/config/pid: {out:?}"),
     )?;
     expect(
-        apps.join("web.toml").is_file(),
+        apps.join("adhoc/web.toml").is_file(),
         "the registration landed in app_dir",
     )?;
     let web_pid = wait_running(ws, "web")?;
@@ -3711,8 +3729,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     // without `--force` is a conflict with zero side effects
     // (app-registry: run ad-hoc 同名应用拦截; task 4.2).
     let web_pid = pid_of(ws, "web")?.expect("web is running");
-    let web_before = std::fs::read_to_string(apps.join("web.toml"))?;
-    let web_mtime = std::fs::metadata(apps.join("web.toml"))?.modified()?;
+    let web_before = std::fs::read_to_string(apps.join("adhoc/web.toml"))?;
+    let web_mtime = std::fs::metadata(apps.join("adhoc/web.toml"))?.modified()?;
     let files_before = app_dir_files(ws);
     for (label, args) in [
         (
@@ -3742,11 +3760,11 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             &format!("the refusal ({label}) names the app and --force: {combined:?}"),
         )?;
         expect(
-            std::fs::read_to_string(apps.join("web.toml"))? == web_before,
+            std::fs::read_to_string(apps.join("adhoc/web.toml"))? == web_before,
             &format!("the refusal ({label}) left the record bytes unchanged"),
         )?;
         expect(
-            std::fs::metadata(apps.join("web.toml"))?.modified()? == web_mtime,
+            std::fs::metadata(apps.join("adhoc/web.toml"))?.modified()? == web_mtime,
             &format!("the refusal ({label}) left the record mtime unchanged"),
         )?;
         expect(
@@ -3765,7 +3783,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("refusals left app_dir untouched: {:?}", app_dir_files(ws)),
     )?;
     expect(
-        apps.join("web.toml").is_file() && !apps.join("web.toml.pending").exists(),
+        apps.join("adhoc/web.toml").is_file() && !apps.join("adhoc/web.toml.pending").exists(),
         "the refusals left the record in place and no placeholder",
     )?;
 
@@ -3781,7 +3799,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         out.contains("started") && out.contains("pid:"),
         &format!("a forced overwrite reports the new pid: {out:?}"),
     )?;
-    let web_text = std::fs::read_to_string(apps.join("web.toml"))?;
+    let web_text = std::fs::read_to_string(apps.join("adhoc/web.toml"))?;
     expect(
         web_text.contains("303") && web_text.contains("args"),
         &format!("the record was rewritten from the new command line: {web_text:?}"),
@@ -3807,15 +3825,15 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("`ps` shows the new pid: {web_row:?}"),
     )?;
     expect(
-        !apps.join("web.toml.pending").exists(),
+        !apps.join("adhoc/web.toml.pending").exists(),
         "the forced overwrite left no placeholder",
     )?;
 
     step("RDF9d. --force with identical content does nothing at all");
     // 5.2 / D6: bytes, mtime and pid are untouched, no stop/spawn happens,
     // and the CLI prints the fixed hint with exit 0.
-    let text_now = std::fs::read_to_string(apps.join("web.toml"))?;
-    let mtime_now = std::fs::metadata(apps.join("web.toml"))?.modified()?;
+    let text_now = std::fs::read_to_string(apps.join("adhoc/web.toml"))?;
+    let mtime_now = std::fs::metadata(apps.join("adhoc/web.toml"))?.modified()?;
     let out = cli(
         bin,
         ws,
@@ -3830,11 +3848,11 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the unchanged force run reports no start: {out:?}"),
     )?;
     expect(
-        std::fs::read_to_string(apps.join("web.toml"))? == text_now,
+        std::fs::read_to_string(apps.join("adhoc/web.toml"))? == text_now,
         "the unchanged force run left the record bytes unchanged",
     )?;
     expect(
-        std::fs::metadata(apps.join("web.toml"))?.modified()? == mtime_now,
+        std::fs::metadata(apps.join("adhoc/web.toml"))?.modified()? == mtime_now,
         "the unchanged force run left the record mtime unchanged",
     )?;
     expect(
@@ -3848,7 +3866,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         )?;
     }
     expect(
-        !apps.join("web.toml.pending").exists(),
+        !apps.join("adhoc/web.toml.pending").exists(),
         "the unchanged force run wrote no placeholder",
     )?;
 
@@ -3873,7 +3891,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         !out.contains("配置无修改"),
         &format!("a changed force --restart=no is not a no-op: {out:?}"),
     )?;
-    let text_no = std::fs::read_to_string(apps.join("web.toml"))?;
+    let text_no = std::fs::read_to_string(apps.join("adhoc/web.toml"))?;
     expect(
         text_no.contains("304") && text_no.contains("restart = \"no\""),
         &format!("the record was rewritten with restart = no: {text_no:?}"),
@@ -3884,7 +3902,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     )?;
     wait_state_in(ws, "web", &["stopped"])?;
     expect(
-        !apps.join("web.toml.pending").exists(),
+        !apps.join("adhoc/web.toml.pending").exists(),
         "force --restart=no left no placeholder",
     )?;
     // Same definition again: no-op, still stopped.
@@ -3928,7 +3946,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         ],
     )?;
     expect(pid_of(ws, "idle")?.is_none(), "idle starts stopped")?;
-    let idle_cfg = apps.join("idle.toml");
+    let idle_cfg = apps.join("adhoc/idle.toml");
     let idle_before = std::fs::read_to_string(&idle_cfg)?;
     let out = cli(
         bin,
@@ -3978,7 +3996,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         "the unchanged force run did not pull the stopped app up",
     )?;
     expect(
-        idle_cfg.is_file() && !apps.join("idle.toml.pending").exists(),
+        idle_cfg.is_file() && !apps.join("adhoc/idle.toml.pending").exists(),
         "the unchanged force run left the record in place and no placeholder",
     )?;
 
@@ -4016,7 +4034,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "--restart=no",
         ],
     )?;
-    let doomed_cfg = apps.join("doomed.toml");
+    let doomed_cfg = apps.join("adhoc/doomed.toml");
     let (ok, code, combined) = cli_try(
         bin,
         ws,
@@ -4040,7 +4058,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         "the failed new process was stopped",
     )?;
     expect(
-        !apps.join("doomed.toml.pending").exists(),
+        !apps.join("adhoc/doomed.toml.pending").exists(),
         "the failed forced start left no placeholder",
     )?;
 
@@ -4132,11 +4150,11 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     // The startup window is the built-in 3s startsecs: sample it mid-flight.
     std::thread::sleep(Duration::from_millis(800));
     expect(
-        !apps.join("atomic.toml").exists(),
+        !apps.join("adhoc/atomic.toml").exists(),
         "no .toml record while the startup judgement is still pending",
     )?;
     expect(
-        apps.join("atomic.toml.pending").is_file(),
+        apps.join("adhoc/atomic.toml.pending").is_file(),
         "the placeholder exists mid-flight (a scanner cannot see it as a record)",
     )?;
     // The registry half of `ps --all` must not see the placeholder: the app
@@ -4175,7 +4193,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the ad-hoc run still succeeds after the mid-flight reload ({status})"),
     )?;
     expect(
-        apps.join("atomic.toml").is_file() && !apps.join("atomic.toml.pending").exists(),
+        apps.join("adhoc/atomic.toml").is_file()
+            && !apps.join("adhoc/atomic.toml.pending").exists(),
         "the placeholder was renamed onto the record",
     )?;
     let atomic_text = std::fs::read_to_string(&atomic_out).unwrap_or_default();
@@ -4218,7 +4237,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             &format!("the terminal frame carries a pid: {terminal}"),
         )?;
         expect(
-            apps.join("healthy.toml").is_file(),
+            apps.join("adhoc/healthy.toml").is_file(),
             "the health-probed app landed after the first successful probe",
         )?;
 
@@ -4282,7 +4301,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         frames[0].get("ok").and_then(|o| o.as_bool()) == Some(true),
         &format!("the terminal frame reports success: {}", frames[0]),
     )?;
-    expect(apps.join("plain.toml").is_file(), "the plain app landed")?;
+    expect(
+        apps.join("adhoc/plain.toml").is_file(),
+        "the plain app landed",
+    )?;
 
     step("RDF13c. an unusable app_dir refuses before starting any process");
     // Point a fresh daemon's app_dir underneath a regular file: creating the
@@ -4379,7 +4401,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         // Simulate an unwritable TARGET (robust even as root): a directory named
         // `<name>.toml` makes the same-directory rename fail with EISDIR after
         // startup already succeeded — exactly the partial-failure path.
-        std::fs::create_dir_all(apps.join("weird.toml"))?;
+        std::fs::create_dir_all(apps.join("adhoc/weird.toml"))?;
         let (ok, code, combined) =
             cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--app", "weird"])?;
         expect(
@@ -4398,7 +4420,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         )?;
         let weird_pid = pid_of(ws, "weird")?.expect("the process was kept running");
         expect(
-            apps.join("weird.toml.pending").is_file(),
+            apps.join("adhoc/weird.toml.pending").is_file(),
             "the placeholder is kept for diagnosis",
         )?;
 
@@ -4418,12 +4440,12 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "the refusal did not restart the process",
         )?;
         expect(
-            !apps.join("weird.toml").is_file(),
+            !apps.join("adhoc/weird.toml").is_file(),
             "the refusal wrote no record",
         )?;
 
         step("RDF16. confirming the residual re-lands the record without restarting");
-        std::fs::remove_dir(apps.join("weird.toml"))?;
+        std::fs::remove_dir(apps.join("adhoc/weird.toml"))?;
         let cmd = format!(
             "{} --config {} run -- {} 400 --app weird",
             bin.display(),
@@ -4460,7 +4482,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             &format!("the confirmation reports the registration: {confirm_text:?}"),
         )?;
         expect(
-            apps.join("weird.toml").is_file() && !apps.join("weird.toml.pending").exists(),
+            apps.join("adhoc/weird.toml").is_file()
+                && !apps.join("adhoc/weird.toml.pending").exists(),
             "the record landed and the placeholder is gone",
         )?;
         expect(
@@ -4486,6 +4509,771 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
     let _ = &mut *daemon;
     Ok(())
+}
+
+// -- compose up scenario group (add-compose-up) -------------------------------
+
+/// A `.appkeeper.toml` declaration for a project directory: `<p>_web`
+/// (priority 10) → `<p>_worker` (depends_on) → `<p>_opt` (unless-stopped);
+/// everything sleeps, so the startup judgement is startsecs only. Program
+/// names carry the prefix because they are globally unique across apps.
+fn write_compose_declaration(dir: &Path, p: &str, sleep: &str, startsecs: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join(".appkeeper.toml"),
+        format!(
+            "[app]\npriority = 10\n\n\
+             [program.{p}_web]\ncommand = \"{sleep}\"\nargs = [\"100000\"]\nstartsecs = {startsecs}\nrestart = \"always\"\n\n\
+             [program.{p}_worker]\ncommand = \"{sleep}\"\nargs = [\"100000\"]\nstartsecs = {startsecs}\nrestart = \"always\"\ndepends_on = [\"{p}_web\"]\n\n\
+             [program.{p}_opt]\ncommand = \"{sleep}\"\nargs = [\"100000\"]\nstartsecs = {startsecs}\nrestart = \"unless-stopped\"\n"
+        ),
+    )?;
+    Ok(())
+}
+
+/// The record mtime for the "nothing was written" assertions.
+fn mtime_of(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Run a command line under a pty (`script -qefc`), feeding `input` on the
+/// terminal stdin. Returns (success, combined output). The caller gates on
+/// `cfg!(unix)` (the residual-confirmation scenario in RDF16 uses the same
+/// wrapper); on unix `script` ships with util-linux/bsdutils everywhere the
+/// daemon builds.
+fn run_pty(cmd: &str, input: &[u8]) -> Result<(bool, String)> {
+    let mut child = Command::new("script")
+        .args(["-qefc", cmd, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn under a pty")?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(input)?;
+    }
+    let out = child.wait_with_output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok((out.status.success(), text))
+}
+
+/// add-compose-up acceptance (task 5.1) in its own workspace: the offline
+/// implicit pull-up first (the adopted daemon is shut down again), then the
+/// online scenarios on an explicitly spawned daemon.
+fn compose_up_pass(bin: &Path) -> Result<()> {
+    let root = std::env::temp_dir().join(format!("ak-xtask-e2e-composeup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for d in ["apps", "logs"] {
+        std::fs::create_dir_all(root.join(d)).context("create compose-up dirs")?;
+    }
+    let control_socket = control_socket_in(&root);
+    let webui_port = free_port()?;
+    let log_dir = root.join("logs").to_string_lossy().replace('\\', "/");
+    // Explicit workspace-local state_dir — same isolation rule as everywhere
+    // (harden-daemon-autostart: the derived default would be shared per user).
+    let state_dir = root.join("state").to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        root.join("daemon.toml"),
+        format!(
+            "[daemon]\nsocket = {socket}\nlog_dir = \"{log_dir}\"\nstate_dir = \"{state_dir}\"\nlog_level = \"warn\"\nmonitor_interval = 0.5\napp_dir = \"apps\"\n\n[webui]\nlisten = \"127.0.0.1:{webui_port}\"\n",
+            socket = socket_toml_value(&control_socket),
+        ),
+    )?;
+    let ws = Workspace {
+        root,
+        control_socket,
+        webui_port,
+    };
+    let result = compose_up_scenarios(bin, &ws);
+    // The daemon may be ours (spawned below) or an adopted auto-pull-up;
+    // either way it dies through the control plane.
+    let _ = control_http(&ws.control_socket, "POST", "/v1/shutdown", None);
+    for _ in 0..60 {
+        if !socket_health_ok(&ws.control_socket) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+fn compose_up_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
+    let apps = ws.root.join("apps");
+    let proj = ws.root.join("proj");
+    let proj2 = ws.root.join("proj2");
+    let take_proj = ws.root.join("take-proj");
+    let fail_proj = ws.root.join("fail-proj");
+    let proj_s = proj.to_string_lossy().replace('\\', "/");
+    write_compose_declaration(&proj, "p0", &sleep_s, "0.2")?;
+    write_compose_declaration(&proj2, "p2", &sleep_s, "0.2")?;
+    write_compose_declaration(&take_proj, "t", &sleep_s, "0.2")?;
+    std::fs::create_dir_all(&fail_proj)?;
+    std::fs::write(
+        fail_proj.join(".appkeeper.toml"),
+        format!(
+            "[program.f_good]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\nstartsecs = 0.2\nrestart = \"always\"\n\n\
+             [program.f_bad]\ncommand = \"{sleep_s}\"\nargs = [\"0.05\"]\nstartsecs = 1.0\nrestart = \"always\"\n"
+        ),
+    )?;
+
+    // -- client-side refusals (app-registry spec: 零副作用、不联系守护进程) ----
+
+    step(
+        "CU0a. missing declaration / tweak flags / reserved names refuse before any daemon contact",
+    );
+    // Missing declaration: the error names the searched path and states the
+    // no-upward-search rule (spec scenario 找不到声明文件).
+    let empty_proj = ws.root.join("empty-proj");
+    std::fs::create_dir_all(&empty_proj)?;
+    let empty_s = empty_proj.to_string_lossy().replace('\\', "/");
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &empty_s])?;
+    expect(
+        !ok && code == 2,
+        &format!("a missing declaration is a config error (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains(".appkeeper.toml") && combined.contains("does not search parent"),
+        &format!("the error names the searched path and the lookup rule: {combined:?}"),
+    )?;
+    // Content-tuning flags are refused with the reason (spec scenario
+    // 内容微调旗标被拒绝): the declaration file is the single source of truth.
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["compose", "up", &proj_s, "--restart", "always"])?;
+    expect(
+        !ok && code == 2,
+        &format!("a tweak flag is a usage error (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("--restart") && combined.contains("single source"),
+        &format!("the refusal names the flag and the reason: {combined:?}"),
+    )?;
+    // The reserved `all` is refused via --name and via the directory stem
+    // (spec scenario 保留字与非法名拒绝).
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &proj_s, "--name", "all"])?;
+    expect(
+        !ok && code == 2,
+        &format!("--name all is refused (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("reserved"),
+        &format!("the refusal says the name is reserved: {combined:?}"),
+    )?;
+    let all_proj = ws.root.join("all");
+    std::fs::create_dir_all(&all_proj)?;
+    std::fs::write(
+        all_proj.join(".appkeeper.toml"),
+        format!("[program.all_web]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\n"),
+    )?;
+    let all_s = all_proj.to_string_lossy().replace('\\', "/");
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &all_s])?;
+    expect(
+        !ok && code == 2,
+        &format!("a directory named `all` is refused (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("reserved"),
+        &format!("the derived-name refusal says reserved: {combined:?}"),
+    )?;
+    // None of the refusals contacted the daemon (the control endpoint is
+    // still down) and no registration artifact exists anywhere.
+    expect(
+        !socket_health_ok(&ws.control_socket),
+        "the client-side refusals never pulled the daemon up",
+    )?;
+    expect(
+        app_dir_files(ws).is_empty(),
+        &format!(
+            "the refusals left no registration artifacts: {:?}",
+            app_dir_files(ws)
+        ),
+    )?;
+
+    // -- offline: the implicit pull-up (background-daemon spec) --------------
+
+    step("CU0. offline `compose up` auto-pulls the daemon up and registers");
+    expect(
+        !socket_health_ok(&ws.control_socket),
+        "the pass starts with no daemon",
+    )?;
+    let out = cli(bin, ws, &["compose", "up", &proj_s])?;
+    expect(
+        out.contains("daemon started in the background"),
+        &format!("the auto-pull-up is reported: {out:?}"),
+    )?;
+    expect(
+        out.contains("app[proj] registered"),
+        &format!("the fresh up reports the registration: {out:?}"),
+    )?;
+    expect(
+        apps.join("proj.toml").is_file(),
+        "the record landed at the app_dir top level",
+    )?;
+    expect(
+        !apps.join("adhoc/proj.toml").is_file(),
+        "compose never writes the adhoc/ area",
+    )?;
+    wait_running(ws, "p0_web")?;
+    wait_running(ws, "p0_worker")?;
+    expect(
+        api(ws, "/v1/status")?.contains("p0_web"),
+        "the auto-pulled daemon serves the new app",
+    )?;
+    // The adopted daemon is shut down again so the explicit spawn below owns
+    // the control plane.
+    cli(bin, ws, &["daemon", "shutdown"])?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while socket_health_ok(&ws.control_socket) {
+        if Instant::now() > deadline {
+            bail!("the auto-pulled-up daemon did not shut down");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // -- online ---------------------------------------------------------------
+
+    let mut daemon = spawn_daemon(bin, ws)?;
+    let result = compose_up_online(bin, ws, &mut daemon);
+    shutdown_daemon(ws, &mut daemon);
+    result
+}
+
+fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()> {
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
+    let apps = ws.root.join("apps");
+    let proj2 = ws.root.join("proj2");
+    let take_proj = ws.root.join("take-proj");
+    let proj2_s = proj2.to_string_lossy().replace('\\', "/");
+    let take_s = take_proj.to_string_lossy().replace('\\', "/");
+    let fail_s = ws
+        .root
+        .join("fail-proj")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let record2 = apps.join("proj2.toml");
+
+    step("CU1. fresh declaration registers in dependency order (--json passthrough)");
+    let out = cli(bin, ws, &["compose", "up", &proj2_s, "--json"])?;
+    let frames: Vec<serde_json::Value> = out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("--json passes the frame stream through as JSON lines")?;
+    expect(
+        frames
+            .first()
+            .and_then(|f| f.get("phase"))
+            .and_then(|p| p.as_str())
+            == Some("staged"),
+        &format!("the first frame is the staged event: {out:?}"),
+    )?;
+    let order = |name: &str| {
+        frames
+            .first()
+            .and_then(|f| f.get("programs"))
+            .and_then(|p| p.as_array())
+            .and_then(|a| a.iter().filter_map(|v| v.as_str()).position(|s| s == name))
+    };
+    expect(
+        matches!((order("p2_web"), order("p2_worker")), (Some(w), Some(k)) if w < k),
+        &format!("the staged frame lists the dependency order (web before worker): {out:?}"),
+    )?;
+    let terminal = frames.last().expect("at least one frame");
+    expect(
+        terminal.get("ok").and_then(|o| o.as_bool()) == Some(true)
+            && terminal.get("app").and_then(|a| a.as_str()) == Some("proj2"),
+        &format!("the terminal frame is a success for proj2: {terminal}"),
+    )?;
+    expect(
+        terminal
+            .get("config_path")
+            .and_then(|c| c.as_str())
+            .map(|c| c.ends_with("proj2.toml"))
+            .unwrap_or(false),
+        "the terminal frame names the top-level record",
+    )?;
+    expect(record2.is_file(), "the record landed at the top level")?;
+    wait_running(ws, "p2_web")?;
+    wait_running(ws, "p2_worker")?;
+    wait_running(ws, "p2_opt")?;
+
+    step("CU2. identical re-run is a no-op with exit 0");
+    let mtime_before = mtime_of(&record2);
+    let web_pid = pid_of(ws, "p2_web")?;
+    let out = cli(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        out.contains("unchanged"),
+        &format!("the identical up reports unchanged: {out:?}"),
+    )?;
+    expect(
+        mtime_of(&record2) == mtime_before,
+        "the record was not rewritten",
+    )?;
+    expect(
+        pid_of(ws, "p2_web")? == web_pid,
+        "running programs were not touched",
+    )?;
+
+    step("CU3. identical: a user-stopped program stays stopped with a notice");
+    // Mid-lifetime the daemon start rules keep a user-stopped program down no
+    // matter its policy (start_eligible's in-memory flag rule), so `compose
+    // up`'s ensure-running reports the skip instead of pulling it.
+    cli(bin, ws, &["stop", "proj2", "p2_web"])?;
+    wait_state_in(ws, "p2_web", &["stopped"])?;
+    let out = cli(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        out.contains("unchanged") && out.contains("kept it stopped"),
+        &format!("the skip notice names the user stop record: {out:?}"),
+    )?;
+    expect(
+        mtime_of(&record2) == mtime_before,
+        "the record was not rewritten",
+    )?;
+    expect(
+        pid_of(ws, "p2_web")?.is_none(),
+        "the stopped program stays stopped",
+    )?;
+    // An explicit start clears the record; the identical up is a no-op again.
+    cli(bin, ws, &["start", "proj2", "p2_web"])?;
+    wait_running(ws, "p2_web")?;
+    let out = cli(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        out.contains("unchanged"),
+        &format!("the identical up is a no-op again: {out:?}"),
+    )?;
+    expect(
+        mtime_of(&record2) == mtime_before,
+        "the record was not rewritten",
+    )?;
+
+    step("CU4. the unless-stopped user stop record is kept, even across a daemon restart");
+    cli(bin, ws, &["stop", "proj2", "p2_opt"])?;
+    wait_state_in(ws, "p2_opt", &["stopped"])?;
+    let out = cli(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        out.contains("unchanged") && out.contains("kept it stopped"),
+        &format!("the skip notice names the user stop record: {out:?}"),
+    )?;
+    expect(
+        out.contains("ak start proj2 p2_opt"),
+        &format!("the notice carries the pull-up hint: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "p2_opt")?.is_none(),
+        "the stopped program stays stopped",
+    )?;
+    expect(
+        mtime_of(&record2) == mtime_before,
+        "the record was not rewritten",
+    )?;
+    // The record lives in the durable state_dir: a fresh daemon honors it too
+    // (harden-daemon-autostart), while the `always` program p2_web is pulled
+    // by the boot regardless of its own record.
+    shutdown_daemon(ws, daemon);
+    *daemon = spawn_daemon(bin, ws)?;
+    wait_running(ws, "p2_web")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_of(ws, "p2_opt")?.is_some() {
+        if Instant::now() > deadline {
+            bail!("the unless-stopped record did not survive the daemon restart");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let out = cli(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        out.contains("kept it stopped"),
+        &format!("the fresh daemon's identical up keeps the record: {out:?}"),
+    )?;
+
+    if cfg!(unix) {
+        step("CU5. TTY confirmation, no-branch: nothing changes, exit non-zero");
+        write_compose_declaration(&proj2, "p2", &sleep_s, "0.25")?;
+        let cmd = format!(
+            "{} --config {} compose up {}",
+            bin.display(),
+            ws.config_arg(),
+            proj2_s
+        );
+        let (ok, text) = run_pty(&cmd, b"n\n")?;
+        expect(
+            !ok,
+            &format!("the declined confirmation exits non-zero: {text:?}"),
+        )?;
+        expect(
+            text.contains("[y/N]"),
+            &format!("the prompt was shown on the terminal: {text:?}"),
+        )?;
+        expect(
+            text.contains("nothing was changed"),
+            &format!("the decline reports zero changes: {text:?}"),
+        )?;
+        expect(
+            mtime_of(&record2) == mtime_before,
+            "the record was not rewritten",
+        )?;
+        expect(
+            pid_of(ws, "p2_worker")?.is_some(),
+            "the decline stopped nothing",
+        )?;
+
+        step("CU6. TTY confirmation, yes-branch: stop, rewrite, restart");
+        let worker_pid = pid_of(ws, "p2_worker")?;
+        let (ok, text) = run_pty(&cmd, b"y\n")?;
+        expect(ok, &format!("the confirmed update exits 0: {text:?}"))?;
+        expect(
+            text.contains("app[proj2] registered"),
+            &format!("the confirmed update reports the rewrite: {text:?}"),
+        )?;
+        let on_disk = std::fs::read_to_string(&record2)?;
+        expect(
+            on_disk.contains("0.25"),
+            "the record was rewritten from the declaration",
+        )?;
+        let new_pid = wait_running(ws, "p2_worker")?;
+        expect(
+            Some(new_pid) != worker_pid,
+            "the replaced program came back as a new process",
+        )?;
+        expect(
+            pid_of(ws, "p2_opt")?.is_none(),
+            "the user-stopped program is still not pulled up after the update",
+        )?;
+    } else {
+        println!("    (windows: the TTY confirmation scenarios need a pty; skipping)");
+    }
+
+    step("CU7. non-TTY refusal is zero-side-effect; --force is the passthrough yes");
+    write_compose_declaration(&proj2, "p2", &sleep_s, "0.3")?;
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &proj2_s])?;
+    expect(
+        !ok && code != 0,
+        &format!("the non-interactive session refuses, got code {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("--force"),
+        &format!("the refusal names the --force bypass: {combined:?}"),
+    )?;
+    let on_disk = std::fs::read_to_string(&record2)?;
+    expect(
+        on_disk.contains("0.25"),
+        "the refusal did not rewrite the record",
+    )?;
+    expect(
+        pid_of(ws, "p2_worker")?.is_some(),
+        "the refusal stopped nothing",
+    )?;
+    let out = cli(bin, ws, &["compose", "up", &proj2_s, "--force"])?;
+    expect(
+        out.contains("app[proj2] registered"),
+        &format!("--force behaves like the interactive yes: {out:?}"),
+    )?;
+    let on_disk = std::fs::read_to_string(&record2)?;
+    expect(on_disk.contains("0.3"), "the forced rewrite landed")?;
+    wait_running(ws, "p2_worker")?;
+
+    step("CU8. an adhoc/ run record is adopted (adhoc record deleted, top-level lands)");
+    cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "100000", "--app", "taken"],
+    )?;
+    wait_running(ws, "taken")?;
+    expect(
+        apps.join("adhoc/taken.toml").is_file(),
+        "the run product lives in adhoc/",
+    )?;
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &take_s, "--name", "taken"])?;
+    expect(
+        !ok && code != 0,
+        &format!("the takeover needs a confirmation (non-TTY refuses), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("--force"),
+        "the refusal names the --force bypass",
+    )?;
+    expect(
+        apps.join("adhoc/taken.toml").is_file(),
+        "the refused takeover left the adhoc record alone",
+    )?;
+    let out = cli(
+        bin,
+        ws,
+        &["compose", "up", &take_s, "--name", "taken", "--force"],
+    )?;
+    expect(
+        out.contains("app[taken] registered"),
+        &format!("the confirmed adoption reports the new record: {out:?}"),
+    )?;
+    expect(
+        !apps.join("adhoc/taken.toml").exists(),
+        "the adhoc record was deleted by the adoption",
+    )?;
+    expect(
+        apps.join("taken.toml").is_file(),
+        "the compose record is top-level",
+    )?;
+    wait_running(ws, "t_web")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_of(ws, "taken")?.is_some() {
+        if Instant::now() > deadline {
+            bail!("the adopted-away run process was never stopped");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    step("CU9. an external deployment link is refused, --force included");
+    let ext_dir = ws.root.join("ext-app");
+    std::fs::create_dir_all(&ext_dir)?;
+    std::fs::write(
+        ext_dir.join("appkeeper.toml"),
+        format!(
+            "[program.ext_web]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\nrestart = \"always\"\n"
+        ),
+    )?;
+    link_registration(&ext_dir.join("appkeeper.toml"), &apps.join("ext.toml"))?;
+    let ext_before = mtime_of(&apps.join("ext.toml"));
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &proj2_s, "--name", "ext"])?;
+    expect(
+        !ok && code != 0,
+        &format!("the external record is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("ak remove ext"),
+        &format!("the refusal carries the remove guidance: {combined:?}"),
+    )?;
+    expect(!combined.contains("[y/N]"), "the refusal never prompts")?;
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["compose", "up", &proj2_s, "--name", "ext", "--force"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("--force does not lift the external refusal, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("ak remove ext"),
+        "the forced refusal carries the guidance too",
+    )?;
+    expect(
+        mtime_of(&apps.join("ext.toml")) == ext_before,
+        "the external link was never touched",
+    )?;
+
+    step("CU10. a startup failure stops the round and leaves zero residue");
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &fail_s])?;
+    expect(
+        !ok && code != 0,
+        &format!("the failed startup exits non-zero, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("f_bad"),
+        &format!("the failure names the program: {combined:?}"),
+    )?;
+    expect(!apps.join("fail-proj.toml").exists(), "no record residue")?;
+    let mut stray: Vec<String> = app_dir_files(ws)
+        .into_iter()
+        .filter(|f| f.ends_with(".toml.pending"))
+        .collect();
+    stray.extend(
+        std::fs::read_dir(apps.join("adhoc"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|f| f.ends_with(".toml.pending"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+    expect(
+        stray.is_empty(),
+        &format!("no placeholder residue anywhere: {stray:?}"),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_of(ws, "f_good")?.is_some() {
+        if Instant::now() > deadline {
+            bail!("the already-started program of the failed round was never stopped");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    step("CU11. `ps --all` labels the registration origin (compose vs run)");
+    cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "100000", "--app", "remnant"],
+    )?;
+    wait_running(ws, "remnant")?;
+    let out = cli(bin, ws, &["ps", "--all"])?;
+    expect(
+        out.contains("ORIGIN"),
+        &format!("the origin column is on: {out:?}"),
+    )?;
+    let row = |name: &str, what: &str| -> Result<String> {
+        out.lines()
+            .find(|l| l.contains(name))
+            .map(|l| l.to_string())
+            .ok_or_else(|| anyhow::anyhow!("assertion failed: no ps row for {what}: {out}"))
+    };
+    expect(
+        row("p0_web", "compose snapshot")?.ends_with("compose"),
+        "the compose snapshot is labelled compose",
+    )?;
+    expect(
+        row("p2_web", "second compose snapshot")?.ends_with("compose"),
+        "the second compose snapshot is labelled compose",
+    )?;
+    expect(
+        row("remnant", "adhoc record")?.ends_with("run"),
+        "the adhoc/ record is labelled run",
+    )?;
+    expect(
+        row("ext", "external link")?.ends_with("compose"),
+        "the top-level link is labelled compose",
+    )?;
+
+    step("CU12. a pre-partition top-level run file keeps working, labelled compose");
+    std::fs::write(
+        apps.join("legacy.toml"),
+        format!(
+            "[app]\ndescription = \"pre-partition run file\"\n\n\
+             [program.legacy]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\nwork_dir = \"{}\"\nrestart = \"always\"\n",
+            ws.root.display()
+        ),
+    )?;
+    cli(bin, ws, &["config", "--reload"])?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match row_in(&cli(bin, ws, &["ps", "--all"])?, "legacy") {
+            Some(l) if l.ends_with("compose") => {
+                expect(
+                    true,
+                    "the legacy top-level file is listed with origin compose",
+                )?;
+                break;
+            }
+            _ => {
+                if Instant::now() > deadline {
+                    bail!("the legacy top-level run file never showed up labelled compose");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    expect(
+        !apps.join("adhoc/legacy.toml").exists(),
+        "the legacy file was not migrated into adhoc/",
+    )?;
+
+    step("CU13. `run --force` refuses a top-level record (BREAKING)");
+    let mtime_before = mtime_of(&record2);
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--force", "--", &sleep_s, "100000", "--app", "proj2"],
+    )?;
+    expect(
+        !ok && code != 0,
+        &format!("run --force on a top-level record is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("top level") && combined.contains("compose up"),
+        &format!("the refusal points at remove / compose up: {combined:?}"),
+    )?;
+    expect(
+        mtime_of(&record2) == mtime_before,
+        "the record was not touched",
+    )?;
+    expect(
+        pid_of(ws, "p2_web")?.is_some(),
+        "the refused overwrite stopped nothing",
+    )?;
+
+    step("CU13b. removing an adhoc/ record deletes the file and reports its path");
+    cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "100000", "--app", "mortal"],
+    )?;
+    wait_running(ws, "mortal")?;
+    expect(
+        apps.join("adhoc/mortal.toml").is_file(),
+        "the run record lives in adhoc/",
+    )?;
+    cli(bin, ws, &["stop", "mortal"])?;
+    wait_state_in(ws, "mortal", &["stopped"])?;
+    let out = cli(bin, ws, &["remove", "mortal"])?;
+    expect(
+        out.contains("generated config file removed")
+            && out.contains("mortal.toml")
+            && out.contains("adhoc"),
+        &format!("the removal names the deleted adhoc record: {out:?}"),
+    )?;
+    expect(
+        !apps.join("adhoc/mortal.toml").exists(),
+        "the adhoc record file is gone",
+    )?;
+    expect(
+        !apps.join("mortal.toml").exists(),
+        "nothing landed at the top level",
+    )?;
+    expect(
+        pid_of(ws, "mortal")?.is_none(),
+        "the removed program left the projection",
+    )?;
+
+    step("CU14. the offline `ps --all` degradation keeps the origin labels");
+    let _ = control_http(&ws.control_socket, "POST", "/v1/shutdown", None);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while socket_health_ok(&ws.control_socket) {
+        if Instant::now() > deadline {
+            bail!("the daemon did not shut down for the offline listing");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let (ok, code, out) = cli_try(bin, ws, &["ps", "--all"])?;
+    expect(
+        ok && code == 0,
+        &format!("the offline listing exits 0, got {code}"),
+    )?;
+    expect(
+        out.contains("daemon offline") && out.contains("ORIGIN"),
+        &format!("the offline listing keeps the origin column: {out:?}"),
+    )?;
+    expect(
+        out.lines()
+            .any(|l| l.contains("remnant") && l.ends_with("run")),
+        "the offline listing labels the adhoc record run",
+    )?;
+    expect(
+        out.lines()
+            .any(|l| l.contains("legacy") && l.ends_with("compose")),
+        "the offline listing labels the top-level record compose",
+    )?;
+    Ok(())
+}
+
+/// The first table line containing `name`, if any.
+fn row_in(table: &str, name: &str) -> Option<String> {
+    table
+        .lines()
+        .find(|l| l.contains(name))
+        .map(|l| l.to_string())
 }
 
 // -- harden-daemon-autostart: boot simulation / state_dir / systemd smoke ----
@@ -8815,6 +9603,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         revamp_pass(&bin)?;
         remove_guard_pass(&bin)?;
         run_daemon_first_pass(&bin)?;
+        compose_up_pass(&bin)?;
         detach_pass(&bin)?;
         boot_sim_pass(&bin)?;
         state_dir_pass(&bin)?;

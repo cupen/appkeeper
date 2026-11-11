@@ -2332,12 +2332,14 @@ mod tests {
                 path: PathBuf::from("/x/broken.toml"),
                 description: None,
                 broken: Some("cannot parse: missing command".into()),
+                origin: crate::registry::Origin::Compose,
             },
             crate::registry::ListedApp {
                 name: "good".into(),
                 path: PathBuf::from("/x/good.toml"),
                 description: None,
                 broken: None,
+                origin: crate::registry::Origin::Compose,
             },
         ];
         let outcome = precheck(
