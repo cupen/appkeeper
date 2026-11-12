@@ -43,7 +43,7 @@
 
 守护启动与 apply 引入新程序时的拉起语义：`no` 不拉起；其余三种策略拉起，其中 `unless-stopped` 存在「用户停止」记录时保持停止。
 
-「用户停止」记录（支撑 `unless-stopped` 的字面语义）SHALL 由守护进程持久化维护（如状态文件，位置与格式为实现细节）：用户对程序的显式 stop SHALL 写入该程序的记录；对该程序的显式启动 SHALL 清除记录；守护进程正常关机（shutdown 停止全部程序）SHALL NOT 写入记录（不属于用户停止）；`always` 策略的守护启动拉起 SHALL NOT 受记录影响。
+「用户停止」记录（支撑 `unless-stopped` 的字面语义）SHALL 由守护进程持久化维护，且 MUST 落在持久状态目录——即 `configuration` 能力中 `daemon.state_dir` 的生效值（State 类目录，跨重启保留、停服不删、卸载不删）；MUST NOT 落在日志目录或运行时目录。记录的文件名与格式为实现细节。守护进程 SHALL 在启动时把旧位置（`log_dir`）下的记录一次性迁移到生效状态目录，迁移后 `log_dir` 的改变或清理 MUST NOT 影响记录。用户对程序的显式 stop SHALL 写入该程序的记录；对该程序的显式启动 SHALL 清除记录；守护进程正常关机（shutdown 停止全部程序）SHALL NOT 写入记录（不属于用户停止）；`always` 策略的守护启动拉起 SHALL NOT 受记录影响。
 
 #### Scenario: always 对干净退出也重启
 
@@ -57,7 +57,7 @@
 
 #### Scenario: on-failure 对非期望退出码重启
 
-- **WHEN** 策略为 `on-failure` 的程序以退出码 3 退出
+- **WHEN** 策略为 `on-failure`、`exit_codes` 为 `[0]` 的程序以退出码 3 退出
 - **THEN** 程序按退避计划重启
 
 #### Scenario: 启动重试耗尽进入 fatal
@@ -84,6 +84,21 @@
 
 - **WHEN** `unless-stopped` 程序随 `ak daemon shutdown` 被停止后守护进程重新启动
 - **THEN** 无「用户停止」记录，该程序被自动拉起
+
+#### Scenario: 记录不随日志目录变化丢失
+
+- **WHEN** 用户 stop 一个 `unless-stopped` 程序后修改 daemon 配置的 `log_dir`（或清理日志目录），随后守护进程重启
+- **THEN** 该程序仍保持 `stopped`，记录的落位与内容不受日志目录影响
+
+#### Scenario: 旧位置记录一次性迁移
+
+- **WHEN** 升级前 `log_dir/state.json` 含某程序的用户停止记录，升级后守护进程首次启动
+- **THEN** 记录被迁移到生效状态目录并继续生效（该程序不被拉起），旧文件被清理
+
+#### Scenario: 卸载服务保留停止记录
+
+- **WHEN** 用户执行 `ak daemon uninstall` 卸载服务（状态目录中有停止记录），随后重新安装并启动
+- **THEN** 状态目录未被卸载流程删除，`unless-stopped` 的记录仍然生效
 
 ### Requirement: 启动与停止排序
 

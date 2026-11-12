@@ -529,3 +529,200 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 守护进程不可达时执行 `ak remove web`
 - **THEN** CLI 输出不可达提示并以退出码 3 退出，不直接删除注册、不自动拉起守护进程，也不请求 apply
+
+### Requirement: compose up 端点族
+
+守护进程 SHALL 为 `ak compose up` 提供两段式端点（声明文件语义与撞名分支见 `app-registry` 的「声明式编排（compose up）」）：
+
+- `POST /v1/compose/up/preview`：**无副作用**预览。请求 SHALL 携带声明文件内容与渲染基准目录（基准目录用于把相对路径绝对化），MUST NOT 只传文件路径——TCP 形态下 CLI 与守护进程可不在同一台机器；另携带请求的应用名，以及 `-e/--env` 传入的变量名值对（缺省为空对象）。渲染前 SHALL 按 `app-registry` 的替换规则把变量值代入声明文本（替换发生在解析之前，所有字段同源生效）。守护进程 SHALL 解析、校验并渲染，与现有注册记录比对后回传**分类**与详情：
+  - `fresh`：无同名记录，可直接提交；
+  - `identical`：渲染结果与注册记录逐字节相同，附各程序当前运行态（供 CLI 呈现 ensure-running 结果）；
+  - `needs-update`：同名 compose 记录（顶层）与渲染结果有差异，附差异摘要与既有程序运行态；
+  - `adhoc-takeover`：同名记录位于 `app_dir/adhoc/`（run 产物），附其运行态；
+  - `external-refused`：同名记录为外部部署链接，附 `ak remove` 指引。
+  校验失败（非法名/保留字、解析失败、程序名跨 app 冲突、依赖成环）SHALL 以校验类错误回传，零副作用。
+- `POST /v1/compose/up`：执行。请求携带同样的声明内容、应用名、`-e/--env` 变量值对与 `force` 布尔。同名判定 SHALL 在守护进程命令处理路径完成，MUST NOT 仅由客户端预检决定（与「注册并启动端点」同源要求，防与巡检/apply 竞态）。分类为 `needs-update` 或 `adhoc-takeover` 而未带 `force` 时 SHALL 以状态冲突类错误回传并附预览详情（供非交互客户端呈现指引），MUST NOT 写盘、MUST NOT 启停任何进程；`external-refused` 无论 `force` 一律以校验/冲突类错误拒绝回传。
+
+执行 SHALL 复用「注册并启动端点」的 staged 契约并扩展到多程序：按 priority 与 depends_on 拓扑拉起、逐个等待启动判定、**全部通过才落盘**；任一失败 SHALL 由服务端自行中止——停止本轮已拉起的程序、清理全部占位残留——并以结构化错误（失败阶段、程序名、原因）回传。进度 SHALL 按「启动进度流式反馈」语义流式回传（逐程序事件帧）。
+
+`identical` 提交 SHALL 为无写盘操作：未运行的程序按守护启动规则拉起（ensure-running）；全部按策略在运行时回传 `unchanged` 成功。`fresh` 提交即完整注册并启动。`needs-update`/`adhoc-takeover` 带 `force` 的提交：停止同名 app 既有程序（收编分支先删除 `adhoc/` 记录）→ 原子落盘新记录 → 按声明拉起。
+
+#### Scenario: 预览返回 fresh
+
+- **WHEN** 客户端对未注册名提交声明内容至 `/v1/compose/up/preview`
+- **THEN** 回传 `fresh` 分类与渲染出的程序清单，无任何写盘或进程变化
+
+#### Scenario: 预览返回 needs-update 附差异摘要
+
+- **WHEN** 同名顶层记录与渲染结果有差异时请求预览
+- **THEN** 回传 `needs-update`、逐程序差异摘要与既有程序运行态，零副作用
+
+#### Scenario: 预览返回 external-refused
+
+- **WHEN** 同名记录为外部部署链接时请求预览
+- **THEN** 回传 `external-refused` 与 `ak remove` 指引，零副作用
+
+#### Scenario: 需交互分类未带 force 被拒绝
+
+- **WHEN** 分类为 `needs-update` 或 `adhoc-takeover` 的提交未携带 `force`
+- **THEN** 以状态冲突类错误回传并附预览详情，不写盘、不启停进程
+
+#### Scenario: force 更新停旧写新拉起
+
+- **WHEN** 对 `needs-update` 提交携带 `force=true`
+- **THEN** 既有程序被停止、注册记录被原子重写、新声明按序拉起并逐程序回传结果
+
+#### Scenario: 收编删除 adhoc 记录
+
+- **WHEN** 对 `adhoc-takeover` 提交携带 `force=true`
+- **THEN** 该程序被停止、`app_dir/adhoc/<name>.toml` 被删除、新记录落盘顶层并按声明拉起
+
+#### Scenario: identical 提交无操作或补拉起
+
+- **WHEN** 对 `identical` 提交且部分程序未运行（无用户停止记录）
+- **THEN** 未运行的程序被拉起、注册记录不被改写；全部在运行时回传 `unchanged` 成功
+
+#### Scenario: 启动失败服务端中止
+
+- **WHEN** 提交后某程序未通过启动判定
+- **THEN** 本轮已拉起的程序被停止、无注册文件与占位残留，回传含失败阶段与程序名的结构化错误
+
+#### Scenario: 逐程序流式进度
+
+- **WHEN** 多程序声明提交执行
+- **THEN** 守护进程按启动顺序流式回传逐程序进度帧（启动判定通过/失败），最终回传整体结果
+
+#### Scenario: 远程客户端按内容提交
+
+- **WHEN** TCP 形态控制端点下，CLI 从另一台机器提交声明内容与基准目录
+- **THEN** 渲染与注册成功，全程不依赖守护进程侧存在 `.appkeeper.toml` 文件路径
+
+### Requirement: 服务托管时的停机命令语义
+
+当守护进程由系统服务管理器托管（见 `service-registration` 的「服务托管识别」）时：
+
+- `POST /v1/shutdown` SHALL 返回 409，MUST NOT 停止任何程序、MUST NOT 让守护进程退出；响应 SHALL 说明守护进程由服务管理器托管，并给出对应的停机命令（Linux `systemctl stop <unit>`，Windows `sc stop <name>` 或服务管理器）。
+- `ak daemon shutdown` SHALL 以非零退出码呈现该拒绝与提示，且 MUST NOT 产生副作用。
+
+Linux 的 `<unit>` SHALL 取自守护进程自身的 cgroup 归属（`/proc/self/cgroup` 中的 unit 名）；无法判定时 SHALL 以「当前 unit」表述并仍给出 `systemctl stop` 形式。非托管形态（`ak daemon start` 或 `ak daemon start --foreground` 手工启动）下 `POST /v1/shutdown` 与 `ak daemon shutdown` 行为不变：停止全部程序后退出。
+
+#### Scenario: systemd 托管下 shutdown 被拒绝
+
+- **WHEN** 守护进程由 systemd 拉起运行，发送 `POST /v1/shutdown` 或执行 `ak daemon shutdown`
+- **THEN** 请求返回 409（CLI 非零退出），消息包含 `systemctl stop <unit>`；程序状态与守护进程均不受影响
+
+#### Scenario: Windows 服务托管下 shutdown 被拒绝
+
+- **WHEN** 守护进程由 SCM 以 `--service` 模式拉起，发送 `POST /v1/shutdown`
+- **THEN** 返回 409，消息包含 `sc stop <name>`；服务继续运行
+
+#### Scenario: 手工启动 shutdown 正常退出
+
+- **WHEN** 用户手工执行 `ak daemon start` 后执行 `ak daemon shutdown`
+- **THEN** 守护进程停止全部程序后退出，退出码为 0
+
+### Requirement: 状态投影暴露服务托管来源
+
+`GET /v1/status` 的守护进程信息 SHALL 新增可空字段 `managed_by`，取值为 `systemd`、`scm` 或 `null`（非托管）。既有字段名与语义 MUST NOT 改变，忽略该字段的既有消费者 SHALL 不受影响。
+
+#### Scenario: 托管时字段取值
+
+- **WHEN** 守护进程由 systemd 拉起，请求 `GET /v1/status`
+- **THEN** 响应中的 `managed_by` 为 `systemd`（SCM 拉起时为 `scm`）
+
+#### Scenario: 手工启动为 null
+
+- **WHEN** 守护进程由用户手工启动，请求 `GET /v1/status`
+- **THEN** 响应中的 `managed_by` 为 `null`，其余字段与既有投影一致
+
+### Requirement: 控制台引导端点
+
+控制面 SHALL 提供只读端点 `GET /v1/webui`，返回 Web 控制台当前可供浏览器访问的状态。响应 SHALL 为 JSON 对象，至少包含：
+
+- `enabled`（布尔）：daemon 配置的 `[webui]` 段是否存在（控制台意图）；
+- `serving`（布尔）：控制台是否已成功绑定并伺服（端口占用等失败时为 false）；
+- `listen`（字符串）：配置的监听地址（未配置时为内置默认 `127.0.0.1:9877`）；
+- `url`（字符串）：浏览器可用的控制台基址（如 `http://127.0.0.1:9877`）。监听地址为通配地址（`0.0.0.0`、`::`）时 SHALL 以回环地址呈现，MUST NOT 输出不可访问的通配地址；
+- `auth`（字符串）：`auto`（token 于启动时随机生成）或 `token`（固定 token）；
+- `token`（字符串，仅 `auth == "auto"` 时存在）：本次守护进程运行的随机 token。
+
+该端点 SHALL 受与其余 `/v1/*` 相同的准入控制（IPC 形态按端点属主，TCP 形态要求 Bearer 凭据）；未获准入 SHALL 返回 401。随机 token MUST NOT 出现在 `/v1/status`、`/v1/programs*`、任何 `/api/*` 响应或 WebSocket 帧中——它只经此端点向控制面客户端提供。
+
+同一守护进程运行期间，`auth == "auto"` 的 `token` SHALL 保持不变（重复请求返回同一值），除非配置重载改变了控制台 token 模式（见 `webui-api`）。
+
+#### Scenario: auto 模式返回随机 token
+
+- **WHEN** `[webui]` 段存在且未写 `auth_token`，对运行中的守护进程请求 `GET /v1/webui`
+- **THEN** 返回 200，`auth` 为 `auto`、`enabled` 与 `serving` 为 true，`token` 为非空字符串
+
+#### Scenario: 固定 token 模式不回显 token
+
+- **WHEN** `[webui] auth_token` 配置为固定字符串，请求 `GET /v1/webui`
+- **THEN** 返回 200，`auth` 为 `token`，响应中不含 `token` 字段
+
+#### Scenario: 控制台未启用
+
+- **WHEN** daemon 配置不含 `[webui]` 段，请求 `GET /v1/webui`
+- **THEN** 返回 200，`enabled` 与 `serving` 为 false，`url` 为内置默认地址，且不含 `token` 字段
+
+#### Scenario: 随机 token 不出现在状态投影
+
+- **WHEN** `[webui]` 以 auto 模式伺服，分别请求 `GET /v1/status` 与 `GET /v1/programs`
+- **THEN** 两者响应均不含随机 token 的任何形式
+
+### Requirement: 控制台打开命令
+
+CLI SHALL 提供顶层子命令 `ak webui`，用于打开 Web 控制台。命令 SHALL 为 daemon-first：经控制面 `GET /v1/webui` 读取控制台状态，MUST NOT 读取或推断控制台的进程内 token。守护进程不可达时 SHALL 输出不可达提示并以退出码 3 退出，MUST NOT 隐式拉起守护进程。
+
+控制台未启用（`enabled == false`）或未成功伺服（`serving == false`）时，命令 SHALL 以退出码 1 失败，并在错误信息中给出修复命令（启用：`ak config --set webui.listen=<addr>` 配合 `ak config --reload`；伺服失败：查看 daemon 日志与监听地址占用）。
+
+打开前命令 SHALL 探测控制台可达性（`GET /api/health`），等待其上线的总时长 SHALL 有上界（约 5 秒）；超时或不可达 SHALL 按未伺服处理并以退出码 1 失败，不启动浏览器。可达后命令 SHALL 调用系统默认浏览器打开控制台 URL：
+
+- `auth == "auto"` 时 URL SHALL 携带引导查询参数 `?token=<token>`（token 取自 `GET /v1/webui`）；
+- `auth == "token"`（固定 token）时 URL MUST NOT 携带 token；
+- 成功时命令 SHALL 在 stdout 打印浏览器将要打开的完整 URL（auto 模式含 `?token=<token>`），使自动打开失败、无图形会话或终端里点击比切换窗口更方便的场景都能直接进入；固定 token 模式打印的 URL 不含 token。
+
+命令 SHALL 支持两种不打开浏览器的输出模式（二者互斥）：
+
+- `--print-url`：把完整 URL（auto 模式下含 `?token=`）打印到 stdout 并以 0 退出；
+- `--json`：输出机器可读对象，至少含 `url`、`listen`、`auth` 与 `opened` 字段，以 0 退出。
+
+无图形会话的环境（Linux 且 `DISPLAY` 与 `WAYLAND_DISPLAY` 均未设置；macOS 的 `open`
+不依赖这两个变量）SHALL NOT 尝试启动浏览器，改为打印完整 URL 与提示并以 0 退出。浏览器启动失败时 SHALL 打印完整 URL 与失败原因，并以退出码 1 失败。
+
+`ak webui` MUST NOT 修改 daemon 配置、MUST NOT 停止或启动任何受管程序。
+
+#### Scenario: auto 模式一条命令进入控制台
+
+- **WHEN** `[webui]` 以 auto 模式伺服，执行 `ak webui`
+- **THEN** 系统默认浏览器被调起，且 stdout 打印的地址含 `?token=<token>`（完整 URL，可直接点击），退出码 0
+
+#### Scenario: 固定 token 模式不带 token
+
+- **WHEN** `[webui] auth_token` 为固定值，执行 `ak webui`
+- **THEN** 浏览器打开的地址不含 `?token=`，凭据门由用户在页面输入固定 token
+
+#### Scenario: 只打印 URL
+
+- **WHEN** auto 模式下执行 `ak webui --print-url`
+- **THEN** stdout 输出含 `?token=<token>` 的完整 URL，不启动浏览器，退出码 0
+
+#### Scenario: JSON 输出
+
+- **WHEN** 执行 `ak webui --json`
+- **THEN** stdout 输出含 `url`、`listen`、`auth`、`opened` 的 JSON 对象，退出码 0
+
+#### Scenario: 控制台未启用
+
+- **WHEN** daemon 配置不含 `[webui]` 段，执行 `ak webui`
+- **THEN** 退出码 1，错误信息含启用控制台的配置命令，不启动浏览器
+
+#### Scenario: 守护进程离线
+
+- **WHEN** 守护进程未运行，执行 `ak webui`
+- **THEN** 输出守护进程不可达提示，退出码 3，不尝试启动浏览器，不拉起守护进程
+
+#### Scenario: 无图形会话
+
+- **WHEN** Linux 环境下 `DISPLAY` 与 `WAYLAND_DISPLAY` 均未设置，执行 `ak webui`
+- **THEN** 不尝试启动浏览器，打印完整 URL 与提示，退出码 0
