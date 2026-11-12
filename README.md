@@ -137,9 +137,28 @@ ak compose up            # 当前目录；守护离线时自动后台拉起后�
   不受限，目录恰好叫 `up` 时用 `-f` 绕开保留字）。
 - **命名**：应用名缺省取声明文件所在目录名，`--name` 覆盖；保留字 `all`
   拒绝。同一份声明可以用不同 `--name` 部署多份。
-- **旗标**：仅 `-f/--file`、`--name`、`--force`、`--json` 四个。内容微调
-  旗标（`--restart`、`--priority` 等）以用法错误拒绝——声明文件是唯一内容
-  事实源。
+- **旗标**：仅 `-f/--file`、`--name`、`--force`、`--json` 与可重复的
+  `-e/--env NAME=VALUE` 五类。内容微调旗标（`--restart`、`--priority` 等）
+  以用法错误拒绝——声明文件是唯一内容事实源。
+- **占位符**：声明里可写 `${NAME}` 引用本次调用的变量，用
+  `-e NAME=VALUE` 传值（可重复）：
+
+  ```toml
+  [program.web]
+  command = "python -m http.server ${PORT:-8000}"
+  ```
+
+  ```bash
+  ak compose up -e PORT=9090      # 落盘记录里就是 9090
+  ```
+
+  - `${NAME:-default}`：未传值时用默认值；`$$` 是字面 `$`
+    （`$${NAME}` 原样留给程序）。
+  - **未传值且无默认值的 `${NAME}` 原样保留**，交给程序的 shell 处理——所以
+    既有声明里写 `${HOME}`、`${program.web.pid}`（运行期动作变量）不会因为
+    引入了 `-e` 而失效。`-e` 只替换它被显式给到的名字。
+  - 变量值只作用于本次调用，**不落盘**：记录里存的是替换后的快照；值变了
+    再 up 就是一次普通的有差异更新。
 - **执行**（daemon-first）：按 priority 与 depends_on 拉起全部声明的程序，
   逐个等启动判定通过后注册记录才落盘 `app_dir` 顶层；任一失败则停掉本轮已
   拉起的程序、清理占位，零残留非零退出。进度逐程序流式打印，`--json` 直通
@@ -344,7 +363,9 @@ ak config --delete webui                              # 删段 = 关闭
   二进制前，把仍需要的 `adhoc/<名>.toml` 移回顶层（run 产物可由命令重建）。
 - 新增 `ak compose up [目录]`：`.appkeeper.toml` 声明 → 一条命令注册并启动
   （daemon-first，守护离线自动后台拉起；同名差异 TTY 确认、非交互以
-  `--force` 直通）。`up` 为 `ak compose` 的保留第一参数。
+  `--force` 直通）。`up` 为 `ak compose` 的保留第一参数；`-e NAME=VALUE`
+  为声明里的 `${NAME}` / `${NAME:-默认}` 占位符传值（未传值的名字原样留给
+  shell，值不落盘）。
 - v0.1 单文件配置：`ak compose <旧文件>` 自动识别转换。
 - 标识符（app/程序/动作名）仅允许 `[A-Za-z0-9_-]`。
 - `ak remove <app>` 不再是本地直删 + 事后 sync：改为守护进程执行的原子动作

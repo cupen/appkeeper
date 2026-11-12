@@ -4688,6 +4688,17 @@ fn compose_up_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         combined.contains("reserved"),
         &format!("the derived-name refusal says reserved: {combined:?}"),
     )?;
+    // A malformed `-e` pair is a config error before any daemon contact (same
+    // rule as `ak run --env`).
+    let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &proj_s, "-e", "NOEQUALS"])?;
+    expect(
+        !ok && code == 2,
+        &format!("a malformed -e pair is a config error (exit 2), got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("K=V"),
+        &format!("the refusal states the NAME=VALUE shape: {combined:?}"),
+    )?;
     // None of the refusals contacted the daemon (the control endpoint is
     // still down) and no registration artifact exists anywhere.
     expect(
@@ -4856,6 +4867,43 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     wait_running(ws, "p2_web")?;
     wait_running(ws, "p2_worker")?;
     wait_running(ws, "p2_opt")?;
+
+    // `-e/--env` values feed `${NAME}` in the declaration (D8). Distinctive
+    // marker values so the record assertions cannot match another field.
+    let vars_proj = ws.root.join("vars-proj");
+    std::fs::create_dir_all(&vars_proj)?;
+    std::fs::write(
+        vars_proj.join(".appkeeper.toml"),
+        format!(
+            "[program.vp_web]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\nstartsecs = 0.2\n\
+             restart = \"always\"\n\n\
+             [program.vp_web.env]\nPORT = \"${{PORT}}\"\nFALLBACK = \"${{MODE:-dev}}\"\n\
+             SHELL_VAR = \"${{UNSET_PORT}}\"\n"
+        ),
+    )?;
+    let vars_s = vars_proj.to_string_lossy().replace('\\', "/");
+    let vars_record = apps.join("vars-proj.toml");
+
+    step("CU1b. `-e NAME=VALUE` substitutes `${NAME}` before parsing; unsupplied names stay");
+    let out = cli(bin, ws, &["compose", "up", &vars_s, "-e", "PORT=18080"])?;
+    expect(
+        out.contains("app[vars-proj] registered"),
+        &format!("the declaration with placeholders registers: {out:?}"),
+    )?;
+    let record = std::fs::read_to_string(&vars_record)?;
+    expect(
+        record.contains("PORT = \"18080\""),
+        &format!("the -e value landed in the record: {record:?}"),
+    )?;
+    expect(
+        record.contains("FALLBACK = \"dev\""),
+        &format!("the :-default filled the unsupplied name: {record:?}"),
+    )?;
+    expect(
+        record.contains("SHELL_VAR = \"${UNSET_PORT}\""),
+        &format!("the name without a value reaches the shell verbatim: {record:?}"),
+    )?;
+    wait_running(ws, "vp_web")?;
 
     step("CU2. identical re-run is a no-op with exit 0");
     let mtime_before = mtime_of(&record2);
