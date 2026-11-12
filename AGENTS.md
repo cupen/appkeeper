@@ -6,8 +6,9 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
 **本地 IPC**（unix `/run/appkeeper/<uid>/ak.sock`、Windows 命名管道，身份由 OS
 属主强制），或显式 `tcp://host:port`（Bearer 凭据准入，`auth_token` 必配）；
 同一时刻只监听一种形态。内嵌 Web 控制台由 daemon 配置的 `[webui]` 段驱动
-（缺省关闭，`ak config --reload` 热生效；`webui.auth_token` 可选配置后以 cookie 会话
-保护 `/api/*`）。
+（缺省关闭，`ak config --reload` 热生效；`webui.auth_token` 缺省为保留值 `auto`，
+守护启动时随机生成、仅存内存，`ak webui` 打开带引导 token 的 URL 自动换 cookie 会话；
+也可配置固定 token。`/api/*` 与 `/ws` 一律要求会话，不存在免鉴权模式）。
 
 ## Architecture
 
@@ -26,7 +27,9 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   `--force` 逐字节比较新旧配置，**无差异为空操作**（「配置无修改，不做任何动作」，
   退出 0，不写盘/不重启/不拉起），有差异则原子重写后停旧启新；`--force` 不放行
   跨应用程序名冲突与外部部署配置写保护）|
-  `validate`（含 webui 无 token 的暴露警告）| `config`
+  `webui`（打开内嵌控制台：经 `GET /v1/webui` 取运行态，auto 模式 URL 带引导
+  token；`--print-url`/`--json` 不打开浏览器；守护离线退出 3、控制台未启用或
+  未伺服退出 1）| `validate` | `config`
   （daemon 配置动作：init/set/get/delete/edit/reload，白名单键表与读改写/
   原子落盘引擎在 `src/config.rs`；`--reload` 经 `/v1/reload` 触发在线重扫，
   可与 `--set`/`--delete`/`--edit` 组合、与 `--get`/`--init` 互斥；
@@ -75,8 +78,10 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   （openspec/specs/benchmark）。
 - `src/web.rs` + `src/api.rs` — Web 控制台（配置驱动：`[webui]` 段开启，
   supervisor 管理线程按意图 spawn/停 `web::serve`，reload 热生效）：axum 伺服内嵌
-  SPA + `/api/*`（复用控制面投影；可选 `webui.auth_token` → `/api/auth` 换票
-  cookie 会话）+ `/ws` 推送（快照/增量/日志/心跳，MessagePack 二进制帧）；
+  SPA + `/api/*`（复用控制面投影；`webui.auth_token` 默认 auto 随机 token、
+  固定 token 亦可 → `/api/auth` 换票 cookie 会话）+ `/ws` 推送（快照/增量/日志/心跳，
+  MessagePack 二进制帧）；`GET /v1/webui` 是 token 唯一出口（受控制面准入），
+  `src/webui_open.rs` 是 `ak webui` 与 shell `open` 共用的 URL 构造/探活/浏览器启动；
   `POST /api/apps/<app>/remove` 与 `/v1` 同构（同一 `Command::Remove` 与结果类型，
   `/ws` 增量帧新增 `removed`（程序名）与 `apps_gone`（app 名）让前端收敛）。
 - `src/assets.rs` — `rust-embed` 内嵌 webui `dist/`。
@@ -84,8 +89,10 @@ stdout/stderr 落盘、Ctrl+C / SIGTERM 优雅停机、Windows Job Object 清理
   后 `dist/` 经 rust-embed 嵌入二进制；dist 不提交。build.rs 在 release（或
   `AK_WEBUI_BUILD=force`）时自动构建，debug 默认跳过前端工具链（rust-embed
   运行时读盘，无 Node 时回退占位页）。`lib/api.ts`（统一 fetch 封装 +
-  401 换票重放）与 `lib/credentials.ts`（凭据状态机）+ `components/credential-gate.ts`
-  构成可选 token 的前端配合；App 概况页的「移除应用」走 `lib/api.ts` 的
+  401 换票重放）与 `lib/credentials.ts`（凭据状态机）+ `lib/bootstrap.ts`
+  （`?token=` 引导换票、`history.replaceState` 清理地址栏、写入
+  `localStorage['ak.webui.token']`）+ `components/credential-gate.ts`
+  构成 token 会话的前端配合；App 概况页的「移除应用」走 `lib/api.ts` 的
   `removeApp`，确认框说明删除边界且不自动 stop，成功后 `store` 记录
   `removedApps`/`flash` 并由 app-shell 收敛导航。
 

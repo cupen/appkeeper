@@ -221,7 +221,8 @@ ak ps              # 随时看状态；ak log -f <程序> 跟日志
   SIGHUP 的既有语义不变。
 - **Web 控制台**（可选，一次性配置）：
   `ak config --set webui.listen=127.0.0.1:9877 && ak config --reload` 热开启，
-  浏览器访问 `http://127.0.0.1:9877` 看 dev 栈状态（建议本机回环绑定）。
+  然后用 `ak webui` 打开（auto token 自动引导；也可复制 `ak webui --print-url`
+  的输出到目标浏览器）。建议本机回环绑定。
 
 ## 安装
 
@@ -289,18 +290,22 @@ command = "curl -fsS http://127.0.0.1:8000/flush?pid=${program.api.pid}"
 
 ### Web 控制台（可选）
 
-daemon 配置存在 `[webui]` 段即开启（缺省关闭），浏览器访问
-`http://127.0.0.1:9877`：
+daemon 配置存在 `[webui]` 段即开启（缺省关闭）：
 
 ```bash
 ak config --set webui.listen=127.0.0.1:9877          # 写入即配置
 ak config --reload                                    # 守护在线时热开启
-ak config --set webui.auth_token="$(openssl rand -hex 24)" && ak config --reload   # 可选鉴权
+ak webui                                              # 打开浏览器（自动携带引导 token）
+ak webui --print-url                                  # 只打印完整 URL（含 token），便于复制到别的机器
+ak config --set webui.auth_token="$(openssl rand -hex 24)" && ak config --reload   # 改用固定 token
 ak config --delete webui                              # 删段 = 关闭
 ```
 
-未配 token 时 `/api/*` 完全开放（socket 属主隔离不覆盖控制台），`ak validate`
-会对该组合告警。
+`webui.auth_token` 的生效值缺省是保留字 `auto`：守护进程每次启动随机生成 token
+（仅存内存，不落盘、不写日志），`ak webui` 打开 `http://127.0.0.1:9877/?token=…`，
+前端换票后立即从地址栏移除 token 并存入浏览器本地存储，用于会话过期后的静默续票。
+控制台不存在免鉴权模式；固定 token 模式下 URL 不带 token，由页面凭据门输入。
+`ak webui` 守护离线时退出 3、控制台未启用/未伺服时退出 1 并给出修复命令。
 
 控制台的 App 概况页提供「移除应用」操作（需确认）：与 `ak remove` 走同一个
 `POST /api/apps/<app>/remove`，活态冲突时页面保留并展示阻塞原因，成功后提示
@@ -326,6 +331,10 @@ ak config --delete webui                              # 删段 = 关闭
 
 ## 升级速览（历史 BREAKING 摘要）
 
+- Web 控制台不再有免鉴权模式：`[webui]` 未写 `auth_token` 时按保留值 `auto`
+  在启动时随机生成 token，`/api/*` 与 `/ws` 一律要求凭据。升级后旧书签会落到
+  凭据门，执行一次 `ak webui` 即可进入（`ak validate` 不再对无 token 的
+  `[webui]` 段告警）。固定 token 配置不需要迁移。
 - 旧动词已删（无别名）：`service install/uninstall` → `ak daemon install/uninstall`；
   `status`/`list` → `ak ps` / `ak ps --all`（`status --json` → `ps --out json`）；
   `shutdown` → `ak daemon shutdown`；`add` → `ak compose`。
