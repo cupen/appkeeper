@@ -33,3 +33,10 @@
 - [x] 5.2 README：`compose up` 与 `.appkeeper.toml` 用法（发现规则、命名、四旗标、非交互形态）、`app_dir/adhoc/` 分区说明、`run --force` 收窄的迁移提示（顶层旧记录如何处理）；新增「开发场景速览」小节——一条命令 dev 流程（`ak compose up` 守护离线时自动后台拉起）、防复活提示（dev 声明用 `unless-stopped`/`no`，或收工 `ak stop <app>`——用户停止记录跨重启生效）、Windows 前台形态提示（`ak daemon start --foreground` 后再 `compose up`，关终端不影响后台守护；前台守护自身不接 SIGHUP 的既有语义）、webui 控制台一次性配置提示（`[webui]` 段 + `config --reload` 热开启，127.0.0.1 绑定）。验证：人工通读相关段落
 - [x] 5.3 全量门禁：`cargo fmt --check`、`cargo clippy --workspace --all-targets`（不新增告警）、`cargo test --workspace`、`cargo run -- validate` 全绿。验证：上述命令退出码 0
 - [x] 5.4 `openspec validate add-compose-up` 通过；归档前 `openspec validate --specs` 确认主规范无损合入。验证：命令退出码 0
+
+## 6. 增补：`-e/--env` 占位符替换（D8）
+
+- [x] 6.1 `src/config.rs` 新增纯函数 `substitute_declaration_vars(text, vars)`：`${NAME}` / `${NAME:-default}` / `$$`；未传值原样保留、运行期动作变量（`${program.*}` 等）保留、非法名字报错。`render_declaration_with_vars` 在解析前套用（空值表与旧入口逐字节一致），`render_declaration` 成为其空表封装。验证：`cargo test config` 的 `substitute_declaration_vars_covers_the_syntax` / `render_declaration_with_vars_reaches_every_field`
+- [x] 6.2 控制面：请求体增 `vars` 对象（preview 与 submit 同源），daemon 侧 `render_declaration_with_vars` 渲染。验证：`cargo test server` 的 `compose_up_substitutes_env_vars`（值落进 record、无占位残留、`work_dir` 先替换后绝对化）
+- [x] 6.3 CLI：`ak compose up -e/--env NAME=VALUE`（可重复）解析并随请求体提交；畸形 `K=V` 以配置错误（退出码 2）在任何守护进程接触前拒绝。验证：`cargo test` 的 `compose up` parse 单测（缺省空、重复保序）
+- [x] 6.4 e2e + README：compose up 段新增 `-e` 用例（替换值落盘、未传值占位原样保留）；README「`ak compose up`」小节记录 `-e` 与三种语法、未传值留给 shell 的规则，旗标清单改为五类。验证：`cargo run -p xtask -- e2e --no-browser` + 人工通读

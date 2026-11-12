@@ -11,7 +11,8 @@
 - `.appkeeper.toml` SHALL 为一份合法的 app 部署配置（字段域与校验见 `configuration` 能力）：`[app]` 表可选（承载组级默认值与描述），`[program.<名>]` 表至少一个，未知字段 SHALL 被校验拒绝。本能力不为其新增任何配置字段。
 - `dir` 缺省为 `.`；`compose up` SHALL 只在 `dir` 下寻找 `.appkeeper.toml`，MUST NOT 向上级目录递归查找；找不到时 SHALL 以非零码报错并列出查找过的路径。`-f/--file <路径>` SHALL 显式指定声明文件，此时文件名不受限。
 - 应用名 SHALL 缺省取声明文件所在目录的目录名（stem），`--name` 显式覆盖；名字 SHALL 满足既有命名规则，保留字 `all` MUST 拒绝。`[app]` 表 MUST NOT 引入 name 字段（名字属于调用现场，同一份声明可以从不同名字部署多份）。
-- `compose up` SHALL 仅接受 `-f/--file`、`--name`、`--force`、`--json` 四类旗标；内容微调旗标（`--restart`、`--priority` 等）MUST 以用法错误拒绝——声明文件是唯一内容事实源。`up` 为 `ak compose` 的保留子命令词，MUST NOT 被当作 path 参与形态分派。
+- `compose up` SHALL 仅接受 `-f/--file`、`--name`、`--force`、`--json` 与 `-e/--env NAME=VALUE`（可重复）五类旗标；内容微调旗标（`--restart`、`--priority` 等）MUST 以用法错误拒绝——声明文件是唯一内容事实源。`up` 为 `ak compose` 的保留子命令词，MUST NOT 被当作 path 参与形态分派。
+- `-e NAME=VALUE` SHALL 在解析前替换声明文本中的 `${NAME}` 占位符；`${NAME:-default}` 在未传值时才用默认值。未传值且无默认值的 `${NAME}`、以及 `${program.<名>.<字段>}` 等运行期动作变量 SHALL 原样保留（交给 shell / 运行期替换层），MUST NOT 因未知而报错。`$$` SHALL 表示字面 `$`（`$${NAME}` 原样抵达程序）。名字须为环境变量形态（字母或 `_` 开头，仅字母数字与 `_`），否则以校验类错误拒绝。替换仅作用于本次调用的渲染，MUST NOT 持久化变量值（落盘的是替换后的快照）。
 
 **渲染与落盘**：
 
@@ -53,6 +54,11 @@
 
 - **WHEN** 执行 `ak compose up --restart always`
 - **THEN** 以用法错误（非零码）拒绝并说明 `up` 不接受内容微调旗标，配置内容只能改声明文件
+
+#### Scenario: -e 替换声明占位符
+
+- **WHEN** `.appkeeper.toml` 中写有 `${PORT}`、`${MODE:-dev}` 与 `${HOME}`，执行 `ak compose up -e PORT=8080`
+- **THEN** 注册记录中 `${PORT}` 渲染为 `8080`、`${MODE:-dev}` 渲染为 `dev`，而 `${HOME}` 原样保留（交给程序的 shell）；变量值不落盘
 
 #### Scenario: 单行 command 与相对路径渲染
 

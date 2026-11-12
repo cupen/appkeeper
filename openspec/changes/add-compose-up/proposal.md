@@ -20,7 +20,8 @@ appkeeper 目前没有「声明式编排」入口：`ak run --` 只能单程序�
   - 非 TTY（管道/CI）：需要交互的分支默认拒绝（非 0、零副作用）并提示 `--force`；`compose up --force` 为「是」的直通版。
 - **注册表分区**：`app_dir/adhoc/` 子目录承接 run ad-hoc 产物（单程序记录）；compose（脚手架与 `compose up` 渲染快照）与外部链接注册留在顶层。app 名唯一性仍跨全 `app_dir`（含 `adhoc/`）；覆盖权限按**路径**判定（`adhoc/` 内可由 `run --force` 重写；顶层真实文件仅 compose 再生 / `compose up` 可写；symlink 永不写）；`ak ps --all` 按记录位置标注来源（run / compose，纯展示）；既有顶层 run 生成文件不迁移、就地兼容。
 - **BREAKING** `run --force` 覆盖范围收窄：现状下 `app_dir` 顶层真实文件（含 compose 脚手架产物）可被 `run --force` 覆盖；分区后顶层一律拒绝（提示 `ak remove` 或改用 `compose up`），只有 `adhoc/` 内的记录可被 `run --force` 重写。
-- 非目标：`compose down/stop`（已有 `ak stop`/`ak remove`）；单文件多 app；文件监听自动 up；多文件合并；`env_file`/`${VAR}` 替换/profiles；`up` 的「只注册不跑」形态；`up` 不收任何内容微调 flag（仅 `-f/--name/--force/--json`）。
+- **声明内 `${NAME}` 占位符与 `-e/--env NAME=VALUE`**：`-e` 逐次传入的值在解析前替换声明文本中的 `${NAME}` 与 `${NAME:-default}`（`$$` 为字面 `$`）；未传值且无默认的名字原样保留给 shell（与 action 变量同一哲学），`${program.x.pid}` 等运行期变量同样保留。值仅在本次调用内生效、绝不落盘（落盘的是替换后的渲染快照）。
+- 非目标：`compose down/stop`（已有 `ak stop`/`ak remove`）；单文件多 app；文件监听自动 up；多文件合并；`env_file`/auto-load `.env`/profiles；`up` 的「只注册不跑」形态；`up` 不收内容微调 flag（仅 `-f/--name/--force/--json/-e/--env`）。
 
 ## Capabilities
 

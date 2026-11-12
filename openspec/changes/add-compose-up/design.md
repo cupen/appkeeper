@@ -18,7 +18,7 @@
 **Non-Goals:**
 
 - 不改 app 配置 schema、四层默认级联、apply/pending 语义、webui、控制面既有端点。
-- 不做 down/stop/watch/多文件合并/env_file/变量替换/profiles（见 proposal 非目标）。
+- 不做 down/stop/watch/多文件合并/env_file/auto-load `.env`/profiles（见 proposal 非目标）；`${NAME}` 占位符只由显式 `-e` 提供值（见 D8）。
 
 ## Decisions
 
@@ -31,7 +31,7 @@
 
 ### D2: 渲染在 daemon 侧，确定性的快照文本
 
-新纯函数 `render_declaration(text, base_dir, name) -> Result<声明快照>`：解析（`AppRaw`，未知字段拒绝）→ 校验（`resolve_app` 同源规则，含单行带参 `command` 与 `args` 互斥——schema 层既有校验，拆分用既有 `split_command`）→ 相对路径以 `base_dir` 绝对化、`command` 拆分后首 token 为裸命令名时按提交方 PATH 解析 → 快照规范化为「首 token 绝对化的 `command` + `args` 数组」（与 run 的渲染产物同构）→ 序列化为 TOML 文本。**同一函数产出比对基准与落盘内容**，BTreeMap 键序保证渲染确定，逐字节比对因此成立。CLI 只传 `{文件内容, 基准目录, 应用名, force}`，不传路径——TCP 远程 CLI 天然可用。
+新纯函数 `render_declaration(text, base_dir, name) -> Result<声明快照>`：解析（`AppRaw`，未知字段拒绝）→ 校验（`resolve_app` 同源规则，含单行带参 `command` 与 `args` 互斥——schema 层既有校验，拆分用既有 `split_command`）→ 相对路径以 `base_dir` 绝对化、`command` 拆分后首 token 为裸命令名时按提交方 PATH 解析 → 快照规范化为「首 token 绝对化的 `command` + `args` 数组」（与 run 的渲染产物同构）→ 序列化为 TOML 文本。**同一函数产出比对基准与落盘内容**，BTreeMap 键序保证渲染确定，逐字节比对因此成立。CLI 只传 `{文件内容, 基准目录, 应用名, force, vars}`，不传路径——TCP 远程 CLI 天然可用。
 
 - 备选 CLI 渲染：CLI/daemon 版本不一致时比对基准漂移，且远程场景下 daemon 无法校验；渲染必须是 daemon 单一事实源。
 - 跨版本渲染格式变化会触发一次 needs-update（安全方向的误报，交互会展示差异）——可接受。
@@ -56,11 +56,20 @@
 
 ### D6: CLI 面——`up` 保留字、隐式拉起、NDJSON 复用
 
-`ak compose` 的第一位置参数 `up` 解析为子命令（`compose up [dir]` + `-f/--name/--force/--json`），其余路径分派不变；目录恰好名为 `up` 时需 `-f` 显式指文件（帮助文案说明）。守护离线复用 `daemonize::ensure_daemon`（compose --apply 同款）。进度复用 `client.rs` 的 NDJSON 流式读取，逐程序事件逐行打印，`--json` 直通帧流。
+`ak compose` 的第一位置参数 `up` 解析为子命令（`compose up [dir]` + `-f/--name/--force/--json/-e`），其余路径分派不变；目录恰好名为 `up` 时需 `-f` 显式指文件（帮助文案说明）。守护离线复用 `daemonize::ensure_daemon`（compose --apply 同款）。进度复用 `client.rs` 的 NDJSON 流式读取，逐程序事件逐行打印，`--json` 直通帧流。
 
 ### D7: 来源标注走注册表层，不动状态投影
 
 `ListedApp` 增 `origin`（由记录父目录推导：`adhoc/` → `run`，否则 `compose`），`ps --all` 表格加标注列。**不进** `StatusDoc`/`/v1` 投影——origin 是注册表事实而非 supervisor 运行态，离线降级路径也要标注；避免触发 `/v1`、`/api`、WS 三处同源修改。
+
+### D8: `-e/--env` 的替换在解析前、在 daemon 侧
+
+替换是 `substitute_declaration_vars(text, vars)` 纯函数，紧贴在 `render_declaration` 的解析之前调用（`render_declaration_with_vars`），因此替换结果自然流过全部字段（`command`、`args`、`work_dir`、`env`、`description`…），无需逐字段处理。变量值随请求体 `vars` 对象提交给 daemon（与内容、基准目录同源，远程 CLI 可用），daemon 仍是唯一渲染方，逐字节比对基准与落盘内容都含替换结果。
+
+- 语法取 `compose` 家族最小集：`${NAME}` / `${NAME:-default}` / `$$`；**不做** `$NAME`、嵌套、`${NAME:?}`、`${NAME#prefix}`——声明文件不是 shell 脚本。
+- **未传值不报错**：`${HOME}` 之类原样保留，与 action 层 `substitute_vars`「未知变量交给 shell」的既有哲学一致；否则既有声明（含 `$${...}` 或 shell 变量）会因加值反而失效。`${program.<名>.<字段>}` 等运行期变量同样原样保留（先于运行期层）。
+- 名字形状校验（字母/`_` 开头）只针对**未命中运行期变量且要替换**的引用：非法形状直接报错，避免 `-e` 拼错时静默失效。
+- 不接受 `-e` 之外的值源（文件 / 环境变量自动注入）：值必须显式，防止「同一份声明在不同机器上静默不同」。
 
 ## Risks / Trade-offs
 
@@ -70,6 +79,7 @@
 - [回滚到旧版二进制后 `adhoc/` 记录不可见（旧版不扫子目录）] → 迁移段写明：回滚前把仍需要的 `adhoc/` 记录移回顶层；run 产物本质可由命令重建，风险有界。
 - [`up` 保留字与名为 `up` 的目录冲突] → `-f` 显式指定文件可绕开；帮助文案写明。
 - [Windows 硬链接回退] → 链接只出现在顶层，路径判据平台无关；`adhoc/` 只放真实文件，无链接语义。
+- [`-e` 的值是原样文本代入（不转义）] → 值里带引号/换行会改变 TOML 结构或触发解析错误；值来自调用者本人（与其直接编辑声明文件同权），报错会指到渲染后的声明，可接受。不做转义——转义会让「同一个值在 `env` 与 `command` 里语义不同」。
 
 ## Migration Plan
 
