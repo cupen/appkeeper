@@ -1062,8 +1062,9 @@ fn open_webui(c: &Client) -> Result<()> {
         bail!("{e:#}");
     }
     crate::webui_open::launch_browser(&url)?;
-    // The regular report never contains the bootstrap token.
-    println!("opening {}", status.url);
+    // Same contract as `ak webui`: print the URL actually handed to the
+    // browser (token included in auto mode) so it stays clickable.
+    println!("opening {url}");
     Ok(())
 }
 

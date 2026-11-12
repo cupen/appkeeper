@@ -149,7 +149,8 @@ CLI 通过控制面读取 `{enabled, serving, listen, url, auth, token?}`。toke
 ## Risks / Trade-offs
 
 - **[token 短暂进入浏览器历史 / 进程 argv]**（`xdg-open` 的参数、跳转前的历史记录）→
-  默认监听回环、token 随守护进程重启轮换、成功输出与日志均不打印；`--print-url`
+  默认监听回环、token 随守护进程重启轮换、日志不打印；成功路径按操作者要求把
+  完整 URL（含 token）打到 stdout，终端可直接点击；`--print-url`
   的存在明确说明这是有意输出；文档标注「勿把自动 token URL 贴到公开渠道」。
 - **[localStorage 中的 token 受 XSS 威胁]** → 控制台只伺服内嵌 SPA、无第三方脚本；
   cookie 仍为 `HttpOnly`，存储 token 只用于续票；固定 token 模式不写入 URL/存储。

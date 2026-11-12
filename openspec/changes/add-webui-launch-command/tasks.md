@@ -23,7 +23,7 @@
 
 - [x] 4.1 把 `shell.rs` 的 `webui_health`、`browser_command`、URL 构造提取为共享模块（如 `src/webui_open.rs`），shell 改为调用它。验证：`cargo test` 与 `cargo build` 通过，shell `open` 既有测试不变绿。
 - [x] 4.2 新增顶层 `Cmd::Webui`（`--print-url` 与 `--json` 互斥），派发实现：离线退出 3、未启用/未伺服退出 1 并给修复命令、`/api/health` 探测预算约 5s。验证：单测覆盖各退出码与错误文案。
-- [x] 4.3 实现 URL 构造：auto 模式附 `?token=`，fixed 模式不带；默认打开后只打印不含 token 的地址；`--print-url` 打印完整 URL 且不打开；`--json` 输出 `url`/`listen`/`auth`/`opened`。验证：单测断言三种模式的 URL 与输出。
+- [x] 4.3 实现 URL 构造与输出：auto 模式附 `?token=`，fixed 模式不带；默认打开后打印浏览器将打开的完整 URL（auto 含 token，可点击）；`--print-url` 只打印完整 URL 且不打开；`--json` 输出 `url`/`listen`/`auth`/`opened`。验证：单测断言三种模式的 URL 与输出。
 - [x] 4.4 无图形会话（unix 且 `DISPLAY`/`WAYLAND_DISPLAY` 均空）不拉起浏览器、打印完整 URL、退出 0；浏览器启动失败打印 URL 并退出 1。验证：单测用环境变量注入与伪造启动失败路径。
 
 ## 5. shell `open` 对齐（`src/shell.rs`）

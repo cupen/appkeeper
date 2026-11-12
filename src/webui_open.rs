@@ -145,8 +145,10 @@ pub(crate) fn run(
     }
     match launch(&full) {
         Ok(()) => {
-            // Regular success output never contains the token.
-            report.stdout.push(format!("opening {}", status.url));
+            // Print the URL the browser was handed (token included in auto
+            // mode) so a terminal can render it as a clickable link — the
+            // automatic launch may target another desktop/session.
+            report.stdout.push(format!("opening {full}"));
         }
         Err(e) => {
             report.code = 1;
@@ -416,10 +418,11 @@ mod tests {
         assert!(report.stderr.is_empty());
     }
 
-    /// 4.4 + success output: the default open path reports the token-free
-    /// address; a launcher failure prints the full URL and exits 1.
+    /// 4.4 + success output: the default open path prints the full URL it
+    /// handed to the browser (token included in auto mode, so it stays
+    /// clickable); a launcher failure prints the same URL and exits 1.
     #[test]
-    fn launch_success_hides_the_token_and_failure_exits_one() {
+    fn launch_success_prints_the_full_url_and_failure_exits_one() {
         let ok = run(
             &status("auto", Some("abc123")),
             WebuiMode::Open,
@@ -429,8 +432,7 @@ mod tests {
         );
         assert_eq!(ok.code, 0);
         let text = ok.stdout.join("\n");
-        assert_eq!(text, "opening http://127.0.0.1:9877");
-        assert!(!text.contains("abc123"), "success output hides the token");
+        assert_eq!(text, "opening http://127.0.0.1:9877?token=abc123");
 
         let failed = run(
             &status("auto", Some("abc123")),

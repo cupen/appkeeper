@@ -45,7 +45,7 @@ CLI SHALL 提供顶层子命令 `ak webui`，用于打开 Web 控制台。命令
 
 - `auth == "auto"` 时 URL SHALL 携带引导查询参数 `?token=<token>`（token 取自 `GET /v1/webui`）；
 - `auth == "token"`（固定 token）时 URL MUST NOT 携带 token；
-- 成功打开时输出一行不含 token 的地址信息；命令 MUST NOT 在常规成功输出中打印 token。
+- 成功时命令 SHALL 在 stdout 打印浏览器将要打开的完整 URL（auto 模式含 `?token=<token>`），使自动打开失败、无图形会话或终端里点击比切换窗口更方便的场景都能直接进入；固定 token 模式打印的 URL 不含 token。
 
 命令 SHALL 支持两种不打开浏览器的输出模式（二者互斥）：
 
@@ -60,7 +60,7 @@ CLI SHALL 提供顶层子命令 `ak webui`，用于打开 Web 控制台。命令
 #### Scenario: auto 模式一条命令进入控制台
 
 - **WHEN** `[webui]` 以 auto 模式伺服，执行 `ak webui`
-- **THEN** 系统默认浏览器被调起且地址含 `?token=<token>`，命令输出不含 token，退出码 0
+- **THEN** 系统默认浏览器被调起，且 stdout 打印的地址含 `?token=<token>`（完整 URL，可直接点击），退出码 0
 
 #### Scenario: 固定 token 模式不带 token
 
