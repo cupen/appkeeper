@@ -1,21 +1,27 @@
 // @vitest-environment happy-dom
 // Unit tests for the console credential flow (unix-socket-control-plane
-// tasks 6.5 / 6.6 / 6.8):
+// tasks 6.5 / 6.6 / 6.8, add-webui-launch-command 6.2):
 // - 6.5  no token configured → a request succeeds directly; a 401 raises the
 //        gate, a successful exchange replays the request exactly once, a
 //        failed exchange replays nothing;
-// - 6.6  the token never lands in a URL, in localStorage / sessionStorage /
-//        document.cookie, or in a console log;
+// - 6.6  a manually submitted token never lands in a URL, in localStorage /
+//        sessionStorage / document.cookie, or in a console log (only the
+//        bootstrap URL token is persisted — see bootstrap.test.ts);
 // - 6.8  without a 401 challenge the flow is byte-for-byte the old behavior:
-//        no gate, no state change, no extra request.
+//        no gate, no state change, no extra request;
+// - 6.2  a stored token renews silently on 401: one exchange shared by
+//        concurrent 401s, a rejected token is cleared and the gate explains
+//        that `ak webui` must be run again.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  STORED_TOKEN_KEY,
   authState,
   cancelCredential,
   onAuthChange,
   requestCredential,
   resetAuth,
   shouldPrompt,
+  storedTokenRejected,
   submitToken,
   withSession,
 } from './credentials.js'
@@ -58,6 +64,7 @@ async function until(cond: () => boolean): Promise<void> {
 describe('credential flow (6.5)', () => {
   beforeEach(() => {
     resetAuth()
+    localStorage.clear()
   })
   afterEach(() => {
     resetAuth()
@@ -188,7 +195,7 @@ describe('token hygiene (6.6)', () => {
     vi.restoreAllMocks()
   })
 
-  it('the token never reaches a URL, persistent storage, a cookie or the console', async () => {
+  it('a manually submitted token never reaches a URL, persistent storage, a cookie or the console', async () => {
     const token = 's3cret-hygiene-tok'
     const { calls } = stubFetch([jsonResponse(200)])
     const consoleSpy = vi
@@ -208,8 +215,10 @@ describe('token hygiene (6.6)', () => {
     // Not in any URL (no query parameters anywhere).
     for (const c of calls) expect(c.url).not.toContain(token)
     expect(calls.every((c) => !c.url.includes('?'))).toBe(true)
-    // Not in persistent (or any) web storage.
+    // Not in persistent (or any) web storage — manual entry is never stored;
+    // only the bootstrap flow writes `ak.webui.token`.
     expect(localStorage.length).toBe(0)
+    expect(localStorage.getItem(STORED_TOKEN_KEY)).toBeNull()
     expect(sessionStorage.length).toBe(0)
     // Not in a readable cookie.
     expect(document.cookie).not.toContain(token)
@@ -219,5 +228,94 @@ describe('token hygiene (6.6)', () => {
         expect(call.map(String).join(' ')).not.toContain(token)
       }
     }
+  })
+})
+
+describe('stored token silent renewal (6.2)', () => {
+  beforeEach(() => {
+    resetAuth()
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+  afterEach(() => {
+    resetAuth()
+    localStorage.clear()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('a 401 renews from the stored token and replays without raising the gate', async () => {
+    localStorage.setItem(STORED_TOKEN_KEY, 'stored-tok')
+    const { calls } = stubFetch([jsonResponse(200)]) // /api/auth accepts
+    const states: string[] = []
+    onAuthChange((s) => states.push(s))
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(401))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: 1 }))
+
+    const res = await withSession(send)
+
+    expect(res.status).toBe(200)
+    expect(send).toHaveBeenCalledTimes(2) // original + one replay
+    expect(calls).toHaveLength(1) // exactly one silent exchange
+    expect(calls[0]!.url).toBe('/api/auth')
+    expect((calls[0]!.init?.headers as Record<string, string>)['X-Auth-Token']).toBe(
+      'stored-tok',
+    )
+    expect(states).toEqual(['session']) // the UI never showed the gate
+    expect(shouldPrompt()).toBe(false)
+    expect(storedTokenRejected()).toBe(false)
+    expect(localStorage.getItem(STORED_TOKEN_KEY)).toBe('stored-tok')
+  })
+
+  it('a rejected stored token is cleared, the gate asks for a fresh one, no replay', async () => {
+    localStorage.setItem(STORED_TOKEN_KEY, 'stale-tok')
+    const { calls } = stubFetch([jsonResponse(401)]) // /api/auth rejects
+    const send = vi.fn(async () => jsonResponse(401))
+
+    const pending = withSession(send)
+    await until(() => shouldPrompt())
+    expect(storedTokenRejected()).toBe(true)
+    expect(localStorage.getItem(STORED_TOKEN_KEY)).toBeNull()
+    expect(send).toHaveBeenCalledTimes(1) // no replay after a failed renewal
+    expect(calls).toHaveLength(1) // only the exchange attempt
+
+    cancelCredential()
+    expect((await pending).status).toBe(401)
+  })
+
+  it('concurrent 401s share exactly one silent exchange', async () => {
+    localStorage.setItem(STORED_TOKEN_KEY, 'stored-tok')
+    const { calls } = stubFetch([jsonResponse(200)])
+    const first = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(401))
+      .mockResolvedValueOnce(jsonResponse(200))
+    const second = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(401))
+      .mockResolvedValueOnce(jsonResponse(200))
+
+    const [a, b] = await Promise.all([withSession(first), withSession(second)])
+
+    expect(a.status).toBe(200)
+    expect(b.status).toBe(200)
+    expect(calls).toHaveLength(1) // single-flight renewal
+    expect(first).toHaveBeenCalledTimes(2)
+    expect(second).toHaveBeenCalledTimes(2)
+  })
+
+  it('a replay that still 401s neither loops nor re-prompts', async () => {
+    localStorage.setItem(STORED_TOKEN_KEY, 'stored-tok')
+    const { calls } = stubFetch([jsonResponse(200)])
+    const send = vi.fn(async () => jsonResponse(401))
+
+    const res = await withSession(send)
+
+    expect(res.status).toBe(401)
+    expect(send).toHaveBeenCalledTimes(2) // original + one replay only
+    expect(calls).toHaveLength(1)
+    expect(shouldPrompt()).toBe(false)
   })
 })

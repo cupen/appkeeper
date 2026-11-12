@@ -12,6 +12,7 @@
  */
 
 import { apiFetch, apiJson, removeApp, type RemoveAppResult } from './api.js'
+import { bootstrap } from './bootstrap.js'
 import { loadRefreshMs, saveRefreshMs, type RefreshMs } from './prefs.js'
 import type { PendingDoc, ProgramInfo, StatusDoc, StreamId } from './types.js'
 import { WsClient, type WsState } from './ws-client.js'
@@ -377,7 +378,16 @@ export class ConsoleController implements ReactiveController {
   }
 
   hostConnected(): void {
-    this.store.start()
+    // add-webui-launch-command 6.4: a `?token=` launch URL must finish its
+    // cookie exchange before the first console request; otherwise the initial
+    // /api/overview would 401 and raise the gate even though the token is
+    // valid. `bootstrap()` is idempotent and resolves immediately when no
+    // token is present.
+    void bootstrap()
+      .catch(() => {
+        /* a failed bootstrap falls through to the normal 401 gate */
+      })
+      .finally(() => this.store.start())
     this.unsubscribe = this.store.subscribe(() => this.host.requestUpdate())
     this.host.requestUpdate()
   }

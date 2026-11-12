@@ -6,18 +6,26 @@
  *
  * The token lives in one local variable for the lifetime of the input and is
  * handed straight to the exchange request — never stored, never in the URL,
- * never logged.
+ * never logged. (Only the bootstrap token from an `ak webui` launch URL is
+ * persisted; this gate never writes storage.)
  */
 
 import { LitElement, css, html } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
-import { cancelCredential, onAuthChange, submitToken } from '../lib/credentials.js'
+import {
+  cancelCredential,
+  onAuthChange,
+  storedTokenRejected,
+  submitToken,
+} from '../lib/credentials.js'
 
 @customElement('ak-credential-gate')
 export class AkCredentialGate extends LitElement {
   @state() private open = false
   @state() private busy = false
   @state() private failed = false
+  /** The stored token was rejected: tell the operator to run `ak webui`. */
+  @state() private expired = false
 
   // @state is load-bearing: the submit button's ?disabled binding reads it,
   // and without it input events never re-render the button.
@@ -100,6 +108,10 @@ export class AkCredentialGate extends LitElement {
       font-size: 12px;
       color: var(--ak-danger, #f0616d);
     }
+    .expired {
+      margin-bottom: 14px;
+      color: var(--ak-danger, #f0616d);
+    }
   `
 
   connectedCallback(): void {
@@ -109,6 +121,7 @@ export class AkCredentialGate extends LitElement {
       if (state === 'prompting') {
         this.token = ''
         this.failed = false
+        this.expired = storedTokenRejected()
       }
       this.open = state === 'prompting'
     })
@@ -151,8 +164,13 @@ export class AkCredentialGate extends LitElement {
           <h2 id="ak-gate-title">控制台需要凭据</h2>
           <p>
             该控制台配置了 <code>[webui] auth_token</code>。粘贴 token 后会换取一个会话
-            cookie（HttpOnly），token 本身不会被浏览器保存。
+            cookie（HttpOnly）；手工输入的 token 不会被浏览器保存。
           </p>
+          ${this.expired
+            ? html`<p class="expired">
+                token 已失效，请重新执行 <code>ak webui</code>
+              </p>`
+            : ''}
           <label for="ak-gate-token">token</label>
           <input
             id="ak-gate-token"

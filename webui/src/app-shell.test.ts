@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { matchRoute } from './router.js'
 import { AkApp, ROUTES } from './app-shell.js'
 import { consoleStore } from './lib/store.js'
+import { STORED_TOKEN_KEY, resetAuth } from './lib/credentials.js'
+import { resetBootstrap } from './lib/bootstrap.js'
 import { MSG, type ProgramInfo, type StatusDoc } from './lib/types.js'
 import { encode } from '@msgpack/msgpack'
 
@@ -361,6 +363,64 @@ describe('shell convergence after a removal (guard-remove-until-stopped 4.3)', (
     expect(sidebarApps(shell)).toEqual([])
     expect(location.pathname).toBe('/')
     expect(shell.shadowRoot!.querySelector('ak-dashboard')).not.toBeNull()
+    shell.remove()
+  })
+})
+
+// -- add-webui-launch-command 6.4: bootstrap gates the first request --------
+
+describe('launch URL bootstrap precedes the first console request (6.4)', () => {
+  let answerAuth!: (res: Response) => void
+  let calls: string[] = []
+
+  beforeEach(() => {
+    history.replaceState({}, '', '/?token=boot-tok&view=apps')
+    localStorage.clear()
+    resetAuth()
+    resetBootstrap()
+    FakeWebSocket.instances = []
+    calls = []
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        calls.push(String(input))
+        return new Promise<Response>((resolve) => {
+          answerAuth = resolve
+        })
+      }),
+    )
+  })
+
+  afterEach(() => {
+    consoleStore.stop()
+    document.body.innerHTML = ''
+    resetBootstrap()
+    resetAuth()
+    localStorage.clear()
+    history.replaceState({}, '', '/')
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('exchanges ?token= before store.start and strips it immediately', async () => {
+    const shell = document.createElement('ak-app') as AkApp
+    document.body.appendChild(shell)
+    await shell.updateComplete
+
+    // The exchange is in flight; no console transport has started yet.
+    expect(calls).toEqual(['/api/auth'])
+    expect(FakeWebSocket.instances).toHaveLength(0)
+    // The token left the address bar before the network answer arrived.
+    expect(location.search).toBe('?view=apps')
+    expect(localStorage.getItem(STORED_TOKEN_KEY)).toBeNull()
+
+    answerAuth(new Response('{}', { status: 200 }))
+    await tick()
+    await tick()
+
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(0)
+    expect(localStorage.getItem(STORED_TOKEN_KEY)).toBe('boot-tok')
     shell.remove()
   })
 })
