@@ -1,7 +1,7 @@
 //! The supervisor: shared state, the command-driven main loop, ordered
 //! startup, per-app reload and shutdown orchestration.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -193,6 +193,9 @@ pub struct ComposeUpRequest {
     pub base_dir: PathBuf,
     pub caller_path: Option<std::ffi::OsString>,
     pub force: bool,
+    /// `-e/--env NAME=VALUE` values for `${NAME}` in the declaration text
+    /// (per-invocation, never persisted).
+    pub vars: BTreeMap<String, String>,
 }
 
 /// The five compose-up classifications (add-compose-up D3).
@@ -2553,11 +2556,12 @@ impl Supervisor {
         // 1. Render + validate the declaration — the same pure function the
         //    preview uses (naming, reserved words, schema, relative paths,
         //    bare-command resolution against the CALLER's PATH).
-        let rendered = config::render_declaration(
+        let rendered = config::render_declaration_with_vars(
             &req.content,
             &req.base_dir,
             &req.name,
             req.caller_path.as_deref(),
+            &req.vars,
         )
         .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
         let name = req.name.clone();
@@ -7420,6 +7424,7 @@ mod tests {
             base_dir: base.to_path_buf(),
             caller_path: None,
             force,
+            vars: BTreeMap::new(),
         }
     }
 

@@ -1766,6 +1766,83 @@ pub const DECLARATION_FILE: &str = ".appkeeper.toml";
 /// declaration renderer enforces it without depending on upper layers.
 pub const RESERVED_APP_NAMES: [&str; 1] = ["all"];
 
+/// Substitute caller-supplied `-e/--env NAME=VALUE` values into declaration
+/// text before it is parsed (`ak compose up -e`).
+///
+/// Syntax: `${NAME}` and `${NAME:-default}`. A name the caller did not supply
+/// is left verbatim — the same "unknown variables belong to the shell" rule
+/// the action layer uses, so a declaration may hand `${HOME}` through
+/// untouched. Known-domain spawn-time variables (`${program.<p>.pid}`,
+/// `${daemon.socket}`, …) are likewise preserved for the run-time layer.
+/// `$$` is a literal `$` (so `$${NAME}` reaches the shell unchanged).
+pub fn substitute_declaration_vars(text: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            out.push('$');
+            rest = tail;
+            continue;
+        }
+        let Some(body) = after.strip_prefix('{') else {
+            out.push('$');
+            rest = after;
+            continue;
+        };
+        let Some(end) = body.find('}') else {
+            bail!("unterminated ${{...}} in the declaration (missing `}}`)");
+        };
+        let raw = &body[..end];
+        rest = &body[end + 1..];
+        // Spawn-time action placeholders stay for the run-time substitution.
+        if parse_var_ref(raw).is_some() {
+            out.push_str("${");
+            out.push_str(raw);
+            out.push('}');
+            continue;
+        }
+        let (key, default) = match raw.split_once(":-") {
+            Some((k, d)) => (k, Some(d)),
+            None => (raw, None),
+        };
+        if !is_valid_var_name(key) {
+            bail!(
+                "invalid variable name in the declaration: ${{{raw}}} (allowed: letters, digits \
+                 and `_`, not starting with a digit)"
+            );
+        }
+        match vars.get(key) {
+            Some(v) => out.push_str(v),
+            // Not supplied: leave it verbatim, exactly like the action-layer
+            // substitution — a declaration may legitimately hand `${HOME}` (or
+            // any other shell variable) to the program. `-e` only fills in the
+            // names it was given.
+            None => match default {
+                Some(d) => out.push_str(d),
+                None => {
+                    out.push_str("${");
+                    out.push_str(raw);
+                    out.push('}');
+                }
+            },
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// A `-e/--env` variable name: the shape of an environment variable name.
+fn is_valid_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Render a `.appkeeper.toml` declaration into the canonical registration
 /// snapshot (add-compose-up task 2.1/2.2):
 ///
@@ -1788,12 +1865,39 @@ pub const RESERVED_APP_NAMES: [&str; 1] = ["all"];
 /// byte-identical output (BTreeMap key order), which is what makes the
 /// byte-comparison against an existing record meaningful. The rendered text
 /// is BOTH the comparison baseline and the bytes that land on disk.
+///
+/// Test-only convenience for the no-variable render: production paths always go
+/// through [`render_declaration_with_vars`] (the `-e` values may legitimately be
+/// empty).
+#[cfg(test)]
 pub fn render_declaration(
     text: &str,
     base_dir: &Path,
     name: &str,
     caller_path: Option<&std::ffi::OsStr>,
 ) -> Result<String> {
+    render_declaration_with_vars(text, base_dir, name, caller_path, &BTreeMap::new())
+}
+
+/// The declaration render with caller-supplied `-e/--env NAME=VALUE` values —
+/// the production entry point (add-compose-up D8).
+/// Substitution runs on the declaration TEXT before parsing, so the values
+/// reach every field (command, args, work_dir, env, …) and the render stays
+/// the single source of truth (design D2). The values are per-invocation and
+/// never persisted.
+pub fn render_declaration_with_vars(
+    text: &str,
+    base_dir: &Path,
+    name: &str,
+    caller_path: Option<&std::ffi::OsStr>,
+    vars: &BTreeMap<String, String>,
+) -> Result<String> {
+    let text = if vars.is_empty() {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(substitute_declaration_vars(text, vars)?)
+    };
+    let text: &str = &text;
     if !is_valid_name(name) {
         bail!("app name {name:?} is invalid: {NAME_RULE}");
     }
@@ -3829,11 +3933,91 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `-e NAME=VALUE` substitution: plain `${NAME}`, `${NAME:-default}`,
+    /// `$$` escaping, and the two rejections (unknown name, bad name shape).
+    /// Spawn-time action placeholders are left for the run-time layer.
+    #[test]
+    fn substitute_declaration_vars_covers_the_syntax() {
+        let mut vars = BTreeMap::new();
+        vars.insert("PORT".to_string(), "8080".to_string());
+        vars.insert("HOST".to_string(), "127.0.0.1".to_string());
+
+        let out = substitute_declaration_vars("bind ${HOST}:${PORT}", &vars).unwrap();
+        assert_eq!(out, "bind 127.0.0.1:8080");
+
+        // Defaults fill in only the names that were not supplied.
+        let out =
+            substitute_declaration_vars("${PORT}|${MISSING:-fallback}|${PORT:-unused}", &vars)
+                .unwrap();
+        assert_eq!(out, "8080|fallback|8080");
+
+        // `$$` is a literal dollar: `$${NAME}` survives for the shell.
+        let out = substitute_declaration_vars("$${HOME} ${PORT}", &vars).unwrap();
+        assert_eq!(out, "${HOME} 8080");
+
+        // Spawn-time action variables stay verbatim.
+        let out = substitute_declaration_vars("${program.web.pid}", &vars).unwrap();
+        assert_eq!(out, "${program.web.pid}");
+
+        // An unsupplied name stays verbatim for the shell.
+        let out = substitute_declaration_vars("${NOPE}", &vars).unwrap();
+        assert_eq!(out, "${NOPE}");
+
+        // A name that is not a variable name is rejected.
+        let err = substitute_declaration_vars("${1BAD}", &vars).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid variable name"),
+            "{err:#}"
+        );
+        let err = substitute_declaration_vars("${unterminated", &vars).unwrap_err();
+        assert!(format!("{err:#}").contains("unterminated"), "{err:#}");
+    }
+
+    /// The whole declaration render honours `-e` values, and an empty map is
+    /// byte-identical to the plain render (the zero-variable path is
+    /// untouched).
+    #[test]
+    fn render_declaration_with_vars_reaches_every_field() {
+        let (dir, path_env) = caller_path_with("vars", "tool");
+        let text = "[program.web]\ncommand = 'tool'\nargs = ['--port', '${PORT}']\n\
+                    work_dir = './data'\n\n[program.web.env]\nA = '${PORT}'\n";
+        let mut vars = BTreeMap::new();
+        vars.insert("PORT".to_string(), "9000".to_string());
+        let out = render_declaration_with_vars(text, &dir, "shop", Some(&path_env), &vars).unwrap();
+        let raw: AppRaw = toml::from_str(&out).unwrap();
+        let web = &raw.program["web"];
+        assert_eq!(
+            web.args.as_deref(),
+            Some(&["--port".to_string(), "9000".to_string()][..])
+        );
+        assert_eq!(
+            web.env
+                .as_ref()
+                .and_then(|m| m.get("A"))
+                .map(String::as_str),
+            Some("9000")
+        );
+        assert!(
+            !out.contains("${PORT}"),
+            "no placeholder may survive: {out}"
+        );
+
+        // No variables → byte-identical to the plain entry point, and a
+        // `${...}` the caller did not ask to substitute survives verbatim
+        // (existing declarations may legitimately hand `${HOME}` to a shell).
+        let base = render_declaration(text, &dir, "shop", Some(&path_env)).unwrap();
+        let with_empty =
+            render_declaration_with_vars(text, &dir, "shop", Some(&path_env), &BTreeMap::new())
+                .unwrap();
+        assert_eq!(base, with_empty, "the empty `-e` path changes nothing");
+        assert!(with_empty.contains("${PORT}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // tests: `config` subcommand engine (add-config-subcommand)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod config_cmd_tests {

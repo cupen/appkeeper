@@ -1382,6 +1382,15 @@ fn parse_compose_request(
             .filter(|s| !s.is_empty())
             .map(std::ffi::OsString::from),
         force: v.get("force").and_then(|b| b.as_bool()).unwrap_or(false),
+        vars: v
+            .get("vars")
+            .and_then(|m| m.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1407,11 +1416,12 @@ fn respond_compose_preview(sup: &Arc<Supervisor>, body: &[u8]) -> Vec<u8> {
         Ok(r) => r,
         Err(m) => return err_bytes(400, &m),
     };
-    let rendered = match crate::config::render_declaration(
+    let rendered = match crate::config::render_declaration_with_vars(
         &req.content,
         &req.base_dir,
         &req.name,
         req.caller_path.as_deref(),
+        &req.vars,
     ) {
         Ok(t) => t,
         Err(e) => return err_bytes(400, &format!("{e:#}")),
@@ -3527,6 +3537,43 @@ mod tests {
             st.programs.keys().collect::<Vec<_>>()
         );
         drop(st);
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-e/--env` values reach the render: the `vars` object in the request
+    /// body substitutes `${NAME}` before the declaration is parsed, and the
+    /// rendered record holds the value (not the placeholder).
+    #[test]
+    fn compose_up_substitutes_env_vars() {
+        let (sup, dir, ep) = serve_harness("compose-up-vars");
+        let (cmd, args) = sleep_cmd();
+        let decl = format!(
+            "[program.web]\ncommand = '{cmd}'\nargs = {args:?}\nstartsecs = 0.0\n\
+             restart = 'always'\nwork_dir = '${{WD}}'\n\n\
+             [program.web.env]\nPORT = '${{PORT}}'\n"
+        );
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        let resp = ep.post(
+            "/v1/compose/up",
+            &compose_body(
+                &dir,
+                "shop",
+                &decl,
+                serde_json::json!({ "vars": { "WD": "./work", "PORT": "9000" } }),
+            ),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let frames = frames_of(&resp);
+        assert_eq!(frames.last().unwrap()["ok"], true, "{frames:?}");
+        let record = std::fs::read_to_string(dir.join("app.d").join("shop.toml")).unwrap();
+        assert!(!record.contains("${"), "no placeholder survives: {record}");
+        assert!(record.contains("9000"), "env var substituted: {record}");
+        assert!(
+            record.contains(&format!("{}/./work", dir.display())),
+            "work_dir substituted then absolutized: {record}"
+        );
+        drop(sup.state.lock().unwrap());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

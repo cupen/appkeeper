@@ -311,6 +311,10 @@ is the single source of truth."
         /// restart on a same-name record)
         #[arg(long = "force")]
         force: bool,
+        /// Value for a `${NAME}` placeholder in the declaration (repeatable,
+        /// `NAME=VALUE`); `${NAME:-default}` carries its own fallback
+        #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
+        envs: Vec<String>,
         /// Machine-readable output: the NDJSON frame stream is passed through
         #[arg(long = "json")]
         json: bool,
@@ -917,6 +921,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     file,
                     name,
                     force,
+                    envs,
                     json,
                 }),
             ..
@@ -926,6 +931,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             file.as_deref(),
             name.as_deref(),
             *force,
+            envs,
             *json,
         ),
         Some(Cmd::Compose {
@@ -2193,8 +2199,16 @@ fn compose_up_cmd(
     file: Option<&Path>,
     name: Option<&str>,
     force: bool,
+    envs: &[String],
     json: bool,
 ) -> Result<()> {
+    // `-e NAME=VALUE` pairs feed `${NAME}` in the declaration; malformed pairs
+    // are config errors (same rule as `ak run --env`), checked before any
+    // daemon contact or path work.
+    let vars = match parse_envs(envs) {
+        Ok(v) => v,
+        Err(code) => std::process::exit(code),
+    };
     // 1. Client-side resolution: declaration file, base dir, app name. All
     //    failures here are config-class errors with zero side effects and no
     //    daemon contact (app-registry spec: 找不到声明文件 / 保留字与非法名).
@@ -2245,7 +2259,7 @@ fn compose_up_cmd(
 
     // 3. Preview (zero side effects): the daemon renders + classifies.
     let c = client::Client::from_config(&config);
-    let pv = match c.compose_up_preview(&compose_up_body(&app, &content, &base_dir, false)) {
+    let pv = match c.compose_up_preview(&compose_up_body(&app, &content, &base_dir, false, &vars)) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("ak: error: {e:#}");
@@ -2304,7 +2318,7 @@ fn compose_up_cmd(
     //    between preview and submit, or staging failed) is an api error.
     let mut terminal = serde_json::Value::Null;
     let frames = c.compose_up(
-        &compose_up_body(&app, &content, &base_dir, submit_force),
+        &compose_up_body(&app, &content, &base_dir, submit_force, &vars),
         |frame| {
             if json {
                 // --json 直通帧流: every frame passes through as one JSON line.
@@ -2337,15 +2351,23 @@ fn compose_up_cmd(
 }
 
 /// The `/v1/compose/up(/preview)` request body: the declaration CONTENT, the
-/// base directory and the caller's PATH — never a file path (control-plane
-/// spec: TCP 形态下 CLI 与守护进程可不在同一台机器).
-fn compose_up_body(app: &str, content: &str, base_dir: &Path, force: bool) -> serde_json::Value {
+/// base directory, the caller's PATH and the `-e/--env` variable values —
+/// never a file path (control-plane spec: TCP 形态下 CLI 与守护进程可不在同一
+/// 台机器).
+fn compose_up_body(
+    app: &str,
+    content: &str,
+    base_dir: &Path,
+    force: bool,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> serde_json::Value {
     serde_json::json!({
         "name": app,
         "content": content,
         "base_dir": base_dir.display().to_string(),
         "caller_path": std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned()),
         "force": force,
+        "vars": vars,
     })
 }
 
@@ -4943,11 +4965,20 @@ mod compose_up_tests {
                 file,
                 name,
                 force,
+                envs,
                 json,
             } => {
                 assert_eq!(dir.as_deref(), None, "dir defaults to `.` in dispatch");
                 assert!(file.is_none() && name.is_none());
                 assert!(!force && !json);
+                assert!(envs.is_empty(), "no -e by default");
+            }
+        }
+        // `-e NAME=VALUE` is repeatable and lands in order.
+        let cli = parse(&["compose", "up", "-e", "PORT=8080", "-e", "HOST=0.0.0.0"]);
+        match up_of(&cli) {
+            ComposeSub::Up { envs, .. } => {
+                assert_eq!(envs, &["PORT=8080".to_string(), "HOST=0.0.0.0".to_string()]);
             }
         }
         let cli = parse(&["compose", "up", "proj"]);
@@ -5245,7 +5276,13 @@ mod compose_up_tests {
     /// and the caller's PATH — never a file path (control-plane spec).
     #[test]
     fn compose_up_body_shape() {
-        let body = compose_up_body("shop", "CONTENT", Path::new("/opt/shop"), true);
+        let body = compose_up_body(
+            "shop",
+            "CONTENT",
+            Path::new("/opt/shop"),
+            true,
+            &Default::default(),
+        );
         assert_eq!(body["name"], "shop");
         assert_eq!(body["content"], "CONTENT");
         assert_eq!(body["base_dir"], "/opt/shop");
