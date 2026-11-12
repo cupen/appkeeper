@@ -563,18 +563,18 @@ pub struct DaemonConfig {
 pub const DEFAULT_WEBUI_LISTEN: &str = "127.0.0.1:9877";
 
 /// The optional `[webui]` section of the daemon config. `listen` selects the
-/// console's TCP address; `auth_token` (optional, empty by default) turns on
-/// the console's own credential check. The control plane's credential is a
-/// different key: `[daemon] auth_token`, conditional on a `tcp://` socket
-/// (tcp-control-endpoint D2). Unknown keys are rejected like everywhere
-/// else.
+/// console's TCP address; `auth_token` selects the console's own credential.
+/// The control plane's credential is a different key: `[daemon] auth_token`,
+/// conditional on a `tcp://` socket (tcp-control-endpoint D2). Unknown keys
+/// are rejected like everywhere else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebuiSettings {
     pub listen: String,
-    /// `None` = console access is decided by `webui.listen` alone. `Some` =
-    /// credentials required for `/api/*` and `/ws`; an empty `Some` is a
-    /// config error rather than a way to turn auth off.
+    /// Unconfigured or `"auto"` (the reserved default) = the daemon generates
+    /// a random token at startup; any other non-empty string = fixed token.
+    /// There is no unauthenticated console (add-webui-launch-command D1):
+    /// an empty `Some` is a config error, not a way to turn auth off.
     pub auth_token: Option<String>,
 }
 
@@ -583,6 +583,42 @@ impl Default for WebuiSettings {
         Self {
             listen: DEFAULT_WEBUI_LISTEN.to_string(),
             auth_token: None,
+        }
+    }
+}
+
+/// How the console token is sourced, as expressed by the config (design D9).
+/// Token generation itself lives in the daemon (`src/web.rs`), never here:
+/// the config only says which mode the console should run in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WebuiTokenMode {
+    /// Unconfigured, or the reserved literal `"auto"`: a random token is
+    /// generated per daemon run / mode switch (design D4).
+    #[default]
+    Auto,
+    /// A fixed, non-empty token from the config.
+    Fixed(String),
+}
+
+impl WebuiTokenMode {
+    /// The `auth` field `GET /v1/webui` reports (design D2).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WebuiTokenMode::Auto => "auto",
+            WebuiTokenMode::Fixed(_) => "token",
+        }
+    }
+}
+
+impl WebuiSettings {
+    /// The console token mode this section expresses. An empty value is
+    /// rejected by validation long before this is consulted, but it is
+    /// mapped to `Auto` here rather than `Fixed("")` so it can never become
+    /// an "empty credential" by accident.
+    pub fn token_mode(&self) -> WebuiTokenMode {
+        match self.auth_token.as_deref() {
+            None | Some("") | Some("auto") => WebuiTokenMode::Auto,
+            Some(token) => WebuiTokenMode::Fixed(token.to_string()),
         }
     }
 }
@@ -1043,13 +1079,12 @@ impl DaemonConfig {
         self.webui.as_ref().map(|w| w.listen.as_str())
     }
 
-    /// The console's optional access-control token; `None` = unauthenticated
-    /// (see the `webui-api` capability for what that means).
-    pub fn webui_auth_token(&self) -> Option<&str> {
-        self.webui
-            .as_ref()
-            .and_then(|w| w.auth_token.as_deref())
-            .filter(|t| !t.is_empty())
+    /// The console's token mode; `None` when the `[webui]` section is absent
+    /// (the section's presence is the on/off switch, so absence means "no
+    /// console" rather than "auto"). Token generation is a daemon concern —
+    /// this only reports the configured intent (design D9).
+    pub fn webui_token_mode(&self) -> Option<WebuiTokenMode> {
+        self.webui.as_ref().map(|w| w.token_mode())
     }
 
     /// The control-plane IPC endpoint this config resolves to. Built-in
@@ -1113,10 +1148,11 @@ impl DaemonConfig {
             if let Err(e) = validate_listen_addr(&w.listen) {
                 errors.push(format!("webui.listen: {e}"));
             }
-            // An empty `webui.auth_token` would silently read as "no auth",
-            // which is exactly the failure mode the key exists to prevent.
+            // `auto` (the default) needs no further check; any other non-empty
+            // value is a fixed token. An empty value is the only rejected
+            // form: there is no unauthenticated console to fall back to.
             if w.auth_token.as_deref() == Some("") {
-                errors.push("webui.auth_token: must be a non-empty string".to_string());
+                errors.push("webui.auth_token: must be `auto` or a non-empty string".to_string());
             }
         }
         if errors.is_empty() {
@@ -2142,11 +2178,13 @@ fn parse_socket(s: &str) -> std::result::Result<KeyValue, String> {
     Ok(KeyValue::Str(s.to_string()))
 }
 
-/// `webui.auth_token`: non-empty. An empty value would read as "console is
-/// unauthenticated", which is never what a caller writing the key meant.
+/// `webui.auth_token`: the reserved `auto` (or unconfigured) or a non-empty
+/// fixed token. An empty value would read as "console is unauthenticated",
+/// which is never what a caller writing the key meant (and no longer exists
+/// as a mode).
 fn parse_webui_auth_token(s: &str) -> std::result::Result<KeyValue, String> {
     if s.is_empty() {
-        return Err("webui.auth_token: must be a non-empty string".to_string());
+        return Err("webui.auth_token: must be `auto` or a non-empty string".to_string());
     }
     Ok(KeyValue::Str(s.to_string()))
 }
@@ -2359,7 +2397,8 @@ pub fn daemon_key_display(settings: &DaemonSettings, name: &str) -> String {
 }
 
 /// `[webui]` field for `--get`; an absent section answers with the built-in
-/// default listen, and an unconfigured token answers with the empty string.
+/// default listen, and an unconfigured token answers with the reserved
+/// effective value `auto` (design D9 — same shape as `listen`'s default).
 pub fn webui_key_display(settings: Option<&WebuiSettings>, name: &str) -> String {
     match name {
         "listen" => settings
@@ -2367,7 +2406,8 @@ pub fn webui_key_display(settings: Option<&WebuiSettings>, name: &str) -> String
             .unwrap_or_else(|| DEFAULT_WEBUI_LISTEN.to_string()),
         "auth_token" => settings
             .and_then(|w| w.auth_token.clone())
-            .unwrap_or_default(),
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| WebuiTokenMode::Auto.as_str().to_string()),
         other => unreachable!("webui key table and display are in sync: {other:?}"),
     }
 }
@@ -4292,14 +4332,63 @@ mod config_cmd_tests {
         }
     }
 
-    /// `webui.auth_token` is the console's own credential; empty is a config
-    /// error rather than a way to turn the check off.
+    /// `webui.auth_token` is the console's own credential: the reserved
+    /// `auto` or any non-empty fixed string. Empty stays a config error —
+    /// there is no unauthenticated console to fall back to.
     #[test]
-    fn webui_auth_token_is_a_non_empty_string() {
+    fn webui_auth_token_is_auto_or_a_non_empty_string() {
         let parse = |v: &str| (find_webui_key("auth_token").unwrap().parse)(v);
         assert_eq!(parse("s3cr3t").unwrap(), KeyValue::Str("s3cr3t".into()));
-        assert!(parse("").is_err(), "empty token must be rejected");
+        assert_eq!(parse("auto").unwrap(), KeyValue::Str("auto".into()));
+        let err = parse("").unwrap_err();
+        assert!(
+            err.contains("`auto`") && err.contains("non-empty"),
+            "empty value names both legal forms: {err}"
+        );
         assert!(WEBUI_KEYS.iter().any(|k| k.name == "auth_token"));
+    }
+
+    /// design D9: the config layer only expresses the token mode; an absent
+    /// key and the reserved `auto` are both `Auto`, everything else is fixed.
+    #[test]
+    fn webui_token_mode_maps_unconfigured_and_auto_to_auto() {
+        let mode = |text: &str| {
+            toml::from_str::<DaemonConfig>(text)
+                .unwrap()
+                .webui_token_mode()
+        };
+
+        assert_eq!(mode("[webui]\n"), Some(WebuiTokenMode::Auto));
+        assert_eq!(
+            mode("[webui]\nauth_token = \"auto\"\n"),
+            Some(WebuiTokenMode::Auto)
+        );
+        assert_eq!(
+            mode("[webui]\nauth_token = \"s3cr3t\"\n"),
+            Some(WebuiTokenMode::Fixed("s3cr3t".to_string()))
+        );
+        assert_eq!(mode("[daemon]\n"), None, "absent section = no console");
+        // Validation accepts both legal forms and still rejects the empty one.
+        for ok in [
+            "[webui]\n",
+            "[webui]\nauth_token = \"auto\"\n",
+            "[webui]\nauth_token = \"x\"\n",
+        ] {
+            let cfg: DaemonConfig = toml::from_str(ok).unwrap();
+            assert!(cfg.validate().is_ok(), "{ok:?} must validate");
+        }
+        let empty: DaemonConfig = toml::from_str("[webui]\nauth_token = \"\"\n").unwrap();
+        let err = empty.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("webui.auth_token") && err.contains("`auto`"),
+            "empty token is rejected and names both legal forms: {err}"
+        );
+        assert_eq!(WebuiTokenMode::Auto.as_str(), "auto");
+        assert_eq!(
+            WebuiTokenMode::Fixed("x".into()).as_str(),
+            "token",
+            "a fixed token reports the conventional `token` auth name"
+        );
     }
 
     /// Every key accepts legal values and rejects type violations (task 4.3).
@@ -4940,6 +5029,42 @@ log_buffer_lines = 7
             )
             .unwrap(),
             "/tmp/ak.sock"
+        );
+    }
+
+    /// `--get webui.auth_token`: the effective value is the reserved `auto`
+    /// when the section exists without the key, `auto` when explicitly set,
+    /// and the fixed value otherwise. `--get` never rewrites the file.
+    #[test]
+    fn get_webui_auth_token_reports_auto_when_unconfigured() {
+        // Section present, key absent → effective `auto`.
+        assert_eq!(
+            config_effective_value(
+                Some("[webui]\nlisten = \"127.0.0.1:1\"\n"),
+                "webui.auth_token"
+            )
+            .unwrap(),
+            "auto"
+        );
+        // Explicit `auto` prints the same reserved value.
+        assert_eq!(
+            config_effective_value(Some("[webui]\nauth_token = \"auto\"\n"), "webui.auth_token")
+                .unwrap(),
+            "auto"
+        );
+        // A fixed token is reported verbatim.
+        assert_eq!(
+            config_effective_value(
+                Some("[webui]\nauth_token = \"s3cr3t\"\n"),
+                "webui.auth_token"
+            )
+            .unwrap(),
+            "s3cr3t"
+        );
+        // Missing file: the key still answers with its effective default.
+        assert_eq!(
+            config_effective_value(None, "webui.auth_token").unwrap(),
+            "auto"
         );
     }
 

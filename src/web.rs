@@ -275,10 +275,12 @@ async fn program_action(
 
 /// Build the console router (exposed for integration tests). `stop` is the
 /// external lifecycle state shared with the WS sessions (see [`serve`]).
-/// `auth_token` empty = no application-layer credential at all (the console's
-/// isolation is whatever `webui.listen` grants — see the `webui-api`
-/// capability); non-empty = `/api/*` (except `/api/health`) and `/ws` require
-/// a session established by exchanging the token at `/api/auth`.
+/// `auth_token` non-empty = `/api/*` (except `/api/health`) and `/ws` require
+/// a session established by exchanging the token at `/api/auth` — the only
+/// form the daemon serves (add-webui-launch-command: there is no
+/// unauthenticated console). An empty token yields the internal "no console"
+/// state, used by the supervisor before any console starts and by tests that
+/// exercise non-auth surfaces.
 pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>, auth_token: &str) -> Router {
     let auth = console_auth_for(&sup, auth_token);
     let guarded = Router::new()
@@ -333,7 +335,10 @@ pub struct ConsoleAuth {
 }
 
 impl ConsoleAuth {
-    /// Unauthenticated console: every guard is a no-op.
+    /// No console is being served: every guard is a no-op. The daemon never
+    /// *serves* in this state (the manager refuses an empty auto token, see
+    /// `supervisor::webui_manager_loop`); it is the supervisor's initial
+    /// state and the shape the router's non-auth tests use.
     pub fn disabled() -> Self {
         ConsoleAuth {
             token: Arc::new(String::new()),
@@ -354,6 +359,14 @@ impl ConsoleAuth {
         !self.token.is_empty()
     }
 
+    /// The token this instance enforces; empty while no console is served.
+    /// `pub(crate)` on purpose: the only external reader is
+    /// `GET /v1/webui` (control-plane), and it must never reach a serde
+    /// projection or a log line (add-webui-launch-command D10).
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
     fn check(&self, presented: &str) -> bool {
         self.enabled() && self.sessions.lock().unwrap().contains(presented)
     }
@@ -368,7 +381,7 @@ impl ConsoleAuth {
             // clearing wholesale is simpler and only costs a re-login.
             set.clear();
         }
-        let id = random_session_id();
+        let id = random_session_id()?;
         set.insert(id.clone());
         Some(id)
     }
@@ -398,26 +411,35 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// A random hex id. Good enough for an in-memory session that only exists
-/// behind a loopback-ish listener, and it has no dependency on the OS RNG API.
-fn random_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let addr = &nanos as *const u128 as usize as u128;
-    let mut v = nanos ^ (pid << 64) ^ (addr << 32);
-    let mut out = String::with_capacity(32);
-    for _ in 0..4 {
-        v ^= v << 13;
-        v ^= v >> 7;
-        v ^= v << 17;
-        out.push_str(&format!("{v:032x}"));
+/// Generate the console's auto token (add-webui-launch-command D3): 32 bytes
+/// from the OS CSPRNG, rendered as 64 lowercase hex characters (≥256 bits of
+/// entropy, no URL escaping needed). The token lives in memory only and is
+/// handed out solely through `GET /v1/webui`; it never reaches a serde
+/// projection, a cookie or a log line.
+pub(crate) fn generate_console_token() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| std::io::Error::other(format!("CSPRNG unavailable: {e}")))?;
+    Ok(hex_lower(&bytes))
+}
+
+/// Lowercase hex rendering (`[0-9a-f]` only).
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
-    out.truncate(32);
     out
+}
+
+/// An opaque session id from the same CSPRNG as the console token: the
+/// session is a bearer credential too, so a predictable id would bypass the
+/// token entirely. `None` when the OS entropy source is unavailable (the
+/// exchange then fails closed).
+fn random_session_id() -> Option<String> {
+    generate_console_token().ok()
 }
 
 /// Read one cookie by name from a header value.
@@ -573,7 +595,10 @@ pub fn serve(
         log::info!(
             "webui listening on http://{listen} (auth: {})",
             if auth_token.is_empty() {
-                "disabled — anyone who can reach this address has full control"
+                // Unreachable from the daemon: the manager never serves an
+                // empty token (add-webui-launch-command). Kept truthful for
+                // the test-only router state.
+                "none (internal state — never served by the daemon)"
             } else {
                 "token required"
             }
@@ -1072,11 +1097,38 @@ mod tests {
         build_router(test_sup(), test_stop(), token)
     }
 
-    /// 6.1: with no `webui.auth_token`, nothing about the console changes —
-    /// anonymous `/api/overview` still answers 200 and no credential
-    /// endpoint invents a session.
+    /// design D3: the auto token is 64 lowercase hex chars (32 CSPRNG bytes)
+    /// and differs between draws — never a timestamp-derived value.
+    #[test]
+    fn generated_console_token_is_256_bit_lowercase_hex() {
+        let a = generate_console_token().expect("the OS RNG is available in tests");
+        let b = generate_console_token().expect("the OS RNG is available in tests");
+        assert_eq!(a.len(), 64, "32 bytes render as 64 characters: {a}");
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "URL-safe lowercase hex only: {a}"
+        );
+        assert_ne!(a, b, "two draws must not collide");
+    }
+
+    /// design D10: `ConsoleAuth::token()` is the read-only view the
+    /// control-plane endpoint uses; empty while no console is served.
+    #[test]
+    fn console_auth_token_is_empty_when_disabled() {
+        assert_eq!(ConsoleAuth::disabled().token(), "");
+        assert!(!ConsoleAuth::disabled().enabled());
+        let auth = ConsoleAuth::new("s3cr3t");
+        assert_eq!(auth.token(), "s3cr3t");
+        assert!(auth.enabled());
+    }
+
+    /// The router's empty-token state is the internal "no console" state: it
+    /// passes requests through, but the daemon never serves it
+    /// (add-webui-launch-command: `auto` always yields a token, and the
+    /// manager refuses to start with an empty one).
     #[tokio::test]
-    async fn no_token_means_no_authentication_at_all() {
+    async fn empty_token_router_state_is_never_served_by_the_daemon() {
         let app = authed_app("");
         for uri in [
             "/api/overview",

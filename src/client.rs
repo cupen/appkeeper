@@ -59,6 +59,25 @@ enum Framing {
     Eof,
 }
 
+/// `GET /v1/webui` as the CLI consumes it (add-webui-launch-command D2/D7).
+/// `token` is present only when `auth == "auto"`; a fixed token is never
+/// echoed by the daemon (and so never lands in a JSON here).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct WebuiStatus {
+    pub enabled: bool,
+    pub serving: bool,
+    /// Configured listen address (the built-in default when the console is
+    /// off).
+    pub listen: String,
+    /// Browser-facing base URL (wildcards already mapped to loopback).
+    pub url: String,
+    /// `auto` or `token`.
+    pub auth: String,
+    /// The random console token, only in `auto` mode.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 /// A parsed response head plus the connection that still carries its body.
 struct Response {
     status: u16,
@@ -316,6 +335,16 @@ impl Client {
     /// App-level fan-out (start|stop|restart), expanded server-side.
     pub fn app_action(&self, app: &str, verb: &str) -> Result<serde_json::Value> {
         self.call("POST", &format!("/v1/apps/{app}/{verb}"))
+    }
+
+    /// `GET /v1/webui`: the console's runtime status, including the auto
+    /// token (`ak webui` and the shell's `open` are the callers). An
+    /// unreachable daemon yields the usual [`exit_code_of`] → 3 mapping; a
+    /// malformed body is a plain error (exit 1).
+    pub fn webui(&self) -> Result<WebuiStatus> {
+        let value = self.call("GET", "/v1/webui")?;
+        serde_json::from_value(value)
+            .context("control endpoint returned an unexpected /v1/webui payload")
     }
 
     /// `start <app>`: fan out and block until every program's startup
@@ -953,6 +982,60 @@ mod tests {
             is_unreachable(&err),
             "a missing listener is offline: {text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /v1/webui` parsing: the auto token is carried through, and an
+    /// absent token (fixed mode / console off) is `None` rather than "".
+    #[test]
+    fn webui_endpoint_parses_auto_token_and_optional_token() {
+        let dir = tmp_dir("webui");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let body = r#"{"enabled":true,"serving":true,"listen":"127.0.0.1:9877","url":"http://127.0.0.1:9877","auth":"auto","token":"abc123"}"#;
+        let server = fake_server(listener, ok_response(body));
+        let c = Client::from_config(&config_with_socket(&sock));
+        let st = c.webui().unwrap();
+        assert_eq!(
+            st,
+            WebuiStatus {
+                enabled: true,
+                serving: true,
+                listen: "127.0.0.1:9877".to_string(),
+                url: "http://127.0.0.1:9877".to_string(),
+                auth: "auto".to_string(),
+                token: Some("abc123".to_string()),
+            }
+        );
+        let req = server.join().unwrap();
+        assert!(req.starts_with("GET /v1/webui HTTP/1.1\r\n"), "{req}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Fixed mode: the daemon omits the field entirely.
+        let dir = tmp_dir("webui-fixed");
+        let sock = dir.join("ak.sock");
+        let (_, listener) = bound(&sock);
+        let body = r#"{"enabled":true,"serving":true,"listen":"0.0.0.0:9000","url":"http://127.0.0.1:9000","auth":"token"}"#;
+        let server = fake_server(listener, ok_response(body));
+        let c = Client::from_config(&config_with_socket(&sock));
+        let st = c.webui().unwrap();
+        assert_eq!(st.auth, "token");
+        assert_eq!(st.token, None);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ak webui` offline: the existing unreachable class (exit 3), never a
+    /// silent fallback to the local config.
+    #[test]
+    fn webui_offline_maps_to_exit_3() {
+        let dir = tmp_dir("webui-dead");
+        let sock = dir.join("ak.sock");
+        let c = Client::from_config(&config_with_socket(&sock));
+        let err = c.webui().expect_err("nothing is listening");
+        assert!(format!("{err:#}").contains(UNREACHABLE));
+        assert_eq!(exit_code_of(&err), 3);
+        assert!(is_unreachable(&err));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

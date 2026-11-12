@@ -176,6 +176,74 @@ pub(crate) fn status_doc(sup: &Arc<Supervisor>) -> StatusDoc {
     }
 }
 
+/// `GET /v1/webui` (add-webui-launch-command D2/D10): the console's runtime
+/// status for the CLI. `enabled` is the config intent, `serving` the manager's
+/// last applied outcome, and `token` exists only in `auto` mode — a fixed
+/// token is never echoed. The token comes from the live [`ConsoleAuth`], so
+/// the answer reflects what the router actually enforces; the intent's
+/// resolved token is the fallback while a degraded console is not serving.
+///
+/// This is the only surface that carries the token: it is not part of
+/// [`StatusDoc`], `/v1/programs*` or any `/api/*` response.
+pub(crate) fn webui_status_json(sup: &Arc<Supervisor>) -> serde_json::Value {
+    let snapshot = sup.webui.snapshot();
+    let intent = &snapshot.intent;
+    // The absent section still answers with the built-in default address, so
+    // a client can render the "enable it here" hint (control-plane spec).
+    let listen = if intent.enabled {
+        intent.listen.clone()
+    } else {
+        crate::config::DEFAULT_WEBUI_LISTEN.to_string()
+    };
+    // The token is only ever handed out for the intent the manager has
+    // actually converged on (`serving`). During a reload window the new auto
+    // intent may already be published while the live credential is still the
+    // old fixed token; echoing either value would hand `ak webui` a stale
+    // bootstrap URL, so the window reports no token and the CLI exits 1.
+    let token = match intent.mode {
+        crate::config::WebuiTokenMode::Auto if snapshot.serving => {
+            let live = sup.console_auth.lock().unwrap().token().to_string();
+            let token = if live.is_empty() {
+                intent.token.clone()
+            } else {
+                live
+            };
+            (!token.is_empty()).then_some(token)
+        }
+        _ => None,
+    };
+    let mut doc = serde_json::json!({
+        "enabled": intent.enabled,
+        "serving": snapshot.serving,
+        "listen": listen,
+        "url": webui_console_url(&listen),
+        "auth": intent.mode.as_str(),
+    });
+    if let Some(token) = token {
+        doc["token"] = serde_json::Value::String(token);
+    }
+    doc
+}
+
+/// Browser-facing base URL for a `webui.listen` value. Wildcard binds are
+/// rendered as loopback — a browser cannot use `0.0.0.0`/`::`
+/// (control-plane spec: MUST NOT output an unreachable wildcard address).
+pub(crate) fn webui_console_url(listen: &str) -> String {
+    let (host, port) = match listen.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (listen, None),
+    };
+    let host = match host {
+        "0.0.0.0" | "::" | "[::]" | "[::0]" => "127.0.0.1".to_string(),
+        h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
+        h => h.to_string(),
+    };
+    match port {
+        Some(port) => format!("http://{host}:{port}"),
+        None => format!("http://{host}"),
+    }
+}
+
 /// Build the status projection of one program. `metrics` is the shared
 /// sampler table; passing `None` leaves metric fields empty (used by tests).
 /// `config_path` is the app's config file path (run-daemon-first D7), looked
@@ -470,6 +538,10 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
                 },
             )
         }
+        // Console bootstrap endpoint (add-webui-launch-command D2): the only
+        // projection that may carry the auto token, and only under the same
+        // admission as every other `/v1/*` route.
+        ("GET", ["v1", "webui"]) => json_bytes(200, webui_status_json(sup)),
         ("GET", ["v1", "programs"]) => {
             let st = sup.state.lock().unwrap();
             let mut programs: Vec<ProgramInfo> = st
@@ -2086,6 +2158,236 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The JSON body of a non-streaming control-plane response.
+    fn response_json(resp: &str) -> serde_json::Value {
+        let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is JSON ({e}): {resp}"))
+    }
+
+    /// Publish an intent and converge a real webui manager on it (the same
+    /// thread `run_daemon` spawns). Returns the manager handle; stop it with
+    /// [`stop_console_manager`].
+    fn converge_console(
+        sup: &Arc<Supervisor>,
+        listen: &str,
+        mode: crate::config::WebuiTokenMode,
+        token: &str,
+    ) -> std::thread::JoinHandle<()> {
+        let sup2 = sup.clone();
+        let mgr = std::thread::spawn(move || crate::supervisor::webui_manager_loop(sup2));
+        let generation = sup.webui.set_desired(crate::supervisor::WebuiIntent {
+            enabled: true,
+            listen: listen.to_string(),
+            mode,
+            token: token.to_string(),
+        });
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(ok, "console converged: {note}");
+        mgr
+    }
+
+    fn stop_console_manager(sup: &Arc<Supervisor>, mgr: std::thread::JoinHandle<()>) {
+        sup.request_shutdown();
+        mgr.join().unwrap();
+    }
+
+    /// add-webui-launch-command 3.1: `GET /v1/webui` reports the auto token
+    /// in auto mode, withholds it for a fixed token, and falls back to the
+    /// built-in default address when the console is off. The wildcard URL
+    /// mapping is part of the same contract.
+    #[test]
+    fn webui_endpoint_reports_auto_fixed_and_disabled() {
+        let (sup, dir, ep) = serve_harness("v1-webui-modes");
+        let listen = format!("127.0.0.1:{}", free_tcp_port());
+        let token = crate::web::generate_console_token().unwrap();
+        let mgr = converge_console(&sup, &listen, crate::config::WebuiTokenMode::Auto, &token);
+
+        // auto: every documented field, token included and matching the live
+        // credential the router enforces.
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["enabled"], true);
+        assert_eq!(doc["serving"], true);
+        assert_eq!(doc["listen"], listen);
+        assert_eq!(doc["url"], format!("http://{listen}"));
+        assert_eq!(doc["auth"], "auto");
+        assert_eq!(doc["token"], token);
+        assert_eq!(sup.console_auth.lock().unwrap().token(), token);
+
+        // fixed: `auth` flips and the token is absent — never echoed.
+        let generation = sup.webui.set_desired(crate::supervisor::WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+            mode: crate::config::WebuiTokenMode::Fixed("s3cr3t".into()),
+            token: "s3cr3t".into(),
+        });
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(ok, "fixed-token console converged: {note}");
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["enabled"], true);
+        assert_eq!(doc["serving"], true);
+        assert_eq!(doc["auth"], "token");
+        assert!(
+            doc.get("token").is_none(),
+            "fixed token must not be echoed: {doc}"
+        );
+
+        // disabled: intent off, nothing serving, built-in default address.
+        let generation = sup
+            .webui
+            .set_desired(crate::supervisor::WebuiIntent::disabled());
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(ok, "console disabled: {note}");
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["enabled"], false);
+        assert_eq!(doc["serving"], false);
+        assert_eq!(doc["listen"], crate::config::DEFAULT_WEBUI_LISTEN);
+        assert_eq!(
+            doc["url"],
+            format!("http://{}", crate::config::DEFAULT_WEBUI_LISTEN)
+        );
+        assert!(doc.get("token").is_none(), "no token when off: {doc}");
+
+        stop_console_manager(&sup, mgr);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// add-webui-launch-command fix: while a new intent is published but not
+    /// yet converged, `/v1/webui` must report `serving: false` and withhold
+    /// the token. This is the fixed→auto leak the review found: the live
+    /// console still enforces the old fixed credential, so echoing anything
+    /// would hand `ak webui` a stale bootstrap URL. No manager thread runs
+    /// here, which pins the window deterministically.
+    #[test]
+    fn webui_status_withholds_the_token_while_a_mode_switch_is_pending() {
+        let (sup, dir, ep) = serve_harness("v1-webui-switch-pending");
+        let listen = format!("127.0.0.1:{}", free_tcp_port());
+        let live_token = crate::web::generate_console_token().unwrap();
+        // The console is still serving the previous (fixed) intent.
+        *sup.console_auth.lock().unwrap() = Arc::new(crate::web::ConsoleAuth::new("s3cr3t"));
+
+        let new_token = crate::web::generate_console_token().unwrap();
+        sup.webui.set_desired(crate::supervisor::WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+            mode: crate::config::WebuiTokenMode::Auto,
+            token: new_token.clone(),
+        });
+
+        let snapshot = sup.webui.snapshot();
+        assert!(!snapshot.serving, "pending generation is not serving");
+        assert!(snapshot.error.is_none(), "a pending switch is not an error");
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["enabled"], true);
+        assert_eq!(doc["serving"], false);
+        assert_eq!(doc["auth"], "auto");
+        assert!(
+            doc.get("token").is_none(),
+            "no token during the reload window: {doc}"
+        );
+        assert_eq!(
+            sup.console_auth.lock().unwrap().token(),
+            "s3cr3t",
+            "the live console still enforces the old fixed token"
+        );
+        assert_ne!(new_token, live_token);
+
+        // auto→fixed symmetry: the window is closed the same way (and fixed
+        // mode never echoes a token, so `serving: false` is what stops the CLI
+        // from opening anything).
+        sup.webui.set_desired(crate::supervisor::WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+            mode: crate::config::WebuiTokenMode::Fixed("n3w".into()),
+            token: "n3w".into(),
+        });
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["serving"], false);
+        assert_eq!(doc["auth"], "token");
+        assert!(doc.get("token").is_none(), "fixed mode never echoes: {doc}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// After the manager converges on the new auto generation, serving
+    /// resumes and the endpoint returns the new live token (fixed → auto).
+    #[test]
+    fn webui_status_returns_the_new_token_after_a_mode_switch_converges() {
+        let (sup, dir, ep) = serve_harness("v1-webui-switch-converged");
+        let listen = format!("127.0.0.1:{}", free_tcp_port());
+        let mgr = converge_console(
+            &sup,
+            &listen,
+            crate::config::WebuiTokenMode::Fixed("s3cr3t".into()),
+            "s3cr3t",
+        );
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["serving"], true);
+        assert_eq!(doc["auth"], "token");
+        assert!(doc.get("token").is_none(), "fixed mode never echoes: {doc}");
+
+        let new_token = crate::web::generate_console_token().unwrap();
+        let generation = sup.webui.set_desired(crate::supervisor::WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+            mode: crate::config::WebuiTokenMode::Auto,
+            token: new_token.clone(),
+        });
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(ok, "auto console converged: {note}");
+
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["serving"], true);
+        assert_eq!(doc["auth"], "auto");
+        assert_eq!(doc["token"], new_token);
+        assert_eq!(sup.console_auth.lock().unwrap().token(), new_token);
+
+        stop_console_manager(&sup, mgr);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The wildcard binds are rendered as loopback (a browser cannot use
+    /// `0.0.0.0` / `::`), IPv6 literals get brackets, and a host:port passes
+    /// through otherwise.
+    #[test]
+    fn webui_url_maps_wildcards_and_brackets_ipv6() {
+        assert_eq!(webui_console_url("0.0.0.0:9877"), "http://127.0.0.1:9877");
+        assert_eq!(webui_console_url("[::]:9877"), "http://127.0.0.1:9877");
+        assert_eq!(webui_console_url("::1:9877"), "http://[::1]:9877");
+        assert_eq!(webui_console_url("[::1]:9877"), "http://[::1]:9877");
+        assert_eq!(webui_console_url("localhost:8080"), "http://localhost:8080");
+    }
+
+    /// add-webui-launch-command 3.2: the auto token is reachable only through
+    /// `/v1/webui`; the regular status projections never carry it.
+    #[test]
+    fn console_token_never_appears_in_status_projections() {
+        let (sup, dir, ep) = serve_harness("v1-webui-token-leak");
+        let listen = format!("127.0.0.1:{}", free_tcp_port());
+        let token = crate::web::generate_console_token().unwrap();
+        let mgr = converge_console(&sup, &listen, crate::config::WebuiTokenMode::Auto, &token);
+
+        // Sanity: the bootstrap endpoint does hand it out.
+        let doc = response_json(&ep.get("/v1/webui"));
+        assert_eq!(doc["token"], token);
+
+        for path in [
+            "/v1/status",
+            "/v1/programs",
+            "/v1/programs/ghost",
+            "/v1/pending",
+            "/v1/health",
+        ] {
+            let resp = ep.get(path);
+            assert!(
+                !resp.contains(&token),
+                "{path} leaked the console token: {resp}"
+            );
+        }
+
+        stop_console_manager(&sup, mgr);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn sleep_cmd() -> (&'static str, Vec<String>) {

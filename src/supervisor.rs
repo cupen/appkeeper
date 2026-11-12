@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, DaemonConfig, ResolvedApp, ResolvedProgram};
+use crate::config::{self, DaemonConfig, ResolvedApp, ResolvedProgram, WebuiTokenMode};
 use crate::health;
 use crate::program::{ManagedProgram, ProgramState};
 use crate::registry;
@@ -2850,9 +2850,13 @@ impl Supervisor {
         let config_path = self.config_path.lock().unwrap().clone();
         let (new_config, _) = DaemonConfig::load_or_default(&config_path)
             .map_err(|e| anyhow::anyhow!("reload aborted, daemon config invalid: {e:#}"))?;
+        // Hand the published intent in so an unchanged `auto` token survives
+        // the reload (design D4): the manager only rebinds when the intent
+        // actually differs.
+        let previous = self.webui.snapshot().intent;
         let generation = self
             .webui
-            .set_desired(WebuiIntent::from_config(&new_config));
+            .set_desired(WebuiIntent::from_config(&new_config, Some(&previous)));
         // Degraded convergence is logged by the webui manager; the note is
         // appended to the reply below for the CLI caller.
         let (_, note) = self.webui.wait_applied(generation, WEBUI_CONVERGE_TIMEOUT);
@@ -3348,10 +3352,14 @@ const WEBUI_BIND_WAIT: Duration = Duration::from_secs(5);
 pub struct WebuiIntent {
     pub enabled: bool,
     pub listen: String,
-    /// The console's own access-control token; empty = the console applies no
-    /// application-layer credential and its isolation is whatever
-    /// `webui.listen` grants (webui-api capability).
-    pub auth_token: String,
+    /// How the token is sourced: `Auto` (generated, design D4) or a fixed
+    /// config value. Serialized nowhere — `/v1/webui` reports only the mode
+    /// name (`auth`).
+    pub mode: WebuiTokenMode,
+    /// The resolved token the console must enforce. For `Auto` this is the
+    /// generated token; empty only when generation failed, in which case the
+    /// manager refuses to serve (never an empty credential).
+    pub token: String,
 }
 
 impl WebuiIntent {
@@ -3359,22 +3367,70 @@ impl WebuiIntent {
         Self::default()
     }
 
-    pub fn from_config(config: &DaemonConfig) -> Self {
-        match config.webui_listen() {
-            Some(listen) => Self {
-                enabled: true,
-                listen: listen.to_string(),
-                auth_token: config.webui_auth_token().unwrap_or("").to_string(),
-            },
-            None => Self::disabled(),
+    /// Resolve the config's console intent into a runnable one (design D4).
+    /// `previous` is the currently published intent: it is consulted only to
+    /// keep an `auto` token alive across reloads (auto → auto with an
+    /// unchanged `listen`), so a routine `ak config --reload` does not kick
+    /// every browser session. Generation failure is logged here and yields an
+    /// empty token; the manager degrades (records the error, does not serve)
+    /// exactly like a bind failure.
+    pub fn from_config(config: &DaemonConfig, previous: Option<&WebuiIntent>) -> Self {
+        let Some(listen) = config.webui_listen() else {
+            return Self::disabled();
+        };
+        let mode = config.webui_token_mode().unwrap_or_default();
+        let token = match &mode {
+            WebuiTokenMode::Fixed(token) => token.clone(),
+            WebuiTokenMode::Auto => {
+                let keep = previous.filter(|p| {
+                    p.enabled
+                        && p.listen == listen
+                        && p.mode == WebuiTokenMode::Auto
+                        && !p.token.is_empty()
+                });
+                match keep {
+                    Some(p) => p.token.clone(),
+                    None => match crate::web::generate_console_token() {
+                        Ok(token) => token,
+                        Err(e) => {
+                            error!(
+                                "webui console token generation failed: {e}; \
+                                 the console will not be served"
+                            );
+                            String::new()
+                        }
+                    },
+                }
+            }
+        };
+        Self {
+            enabled: true,
+            listen: listen.to_string(),
+            mode,
+            token,
         }
     }
 
     /// Does an instance bound to `listen` with this token already satisfy the
     /// intent? Rotating the token forces a rebind — the router holds it.
     fn serves(&self, listen: &str, auth_token: &str) -> bool {
-        self.enabled && self.listen == listen && self.auth_token == auth_token
+        self.enabled && self.listen == listen && self.token == auth_token
     }
+}
+
+/// Read-only view of the console lifecycle for `GET /v1/webui` (design D10):
+/// the published intent plus the manager's last convergence outcome. The
+/// token is deliberately *not* part of a serde structure; the endpoint reads
+/// the live token from [`crate::web::ConsoleAuth`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebuiSnapshot {
+    pub intent: WebuiIntent,
+    /// True only when the manager applied the current intent with a running
+    /// console (a disabled intent is never "serving").
+    pub serving: bool,
+    /// The manager's last failure note, if any (`None` on success or before
+    /// the first convergence).
+    pub error: Option<String>,
 }
 
 /// Shared intent mailbox between the reload path (writer) and the resident
@@ -3421,6 +3477,37 @@ impl WebuiControl {
     fn desired(&self) -> (WebuiIntent, u64) {
         let sh = self.shared.lock().unwrap();
         sh.desired.clone().unwrap_or((WebuiIntent::disabled(), 0))
+    }
+
+    /// The console's published intent and last applied outcome. `GET /v1/webui`
+    /// reports this verbatim (design D10): `enabled` is the intent, `serving`
+    /// is only true when that intent was applied with a live console, and an
+    /// unapplied/failed convergence carries the note in `error`.
+    pub fn snapshot(&self) -> WebuiSnapshot {
+        let sh = self.shared.lock().unwrap();
+        let (desired_generation, intent) = match &sh.desired {
+            Some((intent, generation)) => (*generation, intent.clone()),
+            None => (0, WebuiIntent::disabled()),
+        };
+        // Only the generation the manager actually converged on counts. A
+        // mismatch is the reload window (new intent published, manager still
+        // holding the old console) or a late result from the previous
+        // generation; reporting `serving` there would let `/v1/webui` echo a
+        // token the current intent no longer owns.
+        let (serving, error) = match &sh.applied {
+            Some((generation, true, _)) if *generation == desired_generation => {
+                (intent.enabled, None)
+            }
+            Some((generation, false, note)) if *generation == desired_generation => {
+                (false, Some(note.clone()))
+            }
+            _ => (false, None),
+        };
+        WebuiSnapshot {
+            intent,
+            serving,
+            error,
+        }
     }
 
     /// Bounded wait until the manager reports `generation` applied. On timeout the
@@ -3475,7 +3562,7 @@ struct RunningWebui {
     listen: String,
     /// The token the running router enforces; part of the identity, so a
     /// rotated token rebinds instead of leaving the old one in place.
-    auth_token: String,
+    token: String,
     stop: Arc<crate::web::WebuiLifecycle>,
     handle: Option<std::thread::JoinHandle<Result<()>>>,
 }
@@ -3538,6 +3625,10 @@ fn start_webui(
     listen: &str,
     auth_token: &str,
 ) -> (Option<RunningWebui>, bool, String) {
+    debug_assert!(
+        !auth_token.is_empty(),
+        "the manager never starts a console without a token"
+    );
     let stop = crate::web::WebuiLifecycle::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let sup2 = Arc::clone(sup);
@@ -3552,7 +3643,7 @@ fn start_webui(
         Ok(Ok(bound)) => (
             Some(RunningWebui {
                 listen: bound.clone(),
-                auth_token: auth_token.to_string(),
+                token: auth_token.to_string(),
                 stop,
                 handle: Some(handle),
             }),
@@ -3580,7 +3671,7 @@ fn start_webui(
             (
                 Some(RunningWebui {
                     listen: listen.to_string(),
-                    auth_token: auth_token.to_string(),
+                    token: auth_token.to_string(),
                     stop,
                     handle: Some(handle),
                 }),
@@ -3621,7 +3712,7 @@ pub fn webui_manager_loop(sup: Arc<Supervisor>) {
         if generation > converged_gen {
             let matches = running
                 .as_ref()
-                .map(|r| desired.serves(&r.listen, &r.auth_token))
+                .map(|r| desired.serves(&r.listen, &r.token))
                 .unwrap_or(false);
             if matches {
                 sup.webui.mark_applied(
@@ -3634,9 +3725,19 @@ pub fn webui_manager_loop(sup: Arc<Supervisor>) {
                     old.stop_and_wait();
                 }
                 running = None;
-                if desired.enabled {
+                if desired.enabled && desired.token.is_empty() {
+                    // Auto-token generation failed (design D3/D4): degrade
+                    // exactly like a bind failure instead of serving an
+                    // empty credential.
+                    let note = "webui console unavailable: no secure random source for the \
+                                auto token (daemon continues without it; fix the environment \
+                                and reload to retry)"
+                        .to_string();
+                    error!("{note}");
+                    sup.webui.mark_applied(generation, false, note);
+                } else if desired.enabled {
                     info!("webui console starting on {}", desired.listen);
-                    let (inst, ok, note) = start_webui(&sup, &desired.listen, &desired.auth_token);
+                    let (inst, ok, note) = start_webui(&sup, &desired.listen, &desired.token);
                     running = inst;
                     // Log degraded starts (bind failure, early exit) right
                     // here so both `run` startup and `reload` record it —
@@ -5358,6 +5459,18 @@ mod tests {
         note
     }
 
+    /// An enabled intent with a fixed token. The manager refuses an empty
+    /// token (there is no unauthenticated console), so tests that want a
+    /// serving console always inject one.
+    fn intent(listen: &str) -> WebuiIntent {
+        WebuiIntent {
+            enabled: true,
+            listen: listen.to_string(),
+            mode: WebuiTokenMode::Fixed("test-token".to_string()),
+            token: "test-token".to_string(),
+        }
+    }
+
     /// manager: an enabled intent starts the console, a disabled one stops
     /// it and closes the port (reload 动态开关的服务端机制).
     #[test]
@@ -5369,11 +5482,7 @@ mod tests {
         let listen = format!("127.0.0.1:{}", free_port());
         let mgr = spawn_manager(&sup);
 
-        let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: listen.clone(),
-            ..Default::default()
-        });
+        let generation = sup.webui.set_desired(intent(&listen));
         let note = wait_applied_ok(&sup, generation);
         assert!(
             note.contains("serving on http://"),
@@ -5408,19 +5517,11 @@ mod tests {
         let new = format!("127.0.0.1:{}", free_port());
         let mgr = spawn_manager(&sup);
 
-        let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: old.clone(),
-            ..Default::default()
-        });
+        let generation = sup.webui.set_desired(intent(&old));
         wait_applied_ok(&sup, generation);
         assert!(std::net::TcpStream::connect(&old).is_ok());
 
-        let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: new.clone(),
-            ..Default::default()
-        });
+        let generation = sup.webui.set_desired(intent(&new));
         wait_applied_ok(&sup, generation);
         std::thread::sleep(Duration::from_millis(150));
         assert!(
@@ -5437,7 +5538,8 @@ mod tests {
 
     /// manager: binding a taken port degrades non-fatally (D5) — the daemon
     /// stays alive, the failure is reported, and the next intent change
-    /// (once the port is free again) recovers.
+    /// (once the port is free again) recovers. `snapshot()` reports the same
+    /// outcome (`serving == false`, non-empty error) for `/v1/webui`.
     #[test]
     fn webui_bind_failure_degrades_then_recovers() {
         let (sup, _) = setup(
@@ -5448,32 +5550,65 @@ mod tests {
         let taken = format!("{}", blocker.local_addr().unwrap());
         let mgr = spawn_manager(&sup);
 
-        let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: taken.clone(),
-            ..Default::default()
-        });
+        let generation = sup.webui.set_desired(intent(&taken));
         let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
         assert!(!ok, "occupied port must not report success: {note}");
         assert!(
             note.contains("unavailable") && note.contains("reload to retry"),
             "note explains the degradation and the retry path: {note}"
         );
+        // design D10: the endpoint-facing snapshot tells the same story.
+        let snap = sup.webui.snapshot();
+        assert!(snap.intent.enabled);
+        assert!(!snap.serving, "a failed bind is not serving");
+        assert!(snap.error.is_some(), "the failure note survives");
         // The daemon itself is unaffected.
         assert!(!sup.state.lock().unwrap().shutdown.load(Ordering::SeqCst));
 
         // Free the port and re-publish the same intent: the manager retries.
         drop(blocker);
         std::thread::sleep(Duration::from_millis(100));
-        let generation = sup.webui.set_desired(WebuiIntent {
-            enabled: true,
-            listen: taken.clone(),
-            ..Default::default()
-        });
+        let generation = sup.webui.set_desired(intent(&taken));
         wait_applied_ok(&sup, generation);
         assert!(
             std::net::TcpStream::connect(&taken).is_ok(),
             "console serving after the port freed up"
+        );
+        assert!(sup.webui.snapshot().serving);
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
+    }
+
+    /// manager: an enabled intent with an empty token (the auto-token
+    /// generation failed) degrades like a bind failure — never an empty
+    /// credential on the wire (design D3/D4).
+    #[test]
+    fn webui_without_a_token_never_serves() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let listen = format!("127.0.0.1:{}", free_port());
+        let mgr = spawn_manager(&sup);
+
+        let generation = sup.webui.set_desired(WebuiIntent {
+            enabled: true,
+            listen: listen.clone(),
+            mode: WebuiTokenMode::Auto,
+            token: String::new(),
+        });
+        let (ok, note) = sup.webui.wait_applied(generation, Duration::from_secs(10));
+        assert!(!ok, "an empty token must never serve: {note}");
+        assert!(
+            note.contains("random source"),
+            "the note names the generation failure: {note}"
+        );
+        let snap = sup.webui.snapshot();
+        assert!(!snap.serving);
+        assert!(snap.error.is_some());
+        assert!(
+            std::net::TcpStream::connect(&listen).is_err(),
+            "nothing was bound"
         );
         end_manager(&sup, mgr);
         let _ = sup.shutdown_all();
@@ -5483,30 +5618,187 @@ mod tests {
     /// and reload (`cmd_reload`): section absent = disabled, bare section =
     /// enabled at the built-in default listen, explicit listen passes through
     /// (webui-api: 启动时按配置伺服; configuration: `listen` 缺省 127.0.0.1:9877).
+    /// An unconfigured `auth_token` resolves to a generated auto token.
     #[test]
     fn webui_intent_from_config_maps_presence_and_default() {
         let off: DaemonConfig = toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
-        assert_eq!(WebuiIntent::from_config(&off), WebuiIntent::disabled());
+        assert_eq!(
+            WebuiIntent::from_config(&off, None),
+            WebuiIntent::disabled()
+        );
         // A bare `[webui]` table enables the console at the default address.
         let bare: DaemonConfig = toml::from_str("[webui]\n").unwrap();
-        assert_eq!(
-            WebuiIntent::from_config(&bare),
-            WebuiIntent {
-                enabled: true,
-                listen: crate::config::DEFAULT_WEBUI_LISTEN.to_string(),
-                ..Default::default()
-            }
-        );
+        let bare_intent = WebuiIntent::from_config(&bare, None);
+        assert!(bare_intent.enabled);
+        assert_eq!(bare_intent.listen, crate::config::DEFAULT_WEBUI_LISTEN);
+        assert_eq!(bare_intent.mode, WebuiTokenMode::Auto);
+        assert_eq!(bare_intent.token.len(), 64, "auto token is generated");
         // An explicit listen passes through verbatim.
-        let explicit: DaemonConfig = toml::from_str("[webui]\nlisten = '0.0.0.0:8080'\n").unwrap();
-        assert_eq!(
-            WebuiIntent::from_config(&explicit),
-            WebuiIntent {
-                enabled: true,
-                listen: "0.0.0.0:8080".to_string(),
-                ..Default::default()
-            }
+        let explicit: DaemonConfig =
+            toml::from_str("[webui]\nlisten = '0.0.0.0:8080'\nauth_token = 's3cr3t'\n").unwrap();
+        let explicit_intent = WebuiIntent::from_config(&explicit, None);
+        assert!(explicit_intent.enabled);
+        assert_eq!(explicit_intent.listen, "0.0.0.0:8080");
+        assert_eq!(explicit_intent.mode, WebuiTokenMode::Fixed("s3cr3t".into()));
+        assert_eq!(explicit_intent.token, "s3cr3t");
+        // The reserved `auto` behaves exactly like "unconfigured".
+        let auto: DaemonConfig = toml::from_str("[webui]\nauth_token = 'auto'\n").unwrap();
+        let auto_intent = WebuiIntent::from_config(&auto, None);
+        assert_eq!(auto_intent.mode, WebuiTokenMode::Auto);
+        assert_eq!(auto_intent.token.len(), 64);
+    }
+
+    /// design D4's keep/rotate table, resolved at reload time:
+    /// auto→auto keeps the token, off→on / fixed→auto generate a new one, and
+    /// auto→fixed adopts the configured value. A `listen` change rotates too
+    /// (the console rebinds on a different origin anyway).
+    #[test]
+    fn webui_intent_rotation_table() {
+        let auto_cfg: DaemonConfig =
+            toml::from_str("[webui]\nlisten = '127.0.0.1:9001'\n").unwrap();
+        let first = WebuiIntent::from_config(&auto_cfg, None);
+        assert_eq!(first.mode, WebuiTokenMode::Auto);
+        assert!(!first.token.is_empty());
+
+        // auto → auto with an unchanged listen: keep (browser sessions and
+        // stored tokens survive a routine reload).
+        let again = WebuiIntent::from_config(&auto_cfg, Some(&first));
+        assert_eq!(again.token, first.token);
+        assert_eq!(again.mode, WebuiTokenMode::Auto);
+
+        // auto → auto with a changed listen: rotate (new origin, new bind).
+        let moved_cfg: DaemonConfig =
+            toml::from_str("[webui]\nlisten = '127.0.0.1:9002'\n").unwrap();
+        let moved = WebuiIntent::from_config(&moved_cfg, Some(&first));
+        assert_ne!(moved.token, first.token);
+        assert_eq!(moved.listen, "127.0.0.1:9002");
+
+        // off → on: generate (the previous intent is disabled).
+        let off = WebuiIntent::disabled();
+        let reopened = WebuiIntent::from_config(&auto_cfg, Some(&off));
+        assert_ne!(reopened.token, first.token);
+        assert_eq!(reopened.token.len(), 64);
+
+        // fixed → auto: generate, never reuse the fixed value.
+        let fixed = WebuiIntent::from_config(
+            &toml::from_str::<DaemonConfig>(
+                "[webui]\nlisten = '127.0.0.1:9001'\nauth_token = 's3cr3t'\n",
+            )
+            .unwrap(),
+            None,
         );
+        let back_to_auto = WebuiIntent::from_config(&auto_cfg, Some(&fixed));
+        assert_eq!(back_to_auto.mode, WebuiTokenMode::Auto);
+        assert_ne!(back_to_auto.token, "s3cr3t");
+        assert_eq!(back_to_auto.token.len(), 64);
+
+        // auto → fixed: adopt the configured value (old sessions invalid).
+        let to_fixed = WebuiIntent::from_config(
+            &toml::from_str::<DaemonConfig>(
+                "[webui]\nlisten = '127.0.0.1:9001'\nauth_token = 'n3w'\n",
+            )
+            .unwrap(),
+            Some(&first),
+        );
+        assert_eq!(to_fixed.mode, WebuiTokenMode::Fixed("n3w".into()));
+        assert_eq!(to_fixed.token, "n3w");
+    }
+
+    /// reload (task 2.5): resolving the same auto config twice — as
+    /// A published-but-unconverged intent is not serving: during the reload
+    /// window the console still runs the old credential, so `/v1/webui` must
+    /// report `serving: false` (and therefore withhold the token). The same
+    /// holds for auto→fixed, where the live token is still the auto one.
+    #[test]
+    fn webui_snapshot_is_not_serving_until_the_generation_converges() {
+        let control = WebuiControl::new();
+        let auto = |listen: &str, token: &str| WebuiIntent {
+            enabled: true,
+            listen: listen.to_string(),
+            mode: WebuiTokenMode::Auto,
+            token: token.to_string(),
+        };
+
+        // fixed → auto: the manager has applied the fixed intent.
+        let g1 = control.set_desired(WebuiIntent {
+            enabled: true,
+            listen: "127.0.0.1:9101".into(),
+            mode: WebuiTokenMode::Fixed("s3cr3t".into()),
+            token: "s3cr3t".into(),
+        });
+        control.mark_applied(g1, true, "serving".into());
+        assert!(control.snapshot().serving);
+
+        // New auto intent published; the manager still holds the fixed one.
+        let g2 = control.set_desired(auto("127.0.0.1:9101", "new-auto-token"));
+        assert!(g2 > g1);
+        let snap = control.snapshot();
+        assert!(!snap.serving, "pending generation must not be serving");
+        assert!(snap.error.is_none(), "a pending switch is not an error");
+        assert_eq!(snap.intent.mode, WebuiTokenMode::Auto);
+
+        // A late result from the previous generation does not count either.
+        control.mark_applied(g1, true, "late".into());
+        assert!(!control.snapshot().serving);
+
+        // Convergence on the new generation restores serving.
+        control.mark_applied(g2, true, "serving".into());
+        assert!(control.snapshot().serving);
+
+        // auto → fixed: same window, live token is still the auto one.
+        let g3 = control.set_desired(WebuiIntent {
+            enabled: true,
+            listen: "127.0.0.1:9101".into(),
+            mode: WebuiTokenMode::Fixed("n3w".into()),
+            token: "n3w".into(),
+        });
+        assert!(
+            !control.snapshot().serving,
+            "auto→fixed window is not serving"
+        );
+        control.mark_applied(g3, true, "serving".into());
+        assert!(control.snapshot().serving);
+    }
+
+    /// `cmd_reload` does with the previous intent — keeps the live token and
+    /// re-publishes an intent the manager already satisfies (no rebind).
+    #[test]
+    fn webui_reload_keeps_the_auto_token_without_rebinding() {
+        let (sup, _) = setup(
+            "demo",
+            "[app]\nautostart = false\n[program.p]\ncommand = 'true'\nstartsecs = 0.0\n",
+        );
+        let listen = format!("127.0.0.1:{}", free_port());
+        let cfg: DaemonConfig =
+            toml::from_str(&format!("[webui]\nlisten = \"{listen}\"\n")).unwrap();
+        let mgr = spawn_manager(&sup);
+
+        let first = WebuiIntent::from_config(&cfg, None);
+        let generation = sup.webui.set_desired(first.clone());
+        wait_applied_ok(&sup, generation);
+        let live = first.token.clone();
+        assert_eq!(
+            sup.console_auth.lock().unwrap().token(),
+            live,
+            "the router enforces the generated token"
+        );
+
+        // Second reload: previous intent handed in, token preserved.
+        let second = WebuiIntent::from_config(&cfg, Some(&sup.webui.snapshot().intent));
+        assert_eq!(second.token, live);
+        let generation = sup.webui.set_desired(second);
+        wait_applied_ok(&sup, generation);
+        assert_eq!(
+            sup.console_auth.lock().unwrap().token(),
+            live,
+            "no rotation on an unchanged auto config"
+        );
+        assert!(
+            std::net::TcpStream::connect(&listen).is_ok(),
+            "the console stayed up"
+        );
+        end_manager(&sup, mgr);
+        let _ = sup.shutdown_all();
     }
 
     /// reload: an unchanged `[webui]` section re-publishes the same intent and

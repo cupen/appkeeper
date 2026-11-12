@@ -26,6 +26,7 @@ mod shutdown_signal;
 mod supervisor;
 mod transport;
 mod web;
+mod webui_open;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -274,6 +275,17 @@ enum Cmd {
         /// App name
         #[arg(value_name = "APP")]
         name: String,
+    },
+    /// Open the embedded web console in the system browser (daemon required)
+    Webui {
+        /// Print the full URL (with the bootstrap token in auto mode) and
+        /// exit; never opens a browser
+        #[arg(long = "print-url", conflicts_with = "json")]
+        print_url: bool,
+        /// Machine-readable output: {url, listen, auth, opened}; never opens
+        /// a browser
+        #[arg(long = "json")]
+        json: bool,
     },
     /// Interactive shell client (supervisorctl style)
     Shell {
@@ -1014,6 +1026,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Remove { name }) => remove_cmd(&config_path, name),
+        Some(Cmd::Webui { print_url, json }) => webui_cmd(&config_path, *print_url, *json),
         Some(Cmd::Shell { cmd }) => shell::run(&config_path, cmd.as_deref()),
     }
 }
@@ -2035,6 +2048,49 @@ fn remove_cmd(config_path: &Path, app: &str) -> Result<()> {
     })
 }
 
+/// `ak webui` (add-webui-launch-command): daemon-first — read the console's
+/// runtime status from `GET /v1/webui`, then print/open according to the
+/// mode. Offline is the client contract's exit 3; an unusable console and a
+/// failed launch are exit 1 with a repair hint; headless prints the full URL
+/// and exits 0. The token is only ever printed by the explicit output modes
+/// (`--print-url`, `--json`) and by the headless/launch-failure fallbacks,
+/// never by the regular success line.
+fn webui_cmd(config_path: &Path, print_url: bool, json: bool) -> Result<()> {
+    let config = client::load_config(config_path)?;
+    let c = client::Client::from_config(&config);
+    let status = match c.webui() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("ak: error: {e:#}");
+            std::process::exit(client::exit_code_of(&e));
+        }
+    };
+    let mode = if print_url {
+        webui_open::WebuiMode::PrintUrl
+    } else if json {
+        webui_open::WebuiMode::Json
+    } else {
+        webui_open::WebuiMode::Open
+    };
+    let report = webui_open::run(
+        &status,
+        mode,
+        webui_open::gui_available(),
+        |base| webui_open::wait_ready(base, webui_open::HEALTH_BUDGET),
+        webui_open::launch_browser,
+    );
+    for line in &report.stdout {
+        println!("{line}");
+    }
+    for line in &report.stderr {
+        eprintln!("{line}");
+    }
+    if report.code != EXIT_OK {
+        std::process::exit(report.code);
+    }
+    Ok(())
+}
+
 /// `ak start|stop|restart <app>`: app-level fan-out; the server expands it in
 /// the established order and reports per-program results. For `start` the
 /// per-program `{name, config_path, pid, status}` is rendered and any failure
@@ -2659,27 +2715,6 @@ fn up_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<String
 
 // -- validate ---------------------------------------------------------------
 
-/// The warning `validate` prints when the console is on but unauthenticated.
-///
-/// The console keeps TCP (browsers cannot reach a unix socket) and owns
-/// stop / apply authority in-process, so with no `[webui] auth_token` the
-/// isolation the control socket provides does not extend to the console: any
-/// local user who can reach `webui.listen` can stop or replace programs.
-/// That is a deliberate default (existing deployments must keep working, see
-/// the `webui-api` capability) — but it must not stay silent.
-pub fn webui_open_console_warning(config: &DaemonConfig) -> Option<String> {
-    let listen = config.webui_listen()?;
-    if config.webui_auth_token().is_some() {
-        return None;
-    }
-    Some(format!(
-        "warning: [webui] is enabled without auth_token — any local user able to reach \
-         {listen} can stop or replace your programs via the console API; set one with \
-         `ak config --set webui.auth_token=<secret>` (clients then exchange it for a \
-         session cookie once)"
-    ))
-}
-
 fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
     if let Some(p) = single {
         let config = client::load_config(config_path)?;
@@ -2727,9 +2762,6 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
         for p in &a.programs {
             println!("    - {} <{}>", p.name, p.command);
         }
-    }
-    if let Some(warning) = webui_open_console_warning(&config) {
-        println!("{warning}");
     }
     Ok(())
 }
@@ -3136,7 +3168,8 @@ fn run_daemon_core(config_path: &Path) -> Result<Arc<Supervisor>> {
     );
 
     // Capture the console intent before `config` is moved into the supervisor.
-    let webui_intent = supervisor::WebuiIntent::from_config(&config);
+    // No previous intent exists: an `auto` token is generated here (design D4).
+    let webui_intent = supervisor::WebuiIntent::from_config(&config, None);
 
     let config_dir = config_dir_of(config_path);
     let sup = Supervisor::new(config, &config_dir)?;
@@ -3908,47 +3941,6 @@ mod config_cmd_tests {
     fn sync_hint_suppressed_when_reload_is_attached() {
         let config = config_with_socket(Path::new("/tmp/ak-test-mock-absent/ak.sock"));
         assert!(config_sync_hint(&config, true).is_none());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// tests: the `validate` console-auth warning (unix-socket-control-plane 6.4)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod validate_warning_tests {
-    use super::*;
-
-    fn daemon_config(toml_text: &str) -> DaemonConfig {
-        toml::from_str(toml_text).unwrap()
-    }
-
-    #[test]
-    fn console_without_token_warns_with_listen_address() {
-        let config = daemon_config("[webui]\nlisten = \"127.0.0.1:8527\"\n");
-        let warning = webui_open_console_warning(&config).expect("an open console must warn");
-        assert!(warning.contains("127.0.0.1:8527"), "{warning}");
-        assert!(warning.contains("without auth_token"), "{warning}");
-        // The warning must name what is actually at risk, not just "insecure".
-        assert!(warning.contains("stop or replace"), "{warning}");
-        // And it must name the fix.
-        assert!(
-            warning.contains("ak config --set webui.auth_token="),
-            "{warning}"
-        );
-    }
-
-    #[test]
-    fn console_with_token_stays_silent() {
-        let config =
-            daemon_config("[webui]\nlisten = \"127.0.0.1:8527\"\nauth_token = \"s3cret\"\n");
-        assert!(webui_open_console_warning(&config).is_none());
-    }
-
-    #[test]
-    fn console_absent_stays_silent() {
-        let config = daemon_config("[daemon]\nlog_level = \"warn\"\n");
-        assert!(webui_open_console_warning(&config).is_none());
     }
 }
 

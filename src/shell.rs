@@ -1,20 +1,16 @@
 //! Interactive shell client (`appkeeper shell`) — a pure client over the
 //! control-plane API, mirroring the supervisorctl workflow. The daemon is
 //! untouched: every command reuses `client::Client` and the shared exit-code
-//! contract. The `open` verb probes the web console (`GET /api/health`) and
-//! launches the system browser; enabling the console itself is a daemon
-//! config concern (`[webui]` section + `ak config --reload`).
+//! contract. The `open` verb consumes the control plane's console status
+//! (`GET /v1/webui`) and shares the URL/probe/browser plumbing with
+//! `ak webui` (see [`crate::webui_open`]); enabling the console itself is a
+//! daemon config concern (`[webui]` section + `ak config --reload`).
 
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
 
 use crate::client::{self, Client};
-use crate::config::DEFAULT_WEBUI_LISTEN;
-
-/// Default webui listen address, matching the built-in default of the
-/// daemon config's `[webui]` section (`webui.listen`, 127.0.0.1:9877).
-const DEFAULT_WEBUI_URL: &str = "http://127.0.0.1:9877";
 
 /// What a start/stop/restart targets: a whole app (bare `<app>`, fan-out
 /// expanded server-side) or one program of that app (the second positional).
@@ -349,41 +345,29 @@ pub(crate) fn run(config_path: &std::path::Path, single: Option<&str>) -> Result
         let cmd = parse_line(line).context("invalid command")?;
         match cmd {
             None => Ok(()),
-            Some(c2) => {
-                let webui_url = webui_url_of(&config);
-                match execute(&c, &c2, &webui_url) {
-                    Ok(Outcome::Continue) => Ok(()),
-                    Ok(Outcome::Exit) => Ok(()),
-                    Err(e) => {
-                        // The message is the only trace of what the control
-                        // plane answered — never exit silently.
-                        eprintln!("ak: error: {e:#}");
-                        let code = e
-                            .downcast_ref::<ActionExit>()
-                            .map(|a| a.0)
-                            .unwrap_or_else(|| client::exit_code_of(&e));
-                        std::process::exit(code);
-                    }
+            Some(c2) => match execute(&c, &c2) {
+                Ok(Outcome::Continue) => Ok(()),
+                Ok(Outcome::Exit) => Ok(()),
+                Err(e) => {
+                    // The message is the only trace of what the control
+                    // plane answered — never exit silently.
+                    eprintln!("ak: error: {e:#}");
+                    let code = e
+                        .downcast_ref::<ActionExit>()
+                        .map(|a| a.0)
+                        .unwrap_or_else(|| client::exit_code_of(&e));
+                    std::process::exit(code);
                 }
-            }
+            },
         }
     } else {
-        repl(&c, &webui_url_of(&config))
-    }
-}
-
-/// Console base URL for the `open` verb: the configured `[webui]` listen
-/// address when the section is present, else the built-in default.
-fn webui_url_of(config: &crate::config::DaemonConfig) -> String {
-    match &config.webui {
-        Some(w) => format!("http://{}", w.listen),
-        None => DEFAULT_WEBUI_URL.to_string(),
+        repl(&c)
     }
 }
 
 /// Read-eval-print loop. rustyline provides line editing/history on a TTY and
 /// degrades to plain line reads when stdin is not one.
-fn repl(c: &Client, webui_url: &str) -> Result<()> {
+fn repl(c: &Client) -> Result<()> {
     let mut rl = rustyline::DefaultEditor::new().context("cannot init line editor")?;
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive {
@@ -403,7 +387,7 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
                 if interactive {
                     rl.add_history_entry(line.trim())?;
                 }
-                match execute(c, &cmd, webui_url) {
+                match execute(c, &cmd) {
                     Ok(Outcome::Continue) => {}
                     Ok(Outcome::Exit) => break,
                     // Per the CLI contract the shell stays alive on command
@@ -418,7 +402,7 @@ fn repl(c: &Client, webui_url: &str) -> Result<()> {
 }
 
 /// Execute one parsed command against the control-plane client.
-fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
+fn execute(c: &Client, cmd: &ShellCmd) -> Result<Outcome> {
     match cmd {
         ShellCmd::Ps => print_status(c).map(|_| Outcome::Continue),
         ShellCmd::Start(t) => run_target(c, t, "start"),
@@ -525,7 +509,7 @@ fn execute(c: &Client, cmd: &ShellCmd, webui_url: &str) -> Result<Outcome> {
             );
             Ok(Outcome::Continue)
         }
-        ShellCmd::Open => open_webui(webui_url).map(|_| Outcome::Continue),
+        ShellCmd::Open => open_webui(c).map(|_| Outcome::Continue),
         ShellCmd::Help => {
             println!("{HELP_TEXT}");
             Ok(Outcome::Continue)
@@ -1049,72 +1033,38 @@ fn str_field(v: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
-// -- webui probing + browser launch -----------------------------------------
+// -- webui open (shared with `ak webui`) ------------------------------------
 
-/// `GET /api/health` on the webui port, short timeout. Public endpoint, no
-/// token involved (webui auth is independent of /v1).
-pub(crate) fn webui_health(base: &str) -> Result<()> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_secs(2)))
-        .timeout_per_call(Some(std::time::Duration::from_secs(2)))
-        .build()
-        .into();
-    let resp = agent
-        .get(&format!("{base}/api/health"))
-        .call()
-        .map_err(|e| anyhow::anyhow!("webui unreachable: {e}"))?;
-    if (200..300).contains(&resp.status().as_u16()) {
-        Ok(())
-    } else {
-        bail!("webui health returned {}", resp.status().as_u16())
-    }
-}
-
-/// Platform browser launcher. Returns the command name for diagnostics.
-fn browser_command(url: &str) -> std::process::Command {
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = std::process::Command::new("open");
-        cmd.arg(url);
-        cmd
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start"]);
-        // raw arg: `start` mangles extra quotes otherwise
-        cmd.raw_arg(format!("\"{url}\""));
-        cmd
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let mut cmd = std::process::Command::new("xdg-open");
-        cmd.arg(url);
-        cmd
-    }
-}
-
-/// Probe webui; when reachable open the browser, otherwise print a hint
-/// (shell-client spec: `open` never launches the browser when the console
-/// is down).
-fn open_webui(url: &str) -> Result<()> {
-    if let Err(e) = webui_health(url) {
-        eprintln!(
-            "webui not reachable at {url} — enable it in the daemon config \
-             (`ak config --set webui.listen={DEFAULT_WEBUI_LISTEN}`) and run \
-             `ak config --reload`, then retry"
-        );
+/// `open` (shell-client spec): consume the control plane's console status,
+/// refuse to launch when the console is unusable (keeping the enable hint),
+/// probe `/api/health`, then launch the shared browser command. The URL comes
+/// from [`crate::webui_open`], so `ak webui` and `open` cannot drift.
+fn open_webui(c: &Client) -> Result<()> {
+    let status = match c.webui() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::webui_open::shell_hint(crate::webui_open::DEFAULT_WEBUI_URL)
+            );
+            bail!("{e:#}");
+        }
+    };
+    let url = match crate::webui_open::shell_target(&status) {
+        Ok(url) => url,
+        Err(hint) => {
+            eprintln!("{hint}");
+            bail!("webui console is not available");
+        }
+    };
+    if let Err(e) = crate::webui_open::webui_health(&status.url) {
+        eprintln!("{}", crate::webui_open::shell_hint(&status.url));
         bail!("{e:#}");
     }
-    let mut cmd = browser_command(url);
-    match cmd.status() {
-        Ok(st) if st.success() => {
-            println!("opening {url}");
-            Ok(())
-        }
-        _ => bail!("could not launch the system browser for {url}"),
-    }
+    crate::webui_open::launch_browser(&url)?;
+    // The regular report never contains the bootstrap token.
+    println!("opening {}", status.url);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1264,7 +1214,7 @@ mod tests {
             ),
         );
         let c = Client::from_config(&cfg);
-        let outcome = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost").unwrap();
+        let outcome = execute(&c, &ShellCmd::Remove("web".into())).unwrap();
         assert!(matches!(outcome, Outcome::Continue), "the shell stays up");
         let req = req.join().unwrap();
         assert!(
@@ -1286,8 +1236,7 @@ mod tests {
             ),
         );
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost")
-            .expect_err("a conflict is an error");
+        let err = execute(&c, &ShellCmd::Remove("web".into())).expect_err("a conflict is an error");
         let text = format!("{err:#}");
         assert!(text.contains("api (running)"), "blockers survive: {text}");
         assert!(text.contains("ak stop web"), "remedy survives: {text}");
@@ -1310,8 +1259,7 @@ mod tests {
         ))
         .unwrap();
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("web".into()), "http://localhost")
-            .expect_err("no daemon");
+        let err = execute(&c, &ShellCmd::Remove("web".into())).expect_err("no daemon");
         assert_eq!(client::exit_code_of(&err), 3);
 
         let (cfg, req) = fake_daemon(
@@ -1319,8 +1267,7 @@ mod tests {
             http_status("404 Not Found", r#"{"error":"unknown app \"ghost\""}"#),
         );
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("ghost".into()), "http://localhost")
-            .expect_err("unknown app");
+        let err = execute(&c, &ShellCmd::Remove("ghost".into())).expect_err("unknown app");
         assert!(format!("{err:#}").contains("unknown app"), "{err:#}");
         assert_eq!(client::exit_code_of(&err), 1);
         req.join().unwrap();
@@ -1762,27 +1709,57 @@ mod tests {
         assert!(out.contains("no programs"), "{out}");
     }
 
-    #[test]
-    fn webui_health_offline_is_error() {
-        assert!(webui_health("http://127.0.0.1:1").is_err());
+    fn webui_status(auth: &str, token: Option<&str>) -> crate::client::WebuiStatus {
+        crate::client::WebuiStatus {
+            enabled: true,
+            serving: true,
+            listen: "127.0.0.1:9877".to_string(),
+            url: "http://127.0.0.1:9877".to_string(),
+            auth: auth.to_string(),
+            token: token.map(str::to_string),
+        }
     }
 
-    /// The `open` verb addresses the console from the `[webui]` config when
-    /// the section is present and falls back to the built-in default listen
-    /// otherwise (shell-client migration: `system webui` is gone, the URL
-    /// follows `webui.listen`).
+    /// add-webui-launch-command 5.1: `open` follows `GET /v1/webui` — auto
+    /// mode gets the bootstrap token, fixed mode does not, and a console that
+    /// is not serving refuses to launch while printing the enable hint
+    /// (shell keeps running; the caller turns the error into a message).
     #[test]
-    fn webui_url_of_uses_configured_listen_or_default() {
-        let cfg: crate::config::DaemonConfig =
-            toml::from_str("[webui]\nlisten = '0.0.0.0:9999'\n").unwrap();
-        assert_eq!(webui_url_of(&cfg), "http://0.0.0.0:9999");
-        let off: crate::config::DaemonConfig =
-            toml::from_str("[daemon]\nsocket = \"/tmp/ak.sock\"\n").unwrap();
-        assert_eq!(webui_url_of(&off), "http://127.0.0.1:9877");
+    fn open_follows_console_token_mode_and_refuses_when_down() {
         assert_eq!(
-            webui_url_of(&off),
-            format!("http://{DEFAULT_WEBUI_LISTEN}"),
-            "the fallback matches the built-in [webui] default"
+            crate::webui_open::shell_target(&webui_status("auto", Some("abc123"))).unwrap(),
+            "http://127.0.0.1:9877?token=abc123"
+        );
+        assert_eq!(
+            crate::webui_open::shell_target(&webui_status("token", Some("s3cr3t"))).unwrap(),
+            "http://127.0.0.1:9877"
+        );
+
+        let mut down = webui_status("auto", None);
+        down.serving = false;
+        let hint = crate::webui_open::shell_target(&down).unwrap_err();
+        assert!(hint.contains("webui not reachable at http://127.0.0.1:9877"));
+        assert!(hint.contains("ak config --set webui.listen=127.0.0.1:9877"));
+        assert!(hint.contains("ak config --reload"));
+
+        // Daemon unreachable (no status at all): the same pre-existing hint,
+        // built without any status.
+        let hint = crate::webui_open::shell_hint(crate::webui_open::DEFAULT_WEBUI_URL);
+        assert!(hint.contains("webui not reachable at http://127.0.0.1:9877"));
+        assert!(hint.contains("ak config --reload"));
+    }
+
+    /// The `open` verb addresses the console from the control plane, so the
+    /// config's `[webui]` section is irrelevant here: it launches whatever
+    /// `/v1/webui` reported.
+    #[test]
+    fn open_uses_the_reported_listen_not_the_local_config() {
+        let mut remote = webui_status("auto", Some("t"));
+        remote.listen = "127.0.0.1:9999".to_string();
+        remote.url = "http://127.0.0.1:9999".to_string();
+        assert_eq!(
+            crate::webui_open::shell_target(&remote).unwrap(),
+            "http://127.0.0.1:9999?token=t"
         );
     }
 }

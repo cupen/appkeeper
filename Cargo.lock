@@ -85,6 +85,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "futures-util",
+ "getrandom",
  "libc",
  "log",
  "rmp-serde",
