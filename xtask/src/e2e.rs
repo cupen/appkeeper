@@ -54,9 +54,13 @@
 //!   rebind, W4/W5 occupy then free the listen → reload degrades with a note
 //!   and recovers, W7 boots a second daemon with a bare `[webui]` → serves the
 //!   built-in default 127.0.0.1:9877 and the console exits with the daemon.
-//!   Offline: G0c2 pins the removed `webui`/`system webui` subcommands,
-//!   G0c3 covers the shell exit-3 contract, G0d2 rejects an unknown
-//!   `[webui]` key through `validate`.
+//!   W1b/W6b cover `ak webui`: a disabled console exits 1 with the enable
+//!   command, and `--print-url`/`--json` expose the auto bootstrap URL whose
+//!   token survives a reload.
+//!   Offline: G0c2 pins `ak webui` as a real daemon-first command (exit 3 when
+//!   the daemon is down) while `system webui` stays removed, G0c3 covers the
+//!   shell exit-3 contract, G0d2 rejects an unknown `[webui]` key through
+//!   `validate`.
 //! - webui pass — a real browser (playwright, chromium) against the embedded
 //!   console: the pending badge appears after a disk edit, "Apply 此应用"
 //!   (app-scope) confirms and applies, the result text renders, and a second
@@ -912,14 +916,29 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         &format!("each JSON entry carries its description: {registry:?}"),
     )?;
 
-    step("G0c2. removed webui/system subcommands stay removed (BREAKING, config-driven-webui)");
-    for bad in [&["webui"][..], &["system", "webui"][..]] {
-        let (ok, _code, combined) = cli_try(bin, ws, bad)?;
+    step(
+        "G0c2. `ak webui` is daemon-first; `system webui` stays removed (add-webui-launch-command)",
+    );
+    // control-plane spec (控制台打开命令): the command exists and is
+    // daemon-first — offline it reports the unreachable daemon and exits 3
+    // without pulling one up or attempting a browser. The retired
+    // `system webui` keeps its unknown-subcommand rejection.
+    for args in [&["webui"][..], &["webui", "--print-url"][..]] {
+        let (ok, code, combined) = cli_try(bin, ws, args)?;
         expect(
-            !ok && combined.contains("unrecognized subcommand"),
-            &format!("{bad:?} must be rejected as an unknown subcommand: {combined:?}"),
+            !ok && code == 3,
+            &format!("offline {args:?} exits 3, got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("unreachable"),
+            &format!("offline {args:?} says the daemon is unreachable: {combined:?}"),
         )?;
     }
+    let (ok, _code, combined) = cli_try(bin, ws, &["system", "webui"])?;
+    expect(
+        !ok && combined.contains("unrecognized subcommand"),
+        &format!("`system webui` must stay an unknown subcommand: {combined:?}"),
+    )?;
 
     step("G0c3. `shell -e ps` with no daemon exits 3 (shell 纳入退出码约定)");
     let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "ps"])?;
@@ -7329,10 +7348,72 @@ fn http_ok(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `GET /v1/webui` over the workspace control socket: the only surface that
+/// carries the auto-mode console token (add-webui-launch-command D2).
+fn webui_status(ws: &Workspace) -> Result<serde_json::Value> {
+    let (code, body) = control_http(&ws.control_socket, "GET", "/v1/webui", None)?;
+    if code != 200 {
+        bail!("GET /v1/webui -> {code}: {body}");
+    }
+    serde_json::from_str(&body).with_context(|| format!("the /v1/webui payload parses: {body}"))
+}
+
+/// The console's browser-facing bootstrap URL plus its token (auto mode), as
+/// reported by `GET /v1/webui`. Fixed-token consoles return no token, so the
+/// URL carries no `?token=` (the credential gate handles the rest).
+fn webui_launch_target(ws: &Workspace) -> Result<(String, Option<String>)> {
+    let status = webui_status(ws)?;
+    let base = status["url"]
+        .as_str()
+        .context("the /v1/webui status carries a url")?;
+    let token = status
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    let launch = match &token {
+        Some(token) => format!("{base}/?token={token}"),
+        None => format!("{base}/"),
+    };
+    Ok((launch, token))
+}
+
+/// Exchange the console's auto token for a session cookie, so console API
+/// calls made by the harness travel the same path a browser does (the
+/// workspace enables `[webui]` without `auth_token`, which is auto mode since
+/// add-webui-launch-command: no unauthenticated console exists).
+fn webui_cookie(ws: &Workspace) -> Result<String> {
+    let token = webui_status(ws)?
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .context("the e2e workspace console runs in auto mode and reports a token")?;
+    // `NUL` on Windows, `/dev/null` elsewhere: only the dumped headers matter.
+    let sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let out = Command::new("curl")
+        .args(["-s", "-D", "-", "-o", sink, "-m", "10", "-X", "POST", "-H"])
+        .arg(format!("X-Auth-Token: {token}"))
+        .arg(format!("http://127.0.0.1:{}/api/auth", ws.webui_port))
+        .output()
+        .context("curl the console auth endpoint")?;
+    let headers = String::from_utf8_lossy(&out.stdout).to_string();
+    for line in headers.lines() {
+        if line.len() >= 11 && line[..11].eq_ignore_ascii_case("set-cookie:") {
+            let cookie = &line[11..];
+            let pair = cookie.split(';').next().unwrap_or("").trim();
+            if let Some(id) = pair.strip_prefix("ak_console=") {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    bail!("no ak_console session cookie in the /api/auth response: {headers}");
+}
+
 /// One console API call against the workspace's `[webui] listen`; returns the
-/// status code and body. The e2e workspace enables no console auth token, so
-/// no session cookie is needed.
+/// status code and body. The console runs in auto mode (no configured
+/// `auth_token`), so a session cookie is exchanged first — an unauthenticated
+/// call would only ever answer 401 after this change.
 fn web_http(ws: &Workspace, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+    let cookie = webui_cookie(ws)?;
     let mut cmd = Command::new("curl");
     cmd.args([
         "-s",
@@ -7344,7 +7425,9 @@ fn web_http(ws: &Workspace, method: &str, path: &str, body: Option<&str>) -> Res
         "\n%{http_code}",
         "-X",
         method,
-    ]);
+        "-H",
+    ])
+    .arg(format!("Cookie: ak_console={cookie}"));
     if let Some(b) = body {
         cmd.args(["-H", "content-type: application/json", "-d", b]);
     }
@@ -7403,6 +7486,24 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     expect(
         !health(ws.webui_port),
         "the console port refuses connections after the reload",
+    )?;
+
+    step("W1b. `ak webui` on a disabled console exits 1 with the enable command");
+    // control-plane spec (控制台未启用): a reachable daemon with no `[webui]`
+    // section is exit 1 — not 3 and never a browser launch.
+    let (ok, code, combined) = cli_try(bin, ws, &["webui"])?;
+    expect(
+        !ok && code == 1,
+        &format!("`ak webui` without [webui] exits 1, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("not enabled"),
+        &format!("the error says the console is not enabled: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("ak config --set webui.listen=")
+            && combined.contains("ak config --reload"),
+        &format!("the error carries the enable + reload commands: {combined:?}"),
     )?;
 
     step("W2. config --set webui.listen + reload serves on the new address (off→on)");
@@ -7511,6 +7612,17 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         api(ws, "/v1/status")?.contains("programs"),
         "the daemon keeps serving the control plane",
     )?;
+    // A degraded console (enabled but not serving) is exit 1 too, and the
+    // error points at the address/occupancy fix (control-plane spec).
+    let (ok, code, combined) = cli_try(bin, ws, &["webui", "--print-url"])?;
+    expect(
+        !ok && code == 1,
+        &format!("`ak webui` on a degraded console exits 1, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("not serving") && combined.contains("already in use"),
+        &format!("the degraded-console error names the fix: {combined:?}"),
+    )?;
 
     step("W5. freeing the port + reload recovers the console on the same address");
     drop(blocker);
@@ -7537,6 +7649,70 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     let _ = cli(bin, ws, &["config", "--reload"])?;
     expect(health(ws.webui_port), "the setup port serves again")?;
     expect(!health(occupied), "the temporary port is released")?;
+
+    step("W6b. `ak webui --print-url` / --json carry the auto bootstrap token; reload keeps it");
+    // control-plane spec (控制台打开命令): the full URL is the one intentional
+    // token-printing surface, and `webui-api` (reload 不轮换 auto token) says
+    // a routine reload must not invalidate it.
+    let listen = format!("127.0.0.1:{}", ws.webui_port);
+    let out = cli(bin, ws, &["webui", "--print-url"])?;
+    let printed = out.trim().to_string();
+    let prefix = format!("http://{listen}?token=");
+    expect(
+        printed.starts_with(&prefix),
+        &format!("--print-url prints the full auto URL, got {printed:?}"),
+    )?;
+    let token = printed
+        .strip_prefix(&prefix)
+        .or_else(|| printed.split_once("?token=").map(|(_, t)| t))
+        .unwrap_or("");
+    expect(
+        token.len() == 64
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        &format!("the auto token is 64 lowercase hex chars, got {token:?}"),
+    )?;
+
+    let out = cli(bin, ws, &["webui", "--json"])?;
+    let doc: serde_json::Value =
+        serde_json::from_str(out.trim()).context("--json emits one JSON object")?;
+    expect(
+        doc["url"].as_str() == Some(printed.as_str()),
+        &format!("--json url matches --print-url: {doc}"),
+    )?;
+    expect(
+        doc["listen"].as_str() == Some(listen.as_str()),
+        &format!("--json reports the listen address: {doc}"),
+    )?;
+    expect(
+        doc["auth"] == "auto",
+        &format!("--json reports auto mode: {doc}"),
+    )?;
+    expect(
+        doc["opened"] == false,
+        &format!("--json never opens a browser: {doc}"),
+    )?;
+    // The same token is what GET /v1/webui hands out (one source of truth).
+    let status = webui_status(ws)?;
+    expect(
+        status["token"].as_str() == Some(token),
+        &format!("--print-url token matches /v1/webui: {status}"),
+    )?;
+
+    let _ = cli(bin, ws, &["config", "--reload"])?;
+    let out = cli(bin, ws, &["webui", "--json"])?;
+    let doc2: serde_json::Value =
+        serde_json::from_str(out.trim()).context("--json emits one JSON object after reload")?;
+    let token2 = doc2["url"]
+        .as_str()
+        .and_then(|u| u.rsplit_once("?token="))
+        .map(|(_, t)| t)
+        .unwrap_or("");
+    expect(
+        token2 == token,
+        &format!("a reload keeps the auto token ({token:?} -> {token2:?}): {doc2}"),
+    )?;
 
     step(
         "W7. a bare [webui] section serves the built-in default 127.0.0.1:9877 and exits with the daemon",
@@ -7722,7 +7898,10 @@ fn bench_webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     // Drive the real browser: start from the program view, then read the log
     // panel's own line count as the workload produces.
-    run_playwright_script(ws, "e2e-bench-webui.mjs", bench_webui_script(ws))?;
+    // The console only serves with a token now; enter through the same
+    // bootstrap URL `ak webui` produces (7.2's mechanism, second driver).
+    let (launch, _) = webui_launch_target(ws)?;
+    run_playwright_script(ws, "e2e-bench-webui.mjs", bench_webui_script(&launch))?;
 
     // Disk side: the pump appends every generated row to `<name>.out.log`.
     let log = ws
@@ -7798,14 +7977,14 @@ fn bench_webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
 /// The webui script for the bench pass: click start in the program view, wait
 /// for the state to turn running, then watch the log panel accumulate lines.
-fn bench_webui_script(ws: &Workspace) -> String {
+fn bench_webui_script(launch_url: &str) -> String {
     format!(
         r###"// Generated by xtask e2e — bench started from the console UI.
 import {{ createRequire }} from 'node:module';
 const require = createRequire(import.meta.url);
 const {{ chromium }} = require(process.argv[2] + '/index.js');
 
-const URL = 'http://127.0.0.1:{webui}/';
+const LAUNCH_URL = '{launch_url}';
 const PROGRAM_PATH = '/app/{app}/program/{app}';
 const ok = (m) => console.log('    ok: ' + m);
 
@@ -7813,7 +7992,7 @@ const browser = await chromium.launch({{ headless: true }});
 const page = await browser.newPage();
 page.setDefaultTimeout(15_000);
 try {{
-  await page.goto(URL);
+  await page.goto(LAUNCH_URL);
   // The console boots on the dashboard; the router is a History-API SPA, so
   // drive it with pushState (a `#/...` hash would not match any route).
   await page.waitForFunction(() => !!document.querySelector('ak-app'));
@@ -7896,7 +8075,7 @@ try {{
 }}
 console.log('BENCH WEBUI PASS OK');
 "###,
-        webui = ws.webui_port,
+        launch_url = launch_url,
         app = BENCH_WEBUI_APP,
     )
 }
@@ -8412,7 +8591,19 @@ fn tcp_control_scenarios(bin: &Path, ws: &TcpWs, root: &Path) -> Result<()> {
 /// module). Kept as a subprocess so xtask carries no node dependency.
 fn browser_pass(ws: &Workspace) -> Result<()> {
     step("F. browser: badge appears, app-scoped apply works, result renders");
-    run_playwright_script(ws, "e2e-browser.mjs", browser_script(ws))?;
+    // add-webui-launch-command 7.2: enter through the same URL `ak webui`
+    // produces — the auto token comes from GET /v1/webui over the control
+    // socket, never from the config or this harness.
+    let (launch, token) = webui_launch_target(ws)?;
+    let token_literal = token
+        .as_deref()
+        .map(|t| format!("'{t}'"))
+        .unwrap_or_else(|| "null".to_string());
+    run_playwright_script(
+        ws,
+        "e2e-browser.mjs",
+        browser_script(ws, &launch, &token_literal),
+    )?;
     Ok(())
 }
 
@@ -8475,13 +8666,17 @@ fn repo_root() -> PathBuf {
 
 /// The browser script asserts the webui-ui spec scenarios. Node-side asserts
 /// print `ok:` lines; failures throw and exit non-zero.
-fn browser_script(ws: &Workspace) -> String {
+fn browser_script(ws: &Workspace, launch_url: &str, token_literal: &str) -> String {
     format!(
         r###"// Generated by xtask e2e — drives the embedded console UI.
 import {{ createRequire }} from 'node:module';
 const require = createRequire(import.meta.url);
 const {{ chromium }} = require(process.argv[2] + '/index.js');
 
+// LAUNCH_URL is what `ak webui` would open: the auto token rides in
+// ?token=. URL stays token-free for later same-session navigation.
+const LAUNCH_URL = '{launch_url}';
+const TOKEN = {token_literal};
 const URL = 'http://127.0.0.1:{webui}/';
 const ALPHA_CFG = '{alpha}';
 const ok = (m) => console.log('    ok: ' + m);
@@ -8494,12 +8689,23 @@ const page = await browser.newPage();
 page.setDefaultTimeout(10_000);
 await page.setViewportSize({{ width: 1440, height: 900 }});
 try {{
-  await page.goto(URL);
+  await page.goto(LAUNCH_URL);
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
     const bar = app?.shadowRoot?.querySelector('ak-overview-bar');
     return !!bar?.shadowRoot?.querySelector('.bar');
   }});
+  // add-webui-launch-command 7.2: the launch token is a one-shot bootstrap
+  // channel. The SPA exchanges it for a session cookie, strips it from the
+  // address bar/history entry and persists it for silent renewal.
+  if (TOKEN) {{
+    await page.waitForFunction((t) => localStorage.getItem('ak.webui.token') === t, TOKEN);
+    const addr = page.url();
+    if (addr.includes('token=') || addr.includes(TOKEN)) {{
+      throw new Error('the bootstrap token must leave the address bar: ' + addr);
+    }}
+    ok('?token= exchanged: address bar clean and localStorage holds ak.webui.token');
+  }}
   // No pending initially: the badge must not exist.
   await page.waitForFunction(() => {{
     const app = document.querySelector('ak-app');
