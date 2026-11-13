@@ -111,6 +111,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "flate2",
  "serde",
  "serde_json",
  "toml",

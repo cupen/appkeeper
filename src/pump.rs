@@ -275,7 +275,7 @@ fn flush_batch(
     if let Some(l) = limit
         && *size >= l
     {
-        match rotate(path, keep).and_then(|_| open_append(path)) {
+        match rotate_now(path, keep) {
             Ok(f) => {
                 *file = f;
                 *size = 0;
@@ -426,29 +426,276 @@ fn open_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// Shift `path` -> `path.1` -> ... -> `path.<keep>`, dropping the oldest.
-fn rotate(path: &Path, keep: u32) -> std::io::Result<()> {
-    if keep == 0 {
-        std::fs::remove_file(path)?;
-        return Ok(());
-    }
-    for i in (1..keep).rev() {
-        let from = numbered(path, i);
-        let to = numbered(path, i + 1);
-        if from.exists() {
-            let _ = std::fs::remove_file(&to);
-            std::fs::rename(&from, &to)?;
-        }
-    }
-    let first = numbered(path, 1);
-    let _ = std::fs::remove_file(&first);
-    std::fs::rename(path, &first)?;
-    Ok(())
+/// Archive name for rotation slot `i` (`.1.gz`, `.2.gz`, …).
+fn archive_path(path: &Path, i: u32) -> PathBuf {
+    let os = path.as_os_str().to_string_lossy();
+    PathBuf::from(format!("{os}.{i}.gz"))
 }
 
+/// The pre-upgrade (uncompressed) archive name, cleaned up on the next shift.
 fn numbered(path: &Path, i: u32) -> PathBuf {
     let os = path.as_os_str().to_string_lossy();
     PathBuf::from(format!("{os}.{i}"))
+}
+
+// -- rotation + archive compression -----------------------------------------
+//
+// The pump thread only takes the full file out of the write path, reopens the
+// current file and enqueues the archive; gzip and the archive shift run on a
+// single worker (design D2), so `flush_batch` never blocks on compression
+// (log-management spec: 压缩不阻塞排空). A full or disconnected queue degrades
+// to an uncompressed `.1` — content is never dropped.
+
+/// Bound on pending compression jobs; past this a rotation degrades in place.
+const ROTATION_QUEUE: usize = 1024;
+
+struct RotationJob {
+    /// The renamed full file awaiting compression.
+    tmp: PathBuf,
+    /// The live log path the archive belongs to (`…out.log`).
+    current: PathBuf,
+    keep: u32,
+}
+
+/// Queue entries: compression work, or a barrier used at shutdown to prove
+/// the backlog was applied (so no archive is left as a `.tmp` on exit).
+enum RotationMessage {
+    Compress(RotationJob),
+    Barrier(mpsc::Sender<()>),
+}
+
+static ROTATION_TX: std::sync::OnceLock<SyncSender<RotationMessage>> = std::sync::OnceLock::new();
+
+fn rotation_sender() -> &'static SyncSender<RotationMessage> {
+    ROTATION_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<RotationMessage>(ROTATION_QUEUE);
+        std::thread::Builder::new()
+            .name("ak-log-compress".to_string())
+            .spawn(move || {
+                for msg in rx {
+                    match msg {
+                        RotationMessage::Compress(job) => compress_archive(job),
+                        RotationMessage::Barrier(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn the log compression worker");
+        tx
+    })
+}
+
+/// Best-effort drain of the compression backlog, for the shutdown path: waits
+/// until every job queued *so far* is applied. Returns `false` on timeout or
+/// when the worker is gone (the jobs then stay as `.tmp`, never lost silently).
+/// Bounded by `timeout` in total, so a stuck worker cannot hang the daemon.
+pub fn flush_rotations(timeout: Duration) -> bool {
+    if ROTATION_TX.get().is_none() {
+        return true; // nothing was ever rotated: no worker, no backlog
+    }
+    let deadline = Instant::now() + timeout;
+    let (ack_tx, ack_rx) = mpsc::channel();
+    // A full queue means the worker is behind; wait for room rather than
+    // degrading (this is the exit path, not the pump's write path).
+    let mut msg = RotationMessage::Barrier(ack_tx);
+    loop {
+        match rotation_sender().try_send(msg) {
+            Ok(()) => break,
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                msg = returned;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ack_rx.recv_timeout(remaining).is_ok()
+}
+
+/// A unique name for the full file while the worker compresses it (never
+/// collides with an archive, so the shift cannot see it).
+fn rotation_tmp(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let os = path.as_os_str().to_string_lossy();
+    PathBuf::from(format!("{os}.{seq}.{}.tmp", std::process::id()))
+}
+
+/// Rotate one stream: `keep = 0` drops the full file (no archive); otherwise
+/// the file is renamed out of the way, reopened, and the archive is queued.
+fn rotate_now(path: &Path, keep: u32) -> std::io::Result<File> {
+    if keep == 0 {
+        // Explicit opt-out: delete and reopen, no archive is produced.
+        let _ = std::fs::remove_file(path);
+        return open_append(path);
+    }
+    let tmp = rotation_tmp(path);
+    std::fs::rename(path, &tmp)?;
+    let file = match open_append(path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Put the file back: nothing was rotated after all.
+            let _ = std::fs::rename(&tmp, path);
+            return Err(e);
+        }
+    };
+    let rejected = match rotation_sender().try_send(RotationMessage::Compress(RotationJob {
+        tmp,
+        current: path.to_path_buf(),
+        keep,
+    })) {
+        Ok(()) => None,
+        Err(TrySendError::Full(RotationMessage::Compress(job)))
+        | Err(TrySendError::Disconnected(RotationMessage::Compress(job))) => Some(job),
+        // Unreachable: only `Compress` is ever sent on this path.
+        Err(_) => None,
+    };
+    if let Some(job) = rejected {
+        // Never block the pump: keep the newest archive uncompressed.
+        warn!(
+            "log compression queue is busy; keeping an uncompressed archive for {}",
+            job.current.display()
+        );
+        keep_uncompressed(&job.tmp, &job.current, job.keep);
+    }
+    Ok(file)
+}
+
+/// Degraded rotation: park the archive as `.1` (no gzip). Best effort — a
+/// failure here still leaves the current file writable.
+fn keep_uncompressed(tmp: &Path, current: &Path, keep: u32) {
+    if keep == 0 {
+        let _ = std::fs::remove_file(tmp);
+        return;
+    }
+    let target = numbered(current, 1);
+    let _ = std::fs::remove_file(&target);
+    if let Err(e) = std::fs::rename(tmp, &target) {
+        warn!(
+            "cannot keep the uncompressed log archive {}: {e}",
+            tmp.display()
+        );
+    }
+}
+
+/// Worker: drop the oldest, shift `.N.gz` -> `.N+1.gz`, then compress the
+/// newest archive into `.1.gz` (falling back to an uncompressed `.1`).
+fn compress_archive(job: RotationJob) {
+    let archive = |i: u32| archive_path(&job.current, i);
+    let legacy = |i: u32| numbered(&job.current, i);
+
+    // Oldest slot: both the compressed archive and a pre-upgrade `.N`.
+    let _ = std::fs::remove_file(archive(job.keep));
+    let _ = std::fs::remove_file(legacy(job.keep));
+    for i in (1..job.keep).rev() {
+        let to = archive(i + 1);
+        let _ = std::fs::remove_file(&to);
+        let _ = std::fs::remove_file(legacy(i + 1));
+        let from = archive(i);
+        if from.exists()
+            && let Err(e) = std::fs::rename(&from, &to)
+        {
+            warn!("cannot shift log archive {}: {e}", from.display());
+        }
+    }
+    // Newest slot: compress, then clean the pre-upgrade `.1`.
+    let target = archive(1);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(legacy(1));
+    match gzip_file(&job.tmp, &target) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&job.tmp);
+        }
+        Err(e) => {
+            warn!(
+                "log compression failed for {}: {e}; keeping an uncompressed archive",
+                job.tmp.display()
+            );
+            keep_uncompressed(&job.tmp, &job.current, job.keep);
+        }
+    }
+}
+
+/// gzip `from` into `to` through a temp file, so readers never observe a
+/// partially written archive.
+fn gzip_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut input = std::io::BufReader::new(File::open(from)?);
+    let tmp = PathBuf::from(format!("{}.tmp", to.display()));
+    {
+        let out = File::create(&tmp)?;
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::io::BufWriter::new(out),
+            flate2::Compression::default(),
+        );
+        std::io::copy(&mut input, &mut encoder)?;
+        let mut out = encoder.finish()?;
+        out.flush()?;
+    }
+    std::fs::rename(&tmp, to)
+}
+
+/// Env var the detached launcher sets so the daemon rotates its own log
+/// (log-management spec: 后台守护日志按大小轮转). Absent in foreground and
+/// service modes, which keep writing to stderr.
+pub const DAEMON_LOG_ENV: &str = "AK_DAEMON_LOG_FILE";
+
+/// A `Write` sink that rotates by size and enqueues gzip compression on the
+/// shared worker. Used as `env_logger`'s `Target::Pipe` for the daemon's own
+/// log, reusing the exact same archive contract as the child-log pumps.
+pub struct RotatingWriter {
+    file: File,
+    size: u64,
+    path: PathBuf,
+    limit: u64,
+    keep: u32,
+}
+
+impl RotatingWriter {
+    /// Open (or create) `path` for appending and start tracking its size.
+    pub fn open(path: PathBuf, limit: u64, keep: u32) -> std::io::Result<Self> {
+        let file = open_append(&path)?;
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            file,
+            size,
+            path,
+            limit,
+            keep,
+        })
+    }
+}
+
+impl Write for RotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.limit > 0 && self.size >= self.limit {
+            match rotate_now(&self.path, self.keep) {
+                Ok(file) => {
+                    self.file = file;
+                    self.size = 0;
+                }
+                Err(e) => {
+                    // Keep logging: a failed rotation must not silence the
+                    // daemon (and must not recurse into `log::`).
+                    eprintln!(
+                        "ak: warning: cannot rotate the daemon log {}: {e}",
+                        self.path.display()
+                    );
+                }
+            }
+        }
+        let written = self.file.write(buf)?;
+        self.size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 #[cfg(test)]
@@ -692,16 +939,163 @@ mod tests {
     }
 
     #[test]
-    fn rotation_shifts_files() {
+    fn rotation_archives_as_gzip_and_shifts() {
         let tmp = std::env::temp_dir().join(format!("ak-test-rot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let p = tmp.join("t.log");
         std::fs::write(&p, "current").unwrap();
+        // Pre-upgrade uncompressed archives: cleaned up on the next rotation.
         std::fs::write(numbered(&p, 1), "one").unwrap();
         std::fs::write(numbered(&p, 2), "two").unwrap();
-        rotate(&p, 2).unwrap();
-        assert_eq!(std::fs::read_to_string(numbered(&p, 1)).unwrap(), "current");
-        assert_eq!(std::fs::read_to_string(numbered(&p, 2)).unwrap(), "one");
+
+        rotate_now(&p, 2).unwrap();
+        assert!(p.exists(), "the current file is reopened immediately");
+        let newest = archive_path(&p, 1);
+        wait_for(|| newest.exists());
+        assert_eq!(read_gzip(&newest), "current");
+        assert!(!numbered(&p, 1).exists(), "legacy .1 is cleaned up");
+        assert!(!numbered(&p, 2).exists(), "legacy .2 is cleaned up");
+
+        // A second rotation shifts the previous archive to `.2.gz`.
+        std::fs::write(&p, "second").unwrap();
+        rotate_now(&p, 2).unwrap();
+        let older = archive_path(&p, 2);
+        wait_for(|| older.exists() && newest.exists());
+        assert_eq!(read_gzip(&newest), "second");
+        assert_eq!(read_gzip(&older), "current");
+
+        // keep = 0 drops the full file without producing an archive.
+        let _ = std::fs::remove_file(&older);
+        let _ = std::fs::remove_file(&newest);
+        rotate_now(&p, 0).unwrap();
+        assert!(p.exists() && std::fs::metadata(&p).unwrap().len() == 0);
+        assert!(!archive_path(&p, 1).exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 2.2/2.4: the shutdown barrier applies everything queued so far, so a
+    /// graceful stop leaves archives (never `.tmp` files) on disk.
+    #[test]
+    fn flush_rotations_drains_the_backlog() {
+        let tmp = std::env::temp_dir().join(format!("ak-test-rotflush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = tmp.join("t.log");
+        std::fs::write(&p, "first").unwrap();
+        rotate_now(&p, 2).unwrap();
+        std::fs::write(&p, "second").unwrap();
+        rotate_now(&p, 2).unwrap();
+
+        assert!(
+            flush_rotations(Duration::from_secs(10)),
+            "the worker must acknowledge the barrier"
+        );
+        assert_eq!(read_gzip(&archive_path(&p, 1)), "second");
+        assert_eq!(read_gzip(&archive_path(&p, 2)), "first");
+        let leftovers: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no .tmp left after the drain: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn read_gzip(path: &Path) -> String {
+        use std::io::Read;
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .expect("archive must be valid gzip");
+        text
+    }
+
+    /// 2.3: gzip failure degrades to an uncompressed `.1` — content survives,
+    /// no `.1.gz` is left behind, and the pump keeps draining.
+    #[test]
+    fn compression_failure_keeps_an_uncompressed_archive() {
+        let tmp = std::env::temp_dir().join(format!("ak-test-rotfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let current = tmp.join("t.log");
+        let src = tmp.join("full.tmp");
+        std::fs::write(&src, "payload").unwrap();
+        // A directory where the gzip temp file would go makes compression fail.
+        std::fs::create_dir(tmp.join("t.log.1.gz.tmp")).unwrap();
+
+        compress_archive(RotationJob {
+            tmp: src.clone(),
+            current: current.clone(),
+            keep: 2,
+        });
+        assert_eq!(
+            std::fs::read_to_string(numbered(&current, 1)).unwrap(),
+            "payload",
+            "the archive is kept uncompressed"
+        );
+        assert!(
+            !archive_path(&current, 1).exists(),
+            "no partial .1.gz is exposed"
+        );
+        assert!(!src.exists(), "the temp file was consumed");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.3: a full/disconnected queue takes the same degradation path, so the
+    /// pump thread never blocks on compression.
+    #[test]
+    fn queue_full_degrades_to_an_uncompressed_archive() {
+        let tmp = std::env::temp_dir().join(format!("ak-test-rotfull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let current = tmp.join("t.log");
+        let src = tmp.join("full.tmp");
+        std::fs::write(&src, "payload").unwrap();
+        keep_uncompressed(&src, &current, 2);
+        assert_eq!(
+            std::fs::read_to_string(numbered(&current, 1)).unwrap(),
+            "payload"
+        );
+        assert!(!src.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 3.2/3.3: the daemon's own log rotates through the same writer —
+    /// gzip archives, bounded retention, no legacy `.N` left behind.
+    #[test]
+    fn rotating_writer_rotates_and_bounds_archives() {
+        let tmp = std::env::temp_dir().join(format!("ak-test-daemonlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let p = tmp.join("daemon.out.log");
+        let mut w = RotatingWriter::open(p.clone(), 1024, 2).unwrap();
+        let line = format!("daemon-event {}\n", "x".repeat(300));
+        for _ in 0..30 {
+            w.write_all(line.as_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+
+        let newest = archive_path(&p, 1);
+        let older = archive_path(&p, 2);
+        wait_for(|| newest.exists() && older.exists());
+        assert!(read_gzip(&newest).contains("daemon-event"));
+        assert!(read_gzip(&older).contains("daemon-event"));
+        assert!(
+            !archive_path(&p, 3).exists(),
+            "retention is bounded by `keep`"
+        );
+        assert!(!numbered(&p, 1).exists(), "no legacy .1 archive");
+        assert!(p.exists(), "the live file is recreated after rotation");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

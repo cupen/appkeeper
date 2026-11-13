@@ -4924,6 +4924,109 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     )?;
     wait_running(ws, "vp_web")?;
 
+    // -- identity declarations (add-program-user) ---------------------------
+
+    step("CU1c. identity is resolved and judged before anything is written or started");
+    let id_proj = ws.root.join("identity-proj");
+    std::fs::create_dir_all(&id_proj)?;
+    let id_s = id_proj.to_string_lossy().replace('\\', "/");
+    let id_record = apps.join("identity-proj.toml");
+    let decl_with = |extra: &str| {
+        format!(
+            "[program.id_web]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\n\
+             startsecs = 0.2\nrestart = \"always\"\n{extra}"
+        )
+    };
+    // Parse-time failures (unknown account/group, malformed umask) are 400s
+    // with zero side effects: no record, no placeholder, no process.
+    for (tag, extra, want) in [
+        (
+            "an unknown user",
+            "user = \"no-such-account-xyz\"\n",
+            "does not exist",
+        ),
+        (
+            "an unknown group",
+            "group = \"no-such-group-xyz\"\n",
+            "does not exist",
+        ),
+        ("a malformed umask", "umask = \"08\"\n", "umask"),
+    ] {
+        std::fs::write(id_proj.join(".appkeeper.toml"), decl_with(extra))?;
+        let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &id_s])?;
+        expect(
+            !ok && code == 1,
+            &format!("{tag} is a validation error (exit 1), got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains(want),
+            &format!("{tag} names the cause: {combined:?}"),
+        )?;
+    }
+    expect(
+        !id_record.exists() && !apps.join("identity-proj.toml.pending").exists(),
+        "identity refusals wrote no record and left no placeholder",
+    )?;
+    expect(
+        pid_of(ws, "id_web")?.is_none(),
+        "identity refusals started no process",
+    )?;
+
+    if current_uid_e2e() != 0 {
+        // A non-root daemon can never switch users (design D3): refused at
+        // preview/submit time, never entering the restart loop.
+        std::fs::write(
+            id_proj.join(".appkeeper.toml"),
+            decl_with("user = \"nobody\"\n"),
+        )?;
+        let (ok, code, combined) = cli_try(bin, ws, &["compose", "up", &id_s])?;
+        expect(
+            !ok && code == 1,
+            &format!("a non-root daemon refuses cross-user (exit 1), got {code}: {combined:?}"),
+        )?;
+        expect(
+            combined.contains("cannot switch users"),
+            &format!("the refusal explains why: {combined:?}"),
+        )?;
+        expect(
+            !id_record.exists(),
+            "the refused declaration wrote no record",
+        )?;
+    } else {
+        // Root: drop to `nobody` and apply the umask, then read both back from
+        // the child itself.
+        let mask_file = ws.root.join("identity-umask.txt");
+        let uid_file = ws.root.join("identity-uid.txt");
+        std::fs::write(
+            id_proj.join(".appkeeper.toml"),
+            format!(
+                "[program.id_web]\ncommand = \"sh\"\nargs = [\"-c\", \"umask > {m}; id -u > {u}; sleep 100000\"]\n\
+                 startsecs = 0.2\nrestart = \"always\"\nuser = \"nobody\"\numask = \"0077\"\n",
+                m = mask_file.display(),
+                u = uid_file.display(),
+            ),
+        )?;
+        let out = cli(bin, ws, &["compose", "up", &id_s])?;
+        expect(
+            out.contains("app[identity-proj] registered"),
+            &format!("the drop declaration registers: {out:?}"),
+        )?;
+        wait_running(ws, "id_web")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(mask_file.is_file() && uid_file.is_file()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        expect(
+            std::fs::read_to_string(&mask_file)?.trim() == "0077",
+            "the child created files under the declared umask",
+        )?;
+        expect(
+            std::fs::read_to_string(&uid_file)?.trim() == "65534",
+            "the child runs as the declared user (nobody)",
+        )?;
+        cli(bin, ws, &["stop", "identity-proj", "id_web"])?;
+    }
+
     step("CU2. identical re-run is a no-op with exit 0");
     let mtime_before = mtime_of(&record2);
     let web_pid = pid_of(ws, "p2_web")?;

@@ -148,7 +148,13 @@ fn unique_suffix() -> u128 {
 // -- daemon binary discovery (design D4) -------------------------------------
 
 pub fn discover_daemon(explicit: Option<&Path>) -> Result<PathBuf> {
-    let exe_name = if cfg!(windows) { "ak.exe" } else { "appkeeper" };
+    // The workspace's daemon binary is `ak` (Cargo.toml `[[bin]] name`); older
+    // releases shipped it as `appkeeper`, so both names are accepted.
+    let exe_names: &[&str] = if cfg!(windows) {
+        &["ak.exe", "appkeeper.exe"]
+    } else {
+        &["ak", "appkeeper"]
+    };
     if let Some(p) = explicit {
         let p = p
             .canonicalize()
@@ -162,18 +168,22 @@ pub fn discover_daemon(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Ok(me) = std::env::current_exe()
         && let Some(dir) = me.parent()
     {
-        let cand = dir.join(exe_name);
-        if cand.is_file() {
-            return Ok(cand);
+        for exe_name in exe_names {
+            let cand = dir.join(exe_name);
+            if cand.is_file() {
+                return Ok(cand);
+            }
         }
     }
     // Workspace target dirs, debug first (design D4).
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if let Some(root) = manifest.parent() {
         for profile in ["debug", "release"] {
-            let cand = root.join("target").join(profile).join(exe_name);
-            if cand.is_file() {
-                return Ok(cand);
+            for exe_name in exe_names {
+                let cand = root.join("target").join(profile).join(exe_name);
+                if cand.is_file() {
+                    return Ok(cand);
+                }
             }
         }
     }
@@ -454,11 +464,17 @@ fn remove_log_files(log_dir: &Path, name: &str) {
             let suffix = format!("{name}.{stream}.log.");
             for e in entries.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with(&suffix)
-                    && n[suffix.len()..].bytes().all(|b| b.is_ascii_digit())
-                    && n.len() > suffix.len()
-                {
-                    let _ = std::fs::remove_file(e.path());
+                if let Some(rest) = n.strip_prefix(&suffix) {
+                    // `.N` (degraded rotation), `.N.gz` (normal), and any
+                    // `.tmp` a killed daemon left mid-compression.
+                    if rest.ends_with(".tmp") {
+                        let _ = std::fs::remove_file(e.path());
+                        continue;
+                    }
+                    let digits = rest.strip_suffix(".gz").unwrap_or(rest);
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
                 }
             }
         }
@@ -571,20 +587,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for f in [
             "p.out.log",
-            "p.out.log.1",
-            "p.out.log.2",
+            "p.out.log.1.gz",
+            "p.out.log.2.gz",
+            "p.out.log.3",            // degraded (uncompressed) rotation
+            "p.out.log.42.12345.tmp", // killed mid-compression
             "p.err.log",
-            "p.err.log.1",
+            "p.err.log.1.gz",
             "other.out.log", // untouched
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
         remove_log_files(&dir, "p");
         assert!(!dir.join("p.out.log").exists());
-        assert!(!dir.join("p.out.log.1").exists());
-        assert!(!dir.join("p.out.log.2").exists());
+        assert!(!dir.join("p.out.log.1.gz").exists());
+        assert!(!dir.join("p.out.log.2.gz").exists());
+        assert!(!dir.join("p.out.log.3").exists());
+        assert!(!dir.join("p.out.log.42.12345.tmp").exists());
         assert!(!dir.join("p.err.log").exists());
-        assert!(!dir.join("p.err.log.1").exists());
+        assert!(!dir.join("p.err.log.1.gz").exists());
         assert!(dir.join("other.out.log").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -100,6 +100,23 @@ fn daemon_command(exe: &Path, config_path: &Path) -> Command {
     cmd
 }
 
+/// The detached child's command: the foreground daemon plus the absolute path
+/// of the log file it must rotate (log-management spec). Pure for testing.
+fn detached_command(exe: &Path, config_path: &Path, log_path: &Path) -> Result<Command> {
+    let absolute_log = if log_path.is_absolute() {
+        log_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("cannot resolve the current directory")?
+            .join(log_path)
+    };
+    let mut cmd = daemon_command(exe, config_path);
+    // Only the detached (background) path sets this; foreground and service
+    // modes keep stderr and never create or rotate the file.
+    cmd.env(crate::pump::DAEMON_LOG_ENV, &absolute_log);
+    Ok(cmd)
+}
+
 /// Spawn `ak daemon start --foreground -c <config>` detached, with
 /// stdout/stderr appended to
 /// `log_path`. Returns the child pid for diagnostics.
@@ -118,7 +135,7 @@ pub fn spawn_detached(config_path: &Path, log_path: &Path) -> Result<u32> {
         .try_clone()
         .with_context(|| format!("cannot duplicate {}", log_path.display()))?;
 
-    let mut cmd = daemon_command(&exe, config_path);
+    let mut cmd = detached_command(&exe, config_path, log_path)?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
@@ -388,6 +405,24 @@ mod tests {
         // Give it a moment; the daemon will fail to bind :1 and exit, which is
         // fine — we only assert the plumbing.
         std::thread::sleep(Duration::from_millis(200));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1: the detached launcher exports the daemon's log path (absolute) so
+    /// the child can rotate its own log; nothing else sets it.
+    #[test]
+    fn detached_command_exports_an_absolute_daemon_log_path() {
+        let dir = tmp_dir("logenv");
+        let log = dir.join("logs").join("daemon.out.log");
+        let cmd = detached_command(Path::new("/bin/ak"), &dir.join("daemon.toml"), &log)
+            .expect("command");
+        let value = cmd
+            .get_envs()
+            .find(|(k, _)| *k == crate::pump::DAEMON_LOG_ENV)
+            .and_then(|(_, v)| v)
+            .expect("the daemon log env var is exported");
+        assert_eq!(Path::new(value), log);
+        assert!(Path::new(value).is_absolute());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

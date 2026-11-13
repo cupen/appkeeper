@@ -2330,6 +2330,13 @@ fn compose_up_cmd(
     if !json {
         print_up_preview(&app, &pv);
     }
+    // Non-fatal identity notices (e.g. "runs as root") go to stderr so a
+    // `--json` stdout stream stays machine-clean; they never change the code.
+    if let Some(warnings) = pv.get("warnings").and_then(|v| v.as_array()) {
+        for warning in warnings.iter().filter_map(|w| w.as_str()) {
+            eprintln!("ak: warning: {warning}");
+        }
+    }
 
     // 4. The same-name branch: TTY confirmation for needs-update /
     //    adhoc-takeover, refusal for external-refused (with or without
@@ -2715,6 +2722,22 @@ fn up_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<String
 
 // -- validate ---------------------------------------------------------------
 
+/// Print identity notices for `app` without failing (add-program-user D3):
+/// `ak validate` runs as the caller, so it cannot judge whether the *daemon*
+/// can switch identities — that gate lives in the daemon. Locally we only
+/// surface what is certainly worth knowing (root execution, and why the
+/// daemon would refuse this declaration).
+fn print_identity_warnings(app: &config::ResolvedApp) {
+    match config::check_identity_feasible(app) {
+        Ok(warnings) => {
+            for warning in warnings {
+                eprintln!("ak: warning: {warning}");
+            }
+        }
+        Err(e) => eprintln!("ak: warning: {e:#}"),
+    }
+}
+
 fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
     if let Some(p) = single {
         let config = client::load_config(config_path)?;
@@ -2722,6 +2745,7 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
         let name = registry::name_from_dir(p);
         let app = config::resolve_app(&name, p, &raw, config.app_default.as_ref())?;
         config::validate_all(&[app.clone()])?;
+        print_identity_warnings(&app);
         println!(
             "OK: app {:?} with {} program(s)",
             app.name,
@@ -2752,6 +2776,9 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
         )?);
     }
     config::validate_all(&resolved)?;
+    for app in &resolved {
+        print_identity_warnings(app);
+    }
     println!(
         "OK: daemon config + {} registered app(s), {} program(s)",
         resolved.len(),
@@ -3155,12 +3182,30 @@ fn run_daemon_core(config_path: &Path) -> Result<Arc<Supervisor>> {
         );
     }
 
-    // Honor RUST_LOG over the config level.
-    env_logger::Builder::from_env(
+    // Honor RUST_LOG over the config level. In background mode the launcher
+    // points us at the daemon's own log file, which rotates with the same
+    // 50MB/2/gzip contract as program logs (log-management spec); foreground
+    // and service modes keep stderr.
+    let mut logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(&config.daemon.log_level),
-    )
-    .try_init()
-    .ok();
+    );
+    if let Some(path) = std::env::var_os(pump::DAEMON_LOG_ENV) {
+        let path = std::path::PathBuf::from(path);
+        match pump::RotatingWriter::open(
+            path.clone(),
+            config::DEFAULT_LOG_MAX_SIZE,
+            config::DEFAULT_LOG_ROTATE_KEEP,
+        ) {
+            Ok(writer) => {
+                logger.target(env_logger::Target::Pipe(Box::new(writer)));
+            }
+            Err(e) => eprintln!(
+                "ak: warning: cannot open the daemon log {}: {e}; falling back to stderr",
+                path.display()
+            ),
+        }
+    }
+    logger.try_init().ok();
     info!(
         "daemon config: {}{}",
         config_path.display(),

@@ -1476,6 +1476,7 @@ fn compose_preview_json(pv: &crate::supervisor::ComposePreview) -> serde_json::V
         "diff": pv.diff,
         "hint": pv.hint,
         "programs": pv.programs,
+        "warnings": pv.warnings,
     })
 }
 
@@ -1498,7 +1499,10 @@ fn respond_compose_preview(sup: &Arc<Supervisor>, body: &[u8]) -> Vec<u8> {
         Ok(t) => t,
         Err(e) => return err_bytes(400, &format!("{e:#}")),
     };
-    let pv = sup.compose_preview(&req.name, &rendered);
+    let pv = match sup.compose_preview(&req.name, &rendered) {
+        Ok(pv) => pv,
+        Err(m) => return err_bytes(400, &m),
+    };
     json_bytes(200, compose_preview_json(&pv))
 }
 
@@ -1583,6 +1587,7 @@ fn respond_compose_up(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wr
                 "identical": true,
                 "programs": [],
                 "skipped": staged.skipped,
+                "warnings": staged.warnings,
             }),
         );
         finish_chunked(&mut writer);
@@ -3584,6 +3589,61 @@ mod tests {
             serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(v["classification"], "external-refused", "{v}");
         assert!(v["hint"].as_str().unwrap().contains("ak remove"), "{v}");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: the preview always carries `warnings`; under root the
+    /// "runs as root" notice is present, and under a non-root daemon an
+    /// unswitchable identity is a 400 validation error (zero side effects).
+    #[cfg(unix)]
+    #[test]
+    fn compose_preview_carries_identity_warnings() {
+        let (sup, dir, ep) = serve_harness("compose-preview-identity");
+        let euid = unsafe { libc::geteuid() };
+
+        // No `user`: feasible everywhere, warnings only for root execution.
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "shop", &compose_decl(), serde_json::json!({})),
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let warnings = v["warnings"].as_array().expect("warnings is an array");
+        assert_eq!(
+            !warnings.is_empty(),
+            euid == 0,
+            "root warning must track the daemon euid: {v}"
+        );
+        assert_eq!(v["classification"], "fresh", "warnings never change class");
+
+        // `user = "root"` from a non-root daemon cannot be honored.
+        let as_root = format!("{}user = \"root\"\n", compose_decl());
+        let resp = ep.post(
+            "/v1/compose/up/preview",
+            &compose_body(&dir, "shop", &as_root, serde_json::json!({})),
+        );
+        if euid == 0 {
+            assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+            let v: serde_json::Value =
+                serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert!(
+                v["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().unwrap().contains("runs as root")),
+                "{v}"
+            );
+        } else {
+            assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+            assert!(resp.contains("cannot switch users"), "{resp}");
+        }
+        assert!(
+            !dir.join("app.d").join("shop.toml").exists(),
+            "preview has zero side effects"
+        );
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

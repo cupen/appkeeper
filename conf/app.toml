@@ -22,8 +22,7 @@ restart = "always"         # no | on-failure | always | unless-stopped
 # startretries = 3         # 启动失败重试预算，耗尽后进入 fatal 不再拉起
 # stop_timeout = 10.0      # 优雅停止的最长等待（秒），超时强杀
 # restart_on_unhealthy = false # 健康探测连续失败时是否重启
-# log_max_size = "50MB"    # 单文件超过即轮转；"0" = 关闭轮转
-# log_rotate_keep = 2      # 保留的轮转份数（每流盘上最多 1+2 个文件）
+# log = { max_size = "50MB", keep = 2 }   # 单文件超过即轮转；"0" = 关闭轮转；keep = 保留份数
 
 # ---------------------------------------------------------------------------
 # 程序定义：每个 [program.<名字>] 一个子进程。名字用于日志文件与 CLI/webui 展示。
@@ -52,8 +51,7 @@ command = "/opt/myapp/myserver --port 8080"
 # max_restarts = 0
 # backoff_reset_after = 60.0
 # restart_on_unhealthy = false
-# log_max_size = "50MB"
-# log_rotate_keep = 2
+# log = { max_size = "50MB", keep = 2 }
 
 # 健康探测（可选）：三种写法
 #   health_check = "http://127.0.0.1:8080/health"   # HTTP GET，2xx 视为健康

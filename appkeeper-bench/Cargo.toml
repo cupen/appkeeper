@@ -14,3 +14,5 @@ serde_json = "1.0"
 toml = "1.1"
 # 退出路径（含 ctrl-C）统一清理
 ctrlc = "3.4"
+# 轮转归档是 gzip（`.N.gz`）：对账时解压后校验序号连续性
+flate2 = "1"

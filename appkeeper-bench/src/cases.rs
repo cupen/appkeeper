@@ -23,11 +23,17 @@ pub struct ProgramPlan {
     pub toml: String,
     /// Where the generator writes its row/byte counters on exit.
     pub count_file: PathBuf,
+    /// Archive slots configured for both streams (`log.keep`); `0` when
+    /// rotation is disabled. Integrity uses it to tell deliberate retention
+    /// deletion from lost rows.
+    pub keep: u32,
 }
 
 /// rotation sizing (design D9): a threshold well below the produced volume
-/// so many rotations happen, plus keep large enough that no file is deleted
-/// (the full set must reconcile on disk).
+/// so many rotations happen, plus keep large enough that a row-bounded run
+/// deletes nothing. A duration-only run has no upper bound on the produced
+/// volume, so the fallback `keep` may still be exceeded; integrity reconciles
+/// the retained window in that case (see `integrity::check_stream`).
 fn rotation_sizing(eff: &Effective) -> (u64, u32) {
     let floor = 64 * 1024u64;
     let max_size = floor.max(eff.row_size.saturating_mul(4)); // max(64KB, 4*row_size)
@@ -105,25 +111,22 @@ pub fn plan(eff: &Effective, exe: &Path, count_dir: &Path) -> Result<Vec<Program
         }
         let gen_args: Vec<&str> = gen_args.iter().map(String::as_str).collect();
 
-        let log_max_size_line = if max_size == 0 {
-            "log_max_size = \"0\"".to_string() // explicit rotation opt-out
+        let log_table = if max_size == 0 {
+            // Explicit rotation opt-out.
+            "log = { max_size = \"0\" }".to_string()
         } else {
-            format!("log_max_size = \"{max_size}\"")
-        };
-        let log_rotate_line = if max_size == 0 {
-            String::new()
-        } else {
-            format!("log_rotate_keep = {keep}\n")
+            format!("log = {{ max_size = \"{max_size}\", keep = {keep} }}")
         };
 
         let toml = format!(
-            "[app]\nrestart = \"on-failure\"\n\n[program.{name}]\ncommand = {exe_lit}\nargs = [{args}]\nstartsecs = 0\n{log_max_size_line}\n{log_rotate_line}",
+            "[app]\nrestart = \"on-failure\"\n\n[program.{name}]\ncommand = {exe_lit}\nargs = [{args}]\nstartsecs = 0\n{log_table}\n",
             args = render_args(&gen_args),
         );
         plans.push(ProgramPlan {
             name: name.clone(),
             toml,
             count_file,
+            keep: if max_size == 0 { 0 } else { keep },
         });
     }
     Ok(plans)
@@ -160,7 +163,7 @@ mod tests {
         let plans = plan(&eff(Case::Firehose), &fake_exe(), &dir).unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].name, "appkeeper-bench-firehose");
-        assert!(plans[0].toml.contains("log_max_size = \"0\""));
+        assert!(plans[0].toml.contains("log = { max_size = \"0\" }"));
         assert!(plans[0].toml.contains("restart = \"on-failure\""));
         assert!(plans[0].toml.contains("__generate"));
         assert!(plans[0].toml.contains("--stderr-every', '0"));
@@ -198,15 +201,11 @@ mod tests {
         let plans = plan(&e, &fake_exe(), &dir).unwrap();
         // 200000 * 129 bytes = 25.8MB; threshold 65536 → 394 rotations + 2
         assert!(
-            plans[0].toml.contains("log_max_size = \"65536\""),
+            plans[0].toml.contains("max_size = \"65536\""),
             "{}",
             plans[0].toml
         );
-        assert!(
-            plans[0].toml.contains("log_rotate_keep = 396"),
-            "{}",
-            plans[0].toml
-        );
+        assert!(plans[0].toml.contains("keep = 396"), "{}", plans[0].toml);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -214,8 +213,8 @@ mod tests {
     fn rotation_without_row_bound_falls_back_to_a_generous_keep() {
         let dir = std::env::temp_dir().join(format!("ak-test-plan-{}-u", std::process::id()));
         let plans = plan(&eff(Case::Rotation), &fake_exe(), &dir).unwrap();
-        assert!(plans[0].toml.contains("log_rotate_keep = 64"));
-        assert!(plans[0].toml.contains("log_max_size = \"65536\""));
+        assert!(plans[0].toml.contains("keep = 64"));
+        assert!(plans[0].toml.contains("max_size = \"65536\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

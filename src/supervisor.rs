@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, DaemonConfig, ResolvedApp, ResolvedProgram, WebuiTokenMode};
 use crate::health;
 use crate::program::{ManagedProgram, ProgramState};
+use crate::pump;
 use crate::registry;
 
 pub type Reply = std::sync::mpsc::Sender<Result<String>>;
@@ -250,6 +251,9 @@ pub struct ComposePreview {
     pub hint: String,
     /// The existing app's program states (empty for `fresh`).
     pub programs: Vec<ComposeProgramInfo>,
+    /// Non-fatal notices (e.g. a program would run as root). The CLI prints
+    /// them to stderr; they never change the classification or exit code.
+    pub warnings: Vec<String>,
 }
 
 /// Why a compose-up submission was refused without touching anything.
@@ -345,6 +349,8 @@ pub struct ComposeUpStaged {
     pub unchanged: bool,
     pub waits: Vec<ComposeWait>,
     pub skipped: Vec<ComposeSkip>,
+    /// Non-fatal notices the CLI should print (see [`ComposePreview::warnings`]).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1183,14 +1189,23 @@ impl Supervisor {
                 continue;
             }
             match registry::reload_app(&l.name, &l.path, config.app_default.as_ref()) {
-                Ok(a) => {
-                    records.push(AppRecord {
-                        name: a.name.clone(),
-                        path: a.path.clone(),
-                        priority: a.priority,
-                    });
-                    resolved.push(a);
-                }
+                Ok(a) => match config::check_identity_feasible(&a) {
+                    Ok(warnings) => {
+                        for w in warnings {
+                            warn!("{w}");
+                        }
+                        records.push(AppRecord {
+                            name: a.name.clone(),
+                            path: a.path.clone(),
+                            priority: a.priority,
+                        });
+                        resolved.push(a);
+                    }
+                    // A non-root daemon cannot switch users: isolate this app
+                    // like any other broken record instead of spawning into a
+                    // restart loop (process-management spec).
+                    Err(e) => error!("app[{}] failed to load at startup (skipped): {e:#}", l.name),
+                },
                 Err(e) => error!("app[{}] failed to load at startup (skipped): {e:#}", l.name),
             }
         }
@@ -2087,6 +2102,11 @@ impl Supervisor {
                 return Err(AdhocUpError::Validation(format!("{e:#}")));
             }
         };
+        // Identity feasibility, before the placeholder is ever spawned.
+        if let Err(e) = config::check_identity_feasible(&resolved) {
+            registry::discard_placeholder(&config, &config_dir, &name, registry::Origin::Run);
+            return Err(AdhocUpError::Validation(format!("{e:#}")));
+        }
         let estimate = self.startup_estimate_secs(&resolved);
         let program = resolved.programs[0].name.clone();
         let staged = StagedApp {
@@ -2253,6 +2273,12 @@ impl Supervisor {
                 return Err(AdhocUpError::Validation(format!("{e:#}")));
             }
         };
+        // Identity feasibility, before the record is landed or any old process
+        // is stopped (process-management spec: 执行前拦截).
+        if let Err(e) = config::check_identity_feasible(&resolved) {
+            registry::discard_placeholder(&config, &config_dir, name, registry::Origin::Run);
+            return Err(AdhocUpError::Validation(format!("{e:#}")));
+        }
         match registry::commit_staged(&config, &config_dir, name, &text, registry::Origin::Run) {
             // A racing writer landed identical content: treat as unchanged.
             Ok(o) if o.unchanged() => {
@@ -2436,11 +2462,25 @@ impl Supervisor {
     /// same-name situation for `rendered`. Called on HTTP threads — it only
     /// locks the state briefly and reads the registry; nothing is written and
     /// no process is touched.
-    pub fn compose_preview(&self, name: &str, rendered: &str) -> ComposePreview {
-        let declared: Vec<String> = toml::from_str::<crate::config::AppRaw>(rendered)
-            .map(|r| r.program.into_keys().collect())
-            .unwrap_or_default();
-        self.classify_compose(name, rendered, declared)
+    pub fn compose_preview(
+        &self,
+        name: &str,
+        rendered: &str,
+    ) -> std::result::Result<ComposePreview, String> {
+        let raw: crate::config::AppRaw =
+            toml::from_str(rendered).map_err(|e| format!("rendered snapshot: {e}"))?;
+        let declared: Vec<String> = raw.program.keys().cloned().collect();
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let target = registry::link_path(&config, &config_dir, name);
+        let resolved = config::resolve_app(name, &target, &raw, config.app_default.as_ref())
+            .map_err(|e| format!("{e:#}"))?;
+        let warnings = config::check_identity_feasible(&resolved).map_err(|e| format!("{e:#}"))?;
+        let mut preview = self.classify_compose(name, rendered, declared);
+        preview.warnings = warnings;
+        Ok(preview)
     }
 
     /// Classify a same-name compose-up submission against the registry (D3).
@@ -2541,6 +2581,7 @@ impl Supervisor {
             diff,
             hint,
             programs,
+            warnings: Vec::new(),
         }
     }
 
@@ -2586,6 +2627,14 @@ impl Supervisor {
             .map_err(|e| ComposeUpError::Validation(format!("rendered snapshot: {e}")))?;
         let resolved = config::resolve_app(&name, &target, &raw, config.app_default.as_ref())
             .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+        // Identity feasibility: a daemon that cannot switch to the requested
+        // account must refuse before anything is written or started, never
+        // fall into the spawn-failure restart loop (process-management spec).
+        let warnings = config::check_identity_feasible(&resolved)
+            .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
+        for w in &warnings {
+            warn!("{w}");
+        }
         let existing = registry::list(&config, &config_dir)
             .map_err(|e| ComposeUpError::Validation(format!("{e:#}")))?;
         let mut all = Vec::new();
@@ -2605,7 +2654,8 @@ impl Supervisor {
 
         // 3. Classify (authoritative — see [`Self::classify_compose`]).
         let declared = resolved.programs.iter().map(|p| p.name.clone()).collect();
-        let preview = self.classify_compose(&name, &rendered, declared);
+        let mut preview = self.classify_compose(&name, &rendered, declared);
+        preview.warnings = warnings;
         match preview.class {
             ComposeClass::ExternalRefused => {
                 return Err(ComposeUpError::Conflict(Box::new(preview)));
@@ -2626,6 +2676,7 @@ impl Supervisor {
                     unchanged: waits.is_empty(),
                     waits,
                     skipped,
+                    warnings: preview.warnings.clone(),
                 });
             }
             _ => {}
@@ -2753,6 +2804,7 @@ impl Supervisor {
             unchanged: false,
             waits,
             skipped,
+            warnings: preview.warnings.clone(),
         })
     }
 
@@ -2896,6 +2948,24 @@ impl Supervisor {
             }
             match registry::reload_app(&l.name, &l.path, defaults.as_ref()) {
                 Ok(a) => {
+                    // Same pre-spawn gate as bootstrap: an app the daemon
+                    // cannot run under the requested identity keeps its old
+                    // config instead of entering a restart loop.
+                    match config::check_identity_feasible(&a) {
+                        Ok(warnings) => {
+                            for w in warnings {
+                                warn!("{w}");
+                            }
+                        }
+                        Err(e) => {
+                            failed.push(format!("app[{}] kept old config: {e:#}", l.name));
+                            let st = self.state.lock().unwrap();
+                            if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                                new_records.push(old.clone());
+                            }
+                            continue;
+                        }
+                    }
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
@@ -3329,6 +3399,13 @@ impl Supervisor {
         }
         info!("shutdown requested, stopping all programs...");
         self.shutdown_all();
+        // Log archives are compressed off the pump threads; apply whatever is
+        // still queued before exiting so a graceful stop does not leave `.tmp`
+        // files behind (log-management spec: 不丢失已写入内容). Bounded — a
+        // stuck worker must not delay the daemon's exit indefinitely.
+        if !pump::flush_rotations(Duration::from_secs(10)) {
+            warn!("log compression backlog did not drain before exit; archives may remain as .tmp");
+        }
         info!("all programs stopped, appkeeper exits");
     }
 }

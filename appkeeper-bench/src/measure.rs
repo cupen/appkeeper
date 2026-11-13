@@ -140,6 +140,53 @@ fn drain(log_dir: &std::path::Path, names: &[String]) -> Result<()> {
     }
 }
 
+/// Wait until the daemon's asynchronous log rotation has settled: no `.tmp`
+/// archive pending and the archive slot set unchanged across consecutive
+/// polls. The pump enqueues compression off the write path, so the live log
+/// being quiescent does NOT mean the archive chain is — reconciling too early
+/// reads a set that is mid-shift (missing slot 1, rows still moving between
+/// slots) and produces bogus gap reports. Bounded; on timeout reconcile
+/// anyway so the mismatch is reported rather than hanging.
+fn wait_rotations_settled(log_dir: &std::path::Path, names: &[String]) {
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+    let snapshot = || {
+        names
+            .iter()
+            .map(|n| integrity::rotation_slots(log_dir, n))
+            .collect::<Vec<_>>()
+    };
+    let pending = || {
+        names
+            .iter()
+            .any(|n| integrity::rotations_pending(log_dir, n))
+    };
+
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    let mut last = snapshot();
+    let mut stable = 0u32;
+    loop {
+        if !pending() {
+            let now = snapshot();
+            stable = if now == last { stable + 1 } else { 0 };
+            if stable >= 3 {
+                return;
+            }
+            last = now;
+        } else {
+            stable = 0;
+        }
+        if Instant::now() > deadline {
+            eprintln!(
+                "[bench] warning: log rotation did not settle within {SETTLE_TIMEOUT:?}; \
+                 reconciling the current archive set"
+            );
+            return;
+        }
+        progress("waiting for log rotation to settle");
+        std::thread::sleep(DRAIN_POLL);
+    }
+}
+
 fn read_counts(count_files: &[(String, std::path::PathBuf)]) -> Result<Vec<(String, GenCounters)>> {
     let mut out = Vec::new();
     for (name, path) in count_files {
@@ -274,6 +321,9 @@ fn measure(
 
     // Drain, then stop sampling.
     drain(&site.log_dir, names)?;
+    // The pump is done writing, but archives are compressed off-thread: wait
+    // for the shift to settle before reconciling (see the function docs).
+    wait_rotations_settled(&site.log_dir, names);
     stop.store(true, Ordering::Relaxed);
     let daemon_rss = rss_handle
         .and_then(|h| h.join().ok())
@@ -295,7 +345,15 @@ fn measure(
     let mut rotation_count = 0u64;
     let mut problems = Vec::new();
     for (name, c) in &counts {
-        let (out, err) = integrity::verify_program(&site.log_dir, name, c.out_rows, c.err_rows);
+        // The configured archive slots decide how much of the produced stream
+        // is still expected on disk (see `integrity::verify_program`).
+        let keep = plans
+            .iter()
+            .find(|p| &p.name == name)
+            .map(|p| p.keep)
+            .unwrap_or(0);
+        let (out, err) =
+            integrity::verify_program(&site.log_dir, name, c.out_rows, c.err_rows, keep);
         rotation_count += integrity::count_rotated(&site.log_dir.join(format!("{name}.out.log")));
         rotation_count += integrity::count_rotated(&site.log_dir.join(format!("{name}.err.log")));
         expected_total += out.expected + err.expected;

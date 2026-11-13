@@ -653,8 +653,8 @@ pub fn validate_listen_addr(s: &str) -> std::result::Result<(), String> {
 
 /// Built-in rotation defaults: 50MB per file, 2 rotated files kept
 /// (3 files on disk per stream including the live one).
-const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
-const DEFAULT_LOG_ROTATE_KEEP: u32 = 2;
+pub const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_LOG_ROTATE_KEEP: u32 = 2;
 
 /// Fixed absolute default so the log location never depends on where the
 /// daemon config lives. `/tmp` is volatile by design (see README); pin an
@@ -1170,6 +1170,18 @@ impl DaemonConfig {
 // app-level default fields (used by daemon [app-default] and app [app])
 // ---------------------------------------------------------------------------
 
+/// The `log` sub-table: rotation policy. Both fields are optional and merge
+/// field-wise across layers (program > app > app-default > built-in), so a
+/// program that only sets `max_size` keeps the app-level `keep`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogOptions {
+    /// Size string (`"10MB"`, `"1GB"`, bytes). `"0"` disables rotation.
+    pub max_size: Option<String>,
+    /// Number of compressed archives to keep (`log-management` spec).
+    pub keep: Option<u32>,
+}
+
 /// Optional program-level knobs shared across layers. Each layer may set any
 /// subset; resolution picks the highest layer that sets a field.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1190,8 +1202,12 @@ pub struct LevelOptions {
     pub startretries: Option<u32>,
     pub stop_timeout: Option<f64>,
     pub restart_on_unhealthy: Option<bool>,
-    pub log_max_size: Option<String>,
-    pub log_rotate_keep: Option<u32>,
+    pub log: Option<LogOptions>,
+    /// Removed flat key: accepted by the parser only so the error can name the
+    /// `log = { ... }` rewrite (configuration spec: 旧日志键被拒绝).
+    pub log_max_size: Option<toml::Value>,
+    /// Removed flat key (see `log_max_size`).
+    pub log_rotate_keep: Option<toml::Value>,
 }
 
 /// Defaults shared by every app, from the daemon config `[app-default]` table.
@@ -1229,11 +1245,42 @@ pub struct AppMeta {
     pub startretries: Option<u32>,
     pub stop_timeout: Option<f64>,
     pub restart_on_unhealthy: Option<bool>,
-    pub log_max_size: Option<String>,
-    pub log_rotate_keep: Option<u32>,
+    pub log: Option<LogOptions>,
+    /// Removed flat keys (see [`LevelOptions`]).
+    pub log_max_size: Option<toml::Value>,
+    pub log_rotate_keep: Option<toml::Value>,
+}
+
+/// Hard-break the two removed flat log keys with an actionable rewrite
+/// (add-log-governance D1). `None` when neither key is present.
+fn legacy_log_keys_error(
+    label: &str,
+    max_size: Option<&toml::Value>,
+    keep: Option<&toml::Value>,
+) -> Option<String> {
+    if max_size.is_none() && keep.is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(v) = max_size {
+        parts.push(format!("max_size = {v}"));
+    }
+    if let Some(v) = keep {
+        parts.push(format!("keep = {v}"));
+    }
+    Some(format!(
+        "{label}: `log_max_size` / `log_rotate_keep` were removed — write the `log` table instead: \
+         log = {{ {} }}",
+        parts.join(", ")
+    ))
 }
 
 fn check_level_defaults(label: &str, l: &AppDefaults, errors: &mut Vec<String>) {
+    if let Some(msg) =
+        legacy_log_keys_error(label, l.log_max_size.as_ref(), l.log_rotate_keep.as_ref())
+    {
+        errors.push(msg);
+    }
     if let Some(b) = l.restart_backoff
         && b <= 0.0
     {
@@ -1286,6 +1333,17 @@ pub struct ProgramRaw {
     pub args: Option<Vec<String>>,
     pub work_dir: Option<PathBuf>,
     pub env: Option<BTreeMap<String, String>>,
+    /// Unix run identity: a user name or a numeric uid. Absent = inherit the
+    /// daemon's effective user (resolved from `getpwuid(geteuid())`, never
+    /// from `$USER`). Rejected on Windows.
+    pub user: Option<String>,
+    /// Unix primary group: a group name or a numeric gid. Absent = the target
+    /// user's passwd primary group (or the daemon's egid when `user` is also
+    /// absent). Rejected on Windows.
+    pub group: Option<String>,
+    /// Unix file-creation mask as a quoted octal string (`"0027"`). Absent =
+    /// inherit the daemon's umask. Rejected on Windows.
+    pub umask: Option<String>,
     pub depends_on: Option<Vec<String>>,
     pub restart: Option<RestartPolicy>,
     /// Deprecated alias (read-only).
@@ -1299,8 +1357,10 @@ pub struct ProgramRaw {
     pub startretries: Option<u32>,
     pub stop_timeout: Option<f64>,
     pub restart_on_unhealthy: Option<bool>,
-    pub log_max_size: Option<String>,
-    pub log_rotate_keep: Option<u32>,
+    pub log: Option<LogOptions>,
+    /// Removed flat keys (see [`LevelOptions`]).
+    pub log_max_size: Option<toml::Value>,
+    pub log_rotate_keep: Option<toml::Value>,
     pub health_check: Option<String>,
     pub health_interval: Option<f64>,
     pub health_timeout: Option<f64>,
@@ -1334,6 +1394,390 @@ pub struct ResolvedAction {
     pub timeout: u64,
 }
 
+/// One resolved Unix user identity (process-management spec: 子进程运行身份).
+/// Resolution happens at config-load time so unknown accounts fail `ak
+/// validate` / compose previews early; the pre-fetched group list keeps the
+/// post-fork `pre_exec` closure free of non-async-signal-safe lookups.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserSpec {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    /// Supplementary groups, including the passwd primary gid.
+    pub groups: Vec<u32>,
+    pub home: PathBuf,
+    pub shell: PathBuf,
+}
+
+/// One resolved Unix primary group override.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupSpec {
+    pub name: String,
+    pub gid: u32,
+}
+
+/// Parse a quoted octal `umask` (`"0027"`, `"0o27"`). Values above `0o777`
+/// and non-octal spellings are rejected (configuration spec).
+fn parse_umask(s: &str) -> Result<u32> {
+    let raw = s.trim();
+    let digits = raw
+        .strip_prefix("0o")
+        .or_else(|| raw.strip_prefix("0O"))
+        .unwrap_or(raw);
+    if digits.is_empty() || digits.len() > 4 || !digits.bytes().all(|b| (b'0'..=b'7').contains(&b))
+    {
+        bail!("umask {s:?} must be an octal string such as \"0027\" (0..=0777)");
+    }
+    let value = u32::from_str_radix(digits, 8)
+        .with_context(|| format!("umask {s:?} is not a valid octal value"))?;
+    if value > 0o777 {
+        bail!("umask {s:?} must be <= \"0777\"");
+    }
+    Ok(value)
+}
+
+#[cfg(unix)]
+mod identity {
+    use std::ffi::{CStr, CString};
+
+    use anyhow::{Context, Result, bail};
+
+    use super::{GroupSpec, UserSpec};
+
+    struct Passwd {
+        name: String,
+        uid: u32,
+        gid: u32,
+        home: String,
+        shell: String,
+    }
+
+    fn c_string(s: &str) -> Result<CString> {
+        CString::new(s).map_err(|_| anyhow::anyhow!("identity contains a NUL byte: {s:?}"))
+    }
+
+    /// `getpwnam_r` with a growing buffer; the raw pointers are copied into
+    /// an owned struct before the buffer drops.
+    fn passwd_by_name(name: &CStr) -> Option<Passwd> {
+        let mut buf = vec![0i8; 1024];
+        loop {
+            // SAFETY: `pw` is zero-initialized storage; the call fills it and
+            // points `result` into `buf`, which outlives the copy below.
+            let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    name.as_ptr(),
+                    &mut pw,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == 0 {
+                if result.is_null() {
+                    return None;
+                }
+                // SAFETY: on success the fields point into `buf`.
+                let copy = unsafe {
+                    Passwd {
+                        name: CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned(),
+                        uid: pw.pw_uid,
+                        gid: pw.pw_gid,
+                        home: CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned(),
+                        shell: CStr::from_ptr(pw.pw_shell).to_string_lossy().into_owned(),
+                    }
+                };
+                return Some(copy);
+            }
+            if rc == libc::ERANGE && buf.len() < (1 << 20) {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            return None;
+        }
+    }
+
+    fn passwd_by_uid(uid: u32) -> Option<Passwd> {
+        let mut buf = vec![0i8; 1024];
+        loop {
+            // SAFETY: same pattern as `passwd_by_name`.
+            let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc =
+                unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut result) };
+            if rc == 0 {
+                if result.is_null() {
+                    return None;
+                }
+                // SAFETY: on success the fields point into `buf`.
+                let copy = unsafe {
+                    Passwd {
+                        name: CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned(),
+                        uid: pw.pw_uid,
+                        gid: pw.pw_gid,
+                        home: CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned(),
+                        shell: CStr::from_ptr(pw.pw_shell).to_string_lossy().into_owned(),
+                    }
+                };
+                return Some(copy);
+            }
+            if rc == libc::ERANGE && buf.len() < (1 << 20) {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            return None;
+        }
+    }
+
+    fn group_by_name(name: &CStr) -> Option<(String, u32)> {
+        let mut buf = vec![0i8; 1024];
+        loop {
+            // SAFETY: `gr` is zero-initialized storage; the call fills it and
+            // points `result` into `buf`.
+            let mut gr: libc::group = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getgrnam_r(
+                    name.as_ptr(),
+                    &mut gr,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == 0 {
+                if result.is_null() {
+                    return None;
+                }
+                // SAFETY: on success the name points into `buf`.
+                let copy = unsafe {
+                    (
+                        CStr::from_ptr(gr.gr_name).to_string_lossy().into_owned(),
+                        gr.gr_gid,
+                    )
+                };
+                return Some(copy);
+            }
+            if rc == libc::ERANGE && buf.len() < (1 << 20) {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            return None;
+        }
+    }
+
+    fn group_by_gid(gid: u32) -> Option<(String, u32)> {
+        let mut buf = vec![0i8; 1024];
+        loop {
+            // SAFETY: same pattern as `group_by_name`.
+            let mut gr: libc::group = unsafe { std::mem::zeroed() };
+            let mut result: *mut libc::group = std::ptr::null_mut();
+            let rc =
+                unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut result) };
+            if rc == 0 {
+                if result.is_null() {
+                    return None;
+                }
+                // SAFETY: on success the name points into `buf`.
+                let copy = unsafe {
+                    (
+                        CStr::from_ptr(gr.gr_name).to_string_lossy().into_owned(),
+                        gr.gr_gid,
+                    )
+                };
+                return Some(copy);
+            }
+            if rc == libc::ERANGE && buf.len() < (1 << 20) {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            return None;
+        }
+    }
+
+    /// `getgrouplist` with the POSIX grow-and-retry dance. Always contains
+    /// the primary `gid`; on failure it degrades to just that gid.
+    fn supplementary_groups(name: &CStr, gid: u32) -> Vec<u32> {
+        let mut n: libc::c_int = 16;
+        loop {
+            let mut groups = vec![0 as libc::gid_t; n as usize];
+            let rc = unsafe {
+                libc::getgrouplist(
+                    name.as_ptr(),
+                    gid as libc::gid_t,
+                    groups.as_mut_ptr(),
+                    &mut n,
+                )
+            };
+            if rc >= 0 {
+                groups.truncate(n as usize);
+                let mut out: Vec<u32> = groups.into_iter().collect();
+                if !out.contains(&gid) {
+                    out.push(gid);
+                }
+                return out;
+            }
+            if n <= 0 || n as usize > (1 << 20) {
+                return vec![gid];
+            }
+        }
+    }
+
+    pub(super) fn resolve_user(value: &str) -> Result<UserSpec> {
+        let name = value.trim();
+        if name.is_empty() {
+            bail!("user must not be empty");
+        }
+        let cname = c_string(name)?;
+        let entry =
+            passwd_by_name(&cname).or_else(|| name.parse::<u32>().ok().and_then(passwd_by_uid));
+        let entry = entry.with_context(|| format!("user {name:?} does not exist"))?;
+        let groups = supplementary_groups(&cname, entry.gid);
+        let shell = if entry.shell.is_empty() {
+            "/bin/sh".to_string()
+        } else {
+            entry.shell
+        };
+        Ok(UserSpec {
+            name: entry.name,
+            uid: entry.uid,
+            gid: entry.gid,
+            groups,
+            home: entry.home.into(),
+            shell: shell.into(),
+        })
+    }
+
+    pub(super) fn resolve_group(value: &str) -> Result<GroupSpec> {
+        let name = value.trim();
+        if name.is_empty() {
+            bail!("group must not be empty");
+        }
+        let cname = c_string(name)?;
+        let entry =
+            group_by_name(&cname).or_else(|| name.parse::<u32>().ok().and_then(group_by_gid));
+        let (name, gid) = entry.with_context(|| format!("group {name:?} does not exist"))?;
+        Ok(GroupSpec { name, gid })
+    }
+}
+
+/// Resolve the three Unix identity knobs. On non-Unix platforms any of them
+/// is a hard validation error (configuration spec: 仅 Unix).
+fn resolve_identity(
+    prog_name: &str,
+    raw: &ProgramRaw,
+) -> Result<(Option<UserSpec>, Option<GroupSpec>, Option<u32>)> {
+    let umask = raw
+        .umask
+        .as_deref()
+        .map(parse_umask)
+        .transpose()
+        .with_context(|| format!("program[{prog_name}]: invalid umask"))?;
+    #[cfg(unix)]
+    {
+        let user = raw
+            .user
+            .as_deref()
+            .map(identity::resolve_user)
+            .transpose()
+            .with_context(|| format!("program[{prog_name}]: invalid user"))?;
+        let group = raw
+            .group
+            .as_deref()
+            .map(identity::resolve_group)
+            .transpose()
+            .with_context(|| format!("program[{prog_name}]: invalid group"))?;
+        Ok((user, group, umask))
+    }
+    #[cfg(not(unix))]
+    {
+        if raw.user.is_some() || raw.group.is_some() || raw.umask.is_some() {
+            bail!("program[{prog_name}]: `user`, `group` and `umask` are only supported on unix");
+        }
+        Ok((None, None, None))
+    }
+}
+
+/// Daemon-side feasibility gate for the identity knobs (process-management
+/// spec: 执行前拦截). Deliberately separate from [`resolve_app`]: `ak validate`
+/// runs as the *caller*, so comparing its euid with the target uid would
+/// reject perfectly good configs for a root daemon.
+///
+/// Returns non-fatal warnings (currently "runs as root") on success and the
+/// rejection reason when the daemon could never switch to the requested
+/// identity. Must be called before anything is written or started.
+#[cfg(unix)]
+pub fn check_identity_feasible(app: &ResolvedApp) -> Result<Vec<String>> {
+    // SAFETY: plain getters.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let mut warnings = Vec::new();
+    for p in &app.programs {
+        let run_uid = p.user.as_ref().map(|u| u.uid).unwrap_or(euid);
+        let effective_gid = p
+            .group
+            .as_ref()
+            .map(|g| g.gid)
+            .or_else(|| p.user.as_ref().map(|u| u.gid))
+            .unwrap_or(egid);
+        if run_uid == 0 {
+            warnings.push(format!(
+                "program[{}]: runs as root (uid 0) — set `user` to run it as an unprivileged account",
+                p.name
+            ));
+        }
+        if euid == 0 {
+            // Root can install any uid/gid/groups triple.
+            continue;
+        }
+        if run_uid != euid {
+            bail!(
+                "program[{}]: `user` resolves to uid {run_uid}, but appkeeper runs as uid {euid} — \
+                 a non-root daemon cannot switch users; start the daemon as root or omit `user`",
+                p.name
+            );
+        }
+        // Same user: only a group switch remains, and `setgid` may only reach
+        // a group the daemon is already a member of.
+        if effective_gid != egid && !process_groups().contains(&(effective_gid as libc::gid_t)) {
+            bail!(
+                "program[{}]: `group` resolves to gid {effective_gid}, which is not one of the \
+                 daemon's groups — a non-root daemon cannot switch to it; start the daemon as \
+                 root or use a group the daemon belongs to",
+                p.name
+            );
+        }
+    }
+    Ok(warnings)
+}
+
+#[cfg(not(unix))]
+pub fn check_identity_feasible(_app: &ResolvedApp) -> Result<Vec<String>> {
+    // `user`/`group`/`umask` are rejected during parsing on this platform.
+    Ok(Vec::new())
+}
+
+/// The daemon's supplementary groups, used to decide whether a non-root
+/// `setgid` can succeed.
+#[cfg(unix)]
+fn process_groups() -> Vec<libc::gid_t> {
+    // SAFETY: `getgroups(0, NULL)` only reports the count; the second call
+    // fills a buffer of exactly that size.
+    unsafe {
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut groups = vec![0 as libc::gid_t; count as usize];
+        let written = libc::getgroups(count, groups.as_mut_ptr());
+        if written < 0 {
+            return Vec::new();
+        }
+        groups.truncate(written as usize);
+        groups
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthCheck {
     pub kind: HealthKind,
@@ -1361,6 +1805,12 @@ pub struct ResolvedProgram {
     pub actions: BTreeMap<String, ResolvedAction>,
     pub work_dir: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Resolved run identity (Unix). `None` = inherit the daemon's effective
+    /// user; `group` overrides the primary group independently.
+    pub user: Option<UserSpec>,
+    pub group: Option<GroupSpec>,
+    /// File-creation mask applied to the child before exec (Unix).
+    pub umask: Option<u32>,
     pub depends_on: Vec<String>,
     pub restart: RestartPolicy,
     pub exit_codes: Vec<i32>,
@@ -1544,10 +1994,18 @@ pub fn resolve_program(
         .or(defaults.and_then(|d| d.restart_on_unhealthy))
         .unwrap_or(false);
     let log_max_size = raw
-        .log_max_size
-        .clone()
-        .or(meta.as_ref().and_then(|m| m.log_max_size.clone()))
-        .or(defaults.and_then(|d| d.log_max_size.clone()))
+        .log
+        .as_ref()
+        .and_then(|l| l.max_size.clone())
+        .or_else(|| {
+            meta.and_then(|m| m.log.as_ref())
+                .and_then(|l| l.max_size.clone())
+        })
+        .or_else(|| {
+            defaults
+                .and_then(|d| d.log.as_ref())
+                .and_then(|l| l.max_size.clone())
+        })
         .map(|s| parse_size(&s))
         .transpose()?;
     // Rotation is on by default; "0" is the explicit opt-out (max_size None).
@@ -1557,9 +2015,11 @@ pub fn resolve_program(
         None => Some(DEFAULT_LOG_MAX_SIZE),
     };
     let log_rotate_keep = raw
-        .log_rotate_keep
-        .or(meta.as_ref().and_then(|m| m.log_rotate_keep))
-        .or(defaults.and_then(|d| d.log_rotate_keep))
+        .log
+        .as_ref()
+        .and_then(|l| l.keep)
+        .or_else(|| meta.and_then(|m| m.log.as_ref()).and_then(|l| l.keep))
+        .or_else(|| defaults.and_then(|d| d.log.as_ref()).and_then(|l| l.keep))
         .unwrap_or(DEFAULT_LOG_ROTATE_KEEP);
 
     if restart_backoff <= 0.0 {
@@ -1567,6 +2027,13 @@ pub fn resolve_program(
     }
     if stop_timeout < 0.0 || startsecs < 0.0 || backoff_reset_after < 0.0 {
         bail!("program[{prog_name}]: negative timeout values are not allowed");
+    }
+    if let Some(msg) = legacy_log_keys_error(
+        &format!("program[{prog_name}]"),
+        raw.log_max_size.as_ref(),
+        raw.log_rotate_keep.as_ref(),
+    ) {
+        bail!("{msg}");
     }
 
     let health = match &raw.health_check {
@@ -1583,6 +2050,7 @@ pub fn resolve_program(
     };
     let env = raw.env.clone().unwrap_or_default();
     let depends_on = raw.depends_on.clone().unwrap_or_default();
+    let (user, group, umask) = resolve_identity(prog_name, raw)?;
 
     // Custom actions: validate the name (charset + reserved words), the
     // command (non-empty, variable names known) and the timeout (> 0) at
@@ -1631,6 +2099,9 @@ pub fn resolve_program(
         actions,
         work_dir,
         env,
+        user,
+        group,
+        umask,
         depends_on,
         restart,
         exit_codes,
@@ -1715,8 +2186,9 @@ impl AppMeta {
             startretries: self.startretries,
             stop_timeout: self.stop_timeout,
             restart_on_unhealthy: self.restart_on_unhealthy,
+            log: self.log.clone(),
             log_max_size: self.log_max_size.clone(),
-            log_rotate_keep: self.log_rotate_keep,
+            log_rotate_keep: self.log_rotate_keep.clone(),
         }
     }
 }
@@ -2067,6 +2539,9 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
                 args: p.args,
                 work_dir: p.working_dir.map(PathBuf::from),
                 env: p.environment,
+                user: None,
+                group: None,
+                umask: None,
                 depends_on: None,
                 restart: None,
                 autorestart,
@@ -2079,6 +2554,7 @@ pub fn import_legacy(legacy_path: &Path) -> Result<LegacyImport> {
                 startretries: None,
                 stop_timeout: p.stop_timeout,
                 restart_on_unhealthy: None,
+                log: None,
                 log_max_size: None,
                 log_rotate_keep: None,
                 health_check: None,
@@ -3186,13 +3662,111 @@ mod tests {
 
     #[test]
     fn log_rotation_defaults_and_opt_out() {
-        let a = app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"0\"\n").unwrap();
+        let a = app_of("[program.a]\ncommand=\"x\"\nlog = { max_size = \"0\" }\n").unwrap();
         assert_eq!(a.programs[0].log_max_size, None); // "0" disables rotation
-        let b =
-            app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"10MB\"\nlog_rotate_keep = 3\n")
-                .unwrap();
+        let b = app_of("[program.a]\ncommand=\"x\"\nlog = { max_size = \"10MB\", keep = 3 }\n")
+            .unwrap();
         assert_eq!(b.programs[0].log_max_size, Some(10 * 1024 * 1024));
         assert_eq!(b.programs[0].log_rotate_keep, 3);
+        // Absent `log` keeps the built-in 50MB / 2.
+        let c = app_of("[program.a]\ncommand=\"x\"\n").unwrap();
+        assert_eq!(c.programs[0].log_max_size, Some(50 * 1024 * 1024));
+        assert_eq!(c.programs[0].log_rotate_keep, 2);
+    }
+
+    /// configuration: the inline table and the `[program.x.log]` section form
+    /// are equivalent, and unknown keys inside `log` are rejected.
+    #[test]
+    fn log_table_forms_are_equivalent() {
+        let inline =
+            app_of("[program.a]\ncommand=\"x\"\nlog = { max_size = \"10MB\", keep = 3 }\n")
+                .unwrap();
+        let section = app_of(
+            "[program.a]\ncommand=\"x\"\n\n[program.a.log]\nmax_size = \"10MB\"\nkeep = 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                inline.programs[0].log_max_size,
+                inline.programs[0].log_rotate_keep
+            ),
+            (
+                section.programs[0].log_max_size,
+                section.programs[0].log_rotate_keep
+            )
+        );
+        let msg = format!(
+            "{:#}",
+            app_of("[program.a]\ncommand=\"x\"\nlog = { bogus = 1 }\n")
+                .err()
+                .unwrap()
+        );
+        assert!(msg.contains("bogus") || msg.contains("unknown"), "{msg}");
+    }
+
+    /// configuration: `log.max_size` and `log.keep` merge field-wise across
+    /// layers, so a program that only overrides the size keeps the app default
+    /// for the archive count.
+    #[test]
+    fn log_fields_merge_per_field() {
+        let a = app_of(
+            "[app]\nlog = { keep = 5 }\n\n[program.a]\ncommand=\"x\"\nlog = { max_size = \"10MB\" }\n",
+        )
+        .unwrap();
+        assert_eq!(a.programs[0].log_max_size, Some(10 * 1024 * 1024));
+        assert_eq!(a.programs[0].log_rotate_keep, 5);
+        // Program-level wins when both layers set the same field.
+        let b = app_of(
+            "[app]\nlog = { keep = 5, max_size = \"1MB\" }\n\n[program.a]\ncommand=\"x\"\nlog = { max_size = \"10MB\" }\n",
+        )
+        .unwrap();
+        assert_eq!(b.programs[0].log_max_size, Some(10 * 1024 * 1024));
+        assert_eq!(b.programs[0].log_rotate_keep, 5);
+    }
+
+    /// configuration: the removed flat keys are a hard error with a rewrite
+    /// snippet, at every layer that used to accept them.
+    #[test]
+    fn legacy_flat_log_keys_are_rejected_with_a_rewrite() {
+        let msg = format!(
+            "{:#}",
+            app_of("[program.a]\ncommand=\"x\"\nlog_max_size = \"10MB\"\nlog_rotate_keep = 3\n")
+                .err()
+                .unwrap()
+        );
+        assert!(
+            msg.contains("log_max_size")
+                && msg.contains("log_rotate_keep")
+                && msg.contains("log = {")
+                && msg.contains("max_size = \"10MB\"")
+                && msg.contains("keep = 3"),
+            "{msg}"
+        );
+        let app_msg = format!(
+            "{:#}",
+            app_of("[app]\nlog_max_size = \"1MB\"\n\n[program.a]\ncommand=\"x\"\n")
+                .err()
+                .unwrap()
+        );
+        assert!(
+            app_msg.contains("log_max_size") && app_msg.contains("log = {"),
+            "{app_msg}"
+        );
+    }
+
+    /// configuration: generated snapshots write `log` as a section table
+    /// (`[program.x.log]`), which re-parses to the same policy.
+    #[test]
+    fn snapshot_serializes_log_as_a_section_table() {
+        let raw: AppRaw =
+            toml::from_str("[program.a]\ncommand = 'x'\nlog = { max_size = \"10MB\", keep = 3 }\n")
+                .unwrap();
+        let text = toml::to_string_pretty(&raw).unwrap();
+        assert!(text.contains("[program.a.log]"), "{text}");
+        let back: AppRaw = toml::from_str(&text).unwrap();
+        let a = resolve_app("demo", Path::new("/opt/demo/a.toml"), &back, None).unwrap();
+        assert_eq!(a.programs[0].log_max_size, Some(10 * 1024 * 1024));
+        assert_eq!(a.programs[0].log_rotate_keep, 3);
     }
 
     #[test]
@@ -4053,6 +4627,152 @@ mod tests {
         assert_eq!(base, with_empty, "the empty `-e` path changes nothing");
         assert!(with_empty.contains("${PORT}"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// configuration: `user` resolves names and numeric uids to a full
+    /// passwd identity; unknown accounts are rejected at parse time.
+    #[cfg(unix)]
+    #[test]
+    fn user_resolves_names_and_numeric_uids() {
+        let a = app_of("[program.api]\ncommand = 'x'\nuser = \"root\"\n").unwrap();
+        let user = a.programs[0].user.as_ref().expect("user resolved");
+        assert_eq!(user.uid, 0);
+        assert_eq!(user.name, "root");
+        assert!(
+            user.groups.contains(&user.gid),
+            "the primary gid is part of getgrouplist: {:?}",
+            user.groups
+        );
+        assert!(!user.home.as_os_str().is_empty());
+
+        // The numeric form resolves through getpwuid (root is uid 0).
+        let b = app_of("[program.api]\ncommand = 'x'\nuser = \"0\"\n").unwrap();
+        assert_eq!(b.programs[0].user.as_ref().unwrap().uid, 0);
+
+        let msg = format!(
+            "{:#}",
+            app_of("[program.api]\ncommand = 'x'\nuser = \"no-such-account-xyz\"\n")
+                .err()
+                .unwrap()
+        );
+        assert!(
+            msg.contains("invalid user") && msg.contains("does not exist"),
+            "{msg}"
+        );
+    }
+
+    /// configuration: `group` resolves independently of `user` (group-only
+    /// switching) and rejects unknown groups.
+    #[cfg(unix)]
+    #[test]
+    fn group_resolves_without_user() {
+        let a = app_of("[program.api]\ncommand = 'x'\ngroup = \"root\"\n").unwrap();
+        assert!(
+            a.programs[0].user.is_none(),
+            "group alone must not imply user"
+        );
+        assert_eq!(a.programs[0].group.as_ref().unwrap().gid, 0);
+
+        let b = app_of("[program.api]\ncommand = 'x'\ngroup = \"0\"\n").unwrap();
+        assert_eq!(b.programs[0].group.as_ref().unwrap().gid, 0);
+
+        let msg = format!(
+            "{:#}",
+            app_of("[program.api]\ncommand = 'x'\ngroup = \"no-such-group-xyz\"\n")
+                .err()
+                .unwrap()
+        );
+        assert!(
+            msg.contains("invalid group") && msg.contains("does not exist"),
+            "{msg}"
+        );
+    }
+
+    /// configuration: `umask` is a quoted octal string; malformed values and
+    /// bare TOML integers are rejected with a repair hint.
+    #[cfg(unix)]
+    #[test]
+    fn umask_parses_octal_strings_only() {
+        let a = app_of("[program.api]\ncommand = 'x'\numask = \"0027\"\n").unwrap();
+        assert_eq!(a.programs[0].umask, Some(0o027));
+        let b = app_of("[program.api]\ncommand = 'x'\numask = \"0o77\"\n").unwrap();
+        assert_eq!(b.programs[0].umask, Some(0o077));
+
+        for bad in ["\"08\"", "\"1000\"", "\"\"", "\"0o\""] {
+            let msg = app_of(&format!("[program.api]\ncommand = 'x'\numask = {bad}\n"))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(msg.contains("umask"), "{bad} must name umask: {msg}");
+        }
+        // A bare integer is a type error (TOML `0027` is not even a number).
+        assert!(
+            app_of("[program.api]\ncommand = 'x'\numask = 27\n").is_err(),
+            "bare integer must be rejected"
+        );
+    }
+
+    /// configuration: identity fields participate in the definition hash, so
+    /// changing `user` alone triggers a reload/apply restart.
+    #[cfg(unix)]
+    #[test]
+    fn identity_fields_feed_the_definition_hash() {
+        let h = |text: &str| app_of(text).unwrap().programs[0].hash;
+        let plain = h("[program.api]\ncommand = 'x'\n");
+        let as_root = h("[program.api]\ncommand = 'x'\nuser = \"root\"\n");
+        let as_root_mask = h("[program.api]\ncommand = 'x'\nuser = \"root\"\numask = \"0077\"\n");
+        assert_ne!(plain, as_root, "user must change the hash");
+        assert_ne!(as_root, as_root_mask, "umask must change the hash");
+    }
+
+    /// configuration: `umask` and `env` coexist — the identity environment is
+    /// injected at spawn time, so parsing only carries the declared values.
+    #[cfg(unix)]
+    #[test]
+    fn umask_coexists_with_env() {
+        let a = app_of(
+            "[program.api]\ncommand = 'x'\numask = \"0027\"\n\
+             [program.api.env]\nHOME = \"/srv/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(a.programs[0].umask, Some(0o027));
+        assert_eq!(a.programs[0].env["HOME"], "/srv/app");
+    }
+
+    /// process-management: feasibility follows the daemon's euid. The matrix
+    /// is exercised against the real process identity, so the same test
+    /// asserts different branches under root and non-root runs.
+    #[cfg(unix)]
+    #[test]
+    fn identity_feasibility_tracks_the_daemon_euid() {
+        let euid = unsafe { libc::geteuid() };
+
+        // No identity knobs: always feasible; warning only when running root.
+        let plain = app_of("[program.api]\ncommand = 'x'\n").unwrap();
+        let warnings = check_identity_feasible(&plain).unwrap();
+        assert_eq!(warnings.is_empty(), euid != 0, "{warnings:?}");
+
+        if euid == 0 {
+            // Root can switch anywhere, and the target-is-root case warns.
+            let as_root = app_of("[program.api]\ncommand = 'x'\nuser = \"root\"\n").unwrap();
+            let warnings = check_identity_feasible(&as_root).unwrap();
+            assert!(
+                warnings.iter().any(|w| w.contains("runs as root")),
+                "{warnings:?}"
+            );
+        } else {
+            // A non-root daemon can never become another user.
+            let other = app_of("[program.api]\ncommand = 'x'\nuser = \"root\"\n").unwrap();
+            let msg = check_identity_feasible(&other).err().unwrap().to_string();
+            assert!(msg.contains("cannot switch users"), "{msg}");
+
+            // Same user + a group it does not belong to is equally refused.
+            if !process_groups().contains(&0) {
+                let g = app_of("[program.api]\ncommand = 'x'\ngroup = \"root\"\n").unwrap();
+                let msg = check_identity_feasible(&g).err().unwrap().to_string();
+                assert!(msg.contains("not one of the daemon's groups"), "{msg}");
+            }
+        }
     }
 }
 

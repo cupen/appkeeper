@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
 
-use crate::config::ResolvedProgram;
+use crate::config::{GroupSpec, ResolvedProgram, UserSpec};
 use crate::platform;
 use crate::pump::{self, PumpSet, Stream};
 
@@ -99,6 +99,62 @@ pub struct ManagedProgram {
     last_code: Option<i32>,
     fatal_reason: Option<String>,
     pumps: Option<PumpSet>,
+}
+
+/// The identity switch a child needs before exec. `None`-valued `groups`
+/// means "do not touch supplementary groups" (a non-root group-only switch).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnIdentity {
+    run_uid: u32,
+    effective_gid: u32,
+    /// Supplementary groups to install (root path only); `None` = leave as-is.
+    groups: Option<Vec<u32>>,
+    set_uid: bool,
+    set_gid: bool,
+    umask: Option<u32>,
+}
+
+/// Decide the pre-exec identity switch (process-management spec: 子进程运行身份).
+/// Pure so it can be unit-tested without spawning; feasibility (non-root
+/// cross-user, group membership) is enforced upstream in the daemon.
+#[cfg(unix)]
+fn spawn_identity(
+    user: Option<&UserSpec>,
+    group: Option<&GroupSpec>,
+    umask: Option<u32>,
+    euid: u32,
+    egid: u32,
+) -> Option<SpawnIdentity> {
+    let run_uid = user.map(|u| u.uid).unwrap_or(euid);
+    let effective_gid = group
+        .map(|g| g.gid)
+        .or_else(|| user.map(|u| u.gid))
+        .unwrap_or(egid);
+    let set_uid = run_uid != euid;
+    let set_gid = effective_gid != egid;
+    if !set_uid && !set_gid && umask.is_none() {
+        return None;
+    }
+    // Only root can reset supplementary groups; a non-root same-user group
+    // switch is limited to `setgid` (the daemon must already belong to it).
+    let groups = if euid == 0 && set_uid {
+        let mut groups = user.map(|u| u.groups.clone()).unwrap_or_default();
+        if !groups.contains(&effective_gid) {
+            groups.push(effective_gid);
+        }
+        Some(groups)
+    } else {
+        None
+    };
+    Some(SpawnIdentity {
+        run_uid,
+        effective_gid,
+        groups,
+        set_uid,
+        set_gid,
+        umask,
+    })
 }
 
 impl ManagedProgram {
@@ -221,11 +277,68 @@ impl ManagedProgram {
         if !self.def.work_dir.as_os_str().is_empty() {
             cmd.current_dir(&self.def.work_dir);
         }
+        // Identity environment: only fill in keys the config did not set
+        // explicitly (configuration spec: 未显式设置时注入 passwd 值).
+        if let Some(user) = &self.def.user {
+            let values = [
+                ("HOME", user.home.to_string_lossy().into_owned()),
+                ("USER", user.name.clone()),
+                ("LOGNAME", user.name.clone()),
+                ("SHELL", user.shell.to_string_lossy().into_owned()),
+            ];
+            for (key, value) in values {
+                if !self.def.env.contains_key(key) {
+                    cmd.env(key, value);
+                }
+            }
+        }
         #[cfg(unix)]
         {
             // Own process group so we can kill the whole tree later.
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+
+            // SAFETY: plain getters.
+            let euid = unsafe { libc::geteuid() };
+            let egid = unsafe { libc::getegid() };
+            if let Some(id) = spawn_identity(
+                self.def.user.as_ref(),
+                self.def.group.as_ref(),
+                self.def.umask,
+                euid,
+                egid,
+            ) {
+                // Pre-convert outside the closure: `pre_exec` must stay
+                // async-signal-safe (no allocation after fork).
+                let gids: Option<Vec<libc::gid_t>> = id
+                    .groups
+                    .as_ref()
+                    .map(|groups| groups.iter().map(|g| *g as libc::gid_t).collect());
+                let uid = id.run_uid as libc::uid_t;
+                let gid = id.effective_gid as libc::gid_t;
+                let (set_uid, set_gid, mask) = (id.set_uid, id.set_gid, id.umask);
+                // SAFETY: the closure calls only async-signal-safe syscalls
+                // and owns all of its data; failures reach `spawn` as errors.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if let Some(gids) = &gids
+                            && libc::setgroups(gids.len(), gids.as_ptr()) != 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if set_gid && libc::setgid(gid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if set_uid && libc::setuid(uid) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if let Some(mask) = mask {
+                            libc::umask(mask as libc::mode_t);
+                        }
+                        Ok(())
+                    });
+                }
+            }
         }
 
         match cmd.spawn() {
@@ -790,5 +903,146 @@ mod tests {
             "an explicit stop converges to a removable state"
         );
         let _ = std::fs::remove_dir_all(p.log_dir.clone());
+    }
+
+    #[cfg(unix)]
+    fn user(uid: u32, gid: u32, groups: &[u32]) -> UserSpec {
+        UserSpec {
+            name: format!("u{uid}"),
+            uid,
+            gid,
+            groups: groups.to_vec(),
+            home: PathBuf::from(format!("/home/u{uid}")),
+            shell: PathBuf::from("/bin/sh"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn group(gid: u32) -> GroupSpec {
+        GroupSpec {
+            name: format!("g{gid}"),
+            gid,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_noop_without_identity_options() {
+        assert_eq!(spawn_identity(None, None, None, 1000, 1000), None);
+    }
+
+    /// Root dropping to another user: uid, primary gid and the supplemental
+    /// group list all switch, with the effective gid folded in exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_root_drop_installs_groups() {
+        let id = spawn_identity(Some(&user(1000, 1000, &[1000, 27])), None, None, 0, 0).unwrap();
+        assert_eq!(id.run_uid, 1000);
+        assert_eq!(id.effective_gid, 1000);
+        assert!(id.set_uid && id.set_gid);
+        assert_eq!(id.groups, Some(vec![1000, 27]), "no duplicate gid");
+        assert_eq!(id.umask, None);
+    }
+
+    /// Root staying root: no privilege drop, so supplementary groups are
+    /// left alone (only the explicit group switch, if any, applies).
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_root_staying_root_skips_setgroups() {
+        let id = spawn_identity(Some(&user(0, 0, &[0])), None, Some(0o027), 0, 0).unwrap();
+        assert!(!id.set_uid && !id.set_gid);
+        assert_eq!(id.groups, None);
+        assert_eq!(id.umask, Some(0o027));
+    }
+
+    /// Non-root switching to a group it already belongs to: only `setgid`,
+    /// never `setgroups` (that requires root).
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_non_root_group_switch_is_setgid_only() {
+        let id = spawn_identity(
+            Some(&user(1000, 1000, &[1000, 2000])),
+            Some(&group(2000)),
+            None,
+            1000,
+            1000,
+        )
+        .unwrap();
+        assert!(!id.set_uid);
+        assert!(id.set_gid);
+        assert_eq!(id.effective_gid, 2000);
+        assert_eq!(id.groups, None, "non-root must not call setgroups");
+    }
+
+    /// The same account with no group/umask needs no pre-exec work at all.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_same_account_is_noop() {
+        assert_eq!(
+            spawn_identity(Some(&user(1000, 1000, &[1000])), None, None, 1000, 1000),
+            None
+        );
+    }
+
+    /// `umask` alone still warrants the switch, with no identity syscalls.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_identity_umask_only() {
+        let id = spawn_identity(None, None, Some(0o077), 1000, 1000).unwrap();
+        assert!(!id.set_uid && !id.set_gid);
+        assert_eq!(id.groups, None);
+        assert_eq!(id.umask, Some(0o077));
+    }
+
+    /// process-management: `HOME`/`USER` come from the passwd record unless
+    /// `[program.x.env]` sets them — and this holds even when the identity
+    /// switch itself is a no-op (the test runs as the daemon's own user).
+    #[cfg(unix)]
+    #[test]
+    fn identity_environment_is_injected_only_when_absent() {
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let spec = UserSpec {
+            name: "ak-identity-test".to_string(),
+            uid,
+            gid,
+            groups: vec![gid],
+            home: PathBuf::from("/tmp/ak-identity-home"),
+            shell: PathBuf::from("/bin/sh"),
+        };
+        for (tag, extra, want_home) in [
+            ("identity-env-inject", "", "/tmp/ak-identity-home"),
+            (
+                "identity-env-explicit",
+                "[program.t.env]\nHOME = \"/srv/app\"\n",
+                "/srv/app",
+            ),
+        ] {
+            let mut def = resolved(&format!(
+                "[program.t]\ncommand = 'sh'\nargs = ['-c', 'echo \"$HOME|$USER\"']\n\
+                 startsecs = 0.05\nrestart = \"no\"\n{extra}"
+            ));
+            def.user = Some(spec.clone());
+            let mut p = ManagedProgram::new(def, tmp_dir(tag), 100);
+            p.spawn();
+            drive(&mut p, |p| p.state() == ProgramState::Exited);
+            let log = p.log_dir.join("t.out.log");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut text = String::new();
+            while Instant::now() < deadline {
+                text = std::fs::read_to_string(&log).unwrap_or_default();
+                if !text.trim().is_empty() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let line = text.lines().last().unwrap_or_default().trim();
+            assert_eq!(
+                line,
+                format!("{want_home}|ak-identity-test"),
+                "identity environment ({tag}): {text:?}"
+            );
+            let _ = std::fs::remove_dir_all(p.log_dir.clone());
+        }
     }
 }
