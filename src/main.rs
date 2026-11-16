@@ -1250,21 +1250,16 @@ fn ps_degrades_to_registry(all: bool, err: &anyhow::Error) -> bool {
 fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
     let config = client::load_config(config_path)?;
     let config_dir = config_dir_of(config_path);
-    // The local registry is advisory for the default view: it only supplies
-    // the DESCRIPTION column (the config path comes from the `/v1` projection).
-    // A registry read failure (e.g. an unreadable `app_dir`) MUST NOT turn a
-    // connection-class error into exit 1 — `ps` keeps the exit-3 / permission
-    // contract by asking the daemon first. `--all` keeps the hard dependency:
-    // its view and its offline degradation are registry-sourced by definition.
-    let registry_rows = match ps_registry_rows(&config, &config_dir) {
-        Ok(rows) => rows,
-        Err(e) if !all => {
-            eprintln!(
-                "note: the local registry could not be read; descriptions are omitted: {e:#}"
-            );
-            Vec::new()
-        }
-        Err(e) => return Err(e),
+    // The default view is served by the daemon projection alone (including
+    // DESCRIPTION, which the projection carries): reading the local registry
+    // here would make a read-only online query depend on — and leak warnings
+    // from — an unrelated on-disk scan. `--all` is the only view that merges
+    // the registry, and its offline degradation is registry-sourced by
+    // definition.
+    let registry_rows = if all {
+        ps_registry_rows(&config, &config_dir)?
+    } else {
+        Vec::new()
     };
     let descriptions: std::collections::BTreeMap<String, String> = registry_rows
         .iter()

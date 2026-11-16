@@ -1982,6 +1982,25 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         plain.contains("pending: app[gamma] registered (new)"),
         &format!("plain `ps` names the pending-added app in the summary: {plain:?}"),
     )?;
+    // control-plane: the default view is the daemon projection only. A
+    // dangling record in app_dir (which a local registry scan warns about)
+    // must not leak into this read-only online query.
+    #[cfg(unix)]
+    {
+        let dangling = ws.root.join("apps/dangling.toml");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(ws.root.join("apps/no-such-target.toml"), &dangling)?;
+        let (ok, code, combined) = cli_try(bin, ws, &["ps"])?;
+        expect(
+            ok && code == 0,
+            &format!("plain `ps` succeeds with a dangling record present: {code} {combined:?}"),
+        )?;
+        expect(
+            !combined.contains("dangling registration link"),
+            &format!("plain `ps` does not scan the local registry: {combined:?}"),
+        )?;
+        let _ = std::fs::remove_file(&dangling);
+    }
     let full = cli(bin, ws, &["ps", "--all"])?;
     expect(
         full.contains("gamma") && full.contains("not-applied"),

@@ -1298,6 +1298,7 @@ mod tests {
             args: Vec::new(),
             work_dir: String::new(),
             config_path: None,
+            description: None,
             health_confirmed: true,
         };
         let b_changed = {
@@ -1333,6 +1334,7 @@ mod tests {
             args: Vec::new(),
             work_dir: String::new(),
             config_path: None,
+            description: None,
             health_confirmed: true,
         };
         let mut b = a.clone();
@@ -1365,6 +1367,7 @@ mod tests {
             args: Vec::new(),
             work_dir: String::new(),
             config_path: None,
+            description: None,
             health_confirmed: true,
         };
         let before = vec![mk("web", "api"), mk("web", "web"), mk("other", "job")];

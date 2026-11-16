@@ -71,6 +71,11 @@ pub(crate) struct ProgramInfo {
     /// run-daemon-first (D7); `None` when unknown.
     #[serde(default)]
     pub config_path: Option<String>,
+    /// `[app] description`, carried in the projection so the default `ak ps`
+    /// view needs no local registry read (control-plane spec: 缺省 ps 只看
+    /// 控制面投影). Backward-compatible addition.
+    #[serde(default)]
+    pub description: Option<String>,
     /// True once the program's health has been positively confirmed (D6):
     /// no-health programs confirm at spawn, checked ones on the first
     /// successful probe. Backward-compatible addition.
@@ -246,12 +251,14 @@ pub(crate) fn webui_console_url(listen: &str) -> String {
 
 /// Build the status projection of one program. `metrics` is the shared
 /// sampler table; passing `None` leaves metric fields empty (used by tests).
-/// `config_path` is the app's config file path (run-daemon-first D7), looked
-/// up by the caller from the app records.
+/// `config_path` is the app's config file path (run-daemon-first D7) and
+/// `description` the app's `[app] description`; both are looked up by the
+/// caller from the app records.
 pub(crate) fn program_info(
     p: &crate::program::ManagedProgram,
     metrics: Option<&crate::metrics::MetricsTable>,
     config_path: Option<&str>,
+    description: Option<&str>,
 ) -> ProgramInfo {
     let m = metrics
         .and_then(|t| t.program(&p.def.name))
@@ -275,6 +282,7 @@ pub(crate) fn program_info(
         args: p.def.args.clone(),
         work_dir: p.def.work_dir.display().to_string(),
         config_path: config_path.map(String::from),
+        description: description.map(String::from),
         health_confirmed: p.health_confirmed(),
     }
 }
@@ -313,7 +321,12 @@ pub(crate) fn program_info_state(
     metrics: Option<&crate::metrics::MetricsTable>,
 ) -> ProgramInfo {
     let config_path = app_config_path(st, &p.def.app);
-    program_info(p, metrics, config_path.as_deref())
+    let description = st
+        .apps
+        .iter()
+        .find(|a| a.name == p.def.app)
+        .and_then(|a| a.description.clone());
+    program_info(p, metrics, config_path.as_deref(), description.as_deref())
 }
 
 fn json_bytes(status: u16, body: impl Serialize) -> Vec<u8> {
@@ -1868,6 +1881,7 @@ mod tests {
             args: vec![],
             work_dir: String::new(),
             config_path: Some("/etc/appkeeper/app.d/a.toml".into()),
+            description: None,
             health_confirmed: true,
         };
         StatusDoc {
@@ -2047,6 +2061,41 @@ mod tests {
             doc.daemon.system.cpu_percent, None,
             "system untouched by program entry"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// control-plane: the projection carries `[app] description`, so `ps` can
+    /// show it without reading the local registry (the default view's only
+    /// data source is the daemon).
+    #[test]
+    fn projection_carries_the_app_description() {
+        let dir = std::env::temp_dir().join(format!("ak-test-projdesc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::DaemonConfig::default();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        let raw: AppRaw = toml::from_str(
+            "[app]\ndescription = \"the demo app\"\n\n[program.p]\ncommand = 'true'\n",
+        )
+        .unwrap();
+        let app = resolve_app("demo", Path::new("x.toml"), &raw, None).unwrap();
+        let description = app.description.clone();
+        let def = app.programs.into_iter().next().unwrap();
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.programs.insert(
+                def.name.clone(),
+                ManagedProgram::new(def.clone(), dir.clone(), 10),
+            );
+            st.apps.push(crate::supervisor::AppRecord {
+                name: "demo".into(),
+                path: std::path::PathBuf::from("x.toml"),
+                description,
+                priority: 0,
+            });
+        }
+        let doc = status_doc(&sup);
+        let info = doc.programs.iter().find(|p| p.name == def.name).unwrap();
+        assert_eq!(info.description.as_deref(), Some("the demo app"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

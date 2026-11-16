@@ -775,10 +775,12 @@ fn program_rows(
                             .and_then(|x| x.as_str())
                             .map(String::from)
                             .unwrap_or_else(|| "-".into()),
-                        description: descriptions
-                            .get(&app)
+                        description: p
+                            .get("description")
+                            .and_then(|x| x.as_str())
                             .filter(|d| !d.is_empty())
-                            .cloned()
+                            .map(String::from)
+                            .or_else(|| descriptions.get(&app).filter(|d| !d.is_empty()).cloned())
                             .unwrap_or_else(|| "-".into()),
                         origin: "-".into(),
                     }
@@ -1489,6 +1491,34 @@ mod tests {
         // An app without a registry description shows a placeholder.
         assert!(lines[4].contains("api") && lines[4].contains("-"));
         assert!(!out.contains('{') && !out.contains('}'), "{out}");
+    }
+
+    /// control-plane: the default view takes DESCRIPTION from the daemon
+    /// projection; the client-side map is only a fallback (and plain `ps` no
+    /// longer reads the local registry to fill it).
+    #[test]
+    fn ps_table_prefers_the_projection_description() {
+        let v = serde_json::json!({
+            "programs": [
+                {"name": "web", "app": "demo", "state": "running", "pid": 1,
+                 "total_exits": 0, "unhealthy": false,
+                 "config_path": "/opt/demo/appkeeper.toml",
+                 "description": "from the daemon"},
+                {"name": "worker", "app": "demo", "state": "running", "pid": 2,
+                 "total_exits": 0, "unhealthy": false, "config_path": null}
+            ]
+        });
+        let mut desc = std::collections::BTreeMap::new();
+        desc.insert("demo".to_string(), "from the registry".to_string());
+        let out = render_ps_table(&v, &desc);
+        let web = out.lines().find(|l| l.contains("web")).unwrap_or("");
+        assert!(web.contains("from the daemon"), "projection wins: {out}");
+        assert!(!web.contains("from the registry"), "{out}");
+        let worker = out.lines().find(|l| l.contains("worker")).unwrap_or("");
+        assert!(
+            worker.contains("from the registry"),
+            "the map stays the fallback: {out}"
+        );
     }
 
     /// 4.1: the empty projection renders the registration hint.

@@ -753,6 +753,10 @@ pub struct AppRecord {
     pub name: String,
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// `[app] description` (configuration spec). Carried in the runtime record
+    /// so the projection can serve `ps` without the client reading the local
+    /// registry (control-plane spec: 缺省 ps 只看控制面投影).
+    pub description: Option<String>,
     pub priority: i32,
 }
 
@@ -1197,6 +1201,7 @@ impl Supervisor {
                         records.push(AppRecord {
                             name: a.name.clone(),
                             path: a.path.clone(),
+                            description: a.description.clone(),
                             priority: a.priority,
                         });
                         resolved.push(a);
@@ -1762,6 +1767,7 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
+                        description: a.description.clone(),
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -1779,6 +1785,7 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
+                        description: a.description.clone(),
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -1897,6 +1904,7 @@ impl Supervisor {
             records.push(AppRecord {
                 name: s.resolved.name.clone(),
                 path: s.resolved.path.clone(),
+                description: s.resolved.description.clone(),
                 priority: s.resolved.priority,
             });
             resolved.push(s.resolved.clone());
@@ -2332,6 +2340,7 @@ impl Supervisor {
                 st.apps.push(AppRecord {
                     name: resolved.name.clone(),
                     path: resolved.path.clone(),
+                    description: resolved.description.clone(),
                     priority: resolved.priority,
                 });
             }
@@ -2396,6 +2405,7 @@ impl Supervisor {
                     st.apps.push(AppRecord {
                         name: staged.resolved.name.clone(),
                         path: staged.resolved.path.clone(),
+                        description: staged.resolved.description.clone(),
                         priority: staged.resolved.priority,
                     });
                 }
@@ -2969,6 +2979,7 @@ impl Supervisor {
                     new_records.push(AppRecord {
                         name: a.name.clone(),
                         path: a.path.clone(),
+                        description: a.description.clone(),
                         priority: a.priority,
                     });
                     resolved.push(a);
@@ -3318,6 +3329,7 @@ impl Supervisor {
                     apps.push(AppRecord {
                         name: s.app.clone(),
                         path: s.target.clone(),
+                        description: s.resolved.description.clone(),
                         priority: s.resolved.priority,
                     });
                 }
@@ -5441,6 +5453,7 @@ mod tests {
             st.apps.push(AppRecord {
                 name: "hollow".into(),
                 path: PathBuf::new(),
+                description: None,
                 priority: 0,
             });
         }
