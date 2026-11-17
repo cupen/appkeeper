@@ -53,8 +53,14 @@ export interface DaemonInfo {
 }
 
 export interface ProgramInfo {
+  /** Owning app name; empty for a standalone program (never forged). */
   app: string
   name: string
+  /**
+   * True for an `app_dir/adhoc/` run product, which belongs to no app
+   * (add-standalone-programs D7). Additive field: absent means false.
+   */
+  standalone?: boolean
   state: string
   pid: number | null
   unhealthy: boolean
@@ -76,6 +82,15 @@ export interface ProgramInfo {
   config_path?: string | null
   /** Health positively confirmed (run-daemon-first D6; additive). */
   health_confirmed?: boolean
+}
+
+/**
+ * Whether a projected program is a standalone record: it has no owning app.
+ * `standalone` is the authoritative flag; an empty `app` also means no app
+ * (older payloads may omit the flag).
+ */
+export function isStandalone(p: Pick<ProgramInfo, 'app' | 'standalone'>): boolean {
+  return p.standalone === true || p.app === ''
 }
 
 export interface PendingProgram {

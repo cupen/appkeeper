@@ -13,7 +13,7 @@
 import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property } from 'lit/decorators.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
-import type { ProgramInfo } from '../lib/types.js'
+import { isStandalone, type ProgramInfo } from '../lib/types.js'
 import { navigate } from '../router.js'
 import { viewStyles } from '../styles/shared.js'
 import '../components/program-table.js'
@@ -94,6 +94,9 @@ export class AkDashboard extends LitElement {
   private groups(): AppGroup[] {
     const map = new Map<string, ProgramInfo[]>()
     for (const p of this.consoleState.doc?.programs ?? []) {
+      // Standalone records belong to no app; they get their own section and
+      // must never create an app group (no forged app name).
+      if (isStandalone(p)) continue
       const list = map.get(p.app) ?? []
       list.push(p)
       map.set(p.app, list)
@@ -109,21 +112,48 @@ export class AkDashboard extends LitElement {
     return groups
   }
 
+  /**
+   * Standalone records for the independent 「散装程序」section. Row fields and
+   * the fault/backoff-first ordering match an app group's rows.
+   */
+  private standalonePrograms(): ProgramInfo[] {
+    return (this.consoleState.doc?.programs ?? [])
+      .filter((p) => isStandalone(p))
+      .sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name))
+  }
+
   private pendingOf(app: string): string[] {
     return (this.consoleState.doc?.pending.programs ?? [])
       .filter((x) => x.app === app)
       .map((x) => x.program)
   }
 
+  /**
+   * Pending entries for a row set: match on the program name, since a
+   * standalone pending entry has no owning app to scope the match by.
+   */
+  private pendingOfRows(programs: ProgramInfo[]): string[] {
+    const names = new Set(programs.map((p) => p.name))
+    return (this.consoleState.doc?.pending.programs ?? [])
+      .filter((x) => names.has(x.program))
+      .map((x) => x.program)
+  }
+
   private onSelect(e: Event): void {
     const detail = (e as CustomEvent<ProgramSelectDetail>).detail
-    if (!detail?.app || !detail.program) return
+    if (!detail?.program) return
+    // A standalone row has no app: it lands on the app-less detail route.
+    if (!detail.app) {
+      navigate(`/program/${encodeURIComponent(detail.program)}`)
+      return
+    }
     navigate(`/app/${encodeURIComponent(detail.app)}/program/${encodeURIComponent(detail.program)}`)
   }
 
   render() {
     const { doc, transport } = this.consoleState
     const groups = this.groups()
+    const standalone = this.standalonePrograms()
     const total = doc?.programs.length ?? 0
     return html`
       <header class="page-head">
@@ -162,7 +192,18 @@ export class AkDashboard extends LitElement {
               .showApp=${true}
               @program-select=${this.onSelect}
             ></ak-program-table>`,
-          )}`}
+          )}
+          ${standalone.length > 0
+            ? html`<ak-program-table
+                .programs=${standalone}
+                .pending=${this.pendingOfRows(standalone)}
+                .store=${this.store}
+                heading="散装程序"
+                caption=${`${standalone.length} 个程序`}
+                .showApp=${false}
+                @program-select=${this.onSelect}
+              ></ak-program-table>`
+            : nothing}`}
     `
   }
 }

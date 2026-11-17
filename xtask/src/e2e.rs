@@ -47,6 +47,14 @@
 //!        re-run detects the residual, refuses non-interactively, then
 //!        re-lands on confirm without restarting (RDF14-16); the built-in
 //!        `app_dir` default is `app.d` (RDF17).
+//!   SA. standalone programs (add-standalone-programs): `run` registration
+//!       and `<stem>`/`<stem>-1` auto-naming, explicit duplicate 409s with
+//!       zero side effects, the removed `--app` flag (exit 2), `--force`
+//!       overwrite and byte-identical no-op, an old-format `adhoc/` record
+//!       (with `[app]`) loading and starting, the unified target grammar
+//!       (`<program>`, `<app>/<program>`, `<app>/all`, bare app-name hint,
+//!       reserved `all`), and the standalone exclusion from `/v1/apps`
+//!       fan-out.
 //! - webui lifecycle pass (config-driven-webui): the daemon boots with
 //!   `ak daemon start` and a `[webui]` section in daemon.toml; W1 deletes the
 //!   section + `ak config --reload` → connection refused, W2 sets a new listen
@@ -1023,16 +1031,16 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         !combined.contains("run <name>") && !combined.contains("run --app"),
         &format!("the retired start forms are no longer listed: {combined:?}"),
     )?;
-    // `run --name <x>` is no longer accepted: the ad-hoc naming flag is
-    // `--app`, so clap reports an unknown argument with exit 2.
-    let (ok, code, combined) = cli_try_raw(bin, &["run", "--name", "x"])?;
+    // `run --app <x>` is intercepted pre-clap with exit 2: `--app` was
+    // removed, and the hint names its successor `--name`.
+    let (ok, code, combined) = cli_try_raw(bin, &["run", "--app", "x"])?;
     expect(
         !ok && code == 2,
-        &format!("`run --name x` is rejected with exit 2, got {code}: {combined:?}"),
+        &format!("`run --app x` is rejected with exit 2, got {code}: {combined:?}"),
     )?;
     expect(
-        combined.contains("--name") || combined.contains("unexpected argument"),
-        &format!("the rejection names the unknown argument: {combined:?}"),
+        combined.contains("--app") && combined.contains("--name"),
+        &format!("the rejection names the removed flag and its successor: {combined:?}"),
     )?;
     // A client form is not intercepted: with the daemon still down it reports
     // unreachable (exit 3) instead of the interception (exit 2). A dead-port
@@ -1190,9 +1198,14 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
             &format!("the help no longer lists the removed `{gone}` verb: {combined:?}"),
         )?;
     }
-    // The three-line usage examples ride at the end of the top-level help
-    // (design D7): daemon start → start app → stop app.
-    for example in ["ak daemon start", "ak start <app>", "ak stop <app>"] {
+    // The usage examples ride at the end of the top-level help: daemon start
+    // → standalone run → one program → whole app (unified target grammar).
+    for example in [
+        "ak daemon start",
+        "ak run -- npx serve",
+        "ak start npx",
+        "ak stop gateway/all",
+    ] {
         expect(
             combined.contains(example),
             &format!("the help ends with the {example:?} example: {combined:?}"),
@@ -1268,7 +1281,7 @@ fn offline_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         record.is_file(),
         "the offline registration exists before the attempt",
     )?;
-    let (ok, code, combined) = cli_try(bin, ws, &["remove", "offline-demo"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "offline-demo/all"])?;
     expect(
         !ok && code == 3,
         &format!("offline remove exits 3, got {code}: {combined:?}"),
@@ -1870,7 +1883,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     let job_pid = pid_of(ws, "job")?.expect("job running");
     std::thread::sleep(Duration::from_secs(2));
-    let out = cli(bin, ws, &["apply", "alpha"])?;
+    let out = cli(bin, ws, &["apply", "alpha/all"])?;
     expect(
         out.contains("update-and-restart"),
         "alpha apply rebuilt+restarted the changed worker",
@@ -1916,7 +1929,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("pending changes") && out.contains("job"),
         "shell pending lists the changed program",
     )?;
-    let out = cli(bin, ws, &["shell", "-e", "apply beta"])?;
+    let out = cli(bin, ws, &["shell", "-e", "apply beta/all"])?;
     expect(
         out.contains("update-and-restart") && out.contains("job"),
         "shell scoped apply reports the per-program result",
@@ -2042,7 +2055,7 @@ fn cli_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         out.contains("no pending changes"),
         "shell pending is clean after full apply",
     )?;
-    let out = cli(bin, ws, &["shell", "-e", "apply alpha"])?;
+    let out = cli(bin, ws, &["shell", "-e", "apply alpha/all"])?;
     expect(out.contains("no changes"), "shell scoped apply idempotent")?;
 
     scaffold_pass(bin, ws)?;
@@ -2153,7 +2166,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("G2. apply abc starts the scaffolded program");
-    let out = cli(bin, ws, &["apply", "abc"])?;
+    let out = cli(bin, ws, &["apply", "abc/all"])?;
     expect(out.contains("abc"), "scoped apply picked up abc")?;
     let abc_pid = wait_running(ws, "abc")?;
 
@@ -2178,7 +2191,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "no-change re-compose does not touch the running program",
     )?;
 
-    step("G4. changed re-compose, a second pending app, then `apply all` takes both");
+    step("G4. changed re-compose, a second pending app, then bare `apply` takes both");
     let out = cli(
         bin,
         ws,
@@ -2208,11 +2221,11 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         ],
     )?;
     expect(out.contains("changed"), "fox first generation is changed")?;
-    let out = cli(bin, ws, &["apply", "all"])?;
-    expect(out.contains("abc"), "`apply all` applied abc's change")?;
+    let out = cli(bin, ws, &["apply"])?;
+    expect(out.contains("abc"), "bare `apply` applied abc's change")?;
     expect(
         out.contains("fox"),
-        "`apply all` also applied the other pending app (full-registry scope)",
+        "bare `apply` also applied the other pending app (full-registry scope)",
     )?;
     let abc_pid2 = wait_running(ws, "abc")?;
     expect(abc_pid2 != abc_pid, "abc restarted with the new args")?;
@@ -2281,7 +2294,7 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // running here, so the guard answers 409 and NOTHING changes (no stop, no
     // file deletion, no apply).
     let abc_pid_before = pid_of(ws, "abc")?.expect("abc is running before the refusal");
-    let (ok, code, combined) = cli_try(bin, ws, &["remove", "abc"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "abc/all"])?;
     expect(!ok, &format!("remove of a live app fails, got {code}"))?;
     expect(
         combined.contains("still has live program(s)") && combined.contains("ak stop abc"),
@@ -2295,9 +2308,9 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     // stop → remove: the daemon deletes the generated file and drops the
     // programs in the same turn — no apply, no pending unregistration.
-    let out = cli(bin, ws, &["stop", "abc"])?;
+    let out = cli(bin, ws, &["stop", "abc/all"])?;
     expect(out.contains("abc"), "abc stopped before removal")?;
-    let out = cli(bin, ws, &["remove", "abc"])?;
+    let out = cli(bin, ws, &["remove", "abc/all"])?;
     expect(
         out.contains("generated config file removed") && out.contains("no apply needed"),
         &format!("remove reports the deleted file and no apply: {out:?}"),
@@ -2308,9 +2321,9 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "abc's program is gone from the projection",
     )?;
 
-    let out = cli(bin, ws, &["stop", "fox"])?;
+    let out = cli(bin, ws, &["stop", "fox/all"])?;
     expect(out.contains("fox"), "fox stopped before removal")?;
-    let out = cli(bin, ws, &["remove", "fox"])?;
+    let out = cli(bin, ws, &["remove", "fox/all"])?;
     expect(
         out.contains("generated config file removed"),
         "fox's generated file is deleted too",
@@ -2319,9 +2332,9 @@ fn scaffold_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     // A link registration (gamma) is removed without touching the external
     // deployment file; the message names the kept body.
-    let out = cli(bin, ws, &["stop", "gamma"])?;
+    let out = cli(bin, ws, &["stop", "gamma/all"])?;
     expect(out.contains("gamma"), "gamma stopped before removal")?;
-    let out = cli(bin, ws, &["remove", "gamma"])?;
+    let out = cli(bin, ws, &["remove", "gamma/all"])?;
     expect(
         out.contains("deployment config kept at") && out.contains("no apply needed"),
         &format!("gamma's removal names the kept deployment config: {out:?}"),
@@ -2446,7 +2459,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         body.contains("still has live program(s)") && body.contains("ak stop alpha"),
         &format!("the /api conflict carries the same message: {body}"),
     )?;
-    let (ok, code, combined) = cli_try(bin, ws, &["remove", "alpha"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "alpha/all"])?;
     expect(
         !ok && code == 1,
         &format!("CLI removal of a live app exits 1, got {code}: {combined}"),
@@ -2520,7 +2533,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         )?;
     }
     // Out of scope: an apply scoped to another app is not blocked.
-    let out = cli(bin, ws, &["apply", "beta"])?;
+    let out = cli(bin, ws, &["apply", "beta/all"])?;
     expect(
         out.contains("no changes"),
         &format!("beta-scoped apply proceeds: {out}"),
@@ -2592,7 +2605,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     step("RG4. stop → /api remove is one daemon action (external body kept)");
-    let out = cli(bin, ws, &["stop", "alpha"])?;
+    let out = cli(bin, ws, &["stop", "alpha/all"])?;
     expect(out.contains("web"), &format!("alpha stopped: {out}"))?;
     let (code, body) = web_http(ws, "POST", "/api/apps/alpha/remove", None)?;
     expect(
@@ -2664,10 +2677,10 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     link_registration(&flaky_body, &apps.join("flaky.toml"))?;
     std::thread::sleep(Duration::from_secs(2)); // periodic detect window
-    let out = cli(bin, ws, &["apply", "flaky"])?;
+    let out = cli(bin, ws, &["apply", "flaky/all"])?;
     expect(out.contains("flaky.slow"), &format!("flaky applied: {out}"))?;
     wait_state(ws, "slow", "backoff")?;
-    let (ok, code, combined) = cli_try(bin, ws, &["remove", "flaky"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["remove", "flaky/all"])?;
     expect(
         !ok && code == 1,
         &format!("removal with a backoff program exits 1, got {code}: {combined}"),
@@ -2680,7 +2693,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         apps.join("flaky.toml").is_file(),
         "the refused removal keeps the record",
     )?;
-    let out = cli(bin, ws, &["stop", "flaky"])?;
+    let out = cli(bin, ws, &["stop", "flaky/all"])?;
     expect(out.contains("slow"), &format!("flaky stopped: {out}"))?;
     let (code, body) = api_checked(ws, "POST", "/v1/apps/flaky/remove", "")?;
     expect(
@@ -2706,7 +2719,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     link_registration(&shellapp_body, &apps.join("shellrm.toml"))?;
     std::thread::sleep(Duration::from_secs(2)); // periodic detect window
-    let out = cli(bin, ws, &["apply", "shellrm"])?;
+    let out = cli(bin, ws, &["apply", "shellrm/all"])?;
     expect(
         out.contains("shellrm.svc2"),
         &format!("shellrm applied: {out}"),
@@ -2714,7 +2727,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
     wait_state(ws, "svc2", "running")?;
     // `shell -e` maps the control-plane 409 to exit 1 and prints the daemon's
     // blocker list (shell-client: 拒绝时显示阻塞程序与先 stop 的提示).
-    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "remove shellrm"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["shell", "-e", "remove shellrm/all"])?;
     expect(
         !ok && code == 1,
         &format!("shell remove of a live app exits 1, got {code}: {combined}"),
@@ -2732,9 +2745,9 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         "the refused shell removal did not stop the program",
     )?;
     // stop → remove in one shell command: no apply, record and projection gone.
-    let out = cli(bin, ws, &["shell", "-e", "stop shellrm"])?;
+    let out = cli(bin, ws, &["shell", "-e", "stop shellrm/all"])?;
     expect(out.contains("svc2"), &format!("shell stop reported: {out}"))?;
-    let out = cli(bin, ws, &["shell", "-e", "remove shellrm"])?;
+    let out = cli(bin, ws, &["shell", "-e", "remove shellrm/all"])?;
     expect(
         out.contains("deployment config kept at") && out.contains("no apply needed"),
         &format!("shell remove reports kept config and no apply: {out}"),
@@ -2759,7 +2772,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     link_registration(&batchy_body, &apps.join("batchy.toml"))?;
     std::thread::sleep(Duration::from_secs(2)); // periodic detect window
-    let out = cli(bin, ws, &["apply", "batchy"])?;
+    let out = cli(bin, ws, &["apply", "batchy/all"])?;
     expect(out.contains("batchy.b2"), &format!("batchy applied: {out}"))?;
     wait_state(ws, "b2", "running")?;
     let pid = pid_of(ws, "b2")?.expect("b2 running before the refusal");
@@ -2800,7 +2813,7 @@ fn remove_guard_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
         "the unregistration stays pending after the refused /api apply",
     )?;
     // Cleaning up: stop then let apply finish the removal.
-    let out = cli(bin, ws, &["stop", "batchy"])?;
+    let out = cli(bin, ws, &["stop", "batchy/all"])?;
     expect(out.contains("b2"), &format!("b2 stopped: {out}"))?;
     let out = cli(bin, ws, &["apply"])?;
     expect(
@@ -2841,7 +2854,8 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         &format!("start <app> <program> reports the program: {out:?}"),
     )?;
     wait_running(ws, "web")?;
-    // The removed fan-out flag is a clap error (exit 2), for all three verbs.
+    // The removed fan-out flag is rejected before clap (exit 2), for all
+    // three verbs; `--name` belongs to `run` and is unknown here.
     for verb in ["start", "stop", "restart"] {
         let (ok, code, combined) = cli_try(bin, ws, &[verb, "--app", "alpha"])?;
         expect(
@@ -2850,12 +2864,12 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         )?;
     }
 
-    step("R2. bare `<app>` fans out over the app; the second arg narrows one program");
-    // alpha has two programs (web, worker): the bare name starts both.
-    let out = cli(bin, ws, &["start", "alpha"])?;
+    step("R2. `<app>/all` fans out over the app; the second arg narrows one program");
+    // alpha has two programs (web, worker): `<app>/all` starts both.
+    let out = cli(bin, ws, &["start", "alpha/all"])?;
     expect(
         out.contains("web") && out.contains("worker"),
-        &format!("start <app> fans out over both programs: {out:?}"),
+        &format!("start <app>/all fans out over both programs: {out:?}"),
     )?;
     wait_running(ws, "web")?;
     wait_running(ws, "worker")?;
@@ -2907,7 +2921,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     step("R3. run ad-hoc cold registration + `--cmd`/`--` equivalence + default refusal");
     let sleep = find_sleep()?;
     let sleep_s = sleep.to_string_lossy().replace('\\', "/");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "123", "--app", "adhoc-a"])?;
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
+    )?;
     expect(
         out.contains("started") && out.contains("config:") && out.contains("pid:"),
         &format!("run -- registers and reports {{program, config, pid}}: {out:?}"),
@@ -2931,7 +2949,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "run",
             "--cmd",
             &format!("{sleep_s} 123"),
-            "--app",
+            "--name",
             "adhoc-b",
         ],
     )?;
@@ -2958,11 +2976,11 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     let attempts: Vec<(&str, Vec<&str>)> = vec![
         (
             "changed args",
-            vec!["run", "--", &sleep_s, "456", "--app", "adhoc-a"],
+            vec!["run", "--", &sleep_s, "456", "--name", "adhoc-a"],
         ),
         (
             "identical args",
-            vec!["run", "--", &sleep_s, "123", "--app", "adhoc-a"],
+            vec!["run", "--", &sleep_s, "123", "--name", "adhoc-a"],
         ),
         (
             "--restart=no",
@@ -2971,14 +2989,14 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
                 "--",
                 &sleep_s,
                 "456",
-                "--app",
+                "--name",
                 "adhoc-a",
                 "--restart=no",
             ],
         ),
         (
             "--cmd form",
-            vec!["run", "--cmd", &changed_cmd, "--app", "adhoc-a"],
+            vec!["run", "--cmd", &changed_cmd, "--name", "adhoc-a"],
         ),
     ];
     for (label, args) in attempts {
@@ -3045,7 +3063,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "--",
             &sleep_s,
             "789",
-            "--app",
+            "--name",
             "adhoc-quiet",
             "--restart=no",
         ],
@@ -3066,7 +3084,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     let (ok, code, combined) = cli_try(
         bin,
         ws,
-        &["run", "--", &sleep_s, "789", "--app", "adhoc-quiet"],
+        &["run", "--", &sleep_s, "789", "--name", "adhoc-quiet"],
     )?;
     expect(
         !ok && code != 0,
@@ -3089,8 +3107,8 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
         "the refused re-run left no placeholder",
     )?;
     // Reserved `all` is refused.
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--app", "all"])?;
-    expect(!ok, "run --app all is rejected")?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "--name", "all"])?;
+    expect(!ok, "run --name all is rejected")?;
     expect(
         combined.contains("reserved"),
         "the reserved-word error explains",
@@ -3117,13 +3135,13 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             "run",
             "--cmd",
             &format!("{sleep_s} 999"),
-            "--app",
+            "--name",
             "adhoc-us",
             "--restart=unless-stopped",
         ],
     )?;
     wait_running(ws, "adhoc-us")?;
-    cli(bin, ws, &["stop", "adhoc-us", "adhoc-us"])?;
+    cli(bin, ws, &["stop", "adhoc-us"])?;
     // harden-daemon-autostart: the record lives in the effective state_dir
     // (this workspace pins one) — never in log_dir.
     let state_file = ws.root.join("state/state.json");
@@ -3142,7 +3160,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
     )?;
     wait_running(ws, "job")?;
     // An explicit start clears the record.
-    cli(bin, ws, &["start", "adhoc-us", "adhoc-us"])?;
+    cli(bin, ws, &["start", "adhoc-us"])?;
     wait_running(ws, "adhoc-us")?;
     let state_text = std::fs::read_to_string(&state_file).unwrap_or_default();
     expect(
@@ -3247,7 +3265,7 @@ fn revamp_scenarios(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<(
             ws,
             &["compose", echo_file.to_str().unwrap(), "--name", "echo"],
         )?;
-        cli(bin, ws, &["apply", "echo"])?;
+        cli(bin, ws, &["apply", "echo/all"])?;
         wait_running(ws, "echo-a")?;
         wait_running(ws, "echo-b")?;
         // Give the ring buffer a moment to accumulate a line.
@@ -3478,8 +3496,8 @@ fn runfirst_offline(bin: &Path, ws: &Workspace) -> Result<()> {
     let cmd_form = format!("{sleep_s} 1");
     let forms: [&[&str]; 4] = [
         &["start", "web"],
-        &["run", "--", &sleep_s, "--app", "cold"],
-        &["run", "--cmd", &cmd_form, "--app", "cold2"],
+        &["run", "--", &sleep_s, "--name", "cold"],
+        &["run", "--cmd", &cmd_form, "--name", "cold2"],
         &["start", "ghost"],
     ];
     for args in forms {
@@ -3513,7 +3531,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     // -- 8.1: start <app> / ad-hoc run -- / --json / blocking ----------------
 
     step("RDF1. ad-hoc `run --` registers and returns {program, config, pid}");
-    let out = cli(bin, ws, &["run", "--", &sleep_s, "300", "--app", "web"])?;
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "300", "--name", "web"])?;
     expect(
         out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid:"),
         &format!("run -- reports program/config/pid: {out:?}"),
@@ -3528,10 +3546,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the reported pid is the live one ({web_pid})"),
     )?;
 
-    step("RDF2. `start <app>` returns name/config/pid for a stopped registered program");
-    cli(bin, ws, &["stop", "web", "web"])?;
+    step("RDF2. `start <program>` returns name/config/pid for a stopped standalone");
+    cli(bin, ws, &["stop", "web"])?;
     wait_state_in(ws, "web", &["stopped"])?;
-    let out = cli(bin, ws, &["start", "web", "web"])?;
+    let out = cli(bin, ws, &["start", "web"])?;
     expect(
         out.contains("web") && out.contains(&apps_web_seg()) && out.contains("pid="),
         &format!("start <app> renders the three fields: {out:?}"),
@@ -3542,10 +3560,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the pid in the output is the live one ({web2})"),
     )?;
 
-    step("RDF3. `start <app> <program> --json` is a machine-readable single object");
-    cli(bin, ws, &["stop", "web", "web"])?;
+    step("RDF3. `start <program> --json` is a machine-readable single object");
+    cli(bin, ws, &["stop", "web"])?;
     wait_state_in(ws, "web", &["stopped"])?;
-    let out = cli(bin, ws, &["start", "web", "web", "--json"])?;
+    let out = cli(bin, ws, &["start", "web", "--json"])?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("run --json parses")?;
     expect(
         v.get("name").and_then(|n| n.as_str()) == Some("web"),
@@ -3571,7 +3589,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--json", "--", &sleep_s, "301", "--app", "json-web"],
+        &["run", "--json", "--", &sleep_s, "301", "--name", "json-web"],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("adhoc --json parses")?;
     expect(
@@ -3580,7 +3598,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("adhoc --json is a single object with name/pid: {out:?}"),
     )?;
 
-    step("RDF5. `start <app>` fans out one line per program; `--json` is an array");
+    step("RDF5. `start <app>/all` fans out one line per program; `--json` is an array");
     std::fs::write(
         ws.root.join("fan-app/appkeeper.toml"),
         format!(
@@ -3597,10 +3615,10 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "fan",
         ],
     )?;
-    cli(bin, ws, &["apply", "fan"])?;
+    cli(bin, ws, &["apply", "fan/all"])?;
     wait_running(ws, "fa")?;
     wait_running(ws, "fb")?;
-    let out = cli(bin, ws, &["start", "fan"])?;
+    let out = cli(bin, ws, &["start", "fan/all"])?;
     let (pa, pb) = (out.find("fa "), out.find("fb "));
     expect(
         matches!((pa, pb), (Some(a), Some(b)) if a < b),
@@ -3618,7 +3636,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         out.contains("appkeeper.toml") || out.contains("fan.toml"),
         &format!("the config_path names the app's config body: {out:?}"),
     )?;
-    let json = cli(bin, ws, &["start", "fan", "--json"])?;
+    let json = cli(bin, ws, &["start", "fan/all", "--json"])?;
     let arr: serde_json::Value =
         serde_json::from_str(json.trim()).context("fan-out json parses")?;
     let arr = arr.as_array().context("fan-out --json is an array")?;
@@ -3654,8 +3672,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "mixed",
         ],
     )?;
-    cli(bin, ws, &["apply", "mixed"])?;
-    let (ok, code, combined) = cli_try(bin, ws, &["start", "mixed"])?;
+    cli(bin, ws, &["apply", "mixed/all"])?;
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "mixed/all"])?;
     expect(
         !ok && code != 0,
         &format!("a partial fan-out failure exits non-zero, got {code}: {combined:?}"),
@@ -3686,7 +3704,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "slow",
         ],
     )?;
-    cli(bin, ws, &["apply", "slow"])?;
+    cli(bin, ws, &["apply", "slow/all"])?;
     // `restart = "no"`: the app is registered but not started, so the
     // `start` below is the first start and its 1.5s startsecs is a pure wait.
     expect(
@@ -3718,7 +3736,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
     step("RDF8. a program that exits before startsecs fails with no residue");
     let (ok, code, combined) =
-        cli_try(bin, ws, &["run", "--", &sleep_s, "0.05", "--app", "flaky"])?;
+        cli_try(bin, ws, &["run", "--", &sleep_s, "0.05", "--name", "flaky"])?;
     expect(!ok, &format!("early-exit ad-hoc fails: {combined:?}"))?;
     expect(code != 0, &format!("non-zero exit, got {code}"))?;
     expect(
@@ -3746,8 +3764,9 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "owner",
         ],
     )?;
-    cli(bin, ws, &["apply", "owner"])?;
-    let (ok, code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--app", "clash"])?;
+    cli(bin, ws, &["apply", "owner/all"])?;
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--", &sleep_s, "302", "--name", "clash"])?;
     expect(
         !ok && code != 0,
         &format!("cross-app colliding --name is refused, got {code}: {combined:?}"),
@@ -3757,8 +3776,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         &format!("the error explains the collision: {combined:?}"),
     )?;
     expect(
-        combined.contains("owner"),
-        &format!("the error names the owning app: {combined:?}"),
+        combined.contains("clash") && combined.contains("--name"),
+        &format!("the error names the colliding program and the escape: {combined:?}"),
     )?;
     expect_no_residue(ws, "clash")?;
 
@@ -3773,19 +3792,27 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     for (label, args) in [
         (
             "changed args",
-            vec!["run", "--", &sleep_s, "303", "--app", "web"],
+            vec!["run", "--", &sleep_s, "303", "--name", "web"],
         ),
         (
             "identical args",
-            vec!["run", "--", &sleep_s, "300", "--app", "web"],
+            vec!["run", "--", &sleep_s, "300", "--name", "web"],
         ),
         (
             "--restart=no",
-            vec!["run", "--", &sleep_s, "303", "--app", "web", "--restart=no"],
+            vec![
+                "run",
+                "--",
+                &sleep_s,
+                "303",
+                "--name",
+                "web",
+                "--restart=no",
+            ],
         ),
         (
             "--cmd form",
-            vec!["run", "--cmd", &format!("{sleep_s} 303"), "--app", "web"],
+            vec!["run", "--cmd", &format!("{sleep_s} 303"), "--name", "web"],
         ),
     ] {
         let (ok, code, combined) = cli_try(bin, ws, &args)?;
@@ -3831,7 +3858,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "303", "--app", "web"],
+        &["run", "--force", "--", &sleep_s, "303", "--name", "web"],
     )?;
     expect(
         out.contains("started") && out.contains("pid:"),
@@ -3875,7 +3902,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "303", "--app", "web"],
+        &["run", "--force", "--", &sleep_s, "303", "--name", "web"],
     )?;
     expect(
         out.contains("配置无修改，不做任何动作"),
@@ -3920,7 +3947,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "--",
             &sleep_s,
             "304",
-            "--app",
+            "--name",
             "web",
             "--restart=no",
         ],
@@ -3953,7 +3980,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "--",
             &sleep_s,
             "304",
-            "--app",
+            "--name",
             "web",
             "--restart=no",
         ],
@@ -3978,7 +4005,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "--",
             &sleep_s,
             "305",
-            "--app",
+            "--name",
             "idle",
             "--restart=no",
         ],
@@ -3989,7 +4016,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "306", "--app", "idle"],
+        &["run", "--force", "--", &sleep_s, "306", "--name", "idle"],
     )?;
     expect(
         out.contains("started"),
@@ -4015,7 +4042,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "306", "--app", "idle"],
+        &["run", "--force", "--", &sleep_s, "306", "--name", "idle"],
     )?;
     expect(
         out.contains("配置无修改，不做任何动作"),
@@ -4044,7 +4071,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let (ok, code, combined) = cli_try(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "302", "--app", "clash"],
+        &["run", "--force", "--", &sleep_s, "302", "--name", "clash"],
     )?;
     expect(
         !ok && code != 0,
@@ -4067,7 +4094,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
             "--",
             &sleep_s,
             "308",
-            "--app",
+            "--name",
             "doomed",
             "--restart=no",
         ],
@@ -4076,7 +4103,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let (ok, code, combined) = cli_try(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "0.05", "--app", "doomed"],
+        &["run", "--force", "--", &sleep_s, "0.05", "--name", "doomed"],
     )?;
     expect(
         !ok && code != 0,
@@ -4106,7 +4133,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let out = cli(
         bin,
         ws,
-        &["run", "--json", "--", &sleep_s, "310", "--app", "jf"],
+        &["run", "--json", "--", &sleep_s, "310", "--name", "jf"],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf json parses")?;
     let jf_pid = v["pid"].as_u64().context("jf initial pid")? as u32;
@@ -4118,7 +4145,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "run", "--json", "--force", "--", &sleep_s, "311", "--app", "jf",
+            "run", "--json", "--force", "--", &sleep_s, "311", "--name", "jf",
         ],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf changed json")?;
@@ -4139,7 +4166,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         bin,
         ws,
         &[
-            "run", "--json", "--force", "--", &sleep_s, "311", "--app", "jf",
+            "run", "--json", "--force", "--", &sleep_s, "311", "--name", "jf",
         ],
     )?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("jf unchanged json")?;
@@ -4164,8 +4191,8 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     )?;
 
     step("RDF10. the reserved `all` name is refused with no residue");
-    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "303", "--app", "all"])?;
-    expect(!ok, "run --app all is refused")?;
+    let (ok, _code, combined) = cli_try(bin, ws, &["run", "--", &sleep_s, "303", "--name", "all"])?;
+    expect(!ok, "run --name all is refused")?;
     expect(
         combined.contains("reserved"),
         &format!("the error explains the reserved word: {combined:?}"),
@@ -4180,7 +4207,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let mut atomic = Command::new(bin)
         .arg("--config")
         .arg(ws.config_arg())
-        .args(["run", "--", &sleep_s, "400", "--app", "atomic"])
+        .args(["run", "--", &sleep_s, "400", "--name", "atomic"])
         .stdout(Stdio::from(atomic_log))
         .stderr(Stdio::null())
         .spawn()
@@ -4405,7 +4432,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
     let (ok, code, combined) = cli_try(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "307", "--app", "ext"],
+        &["run", "--force", "--", &sleep_s, "307", "--name", "ext"],
     )?;
     expect(
         !ok && code != 0,
@@ -4441,7 +4468,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         // startup already succeeded — exactly the partial-failure path.
         std::fs::create_dir_all(apps.join("adhoc/weird.toml"))?;
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--app", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("the partial failure exits non-zero, got {code}: {combined:?}"),
@@ -4464,7 +4491,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
 
         step("RDF15. a re-run detects the residual state and asks (non-TTY refuses)");
         let (ok, code, combined) =
-            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--app", "weird"])?;
+            cli_try(bin, ws, &["run", "--", &sleep_s, "400", "--name", "weird"])?;
         expect(
             !ok && code != 0,
             &format!("a non-interactive re-run refuses, got {code}: {combined:?}"),
@@ -4485,7 +4512,7 @@ fn runfirst_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<()
         step("RDF16. confirming the residual re-lands the record without restarting");
         std::fs::remove_dir(apps.join("adhoc/weird.toml"))?;
         let cmd = format!(
-            "{} --config {} run -- {} 400 --app weird",
+            "{} --config {} run -- {} 400 --name weird",
             bin.display(),
             ws.config_arg(),
             sleep_s
@@ -4604,6 +4631,290 @@ fn run_pty(cmd: &str, input: &[u8]) -> Result<(bool, String)> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok((out.status.success(), text))
+}
+
+// -- standalone programs (add-standalone-programs) ---------------------------
+
+/// The standalone-program acceptance matrix (add-standalone-programs 7.2):
+/// run registration and auto-naming, explicit conflicts, the removed `--app`
+/// flag, `--force` overwrite/no-op, old-format `adhoc/` records, the unified
+/// target grammar, and the app-fan-out exclusion. It uses the regular
+/// workspace so app targets (`<program>`, `<app>/<program>`, `<app>/all`) are
+/// exercised next to the standalone records.
+fn standalone_pass(bin: &Path) -> Result<()> {
+    let ws = setup_workspace("standalone")?;
+    let mut daemon = spawn_daemon(bin, &ws)?;
+    let result = standalone_scenarios(bin, &ws);
+    shutdown_daemon(&ws, &mut daemon);
+    let _ = std::fs::remove_dir_all(&ws.root);
+    result
+}
+
+fn standalone_scenarios(bin: &Path, ws: &Workspace) -> Result<()> {
+    let sleep = find_sleep()?;
+    let sleep_s = sleep.to_string_lossy().replace('\\', "/");
+    let stem = sleep
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let apps = ws.root.join("apps");
+
+    step("SA1. `run` registers a standalone program; a second run dedupes `<stem>-N`");
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "100000"])?;
+    expect(
+        out.contains("standalone program") && out.contains(&stem) && out.contains("started"),
+        &format!("the run report names the standalone program: {out:?}"),
+    )?;
+    let stem_cfg = apps.join("adhoc").join(format!("{stem}.toml"));
+    expect(stem_cfg.is_file(), "the record landed in app_dir/adhoc/")?;
+    expect(
+        !apps.join(format!("{stem}.toml")).exists(),
+        "nothing was written at the app_dir top level",
+    )?;
+    wait_running(ws, &stem)?;
+    // Projection: standalone flag + empty app (never a forged app name).
+    let v: serde_json::Value = serde_json::from_str(&api(ws, &format!("/v1/programs/{stem}"))?)?;
+    expect(
+        v.get("standalone").and_then(|s| s.as_bool()) == Some(true),
+        &format!("the projection marks it standalone: {v}"),
+    )?;
+    expect(
+        v.get("app").and_then(|a| a.as_str()) == Some(""),
+        &format!("the projection carries an empty app: {v}"),
+    )?;
+
+    let out = cli(bin, ws, &["run", "--", &sleep_s, "100000"])?;
+    let dedup = format!("{stem}-1");
+    expect(
+        out.contains(&dedup) && out.contains("自动命名") && out.contains(&stem),
+        &format!("the second run advanced to {dedup}: {out:?}"),
+    )?;
+    expect(
+        apps.join("adhoc").join(format!("{dedup}.toml")).is_file(),
+        "the deduped record exists",
+    )?;
+    wait_running(ws, &dedup)?;
+
+    step("SA2. an explicit duplicate name is a 409 with zero side effects");
+    let out = cli(bin, ws, &["run", "--name", "dup", "--", &sleep_s, "100000"])?;
+    expect(out.contains("started"), "dup starts")?;
+    let dup_pid = wait_running(ws, "dup")?;
+    let dup_cfg = apps.join("adhoc/dup.toml");
+    let dup_before = std::fs::read_to_string(&dup_cfg)?;
+    let (ok, code, combined) =
+        cli_try(bin, ws, &["run", "--name", "dup", "--", &sleep_s, "200000"])?;
+    expect(
+        !ok && code != 0,
+        &format!("the explicit duplicate is refused, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("already registered") && combined.contains("--force"),
+        &format!("the refusal explains the conflict and the remedy: {combined:?}"),
+    )?;
+    expect(
+        std::fs::read_to_string(&dup_cfg)? == dup_before,
+        "the refused run left the record untouched",
+    )?;
+    expect(
+        pid_of(ws, "dup")? == Some(dup_pid),
+        "the refused run did not restart the program",
+    )?;
+    expect(
+        !apps.join("adhoc/dup.toml.pending").exists(),
+        "the refused run left no placeholder",
+    )?;
+
+    step("SA3. the removed `--app` flag exits 2 with the `--name` migration hint");
+    let (ok, code, combined) = cli_try(
+        bin,
+        ws,
+        &["run", "--app", "legacy-app", "--", &sleep_s, "1"],
+    )?;
+    expect(
+        !ok && code == 2,
+        &format!("run --app exits 2, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("--app") && combined.contains("--name"),
+        &format!("the error points at --name: {combined:?}"),
+    )?;
+    expect_no_residue(ws, "legacy-app")?;
+
+    step("SA4. `--force` overwrites a run record; identical content is a no-op");
+    let out = cli(
+        bin,
+        ws,
+        &["run", "--name", "forced", "--", &sleep_s, "100000"],
+    )?;
+    expect(out.contains("started"), "forced starts")?;
+    let forced_pid = wait_running(ws, "forced")?;
+    let forced_cfg = apps.join("adhoc/forced.toml");
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run", "--force", "--name", "forced", "--", &sleep_s, "200000",
+        ],
+    )?;
+    expect(
+        out.contains("started"),
+        &format!("the changed force run re-starts: {out:?}"),
+    )?;
+    let forced_pid2 = wait_running(ws, "forced")?;
+    expect(
+        forced_pid2 != forced_pid,
+        "the changed force run replaced the process",
+    )?;
+    expect(
+        std::fs::read_to_string(&forced_cfg)?.contains("200000"),
+        "the record carries the new command line",
+    )?;
+    let out = cli(
+        bin,
+        ws,
+        &[
+            "run", "--force", "--name", "forced", "--", &sleep_s, "200000",
+        ],
+    )?;
+    expect(
+        out.contains("配置无修改，不做任何动作"),
+        &format!("the identical force run is a no-op: {out:?}"),
+    )?;
+    expect(
+        pid_of(ws, "forced")? == Some(forced_pid2),
+        "the no-op force run did not restart the program",
+    )?;
+
+    step("SA5. an old-format `adhoc/` record (with [app]) loads and starts");
+    let legacy_cfg = apps.join("adhoc/legacy.toml");
+    std::fs::write(
+        &legacy_cfg,
+        format!(
+            "[app]\ndescription = \"legacy record\"\nrestart = \"no\"\n\n\
+             [program.legacy]\ncommand = \"{sleep_s}\"\nargs = [\"100000\"]\nstartsecs = 0.2\n"
+        ),
+    )?;
+    std::thread::sleep(Duration::from_secs(2)); // detection window
+    cli(bin, ws, &["apply"])?; // load the pending standalone record
+    let out = cli(bin, ws, &["start", "legacy"])?;
+    expect(
+        out.contains("legacy") && out.contains("pid="),
+        &format!("legacy started: {out:?}"),
+    )?;
+    wait_running(ws, "legacy")?;
+    // `ps` shows the standalone APP column as `-`.
+    let table = cli(bin, ws, &["ps"])?;
+    let row = table
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("legacy"))
+        .unwrap_or_default();
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    expect(
+        cols.get(1) == Some(&"-"),
+        &format!("the ps APP column is `-`: {row:?}"),
+    )?;
+    // `ps --all` labels the registry origin as `run`.
+    let all = cli(bin, ws, &["ps", "--all"])?;
+    let all_row = all
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("legacy"))
+        .unwrap_or_default();
+    expect(
+        all_row.split_whitespace().last() == Some("run"),
+        &format!("ps --all marks the origin run: {all_row:?}"),
+    )?;
+
+    step("SA6. standalone stop/start/remove and the unified target grammar");
+    // solo: register → stop → start → stop → remove (record + projection gone).
+    cli(
+        bin,
+        ws,
+        &["run", "--name", "solo", "--", &sleep_s, "100000"],
+    )?;
+    wait_running(ws, "solo")?;
+    cli(bin, ws, &["stop", "solo"])?;
+    wait_state(ws, "solo", "stopped")?;
+    cli(bin, ws, &["start", "solo"])?;
+    wait_running(ws, "solo")?;
+    cli(bin, ws, &["stop", "solo"])?;
+    wait_state(ws, "solo", "stopped")?;
+    let out = cli(bin, ws, &["remove", "solo"])?;
+    expect(
+        out.contains("generated config file removed") && out.contains("adhoc"),
+        &format!("the removal names the adhoc record: {out:?}"),
+    )?;
+    expect(
+        !apps.join("adhoc/solo.toml").exists(),
+        "the solo record is gone",
+    )?;
+    expect(pid_of(ws, "solo")?.is_none(), "solo left the projection")?;
+
+    // Single program (app-internal): stop/start by the bare program name.
+    cli(bin, ws, &["stop", "alpha/all"])?;
+    wait_state(ws, "web", "stopped")?;
+    wait_state(ws, "worker", "stopped")?;
+    let out = cli(bin, ws, &["start", "web"])?;
+    expect(
+        out.contains("web") && out.contains("pid="),
+        &format!("start <program>: {out:?}"),
+    )?;
+    wait_running(ws, "web")?;
+    // Whole app.
+    let out = cli(bin, ws, &["start", "alpha/all"])?;
+    expect(
+        out.contains("web") && out.contains("worker"),
+        &format!("start <app>/all fans out: {out:?}"),
+    )?;
+    wait_running(ws, "worker")?;
+    // Specified program via the slash form.
+    cli(bin, ws, &["stop", "alpha/worker"])?;
+    wait_state(ws, "worker", "stopped")?;
+    let out = cli(bin, ws, &["start", "alpha/worker"])?;
+    expect(
+        out.contains("worker") && out.contains("pid="),
+        &format!("start <app>/<program>: {out:?}"),
+    )?;
+    wait_running(ws, "worker")?;
+    // A bare app name is a program lookup: 404 + the `<app>/all` hint.
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "alpha"])?;
+    expect(
+        !ok && code == 1,
+        &format!("a bare app name exits 1, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("alpha/all"),
+        &format!("the error hints `<app>/all`: {combined:?}"),
+    )?;
+    // `all` alone is the reserved keyword: usage error (exit 2).
+    let (ok, code, combined) = cli_try(bin, ws, &["start", "all"])?;
+    expect(
+        !ok && code == 2,
+        &format!("`all` alone exits 2, got {code}: {combined:?}"),
+    )?;
+    expect(
+        combined.contains("reserved"),
+        &format!("the error says reserved: {combined:?}"),
+    )?;
+
+    step("SA7. standalone records are not app fan-out targets");
+    for path in [
+        format!("/v1/apps/{stem}/start"),
+        format!("/v1/apps/{stem}/remove"),
+    ] {
+        let (code, body) = api_checked(ws, "POST", &path, "")?;
+        expect(
+            code == 404,
+            &format!("POST {path} is 404 for a standalone program, got {code}: {body}"),
+        )?;
+    }
+    // A real app still fans out (the endpoint itself is alive).
+    let (code, _) = api_checked(ws, "POST", "/v1/apps/alpha/restart", "")?;
+    expect(
+        (200..300).contains(&code),
+        &format!("a real app fan-out still works, got {code}"),
+    )?;
+
+    Ok(())
 }
 
 /// add-compose-up acceptance (task 5.1) in its own workspace: the offline
@@ -5284,7 +5595,7 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     cli(
         bin,
         ws,
-        &["run", "--", &sleep_s, "100000", "--app", "taken"],
+        &["run", "--", &sleep_s, "100000", "--name", "taken"],
     )?;
     wait_running(ws, "taken")?;
     expect(
@@ -5410,7 +5721,7 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     cli(
         bin,
         ws,
-        &["run", "--", &sleep_s, "100000", "--app", "remnant"],
+        &["run", "--", &sleep_s, "100000", "--name", "remnant"],
     )?;
     wait_running(ws, "remnant")?;
     let out = cli(bin, ws, &["ps", "--all"])?;
@@ -5479,7 +5790,9 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     let (ok, code, combined) = cli_try(
         bin,
         ws,
-        &["run", "--force", "--", &sleep_s, "100000", "--app", "proj2"],
+        &[
+            "run", "--force", "--", &sleep_s, "100000", "--name", "proj2",
+        ],
     )?;
     expect(
         !ok && code != 0,
@@ -5502,7 +5815,7 @@ fn compose_up_online(bin: &Path, ws: &Workspace, daemon: &mut Daemon) -> Result<
     cli(
         bin,
         ws,
-        &["run", "--", &sleep_s, "100000", "--app", "mortal"],
+        &["run", "--", &sleep_s, "100000", "--name", "mortal"],
     )?;
     wait_running(ws, "mortal")?;
     expect(
@@ -7023,8 +7336,8 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         "acts programs are not started (restart = no)",
     )?;
 
-    step("H5. `start acts` fans out in dependency order");
-    let out = cli(bin, ws, &["start", "acts"])?;
+    step("H5. `start acts/all` fans out in dependency order");
+    let out = cli(bin, ws, &["start", "acts/all"])?;
     // run-daemon-first re-renders the `start <app>` fan-out as one
     // `{program}  config=...  pid=...  status (...)` line per program; the
     // dependency order is asserted on the program name at each line start.
@@ -7332,8 +7645,8 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         println!("    (windows: signal scenarios require unix; skipping)");
     }
 
-    step("H13. `stop acts` runs in reverse order");
-    let out = cli(bin, ws, &["stop", "acts"])?;
+    step("H13. `stop acts/all` runs in reverse order");
+    let out = cli(bin, ws, &["stop", "acts/all"])?;
     let (ptrap, psig, psvc) = (
         out.find("  trapper:"),
         out.find("  signalee:"),
@@ -7354,7 +7667,7 @@ fn actions_online_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     // Every acts program is user-stopped at this point (explicit stop above
     // and in H11); the fan-out start must pull all of them up and clear the
     // marker. Issued via the shell to prove the shell verb fans out too.
-    let out = cli(bin, ws, &["shell", "-e", "start acts"])?;
+    let out = cli(bin, ws, &["shell", "-e", "start acts/all"])?;
     expect(
         matches!((out.find("  svc:"), out.find("  signalee:"), out.find("  trapper:")),
             (Some(a), Some(b), Some(c)) if a < b && b < c),
@@ -7960,6 +8273,8 @@ fn bench_workspaces() -> Vec<PathBuf> {
 /// appkeeper-bench reentry used by the webui-driven pass below: 1000 rows at
 /// 100 rows/sec (~10s) through the daemon's own pump, then exit.
 const BENCH_WEBUI_APP: &str = "benchweb";
+/// The same app as a whole-app management target (`<app>/all`).
+const BENCH_WEBUI_APP_ALL: &str = "benchweb/all";
 const BENCH_WEBUI_ROWS: u64 = 1000;
 
 /// The bench program registered for the webui pass is produced by the real
@@ -8012,7 +8327,7 @@ fn bench_webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
 
     // Apply registers it; `restart = "no"` keeps it stopped so the webui is
     // the only thing that starts it.
-    cli(bin, ws, &["apply", BENCH_WEBUI_APP])?;
+    cli(bin, ws, &["apply", BENCH_WEBUI_APP_ALL])?;
     expect(
         pid_of(ws, BENCH_WEBUI_APP)?.is_none(),
         "the bench program is registered but not started",
@@ -8083,8 +8398,8 @@ fn bench_webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
 
     // Cleanup: the guard-remove contract requires stop before remove.
-    cli_try(bin, ws, &["stop", BENCH_WEBUI_APP])?;
-    let out = cli(bin, ws, &["remove", BENCH_WEBUI_APP])?;
+    cli_try(bin, ws, &["stop", BENCH_WEBUI_APP_ALL])?;
+    let out = cli(bin, ws, &["remove", BENCH_WEBUI_APP_ALL])?;
     expect(
         out.contains("removed") || out.contains(BENCH_WEBUI_APP),
         "remove reports the app",
@@ -8564,7 +8879,7 @@ fn tcp_control_scenarios(bin: &Path, ws: &TcpWs, root: &Path) -> Result<()> {
             "--",
             sleep.to_str().unwrap(),
             "100000",
-            "--app",
+            "--name",
             "tcpadhoc",
         ],
     )?;
@@ -10307,6 +10622,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
         revamp_pass(&bin)?;
         remove_guard_pass(&bin)?;
         run_daemon_first_pass(&bin)?;
+        standalone_pass(&bin)?;
         compose_up_pass(&bin)?;
         detach_pass(&bin)?;
         boot_sim_pass(&bin)?;

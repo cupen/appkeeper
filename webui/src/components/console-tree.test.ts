@@ -144,4 +144,26 @@ describe('ak-console-tree', () => {
     expect(active?.getAttribute('data-program')).toBe('web')
     el.remove()
   })
+
+  it('renders standalone records as top-level nodes without an app parent', async () => {
+    const el = document.createElement('ak-console-tree') as AkConsoleTree
+    el.apps = apps()
+    el.standalonePrograms = [program('', 'npx', 'running'), program('', 'serve', 'stopped')]
+    el.selectedApp = ''
+    el.selectedProgram = 'serve'
+    document.body.appendChild(el)
+    await el.updateComplete
+
+    const section = el.shadowRoot!.querySelector('section.standalone')!
+    expect(section.textContent).toContain('散装程序')
+    const links = [...section.querySelectorAll('a.prog')]
+    expect(links.map((a) => a.getAttribute('href'))).toEqual(['/program/npx', '/program/serve'])
+    expect(links.map((a) => a.getAttribute('data-app'))).toEqual(['', ''])
+    expect(links.every((a) => a.getAttribute('data-standalone') === 'true')).toBe(true)
+    // Selection is expressed with the app-less coordinates (empty app).
+    expect(links[1]!.getAttribute('data-active')).toBe('true')
+    // Standalone rows never join an app group (demo keeps its five).
+    expect(el.shadowRoot!.querySelectorAll('.app .progs a.prog')).toHaveLength(5)
+    el.remove()
+  })
 })

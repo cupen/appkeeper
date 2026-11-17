@@ -259,7 +259,8 @@ export class AkAppOverview extends LitElement {
       ...new Set(
         (this.console?.snapshot.doc?.programs ?? [])
           .map((p) => p.app)
-          .filter((a) => a !== this.app),
+          // Standalone programs have no app (empty name): never a landing page.
+          .filter((a) => a !== '' && a !== this.app),
       ),
     ].sort()
     const next = others[0]

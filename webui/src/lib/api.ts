@@ -68,11 +68,28 @@ export function removeApp<T = RemoveAppResult>(app: string): Promise<T> {
 }
 
 /**
- * The removal result shared with `POST /v1/apps/<app>/remove`
- * (supervisor::RemoveOutcome). Field names are the wire contract.
+ * Remove one standalone program: `POST /api/programs/<program>/remove`
+ * (add-standalone-programs D6). Only `app_dir/adhoc/` records qualify — an
+ * app-internal program is a 400. The daemon owns the same guard as app
+ * removal: a live program yields a 409 and nothing is deleted.
+ */
+export function removeProgram<T = RemoveProgramResult>(program: string): Promise<T> {
+  return apiJson<T>(`/api/programs/${encodeURIComponent(program)}/remove`, { method: 'POST' })
+}
+
+/** A standalone removal has the same wire shape as an app removal. */
+export type RemoveProgramResult = RemoveAppResult
+
+/**
+ * The removal result shared with `POST /v1/apps/<app>/remove` and
+ * `POST /v1/programs/<name>/remove` (supervisor::RemoveOutcome). Field names
+ * are the wire contract.
  */
 export interface RemoveAppResult {
+  /** App name; for a standalone removal, the record (= program) name. */
   app: string
+  /** True when a standalone `adhoc/` record was removed. */
+  standalone: boolean
   /** The registration record path that was removed (`app_dir/<app>.toml`). */
   config_path: string
   /** True when a scaffold-generated real file was deleted with it. */

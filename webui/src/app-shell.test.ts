@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { matchRoute } from './router.js'
+import { matchRoute, navigate } from './router.js'
 import { AkApp, ROUTES } from './app-shell.js'
 import { consoleStore } from './lib/store.js'
 import { STORED_TOKEN_KEY, resetAuth } from './lib/credentials.js'
@@ -16,11 +16,12 @@ import { MSG, type ProgramInfo, type StatusDoc } from './lib/types.js'
 import { encode } from '@msgpack/msgpack'
 
 describe('shell route surface', () => {
-  it('ships the console routes (dashboard, app, program)', () => {
+  it('ships the console routes (dashboard, app, program, standalone)', () => {
     expect(ROUTES).toEqual([
       { id: 'dashboard', pattern: '/' },
       { id: 'app', pattern: '/app/:app' },
       { id: 'program', pattern: '/app/:app/program/:program' },
+      { id: 'standalone', pattern: '/program/:program' },
     ])
   })
 
@@ -37,6 +38,12 @@ describe('shell route surface', () => {
     expect(prog?.id).toBe('program')
     expect(prog?.params['app']).toBe('my%20app')
     expect(prog?.params['program']).toBe('worker%201')
+  })
+
+  it('resolves an app-less standalone detail deep link', () => {
+    const standalone = matchRoute(ROUTES, '/program/npx%20serve')
+    expect(standalone?.id).toBe('standalone')
+    expect(standalone?.params['program']).toBe('npx%20serve')
   })
 })
 
@@ -363,6 +370,133 @@ describe('shell convergence after a removal (guard-remove-until-stopped 4.3)', (
     expect(sidebarApps(shell)).toEqual([])
     expect(location.pathname).toBe('/')
     expect(shell.shadowRoot!.querySelector('ak-dashboard')).not.toBeNull()
+    shell.remove()
+  })
+})
+
+// -- add-standalone-programs 6.1/6.2/6.4: no app parent, app-less route ------
+
+describe('standalone records in the sidebar and router', () => {
+  function standalone(name: string, state = 'stopped'): ProgramInfo {
+    return { ...program('', name), state, standalone: true }
+  }
+
+  beforeEach(async () => {
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
+    // Fully offline: no REST fallback may inject a projection behind the
+    // assertions (the shared store keeps the last doc across tests).
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    FakeWebSocket.instances = []
+    history.replaceState({}, '', '/')
+    consoleStore.start()
+    const ws = FakeWebSocket.instances[0]!
+    ws.serverOpen()
+    ws.serverFrame(
+      snapshotFrame(
+        doc([program('alpha', 'web'), standalone('serve', 'fatal'), standalone('npx')]),
+      ),
+    )
+    await tick()
+  })
+
+  afterEach(() => {
+    consoleStore.stop()
+    document.body.innerHTML = ''
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  async function mountShell(): Promise<AkApp> {
+    const el = document.createElement('ak-app') as AkApp
+    document.body.appendChild(el)
+    await el.updateComplete
+    return el
+  }
+
+  function treeOf(shell: AkApp): ShadowRoot {
+    const tree = shell.shadowRoot!.querySelector('ak-console-tree') as unknown as {
+      shadowRoot: ShadowRoot
+    }
+    return tree.shadowRoot
+  }
+
+  function detailOf(shell: AkApp): {
+    app: string
+    program: string
+    shadowRoot: ShadowRoot
+    updateComplete: Promise<unknown>
+  } {
+    return shell.shadowRoot!.querySelector('ak-program-detail') as unknown as {
+      app: string
+      program: string
+      shadowRoot: ShadowRoot
+      updateComplete: Promise<unknown>
+    }
+  }
+
+  it('lists standalone programs as top-level nodes, not as an app group', async () => {
+    const shell = await mountShell()
+    const tree = treeOf(shell)
+    // The only app node is the real app; the empty app name forges nothing.
+    expect([...tree.querySelectorAll('.app-link')].map((a) => a.getAttribute('href'))).toEqual([
+      '/app/alpha',
+    ])
+
+    const section = tree.querySelector('section.standalone')!
+    expect(section.textContent).toContain('散装程序')
+    const rows = [...section.querySelectorAll('a.prog')]
+    expect(rows.map((a) => a.getAttribute('data-program'))).toEqual(['npx', 'serve'])
+    expect(rows.map((a) => a.getAttribute('href'))).toEqual([
+      '/program/npx',
+      '/program/serve',
+    ])
+    // Same node contract as an app-internal program (dot + state hooks).
+    expect(rows[1]!.getAttribute('data-state')).toBe('fatal')
+    expect(rows[1]!.querySelector('.dot')).not.toBeNull()
+    shell.remove()
+  })
+
+  it('routes a standalone node to the app-less detail page', async () => {
+    const shell = await mountShell()
+    treeOf(shell).querySelector<HTMLAnchorElement>('a.prog[data-program="npx"]')!.click()
+    await tick()
+    await shell.updateComplete
+    await tick()
+    await shell.updateComplete
+
+    expect(location.pathname).toBe('/program/npx')
+    const detail = detailOf(shell)
+    expect(detail).not.toBeNull()
+    expect(detail.app).toBe('')
+    expect(detail.program).toBe('npx')
+    await detail.updateComplete
+
+    // No forged app affiliation: the breadcrumb is an explicit `-`.
+    const crumb = detail.shadowRoot.querySelector('.crumb')!
+    expect(crumb.textContent?.trim()).toBe('-')
+    expect(crumb.getAttribute('href')).toBeNull()
+    // The standalone record gets its own removal entry.
+    const remove = detail.shadowRoot.querySelector<HTMLButtonElement>(
+      'button[data-kind="remove"]',
+    )
+    expect(remove).not.toBeNull()
+    expect(remove!.textContent).toContain('移除程序')
+    shell.remove()
+  })
+
+  it('keeps the app breadcrumb and hides removal for an in-app program', async () => {
+    const shell = await mountShell()
+    navigate('/app/alpha/program/web')
+    await tick()
+    await shell.updateComplete
+    await tick()
+    await shell.updateComplete
+
+    const detail = detailOf(shell)
+    await detail.updateComplete
+    expect(detail.app).toBe('alpha')
+    expect(detail.shadowRoot.querySelector('.crumb')!.textContent?.trim()).toBe('alpha')
+    expect(detail.shadowRoot.querySelector('button[data-kind="remove"]')).toBeNull()
     shell.remove()
   })
 })

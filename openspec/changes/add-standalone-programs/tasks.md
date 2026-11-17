@@ -40,14 +40,14 @@
 
 ## 6. Web 控制台
 
-- [ ] 6.1 `webui/src/lib/api.ts` 的 `ProgramInfo` 类型增加 `standalone?: boolean`（缺失视为 false）；store/overview 的 app 分组逻辑跳过散装程序
-- [ ] 6.2 左侧导航：散装程序渲染为顶层程序节点，不建 app 节点；选中走程序详情路由；样式与 app 内程序节点一致
-- [ ] 6.3 全局总览：散装程序独立「散装程序」分区，行字段与应用内程序一致；故障/退避排序规则沿用
-- [ ] 6.4 App 概况/详情对散装程序不显示「应用」归属或显示 `-`；移除操作说明删除边界
-- [ ] 6.5 `pnpm exec tsc --noEmit && pnpm test && pnpm build` 通过，并补一个 standalone 渲染测试
+- [x] 6.1 `webui/src/lib/api.ts` 的 `ProgramInfo` 类型增加 `standalone?: boolean`（缺失视为 false）；store/overview 的 app 分组逻辑跳过散装程序
+- [x] 6.2 左侧导航：散装程序渲染为顶层程序节点，不建 app 节点；选中走程序详情路由；样式与 app 内程序节点一致
+- [x] 6.3 全局总览：散装程序独立「散装程序」分区，行字段与应用内程序一致；故障/退避排序规则沿用
+- [x] 6.4 App 概况/详情对散装程序不显示「应用」归属或显示 `-`；移除操作说明删除边界
+- [x] 6.5 `pnpm exec tsc --noEmit && pnpm test && pnpm build` 通过，并补一个 standalone 渲染测试
 
 ## 7. 文档与验收
 
 - [x] 7.1 更新 `README.md`：`ak run` 只造散装程序、`--name` 可选、缺省自动排重、显式重复 409、`--force` 只覆盖 `adhoc/`、`--app` 已移除、`ps` 的 `-` 列
-- [ ] 7.2 `xtask/src/e2e.rs` 增加矩阵：散装注册/启动/停止/移除、连续两次 run 得 `<stem>`/`<stem>-1`、显式冲突 409 零副作用、`--app` 退出 2、`--force` 覆盖与空操作、旧格式 `adhoc/` 记录可启动、`start <program>` 单程序、`start <app>/all` 整组、`start <app>/<program>` 指定程序、裸 app 名报错并提示 `<app>/all`、`all` 退出 2、散装程序不出现在 `/v1/apps` 扇出
-- [ ] 7.3 全量回归：`openspec validate add-standalone-programs`、`cargo test --workspace`、`cargo build --release`、`cargo run -p xtask -- e2e --no-browser` 全绿
+- [x] 7.2 `xtask/src/e2e.rs` 增加矩阵：散装注册/启动/停止/移除、连续两次 run 得 `<stem>`/`<stem>-1`、显式冲突 409 零副作用、`--app` 退出 2、`--force` 覆盖与空操作、旧格式 `adhoc/` 记录可启动、`start <program>` 单程序、`start <app>/all` 整组、`start <app>/<program>` 指定程序、裸 app 名报错并提示 `<app>/all`、`all` 退出 2、散装程序不出现在 `/v1/apps` 扇出
+- [x] 7.3 全量回归：`openspec validate add-standalone-programs`、`cargo test --workspace`、`cargo build --release`、`cargo run -p xtask -- e2e --no-browser` 全绿

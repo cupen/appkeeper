@@ -14,7 +14,7 @@ import { LitElement, css, html, nothing } from 'lit'
 import { customElement, state } from 'lit/decorators.js'
 import { matchRoute, navigate, type RouteDef } from './router.js'
 import { ConsoleController, consoleStore } from './lib/store.js'
-import type { ProgramInfo } from './lib/types.js'
+import { isStandalone, type ProgramInfo } from './lib/types.js'
 
 // Views (side-effect imports register the custom elements).
 import './views/dashboard.js'
@@ -31,6 +31,9 @@ export const ROUTES: RouteDef[] = [
   { id: 'dashboard', pattern: '/' },
   { id: 'app', pattern: '/app/:app' },
   { id: 'program', pattern: '/app/:app/program/:program' },
+  // A standalone record (ak run product) has no app parent, so its detail
+  // page is addressed by program name alone (add-standalone-programs D7).
+  { id: 'standalone', pattern: '/program/:program' },
 ]
 
 @customElement('ak-app')
@@ -260,10 +263,20 @@ export class AkApp extends LitElement {
     if (this.redirecting) return
     const doc = this.console.snapshot.doc
     if (!doc) return
+    if (this.routeId === 'standalone') {
+      // A standalone program is addressed by name alone. Once an established
+      // projection no longer carries the record (removed by another client),
+      // leave the dead page for the dashboard.
+      const name = decodeURIComponent(this.params['program'] ?? '')
+      if (doc.programs.some((p) => isStandalone(p) && p.name === name)) return
+      this.redirecting = true
+      queueMicrotask(() => navigate('/'))
+      return
+    }
     if (this.routeId !== 'app' && this.routeId !== 'program') return
     const app = decodeURIComponent(this.params['app'] ?? '')
     const programs = this.programsOf(app)
-    const apps = new Set(doc.programs.map((p) => p.app))
+    const apps = new Set(doc.programs.filter((p) => !isStandalone(p)).map((p) => p.app))
     // Leave when the app record was removed or the projection knows it is
     // gone. An app with no programs but a live record keeps its overview
     // (which renders its own empty state); an unestablished projection must
@@ -311,15 +324,23 @@ export class AkApp extends LitElement {
 
   protected render(): unknown {
     const { doc } = this.console.snapshot
-    const apps = [...new Set((doc?.programs ?? []).map((p) => p.app))].map((name) => ({
-      name,
-      programs: this.programsOf(name),
-    }))
-    const selectedApp = this.routeId === 'app' || this.routeId === 'program'
-      ? decodeURIComponent(this.params['app'] ?? '')
-      : ''
+    const all = doc?.programs ?? []
+    // Standalone records belong to no app: they never create an app node (and
+    // must never forge one) — the sidebar lists them as top-level programs.
+    const apps = [...new Set(all.filter((p) => !isStandalone(p)).map((p) => p.app))].map(
+      (name) => ({ name, programs: this.programsOf(name) }),
+    )
+    const standalonePrograms = all
+      .filter((p) => isStandalone(p))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    const selectedApp =
+      this.routeId === 'app' || this.routeId === 'program'
+        ? decodeURIComponent(this.params['app'] ?? '')
+        : ''
     const selectedProgram =
-      this.routeId === 'program' ? decodeURIComponent(this.params['program'] ?? '') : ''
+      this.routeId === 'program' || this.routeId === 'standalone'
+        ? decodeURIComponent(this.params['program'] ?? '')
+        : ''
     return html`
       <nav aria-label="Primary">
         <div class="brand-block">
@@ -342,6 +363,7 @@ export class AkApp extends LitElement {
         </div>
         <ak-console-tree
           .apps=${apps}
+          .standalonePrograms=${standalonePrograms}
           selectedApp=${selectedApp}
           selectedProgram=${selectedProgram}
         ></ak-console-tree>
@@ -349,16 +371,21 @@ export class AkApp extends LitElement {
       <main>
         <ak-overview-bar></ak-overview-bar>
         <div class="outlet" data-route=${this.routeId}>
-          ${this.routeId === 'program'
+          ${this.routeId === 'standalone'
             ? html`<ak-program-detail
-                .app=${decodeURIComponent(this.params['app'] ?? '')}
+                .app=${''}
                 .program=${decodeURIComponent(this.params['program'] ?? '')}
               ></ak-program-detail>`
-            : this.routeId === 'app'
-              ? html`<ak-app-overview
+            : this.routeId === 'program'
+              ? html`<ak-program-detail
                   .app=${decodeURIComponent(this.params['app'] ?? '')}
-                ></ak-app-overview>`
-              : html`<ak-dashboard></ak-dashboard>`}
+                  .program=${decodeURIComponent(this.params['program'] ?? '')}
+                ></ak-program-detail>`
+              : this.routeId === 'app'
+                ? html`<ak-app-overview
+                    .app=${decodeURIComponent(this.params['app'] ?? '')}
+                  ></ak-app-overview>`
+                : html`<ak-dashboard></ak-dashboard>`}
         </div>
       </main>
       ${this.versionDialogOpen

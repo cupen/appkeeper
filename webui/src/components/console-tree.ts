@@ -1,8 +1,11 @@
 /**
  * Sidebar two-level tree (webui-ui: 左侧两层导航): registered apps at the
  * top level, their declared programs below — including programs that never
- * started. The selected node is highlighted; selection navigates via the
- * SPA router, so deep links and browser history work for free.
+ * started. Standalone records (`ak run` products) have no app parent, so they
+ * are listed as top-level program nodes under a small section label
+ * (add-standalone-programs D7). The selected node is highlighted; selection
+ * navigates via the SPA router, so deep links and browser history work for
+ * free.
  *
  * Status is carried by a 6px leading dot only — the name text stays neutral
  * (webui-visual-system: 状态的颜色与形状分工). The Chinese state word rides
@@ -25,6 +28,8 @@ export interface TreeApp {
 @customElement('ak-console-tree')
 export class AkConsoleTree extends LitElement {
   @property({ type: Array }) apps: TreeApp[] = []
+  /** Standalone records: top-level program nodes, no app parent. */
+  @property({ type: Array }) standalonePrograms: ProgramInfo[] = []
   /** Currently selected path segments (raw, still encoded). */
   @property() selectedApp = ''
   @property() selectedProgram = ''
@@ -134,6 +139,23 @@ export class AkConsoleTree extends LitElement {
       color: var(--ak-text-faint);
       font-size: var(--ak-fs-sm, 0.8rem);
     }
+    /* Standalone records: a small section label, then top-level program rows
+       (same node style as an app's programs, without the app indent). */
+    .standalone {
+      margin: 0 0 var(--ak-space-2);
+    }
+    .section-label {
+      padding: var(--ak-space-1) var(--ak-space-3);
+      font-size: var(--ak-fs-xs, 0.72rem);
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      color: var(--ak-text-faint);
+    }
+    .progs.standalone-list {
+      margin-left: 0;
+      padding-left: 0;
+      border-left: none;
+    }
   `
 
   private go(e: MouseEvent, path: string): void {
@@ -142,9 +164,38 @@ export class AkConsoleTree extends LitElement {
     navigate(path)
   }
 
+  /** One program node; `app === null` marks a standalone (top-level) record. */
+  private renderProgram(p: ProgramInfo, app: string | null) {
+    const href =
+      app === null
+        ? `/program/${encodeURIComponent(p.name)}`
+        : `/app/${encodeURIComponent(app)}/program/${encodeURIComponent(p.name)}`
+    const active =
+      app === null
+        ? p.name === this.selectedProgram && this.selectedApp === ''
+        : p.name === this.selectedProgram && app === this.selectedApp
+    return html`
+      <a
+        class="prog"
+        data-state=${p.state}
+        data-app=${app ?? ''}
+        data-program=${p.name}
+        data-standalone=${app === null ? 'true' : nothing}
+        data-active=${active}
+        href=${href}
+        @click=${(e: MouseEvent) => this.go(e, href)}
+        title=${`${p.name} — ${stateLabel(p.state)}`}
+        aria-label=${`${p.name} — ${stateLabel(p.state)}`}
+      >
+        <span class="dot" aria-hidden="true"></span>
+        <span class="name">${p.name}</span>
+      </a>
+    `
+  }
+
   render() {
-    if (this.apps.length === 0) {
-      return html`<div class="empty">没有已注册的应用（ak add 注册后出现在这里）</div>`
+    if (this.apps.length === 0 && this.standalonePrograms.length === 0) {
+      return html`<div class="empty">没有已注册的应用或散装程序（ak add / ak run 注册后出现在这里）</div>`
     }
     return html`
       ${this.apps.map(
@@ -164,31 +215,20 @@ export class AkConsoleTree extends LitElement {
             </a>
             ${app.programs.length > 0
               ? html`<div class="progs" role="group" aria-label=${`${app.name} 的程序`}>
-                  ${app.programs.map(
-                    (p) => html`
-                      <a
-                        class="prog"
-                        data-state=${p.state}
-                        data-app=${app.name}
-                        data-program=${p.name}
-                        data-active=${p.name === this.selectedProgram && app.name === this.selectedApp}
-                        href=${`/app/${encodeURIComponent(app.name)}/program/${encodeURIComponent(p.name)}`}
-                        @click=${(
-                          e: MouseEvent,
-                        ) => this.go(e, `/app/${encodeURIComponent(app.name)}/program/${encodeURIComponent(p.name)}`)}
-                        title=${`${p.name} — ${stateLabel(p.state)}`}
-                        aria-label=${`${p.name} — ${stateLabel(p.state)}`}
-                      >
-                        <span class="dot" aria-hidden="true"></span>
-                        <span class="name">${p.name}</span>
-                      </a>
-                    `,
-                  )}
+                  ${app.programs.map((p) => this.renderProgram(p, app.name))}
                 </div>`
               : nothing}
           </section>
         `,
       )}
+      ${this.standalonePrograms.length > 0
+        ? html`<section class="standalone" aria-label="散装程序">
+            <div class="section-label">散装程序</div>
+            <div class="progs standalone-list" role="group" aria-label="散装程序">
+              ${this.standalonePrograms.map((p) => this.renderProgram(p, null))}
+            </div>
+          </section>`
+        : nothing}
     `
   }
 }

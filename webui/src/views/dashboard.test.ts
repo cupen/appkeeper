@@ -210,6 +210,36 @@ describe('dashboard (global program table)', () => {
     el.remove()
   })
 
+  it('puts standalone programs in their own 散装程序 section', async () => {
+    const standalone = (
+      name: string,
+      state: string,
+      fatal: string | null = null,
+    ): ProgramInfo => ({ ...program('', name, state, fatal), standalone: true })
+    const { store, el } = await withSnapshot(
+      doc([
+        program('alpha', 'web', 'running'),
+        standalone('npx', 'stopped'),
+        standalone('serve', 'fatal', 'boom'),
+      ]),
+    )
+    const sections = tables(el)
+    // One real app group, then the standalone section — no empty-name group.
+    expect(sections.map((t) => t.heading)).toEqual(['alpha', '散装程序'])
+    expect(sections[1]!.showApp).toBe(false)
+    // Fault/backoff-first ordering applies inside the section too.
+    expect(rows(sections[1]!).map((r) => r.getAttribute('data-program'))).toEqual([
+      'serve',
+      'npx',
+    ])
+    // Selecting a standalone row uses the app-less detail route.
+    rows(sections[1]!)[0]!.querySelector<HTMLElement>('td.status')!.click()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(location.pathname).toBe('/program/serve')
+    store.stop()
+    el.remove()
+  })
+
   it('shows the empty state when no app is registered', async () => {
     const { store, el } = await withSnapshot(doc([]))
     expect(tables(el)).toHaveLength(0)

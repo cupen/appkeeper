@@ -495,11 +495,12 @@ pub fn render_fanout(r: &FanoutResult) -> String {
     out.join("\n")
 }
 
-/// The structured result of one app removal (guard-remove-until-stopped).
+/// The structured result of one removal (guard-remove-until-stopped).
 ///
-/// Shared verbatim by `POST /v1/apps/<app>/remove` and
-/// `POST /api/apps/<app>/remove`; the CLI and shell render it, the console
-/// shows the same fields. Field names are wire-stable.
+/// Shared verbatim by `POST /v1/programs/<name>/remove`,
+/// `POST /v1/apps/<app>/remove` and their `/api/...` counterparts; the CLI
+/// and shell render it, the console shows the same fields. Field names are
+/// wire-stable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoveOutcome {
     pub app: String,
@@ -4291,8 +4292,8 @@ fn answer(reply: Option<Reply>, r: Result<String>) {
 }
 
 /// The refusal a same-name `ak run` gets without `--force`
-/// (refuse-run-existing-app D3/D8): names the app and points at the two
-/// escapes (a different `--app`, or an explicit overwrite).
+/// (refuse-run-existing-app D3/D8): names the colliding program and points at
+/// the two escapes (a different `--name`, or an explicit overwrite).
 fn adhoc_conflict_message(name: &str) -> String {
     format!(
         "program {name:?} is already registered — `ak run` refuses to replace an existing \

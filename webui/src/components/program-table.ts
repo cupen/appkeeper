@@ -20,7 +20,7 @@
 
 import { LitElement, css, html, nothing } from 'lit'
 import { customElement, property, query, state } from 'lit/decorators.js'
-import type { ProgramInfo } from '../lib/types.js'
+import { isStandalone, type ProgramInfo } from '../lib/types.js'
 import {
   formatBytes,
   formatPercent,
@@ -365,8 +365,10 @@ export class AkProgramTable extends LitElement {
     return `${p.restart_backoff}s 后重启`
   }
 
-  private detailPath(app: string, program: string): string {
-    return `/app/${encodeURIComponent(app)}/program/${encodeURIComponent(program)}`
+  /** A standalone record has no app segment in its detail route. */
+  private detailPath(p: ProgramInfo): string {
+    if (isStandalone(p)) return `/program/${encodeURIComponent(p.name)}`
+    return `/app/${encodeURIComponent(p.app)}/program/${encodeURIComponent(p.name)}`
   }
 
   private emitSelect(p: ProgramInfo): void {
@@ -552,7 +554,7 @@ export class AkProgramTable extends LitElement {
                     <td class="name">
                       <span class="name-cell">
                         <a
-                          href=${this.detailPath(p.app, p.name)}
+                          href=${this.detailPath(p)}
                           title=${p.name}
                           @click=${(e: MouseEvent) => this.onNameClick(e, p)}
                           >${p.name}</a

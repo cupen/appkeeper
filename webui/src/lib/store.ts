@@ -11,7 +11,14 @@
  * - WS back   → stop polling; the fresh snapshot clears staleness.
  */
 
-import { apiFetch, apiJson, removeApp, type RemoveAppResult } from './api.js'
+import {
+  apiFetch,
+  apiJson,
+  removeApp,
+  removeProgram,
+  type RemoveAppResult,
+  type RemoveProgramResult,
+} from './api.js'
 import { bootstrap } from './bootstrap.js'
 import { loadRefreshMs, saveRefreshMs, type RefreshMs } from './prefs.js'
 import type { PendingDoc, ProgramInfo, StatusDoc, StreamId } from './types.js'
@@ -245,6 +252,23 @@ export class ConsoleStore {
     // same removal locally so the sidebar/overview converge immediately even
     // before the next WS delta (a 2xx answer is authoritative).
     this.removedApps.add(app)
+    if (result.programs?.length) {
+      this.mergeDelta([], result.programs)
+    }
+    this.emit()
+    await this.pollOnceIfNotLive()
+    return result
+  }
+
+  /**
+   * Remove one standalone program through the Web endpoint
+   * (add-standalone-programs D6). The daemon owns the guard — a live program
+   * yields a 409 `ApiError` and nothing is deleted, an app-internal program a
+   * 400. A 2xx answer is authoritative, so its dropped program is applied
+   * locally before the next WS delta; degraded sessions refresh once.
+   */
+  async removeProgram(program: string): Promise<RemoveProgramResult> {
+    const result = await removeProgram(program)
     if (result.programs?.length) {
       this.mergeDelta([], result.programs)
     }

@@ -11,6 +11,11 @@
  * webui-ui: 单程序控制); there is no resident start/stop/restart button group
  * and no browser dialog. Action feedback rides the page's notice strip via
  * the menu's `program-action-result` event.
+ *
+ * A standalone record (`ak run` product, `app === ''`) shows `-` in place of
+ * the app breadcrumb and gains the removal entry for its `adhoc/` record
+ * (add-standalone-programs D6/D7); app-internal programs keep the plain
+ * breadcrumb and have no per-program removal (their boundary is the app).
  */
 
 import { LitElement, css, html, nothing } from 'lit'
@@ -18,6 +23,7 @@ import { customElement, property, query, state } from 'lit/decorators.js'
 import { ConsoleController, consoleStore, type ConsoleStore } from '../lib/store.js'
 import { formatBytes, formatPercent, formatUptime, stateLabel } from '../lib/format.js'
 import type { ProgramInfo } from '../lib/types.js'
+import { navigate } from '../router.js'
 import {
   AkActionMenu,
   actionsFor,
@@ -49,6 +55,7 @@ export class AkProgramDetail extends LitElement {
   /** The shared floating action menu rendered at the end of the template. */
   @query('ak-action-menu') private menu!: AkActionMenu
   @state() private notice: { ok: boolean; text: string } | null = null
+  @state() private removing = false
 
   static styles = css`
     :host {
@@ -114,6 +121,38 @@ export class AkProgramDetail extends LitElement {
       align-items: center;
       gap: var(--ak-space-2);
       flex-wrap: wrap;
+    }
+    /* Removal entry for a standalone record: same control height and radius
+       as every other button (webui-visual-system: 控件同高). */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      height: var(--ak-control-h);
+      padding: 0 var(--ak-space-3);
+      box-sizing: border-box;
+      border: 1px solid var(--ak-border);
+      border-radius: var(--ak-radius-sm);
+      background: var(--ak-surface-2);
+      color: var(--ak-text);
+      font: inherit;
+      font-size: var(--ak-fs-sm);
+      cursor: pointer;
+    }
+    .btn:hover:not(:disabled) {
+      border-color: var(--ak-border-strong);
+      color: var(--ak-text-bright);
+    }
+    .btn-danger {
+      border-color: var(--ak-status-failed-border, #b91c1c);
+      background: transparent;
+      color: var(--ak-status-failed, #ef4444);
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--ak-status-failed, #ef4444) 12%, transparent);
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
     /* The single ⋯ trigger; it matches the top bar's control height so the
        rows never look staggered. The action colours live inside the menu. */
@@ -363,26 +402,77 @@ export class AkProgramDetail extends LitElement {
     return { text: '待确认', tone: 'pending' }
   }
 
-  private renderActions() {
+  private renderHeadActions() {
     const p = this.info
     if (!p) return nothing
+    const standalone = p.app === ''
     // No resident button group: one ⋯ trigger opens the shared menu
     // (webui-ui: 单程序控制 — MUST NOT 再渲染常驻按钮组). No actions for this
     // state (stopping): no trigger to open an empty menu with.
-    if (actionsFor(p.state).length === 0) return nothing
+    const canAct = actionsFor(p.state).length > 0
+    if (!standalone && !canAct) return nothing
     return html`
       <span class="head-actions">
-        <button
-          class="op-trigger"
-          aria-haspopup="menu"
-          aria-label=${`程序 ${p.name} 操作菜单`}
-          title="操作菜单"
-          @click=${this.onTriggerClick}
-        >
-          ⋯
-        </button>
+        ${standalone
+          ? html`<button
+              class="btn btn-danger"
+              data-kind="remove"
+              ?disabled=${this.removing}
+              title="移除散装程序（不会自动停止程序；运行中的程序会阻止移除）"
+              @click=${() => void this.onRemoveProgram()}
+            >
+              ${this.removing ? '移除中…' : '移除程序'}
+            </button>`
+          : nothing}
+        ${canAct
+          ? html`<button
+              class="op-trigger"
+              aria-haspopup="menu"
+              aria-label=${`程序 ${p.name} 操作菜单`}
+              title="操作菜单"
+              @click=${this.onTriggerClick}
+            >
+              ⋯
+            </button>`
+          : nothing}
       </span>
     `
+  }
+
+  /**
+   * Remove a standalone record through the Web endpoint. Confirmation states
+   * the deletion boundary honestly: only the `adhoc/` registration record is
+   * deleted, logs are untouched, and nothing is stopped for the user — a live
+   * program makes the daemon refuse with a 409 naming the stop-first remedy.
+   * On success the record is gone immediately (no apply) and the page leaves
+   * for the dashboard.
+   */
+  private async onRemoveProgram(): Promise<void> {
+    const p = this.info
+    if (!p || p.app !== '' || this.removing) return
+    if (
+      !window.confirm(
+        `移除散装程序「${p.name}」？\n` +
+          `将删除其注册记录（app_dir/adhoc/${p.name}.toml）；日志文件不受影响。\n` +
+          `移除不会自动停止任何程序；运行中的程序会阻止移除（请先执行 ak stop ${p.name}）。`,
+      )
+    ) {
+      return
+    }
+    this.removing = true
+    this.notice = null
+    try {
+      const r = await this.store.removeProgram(p.name)
+      // The detail page is about to unmount; carry the message across the
+      // navigation (the daemon's result already says no apply is needed).
+      this.store.setFlash(r.result, true)
+      navigate('/')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      this.notice = { ok: false, text: msg }
+    } finally {
+      this.removing = false
+    }
   }
 
   private renderMetrics(p: ProgramInfo) {
@@ -444,18 +534,20 @@ export class AkProgramDetail extends LitElement {
         : ''
     return html`
       <header>
-        <a
-          class="crumb"
-          href=${`/app/${encodeURIComponent(this.app)}`}
-          title=${`返回 ${this.app} 概况`}
-          @click=${this.onCrumbClick}
-          >${this.app}</a
-        >
+        ${this.app
+          ? html`<a
+              class="crumb"
+              href=${`/app/${encodeURIComponent(this.app)}`}
+              title=${`返回 ${this.app} 概况`}
+              @click=${this.onCrumbClick}
+              >${this.app}</a
+            >`
+          : html`<span class="crumb" title="散装程序（无应用归属）">-</span>`}
         <span class="crumb-sep" aria-hidden="true">/</span>
         <h1>${p.name}</h1>
         <ak-status-badge slug=${p.state} label=${stateLabel(p.state)}></ak-status-badge>
         ${backoff ? html`<span class="backoff-note" title=${backoff}>${backoff}</span>` : nothing}
-        ${this.renderActions()}
+        ${this.renderHeadActions()}
       </header>
       ${this.notice
         ? html`<div

@@ -284,4 +284,40 @@ describe('store', () => {
     expect(init.method).toBe('POST')
     store.stop()
   })
+
+  it('removeProgram() posts to the standalone removal endpoint and drops the row', async () => {
+    const { store, ws } = openStore()
+    ws.serverFrame(
+      frameFor(
+        MSG.SNAPSHOT,
+        encode(
+          doc([prog('npx', { app: '', standalone: true }), prog('web')]) as never,
+        ),
+      ),
+    )
+    await new Promise((r) => setTimeout(r, 0))
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        app: 'npx',
+        standalone: true,
+        config_path: '/t/adhoc/npx.toml',
+        deleted_file: true,
+        kept_config: null,
+        already_unregistered: false,
+        programs: ['npx'],
+        applied: true,
+        result: 'standalone program npx removed; no apply needed',
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await store.removeProgram('npx')
+    expect(result.standalone).toBe(true)
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/programs/npx/remove')
+    expect(init.method).toBe('POST')
+    // A 2xx answer is authoritative: the record left the projection.
+    expect(store.getSnapshot().doc!.programs.map((p) => p.name)).toEqual(['web'])
+    store.stop()
+  })
 })
