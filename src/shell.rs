@@ -294,7 +294,10 @@ fn levenshtein(a: &str, b: &str) -> usize {
 pub(crate) const HELP_TEXT: &str = "\
 Built-in commands:
   ps                                  list all programs (app, state, pid, restarts, pending)
-  start|stop|restart <app> [<program>]  control an app, or one program of it
+  start|stop|restart <target>         control a program or a whole app
+                                      <target> = <program> | <app>/<program> | <app>/all
+                                      (a single token is a program; `all` alone is
+                                      reserved — a whole app is `<app>/all`)
   action <program> <action>           run a custom action (prints its output tail;
                                       -e mode exits with the action's exit code)
   signal <program> <SIGNAL>           send a whitelist signal to the program's
@@ -303,16 +306,16 @@ Built-in commands:
   log <program> [-f] [--tail N] [--stream out|err]
                                       view program logs
   pending                             show pending (detected but not applied) changes
-  apply [<app> [<program>]] [--restart]
-                                      apply pending changes; the literal `all`
-                                      (= no argument) applies everything and is
-                                      reserved — no app can be named `all`;
+  apply [<target>] [--restart]        apply pending changes; no target = everything;
+                                      <program> | <app>/<program> | <app>/all;
                                       --restart restarts unchanged programs too
                                       (user-stopped ones stay stopped)
-  remove <app>                        unregister an app immediately (no apply
-                                      needed); refused while any of its programs
-                                      is running/starting/stopping/backoff —
-                                      run `stop <app>` first
+  remove <target>                     unregister a standalone program (`<program>`)
+                                      or a whole app (`<app>/all`) immediately (no
+                                      apply needed); a program of an app cannot be
+                                      removed on its own; refused while any of its
+                                      programs is running/starting/stopping/backoff —
+                                      run `stop <target>` first
   shutdown                            stop all programs and exit the daemon
   open                                open the web console in the system browser
   help (or ?)                         show this help
@@ -859,20 +862,42 @@ pub(crate) fn render_ps_all_table(
     let pending = PendingView::from_status(v);
     let mut rows = program_rows(v, descriptions);
     mark_pending(&mut rows, &pending);
+    // Standalone programs have no app: the ORIGIN marker and the registry
+    // dedupe are keyed by the record (program) name for them (D3/D7).
     let origins: std::collections::BTreeMap<&str, &str> = registry
         .iter()
         .map(|a| (a.name.as_str(), a.origin.as_str()))
         .collect();
     for row in rows.iter_mut() {
-        if let Some(o) = origins.get(row.app.as_str()) {
+        let key = if row.app.is_empty() {
+            row.name.as_str()
+        } else {
+            row.app.as_str()
+        };
+        if let Some(o) = origins.get(key) {
             row.origin = (*o).to_string();
         }
     }
-    let known: std::collections::BTreeSet<String> = rows.iter().map(|r| r.app.clone()).collect();
+    let known: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|r| {
+            if r.app.is_empty() {
+                r.name.clone()
+            } else {
+                r.app.clone()
+            }
+        })
+        .collect();
     for app in registry.iter().filter(|a| !known.contains(&a.name)) {
+        let standalone = app.origin == crate::registry::Origin::Run;
         rows.push(StatusRow {
             name: app.name.clone(),
-            app: app.name.clone(),
+            // A standalone record is not an app; the APP column renders `-`.
+            app: if standalone {
+                String::new()
+            } else {
+                app.name.clone()
+            },
             state: "not-applied".to_string(),
             pid: "-".to_string(),
             restarts: "-".to_string(),
@@ -965,9 +990,17 @@ fn render_table(
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|r| {
+            // A standalone program belongs to no app: its APP cell is `-`
+            // (add-standalone-programs D7). The projection reports an empty
+            // `app` for those records.
+            let app = if r.app.is_empty() {
+                "-".to_string()
+            } else {
+                r.app.clone()
+            };
             let all = vec![
                 r.name.clone(),
-                r.app.clone(),
+                app,
                 r.state.clone(),
                 r.pid.clone(),
                 r.restarts.clone(),
@@ -1199,8 +1232,11 @@ mod tests {
         assert!(parse_line("remove all").is_err(), "bare `all` is reserved");
         assert!(parse_line("remove a/b/c").is_err());
         // The help text documents the verb and the stop-first contract.
-        assert!(HELP_TEXT.contains("remove <app>"));
-        assert!(HELP_TEXT.contains("stop <app>"));
+        assert!(HELP_TEXT.contains("remove <target>"));
+        assert!(HELP_TEXT.contains("stop <target>"));
+        // The unified target grammar is spelled out; no `--app` remnants.
+        assert!(HELP_TEXT.contains("<app>/all"), "{HELP_TEXT}");
+        assert!(!HELP_TEXT.contains("--app"), "{HELP_TEXT}");
     }
 
     // -- `remove <app>` against a fake control plane (task 2.3) --------------
@@ -1718,6 +1754,47 @@ mod tests {
             );
         }
         assert!(all.contains("ORIGIN") && !plain.contains("ORIGIN"));
+    }
+
+    /// 5.3 / D7: a standalone program (empty projection `app`) shows `-` in
+    /// the APP column, and `ps --all` labels its registry origin `run`
+    /// without duplicating the row.
+    #[test]
+    fn ps_table_standalone_app_column_and_origin() {
+        let v = serde_json::json!({
+            "programs": [
+                {"name": "agent", "app": "", "standalone": true,
+                 "state": "running", "pid": 9, "total_exits": 0,
+                 "unhealthy": false, "config_path": "/opt/app.d/adhoc/agent.toml"},
+                {"name": "web", "app": "demo", "standalone": false,
+                 "state": "running", "pid": 7, "total_exits": 0,
+                 "unhealthy": false, "config_path": "/opt/app.d/demo.toml"}
+            ]
+        });
+        let desc = std::collections::BTreeMap::new();
+        let plain = render_ps_table(&v, &desc);
+        let agent = plain.lines().find(|l| l.contains("agent")).unwrap();
+        let cells: Vec<&str> = agent.split_whitespace().collect();
+        assert_eq!(cells[0], "agent", "{agent}");
+        assert_eq!(cells[1], "-", "standalone APP is `-`: {agent}");
+
+        let registry = vec![RegistryRow {
+            name: "agent".to_string(),
+            path: "/opt/app.d/adhoc/agent.toml".to_string(),
+            description: Some("standalone agent".to_string()),
+            origin: crate::registry::Origin::Run,
+        }];
+        let all = render_ps_all_table(&v, &desc, &registry);
+        // No duplicate row: the projection already covers the record.
+        assert_eq!(
+            all.lines().filter(|l| l.contains("agent")).count(),
+            1,
+            "{all}"
+        );
+        let agent = all.lines().find(|l| l.contains("agent")).unwrap();
+        assert!(agent.ends_with("run"), "origin run: {agent}");
+        let cells: Vec<&str> = agent.split_whitespace().collect();
+        assert_eq!(cells[1], "-", "{agent}");
     }
 
     /// `ps` PENDING column: a program whose disk definition differs carries a

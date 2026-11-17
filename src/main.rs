@@ -58,9 +58,10 @@ const UNCHANGED_HINT: &str = "配置无修改，不做任何动作";
     version,
     about = "Cross-platform application-layer process keeper (daemon + CLI)",
     after_help = "Examples:
-  ak daemon start   # start the daemon in the background
-  ak start <app>    # start an app (all its programs, in order)
-  ak stop <app>     # stop an app"
+  ak daemon start                 # start the daemon
+  ak run -- npx serve             # register standalone program npx
+  ak start npx                    # one program (app-internal: <app>/<program>)
+  ak stop gateway/all             # whole app"
 )]
 struct Cli {
     /// Path to the daemon config file (default: platform location)
@@ -78,20 +79,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<DaemonCmd>,
     },
-    /// Start an app (all its programs, in order) or one program of it
+    /// Start a program or a whole app (all its programs, in order)
     Start {
-        /// App name
-        #[arg(value_name = "APP")]
+        /// Target: `<program>`, `<app>/<program>`, or a whole app `<app>/all`
+        /// (a single token is a program name; `all` alone is reserved)
+        #[arg(value_name = "TARGET")]
         app: String,
-        /// Only this program of the app (default: the whole app)
+        /// Legacy two-positional form: `<app> <program>`
         #[arg(value_name = "PROGRAM")]
         program: Option<String>,
         /// Machine-readable JSON output
         #[arg(long = "json")]
         json: bool,
     },
-    /// Register and start a new command line (ad-hoc; daemon required).
-    /// A same-name app is refused by default; `--force` overwrites it
+    /// Register and start a new command line as a standalone program (daemon
+    /// required). The record lives in `app_dir/adhoc/` and is addressed by its
+    /// program name; `--name` is optional (the command stem is used, and an
+    /// occupied name advances to `<stem>-N`). A same-name record is refused
+    /// with 409; `--force` overwrites a tool-generated `adhoc/` record
     /// (identical config is a no-op)
     Run {
         /// The command line: everything after `--`
@@ -106,10 +111,11 @@ enum Cmd {
         /// The command line as one shell-like string
         #[arg(long = "cmd", value_name = "COMMAND")]
         cmd_str: Option<String>,
-        /// Ad-hoc app name (default: the command file stem)
-        #[arg(long = "app", value_name = "APP")]
-        scaffold_name: Option<String>,
-        /// Ad-hoc app description
+        /// Standalone program name (default: the command stem, deduplicated
+        /// as `<stem>-N`; a single program name — `/` is not allowed)
+        #[arg(long = "name", value_name = "PROGRAM")]
+        name: Option<String>,
+        /// Standalone program description
         #[arg(long = "description")]
         description: Option<String>,
         /// Ad-hoc restart policy: no | on-failure | always | unless-stopped
@@ -124,7 +130,8 @@ enum Cmd {
         /// Ad-hoc working directory (default: current directory)
         #[arg(long = "workdir")]
         workdir: Option<PathBuf>,
-        /// Overwrite an existing same-name app (default: a same-name run is refused)
+        /// Overwrite an existing tool-generated `adhoc/` record (default:
+        /// refuse a same-name record with 409)
         #[arg(long = "force")]
         force: bool,
         /// Machine-readable JSON output
@@ -166,21 +173,23 @@ enum Cmd {
         #[arg(long = "out", value_parser = ["json", "table"], default_value = "table")]
         out: String,
     },
-    /// Stop an app (all its programs, in reverse order) or one program of it
+    /// Stop a program or a whole app (all its programs, in reverse order)
     Stop {
-        /// App name
-        #[arg(value_name = "APP")]
+        /// Target: `<program>`, `<app>/<program>`, or a whole app `<app>/all`
+        /// (a single token is a program name; `all` alone is reserved)
+        #[arg(value_name = "TARGET")]
         app: String,
-        /// Only this program of the app (default: the whole app)
+        /// Legacy two-positional form: `<app> <program>`
         #[arg(value_name = "PROGRAM")]
         program: Option<String>,
     },
-    /// Restart an app (all its programs) or one program of it
+    /// Restart a program or a whole app (all its programs)
     Restart {
-        /// App name
-        #[arg(value_name = "APP")]
+        /// Target: `<program>`, `<app>/<program>`, or a whole app `<app>/all`
+        /// (a single token is a program name; `all` alone is reserved)
+        #[arg(value_name = "TARGET")]
         app: String,
-        /// Only this program of the app (default: the whole app)
+        /// Legacy two-positional form: `<app> <program>`
         #[arg(value_name = "PROGRAM")]
         program: Option<String>,
     },
@@ -223,13 +232,14 @@ enum Cmd {
         #[arg(long = "stream", value_parser = ["out", "err", "both"], default_value = "out")]
         stream: String,
     },
-    /// Apply pending config changes (all, or one app/program)
+    /// Apply pending config changes (all, or one target)
     Apply {
-        /// App name (`all` = everything, the default)
-        #[arg(default_value = None)]
+        /// Target: `<program>`, `<app>/<program>`, or `<app>/all`
+        /// (default: all pending; a single token is a program name)
+        #[arg(default_value = None, value_name = "TARGET")]
         app: Option<String>,
-        /// Program name within that app
-        #[arg(default_value = None)]
+        /// Legacy two-positional form: `<app> <program>`
+        #[arg(default_value = None, value_name = "PROGRAM")]
         program: Option<String>,
         /// Also restart unchanged programs (user-stopped ones stay stopped)
         #[arg(long = "restart")]
@@ -271,11 +281,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: Option<ComposeSub>,
     },
-    /// Unregister an app: only when it has no running/starting/stopping/
-    /// backoff program; the daemon removes it immediately (no apply needed)
+    /// Unregister a standalone program (`<program>`) or a whole app
+    /// (`<app>/all`); a program of an app cannot be removed on its own
     Remove {
-        /// App name
-        #[arg(value_name = "APP")]
+        /// Target: `<program>` (standalone record) or `<app>/all` (whole app);
+        /// a single token is a program name and `all` alone is reserved
+        #[arg(value_name = "TARGET")]
         name: String,
     },
     /// Open the embedded web console in the system browser (daemon required)
@@ -399,6 +410,11 @@ fn main() {
     // subcommand (daemon-subcommand spec). Intercepted before clap for the
     // same reason — the error must carry the per-form migration hint.
     reject_removed_run();
+    // The `--app` flag was removed (add-standalone-programs D1/D6): `run`
+    // names with `--name`, the management verbs address a positional target.
+    // Intercepted so the error carries the migration hint instead of clap's
+    // generic "unexpected argument" (control-plane spec).
+    reject_removed_app_flag();
     // `compose up` rejects the content-tuning flags with a message that says
     // WHY (the declaration file is the only content source of truth) — clap
     // could only answer "unexpected argument", so this is intercepted first
@@ -589,6 +605,79 @@ fn removed_run_hint(detach: bool) -> String {
          ak daemon install --force --now"
             .to_string()
     }
+}
+
+/// The verbs whose target grammar replaced the `--app` flag
+/// (add-standalone-programs D6): `run` names with `--name`, the management
+/// verbs address a positional target.
+const TARGET_GRAMMAR_VERBS: [&str; 6] = ["start", "stop", "restart", "apply", "remove", "run"];
+
+/// The first positional token (global `-c/--config` flags skipped) when it
+/// is one of [`TARGET_GRAMMAR_VERBS`]; `None` for any other argv. Pure so the
+/// interception is unit-testable.
+fn target_grammar_verb(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => i += 2,
+            _ if args[i].starts_with("--config=") => i += 1,
+            _ if args[i].starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    let verb = args.get(i)?.as_str();
+    TARGET_GRAMMAR_VERBS.contains(&verb).then_some(verb)
+}
+
+/// True when `--app`/`--app=<value>` appears before the `--` terminator of
+/// one management verb (after `--` it belongs to a `run` command line and is
+/// passed through untouched).
+fn removed_app_flag_form(args: &[String]) -> Option<&str> {
+    let verb = target_grammar_verb(args)?;
+    let start = args
+        .iter()
+        .position(|a| a.as_str() == verb)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut j = start;
+    while j < args.len() {
+        let tok = args[j].as_str();
+        if tok == "--" {
+            return None;
+        }
+        if tok == "--app" || tok.starts_with("--app=") {
+            return Some(verb);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// The migration hint for the removed `--app` flag (add-standalone-programs
+/// D1/D6): `run` registers a standalone program by `--name`; the management
+/// verbs take the target positionally.
+fn removed_app_flag_hint(verb: &str) -> String {
+    if verb == "run" {
+        "`--app` has been removed — `run` registers a standalone program; \
+         use `--name <program>`"
+            .to_string()
+    } else {
+        format!(
+            "`--app` has been removed — `{verb}` takes a positional target: \
+             `<program> | <app>/<program> | <app>/all` (a whole app is `<app>/all`)"
+        )
+    }
+}
+
+/// Exit-2 interception of the removed `--app` flag (add-standalone-programs
+/// D1/D6).
+fn reject_removed_app_flag() {
+    let args = argv();
+    let Some(verb) = removed_app_flag_form(&args) else {
+        return;
+    };
+    eprintln!("ak: error: {}", removed_app_flag_hint(verb));
+    std::process::exit(EXIT_CONFIG);
 }
 
 /// The bare-`daemon` usage error (exit 2): names all four subcommands.
@@ -807,7 +896,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Some(Cmd::Run {
             cmd,
             cmd_str,
-            scaffold_name,
+            name,
             description,
             restart,
             restart_backoff,
@@ -831,7 +920,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 &config_path,
                 cmd,
                 cmd_str.as_deref(),
-                scaffold_name.as_deref(),
+                name.as_deref(),
                 description.as_deref(),
                 restart.as_deref(),
                 *restart_backoff,
@@ -935,7 +1024,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             app,
             program,
             restart,
-        }) => client_cmd(&config_path, |c| {
+        }) => {
             // Bare `ak apply` is the full scope; otherwise the unified target
             // grammar decides (D6). `all` alone is a usage error there.
             let (scope_app, scope_program) = match app {
@@ -946,15 +1035,29 @@ fn dispatch(cli: &Cli) -> Result<()> {
                     Target::AppAll(app) => (Some(app), None),
                 },
             };
-            let v = c.apply(scope_app.as_deref(), scope_program.as_deref(), *restart)?;
-            println!(
-                "{}",
-                v.get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("applied")
-            );
-            Ok(())
-        }),
+            let config = client::load_config(&config_path)?;
+            let c = client::Client::from_config(&config);
+            match c.apply(scope_app.as_deref(), scope_program.as_deref(), *restart) {
+                Ok(v) => {
+                    println!(
+                        "{}",
+                        v.get("result")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("applied")
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("ak: error: {e:#}");
+                    // A single token is a program name; if it only names an
+                    // app, the fix is `<app>/all` (D6).
+                    if let Some(p) = &scope_program {
+                        eprint_app_all_hint(p, &e);
+                    }
+                    std::process::exit(client::exit_code_of(&e));
+                }
+            }
+        }
         Some(Cmd::Log {
             names,
             tail,
@@ -1383,17 +1486,18 @@ fn ps_cmd(config_path: &Path, all: bool, out: &str) -> Result<()> {
 /// The scaffold flags recognized inside the trailing `run --` region (after
 /// the command line). A leading `--` split means clap hands the whole region
 /// over as one vector, so the runtime splits command-vs-flags at the first
-/// recognized flag (design D10 / app-registry spec examples).
+/// recognized flag (design D1 / app-registry spec examples).
 #[derive(Debug, Default, PartialEq)]
 struct AdhocFlags {
-    /// The ad-hoc app name (`--app`; formerly `--name`).
-    app: Option<String>,
+    /// The standalone program name (`--name`; `--app` was removed).
+    name: Option<String>,
     description: Option<String>,
     restart: Option<String>,
     restart_backoff: Option<f64>,
     envs: Vec<String>,
     workdir: Option<PathBuf>,
-    /// `--force`: overwrite an existing same-name app (a value-less flag).
+    /// `--force`: overwrite an existing same-name `adhoc/` record (a
+    /// value-less flag).
     force: bool,
 }
 
@@ -1405,7 +1509,7 @@ fn split_adhoc_trailing(
     trailing: &[String],
 ) -> std::result::Result<(Vec<String>, AdhocFlags), String> {
     const FLAGS: [&str; 7] = [
-        "--app",
+        "--name",
         "--description",
         "--restart",
         "--restart-backoff",
@@ -1441,7 +1545,7 @@ fn split_adhoc_trailing(
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match flag.as_str() {
-            "--app" => flags.app = Some(take_value(&mut i)?),
+            "--name" => flags.name = Some(take_value(&mut i)?),
             "--description" => flags.description = Some(take_value(&mut i)?),
             "--restart" => flags.restart = Some(take_value(&mut i)?),
             "--restart-backoff" => {
@@ -1498,7 +1602,7 @@ fn run_adhoc(
         }
     };
     // clap-level flags (before `--`) win when set; otherwise the trailing ones.
-    let name = flags.app.as_deref().or(name);
+    let name = flags.name.as_deref().or(name);
     let description = flags.description.as_deref().or(description);
     let restart = flags.restart.as_deref().or(restart);
     let restart_backoff = flags.restart_backoff.or(restart_backoff);
@@ -1543,6 +1647,14 @@ fn run_adhoc(
             std::process::exit(EXIT_CONFIG);
         }
     };
+    // The auto-naming base (D1/D8): only used for the human hint when the
+    // daemon advanced the default name; the daemon derives it from the same
+    // resolved command stem with the same `program` fallback.
+    let auto_base = command
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "program".to_string());
     let register_only = matches!(restart, Some("no"));
 
     let config = client::load_config(config_path)?;
@@ -1579,7 +1691,7 @@ fn run_adhoc(
         }
         print_progress_frame(frame);
     });
-    let terminal = match frames {
+    let mut terminal = match frames {
         Ok(v) => v,
         Err(e) => {
             eprintln!("ak: error: {e:#}");
@@ -1590,6 +1702,16 @@ fn run_adhoc(
     if terminal.get("residual").and_then(|r| r.as_bool()) == Some(true) || residual.is_some() {
         let frame = residual.unwrap_or_else(|| terminal.clone());
         return handle_residual(&c, &frame, json);
+    }
+    // Auto-naming hint source (D8): the final name is in the frame; the base
+    // is only needed for the human line, so it rides along here.
+    if terminal.get("auto_named").and_then(|v| v.as_bool()) == Some(true)
+        && let Some(obj) = terminal.as_object_mut()
+    {
+        obj.insert(
+            "base_name".to_string(),
+            serde_json::Value::String(auto_base),
+        );
     }
     render_run_terminal(&terminal, json)
 }
@@ -1734,10 +1856,21 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
     // started or stopped. A fixed human hint, exit 0; `--json` carries the
     // structured object (refuse-run-existing-app D6).
     let unchanged = frame.get("unchanged").and_then(|u| u.as_bool()) == Some(true);
+    // Every run product is a standalone program; a default name that was
+    // already taken is advanced by the daemon (add-standalone-programs D8).
+    let standalone = frame
+        .get("standalone")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let auto_named = frame
+        .get("auto_named")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false);
     if json {
         // Machine-readable shape (task 6.4): name / config_path / pid / status.
         // The full frame (error, partial, config_text) rides along so a
-        // script can diagnose a partial failure too.
+        // script can diagnose a partial failure too. `standalone` /
+        // `auto_named` are additive (D8: old scripts keep working).
         let program = frame.get("program").and_then(|p| p.as_str()).unwrap_or("");
         let config_path = frame
             .get("config_path")
@@ -1748,6 +1881,8 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
             "name": program,
             "config_path": config_path,
             "pid": pid,
+            "standalone": standalone,
+            "auto_named": auto_named,
             "status": match (ok, unchanged) {
                 (_, true) => "unchanged",
                 (true, false) => "started",
@@ -1813,15 +1948,26 @@ fn run_terminal_render(frame: &serde_json::Value, json: bool) -> (i32, Vec<Strin
         .and_then(|p| p.as_u64())
         .map(|p| p.to_string())
         .unwrap_or_else(|| "null".to_string());
-    (
-        EXIT_OK,
-        vec![
-            format!("program {program} started"),
-            format!("  config: {config_path}"),
-            format!("  pid:    {pid}"),
-        ],
-        Vec::new(),
-    )
+    let kind = if standalone {
+        "standalone program"
+    } else {
+        "program"
+    };
+    let mut out = vec![
+        format!("{kind} {program} started"),
+        format!("  config: {config_path}"),
+        format!("  pid:    {pid}"),
+    ];
+    if auto_named {
+        // Design D8: name the final name and the base that was taken.
+        match frame.get("base_name").and_then(|b| b.as_str()) {
+            Some(base) if !base.is_empty() => {
+                out.push(format!("自动命名：{program}（基名 {base} 已被占用）"));
+            }
+            _ => out.push(format!("自动命名：{program}")),
+        }
+    }
+    (EXIT_OK, out, Vec::new())
 }
 
 /// The full configuration information lines of a partial failure (task 6.8).
@@ -2123,18 +2269,31 @@ fn remove_cmd(config_path: &Path, name: &str) -> Result<()> {
         }
     };
     client_cmd(config_path, |c| {
-        let v = if is_standalone {
-            c.remove_program(&name)?
+        let result = if is_standalone {
+            c.remove_program(&name)
         } else {
-            c.remove_app(&name)?
+            c.remove_app(&name)
         };
-        println!(
-            "{}",
-            v.get("result")
-                .and_then(|r| r.as_str())
-                .unwrap_or("removed")
-        );
-        Ok(())
+        match result {
+            Ok(v) => {
+                println!(
+                    "{}",
+                    v.get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("removed")
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("ak: error: {e:#}");
+                // A single token is a program name; if it only names an app,
+                // the fix is `<app>/all` (D6).
+                if is_standalone {
+                    eprint_app_all_hint(&name, &e);
+                }
+                std::process::exit(client::exit_code_of(&e));
+            }
+        }
     })
 }
 
@@ -4272,6 +4431,82 @@ mod cli_verb_tests {
         assert!(help.contains("run"), "help lists the run verb");
     }
 
+    /// 5.5 / D9: the top-level `Examples:` block is under five lines, covers
+    /// the three target spellings, and contains no removed `--app` or a bare
+    /// app-name whole-group example.
+    #[test]
+    fn top_level_examples_cover_the_target_grammar() {
+        let help = Cli::command().render_help().to_string();
+        let examples = help
+            .split("Examples:")
+            .nth(1)
+            .expect("the help has an Examples section");
+        let lines: Vec<&str> = examples
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ak "))
+            .collect();
+        assert!(lines.len() < 5, "fewer than five examples: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("ak daemon start"), "{joined}");
+        assert!(joined.contains("ak run -- "), "{joined}");
+        assert!(
+            joined.contains("ak start npx"),
+            "single-program example: {joined}"
+        );
+        assert!(
+            joined.contains("<app>/<program>"),
+            "the comment names the app-internal spelling: {joined}"
+        );
+        assert!(
+            joined.contains("ak stop gateway/all"),
+            "whole-app example: {joined}"
+        );
+        assert!(!joined.contains("--app"), "no removed flag: {joined}");
+        // No example addresses a whole app by a bare app name.
+        assert!(
+            !lines.iter().any(|l| l.trim() == "ak stop gateway"),
+            "{joined}"
+        );
+    }
+
+    /// 5.4 / D6: the removed `--app` flag is intercepted with the migration
+    /// hint (`run` names with `--name`, management verbs take a positional
+    /// target).
+    #[test]
+    fn removed_app_flag_migration_hints() {
+        let s = |xs: &[&str]| {
+            removed_app_flag_form(&xs.iter().map(|x| x.to_string()).collect::<Vec<_>>())
+                .map(str::to_string)
+        };
+        assert_eq!(s(&["run", "--app", "web"]).as_deref(), Some("run"));
+        assert_eq!(s(&["run", "--app=web"]).as_deref(), Some("run"));
+        assert_eq!(s(&["start", "--app", "demo"]).as_deref(), Some("start"));
+        assert_eq!(
+            s(&["-c", "/tmp/x.toml", "stop", "--app", "demo"]).as_deref(),
+            Some("stop")
+        );
+        assert_eq!(s(&["apply", "--app", "demo"]).as_deref(), Some("apply"));
+        assert_eq!(s(&["remove", "--app", "demo"]).as_deref(), Some("remove"));
+        // After `--` it belongs to the run command line.
+        assert_eq!(s(&["run", "--", "python", "--app", "web"]), None);
+        // Other verbs are untouched.
+        assert_eq!(s(&["compose", "--app", "x"]), None);
+        assert_eq!(s(&[]), None);
+        let run_hint = removed_app_flag_hint("run");
+        assert!(run_hint.contains("--name"), "{run_hint}");
+        let start_hint = removed_app_flag_hint("start");
+        assert!(start_hint.contains("<app>/all"), "{start_hint}");
+    }
+
+    /// 5.1 / D1: a run `--name` is a program name — `/` (target syntax) is
+    /// rejected with exit 2 by the shared validator.
+    #[test]
+    fn run_name_rejects_target_syntax() {
+        assert!(crate::supervisor::validate_standalone_name("gateway/api").is_err());
+        assert!(crate::supervisor::validate_standalone_name("all").is_err());
+        assert!(crate::supervisor::validate_standalone_name("agent").is_ok());
+    }
+
     /// The removed daemon form of `run` is recognized before clap (design D2):
     /// signature = first subcommand `run` + only `-c/--config` (both positions,
     /// `--config=<path>` included) and `--detach`. Client forms never match.
@@ -4321,22 +4556,34 @@ mod cli_verb_tests {
         assert!(!hint.contains("run --app"), "{hint}");
     }
 
-    /// `run` carries no positional start form and no fan-out flag: a bare
-    /// token or `--app <app>` is no longer accepted (the ad-hoc app name is
-    /// `--app`, so a *value* parses but a positional does not).
+    /// `run` carries no positional start form and no `--app` flag: the
+    /// naming flag is `--name`; a trailing `--app` belongs to the command
+    /// line (add-standalone-programs D1).
     #[test]
     fn run_start_forms_are_gone() {
         assert!(parse_err(&["run", "web"]).contains("unexpected argument"));
-        // `--app` now names the ad-hoc app (it takes a value, so it parses);
-        // the removed program-level fan-out semantics are gone with it.
+        // `--app` is no longer a clap flag (the migration interceptor lives in
+        // `main`; clap itself answers "unexpected argument").
+        assert!(parse_err(&["run", "--app", "demo"]).contains("unexpected argument"));
+        // In the trailing region `--app` is part of the command line.
         let cli = parse(&["run", "--", "python", "-c", "x", "--app", "demo"]);
         let cmd = match cli.cmd {
             Some(Cmd::Run { cmd, .. }) => cmd,
             other => panic!("expected Run, got {other:?}"),
         };
         let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
-        assert_eq!(argv, vec!["python", "-c", "x"]);
-        assert_eq!(flags.app.as_deref(), Some("demo"));
+        assert_eq!(argv, vec!["python", "-c", "x", "--app", "demo"]);
+        assert!(flags.name.is_none());
+        // `--name` is the naming flag in the trailing region too.
+        let (argv, flags) = split_adhoc_trailing(&[
+            "node".into(),
+            "server.js".into(),
+            "--name".into(),
+            "worker".into(),
+        ])
+        .unwrap();
+        assert_eq!(argv, vec!["node", "server.js"]);
+        assert_eq!(flags.name.as_deref(), Some("worker"));
     }
 
     /// The ad-hoc `--` form captures everything after `--` as the command
@@ -4347,13 +4594,10 @@ mod cli_verb_tests {
         let cli = parse(&["run", "--", "python", "-m", "http.server", "8000"]);
         match cli.cmd {
             Some(Cmd::Run {
-                cmd,
-                cmd_str,
-                scaffold_name,
-                ..
+                cmd, cmd_str, name, ..
             }) => {
                 assert_eq!(cmd, vec!["python", "-m", "http.server", "8000"]);
-                assert!(cmd_str.is_none() && scaffold_name.is_none());
+                assert!(cmd_str.is_none() && name.is_none());
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -4363,7 +4607,7 @@ mod cli_verb_tests {
             "--",
             "node",
             "server.js",
-            "--app",
+            "--name",
             "worker",
             "--restart",
             "unless-stopped",
@@ -4374,32 +4618,35 @@ mod cli_verb_tests {
         };
         let (argv, flags) = split_adhoc_trailing(&cmd).unwrap();
         assert_eq!(argv, vec!["node", "server.js"]);
-        assert_eq!(flags.app.as_deref(), Some("worker"));
+        assert_eq!(flags.name.as_deref(), Some("worker"));
         assert_eq!(flags.restart.as_deref(), Some("unless-stopped"));
         // `--flag=value` form too.
         let (argv, flags) =
-            split_adhoc_trailing(&["/bin/echo".into(), "hi".into(), "--app=w2".into()]).unwrap();
+            split_adhoc_trailing(&["/bin/echo".into(), "hi".into(), "--name=w2".into()]).unwrap();
         assert_eq!(argv, vec!["/bin/echo", "hi"]);
-        assert_eq!(flags.app.as_deref(), Some("w2"));
+        assert_eq!(flags.name.as_deref(), Some("w2"));
         // A missing value is a diagnostic error.
-        assert!(split_adhoc_trailing(&["x".into(), "--app".into()]).is_err());
+        assert!(split_adhoc_trailing(&["x".into(), "--name".into()]).is_err());
         // `--cmd "<string>"` is the equivalent single-string entry.
-        let cli = parse(&["run", "--cmd", "python -m http.server 8000", "--app", "web"]);
+        let cli = parse(&[
+            "run",
+            "--cmd",
+            "python -m http.server 8000",
+            "--name",
+            "web",
+        ]);
         match cli.cmd {
             Some(Cmd::Run {
-                cmd,
-                cmd_str,
-                scaffold_name,
-                ..
+                cmd, cmd_str, name, ..
             }) => {
                 assert!(cmd.is_empty());
                 assert_eq!(cmd_str.as_deref(), Some("python -m http.server 8000"));
-                assert_eq!(scaffold_name.as_deref(), Some("web"));
+                assert_eq!(name.as_deref(), Some("web"));
             }
             other => panic!("expected Run, got {other:?}"),
         }
-        // `--name` is no longer an accepted ad-hoc naming flag.
-        assert!(parse_err(&["run", "--cmd", "x", "--name", "web"]).contains("unexpected argument"));
+        // `--app` is no longer an accepted ad-hoc naming flag.
+        assert!(parse_err(&["run", "--cmd", "x", "--app", "web"]).contains("unexpected argument"));
         // The two entry forms are mutually exclusive.
         assert!(parse_err(&["run", "--cmd", "x", "--", "y"]).contains("cannot be used with"));
     }
@@ -4420,11 +4667,11 @@ mod cli_verb_tests {
             other => panic!("expected Run, got {other:?}"),
         }
         // Trailing position: once the flag region starts (the first recognized
-        // flag), `--force` may sit at any point inside it — same as `--app`.
+        // flag), `--force` may sit at any point inside it — same as `--name`.
         for trailing in [
             vec!["python", "-m", "http.server", "--force"],
-            vec!["python", "-m", "http.server", "--app", "web", "--force"],
-            vec!["python", "-m", "http.server", "--force", "--app", "web"],
+            vec!["python", "-m", "http.server", "--name", "web", "--force"],
+            vec!["python", "-m", "http.server", "--force", "--name", "web"],
             vec!["python", "-m", "http.server", "--restart", "no", "--force"],
         ] {
             let owned: Vec<String> = trailing.iter().map(|s| s.to_string()).collect();
@@ -5038,6 +5285,43 @@ mod cli_verb_tests {
         let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "exited");
+    }
+
+    /// 5.2 / D8: a standalone run product says so, and an auto-advanced name
+    /// renders the final/base pair; `--json` adds `standalone`/`auto_named`
+    /// without changing the old fields.
+    #[test]
+    fn run_terminal_standalone_and_auto_named() {
+        let frame = serde_json::json!({
+            "ok": true, "program": "npx-1", "config_path": "/d/adhoc/npx-1.toml",
+            "pid": 5, "standalone": true, "auto_named": true, "base_name": "npx",
+        });
+        let (code, out, err) = run_terminal_render(&frame, false);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty(), "{err:?}");
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("standalone program npx-1 started"),
+            "{joined}"
+        );
+        assert!(joined.contains("自动命名：npx-1"), "{joined}");
+        assert!(joined.contains("基名 npx"), "{joined}");
+        let (_, out, _) = run_terminal_render(&frame, true);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["standalone"], true);
+        assert_eq!(v["auto_named"], true);
+        assert_eq!(v["name"], "npx-1");
+        assert_eq!(v["status"], "started");
+        // A frame without the new fields stays byte-compatible.
+        let plain = serde_json::json!({
+            "ok": true, "program": "web", "config_path": "/d/web.toml", "pid": 7,
+        });
+        let (_, out, _) = run_terminal_render(&plain, false);
+        assert_eq!(out[0], "program web started");
+        let (_, out, _) = run_terminal_render(&plain, true);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["standalone"], false);
+        assert_eq!(v["auto_named"], false);
     }
 
     // -- ps (control-plane spec, tasks 4.x) ---------------------------------

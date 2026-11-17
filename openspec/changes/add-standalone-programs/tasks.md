@@ -32,11 +32,11 @@
 
 ## 5. CLI 与 shell 输出
 
-- [ ] 5.1 `main.rs`：`Cmd::Run` 移除 `--app`/`scaffold_name` 的 app 语义，`--name` 为程序名；`--name` 含 `/` 直接退出 2；`AdhocFlags`/`split_adhoc_trailing` 的 `FLAGS` 列表同步；`run --help` 只描述单程序名
-- [ ] 5.2 `run_adhoc` 的 JSON body 去掉 app 维度，终端输出增加 `standalone` 与自动命名提示；`--json` 只增字段
-- [ ] 5.3 `shell.rs` 的 `ps` 表格：散装程序 APP 列显示 `-`；`ps --all` 的本地注册表清单标注 `run`/`compose` 来源；表格测试覆盖
-- [ ] 5.4 `remove`/`start`/`stop`/`restart`/`apply` 的帮助文案改为统一目标文法 `<program> | <app>/<program> | <app>/all`，说明单 token 是程序、整组用 `<app>/all`、`all` 为保留字；错误信息对 `--app`、裸 app 名给出迁移提示（`app` → `app/all`）
-- [ ] 5.5 顶层 `after_help` 的 `Examples:` 改为少于 5 行：覆盖 daemon 启动、`run` 散装注册、单程序目标、`<app>/all` 整组，注释提示 `<app>/<program>`；单测断言三种写法均出现、无 `--app`、无裸 app 名整组示例
+- [x] 5.1 `main.rs`：`Cmd::Run` 移除 `--app`/`scaffold_name` 的 app 语义，`--name` 为程序名；`--name` 含 `/` 直接退出 2；`AdhocFlags`/`split_adhoc_trailing` 的 `FLAGS` 列表同步；`run --help` 只描述单程序名
+- [x] 5.2 `run_adhoc` 的 JSON body 去掉 app 维度，终端输出增加 `standalone` 与自动命名提示；`--json` 只增字段
+- [x] 5.3 `shell.rs` 的 `ps` 表格：散装程序 APP 列显示 `-`；`ps --all` 的本地注册表清单标注 `run`/`compose` 来源；表格测试覆盖
+- [x] 5.4 `remove`/`start`/`stop`/`restart`/`apply` 的帮助文案改为统一目标文法 `<program> | <app>/<program> | <app>/all`，说明单 token 是程序、整组用 `<app>/all`、`all` 为保留字；错误信息对 `--app`、裸 app 名给出迁移提示（`app` → `app/all`）
+- [x] 5.5 顶层 `after_help` 的 `Examples:` 改为少于 5 行：覆盖 daemon 启动、`run` 散装注册、单程序目标、`<app>/all` 整组，注释提示 `<app>/<program>`；单测断言三种写法均出现、无 `--app`、无裸 app 名整组示例
 
 ## 6. Web 控制台
 
@@ -48,6 +48,6 @@
 
 ## 7. 文档与验收
 
-- [ ] 7.1 更新 `README.md`：`ak run` 只造散装程序、`--name` 可选、缺省自动排重、显式重复 409、`--force` 只覆盖 `adhoc/`、`--app` 已移除、`ps` 的 `-` 列
+- [x] 7.1 更新 `README.md`：`ak run` 只造散装程序、`--name` 可选、缺省自动排重、显式重复 409、`--force` 只覆盖 `adhoc/`、`--app` 已移除、`ps` 的 `-` 列
 - [ ] 7.2 `xtask/src/e2e.rs` 增加矩阵：散装注册/启动/停止/移除、连续两次 run 得 `<stem>`/`<stem>-1`、显式冲突 409 零副作用、`--app` 退出 2、`--force` 覆盖与空操作、旧格式 `adhoc/` 记录可启动、`start <program>` 单程序、`start <app>/all` 整组、`start <app>/<program>` 指定程序、裸 app 名报错并提示 `<app>/all`、`all` 退出 2、散装程序不出现在 `/v1/apps` 扇出
 - [ ] 7.3 全量回归：`openspec validate add-standalone-programs`、`cargo test --workspace`、`cargo build --release`、`cargo run -p xtask -- e2e --no-browser` 全绿

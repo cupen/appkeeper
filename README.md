@@ -8,11 +8,16 @@
 
 ```bash
 ak daemon start                                       # 1. 启动守护进程（后台，就绪即返回）
-ak run --cmd "python -m http.server 8000" --app web    # 2. 注册并立即启动一条命令行
+ak run -- python -m http.server 8000                  # 2. 注册并启动散装程序（缺省名 python）
 ak ps                                                 # 3. 查看状态
-ak stop web                                           # 4. 停止
-ak start web                                          # 5. 再启动
+ak stop python/all                                    # 4. 停止整个 app
+ak start python/all                                   # 5. 再启动
 ```
+
+> `ak run` 只创建**散装程序**（不属于任何 app）：未给 `--name` 时取命令首
+> token 的 stem 作基名，被占用则自动顺延为 `<基名>-N`；显式 `--name` 只接受
+> 单个程序名（含 `/` 以退出码 2 拒绝）。管理面把单 token 视为程序名，整组
+> 用 `<app>/all`，`all` 为保留字。
 
 守护进程不依赖任何配置文件即可运行（内置默认值空启动）。生产部署建议
 `ak config --init` 生成带注释的模板（内含 `restart = "always"`，开箱自动守护）。
@@ -40,31 +45,42 @@ ak start web                                          # 5. 再启动
   由 unit 的 `StateDirectory` 提供（`/var/lib/appkeeper/<uid>`，停服/卸载不删），
   其余形态按 `STATE_DIRECTORY` → 平台 State 缺省推导，可显式配置覆盖。
 
-**启停（`ak start` / `ak stop` / `ak restart`，双位置参数 `<app> [<program>]`）**
+**启停（`ak start` / `ak stop` / `ak restart`，统一目标文法 `<program> | <app>/<program> | <app>/all`）**
 
 | 命令 | 意图 |
 | --- | --- |
-| `ak start <app>` | 按依赖顺序启动整个 app 的全部程序（阻塞至启动判定完成） |
-| `ak start <app> <program>` | 只启动该 app 内的单个程序 |
-| `ak stop <app>` / `ak stop <app> <program>` | 停止整个 app（逆启动序）/ 单个程序 |
-| `ak restart <app> [<program>]` | 重启整个 app / 单个程序 |
-| `ak start <app> --json` | 机器可读输出：`name / config_path / pid / status`（扇出时为数组） |
+| `ak start <program>` | 启动一个程序（散装程序或全局唯一的 app 内程序，阻塞至启动判定完成） |
+| `ak start <app>/<program>` | 只启动该 app 内的单个程序（等价旧双位置 `ak start <app> <program>`） |
+| `ak start <app>/all` | 按依赖顺序启动整个 app 的全部程序（整组只写 `<app>/all`；裸 app 名不扇出） |
+| `ak stop <program>` / `ak stop <app>/all` | 停止单个程序 / 整个 app（逆启动序） |
+| `ak restart <program>` / `ak restart <app>/all` | 重启单个程序 / 整个 app |
+| `ak start <program> --json` | 机器可读输出：`name / config_path / pid / status`（扇出时为数组） |
+
+单 token 永远是程序名（`all` 为保留字）；只命中 app 名时返回未知程序并提示改用
+`<app>/all`。`--app` 旗标已移除（传入即未知参数，退出码 2）。
 
 **跑临时命令（`ak run`，仅 ad-hoc；守护离线一律退出码 3，不隐式拉起）**
 
 | 命令 | 意图 |
 | --- | --- |
-| `ak run --cmd "python -m http.server 8000" --app web` | 注册一条命令行并立即启动（成功才落盘） |
-| `ak run -- python -m http.server 8000 --app web` | 等价的 `--` 写法（脚手架旗标放在命令之后） |
-| `ak run --force -- python -m http.server 9000 --app web` | 覆盖已注册的同名 app（有差异则重写并重启，无差异仅提示；仅限 `app_dir/adhoc/` 内的自家记录，见下） |
-| `ak run … --json` | 机器可读输出：`name / config_path / pid / status` |
+| `ak run -- python -m http.server 8000` | 注册散装程序并立即启动（成功才落盘）；缺省名取 stem `python`，被占用则 `python-1`… |
+| `ak run --name web -- python -m http.server 8000` | 显式命名散装程序 `web`（不排重；同名已注册回 409） |
+| `ak run --cmd "python -m http.server 8000" --name web` | 等价的 `--cmd` 单字符串写法（`--` 与 `--cmd` 二选一） |
+| `ak run --force --name web -- python -m http.server 9000` | 覆盖已注册的 `adhoc/web` 记录（有差异则重写并重启，无差异仅提示；顶层记录与链接仍拒绝） |
+| `ak run … --json` | 机器可读输出：`name / config_path / pid / status / standalone / auto_named` |
 
 `ak run` 只承载 ad-hoc 注册；启动/停止已注册的 app 或程序请用
-`ak start|stop|restart <app> [<program>]`。ad-hoc 形态可附加
-`--restart <no\|on-failure\|always\|unless-stopped>`、`--env K=V`、`--workdir`、
-`--description`。
+`ak start|stop|restart <program> | <app>/<program> | <app>/all`。ad-hoc 形态可附加
+`--name <程序名>`（可选）、`--restart <no\|on-failure\|always\|unless-stopped>`、
+`--env K=V`、`--workdir`、`--description`。
 
-同名默认拒绝：应用名已注册（或在内存中）时，未带 `--force` 的 `ak run` 以
+命名规则：未给 `--name` 时基名取命令首 token 的文件名 stem，基名空闲则直接
+使用，被占用则顺延为 `<基名>-N`（N 取现有最大编号 + 1，不填中间空号）；
+人类输出提示「自动命名：<最终名>（基名 <stem> 已被占用）」，`--json` 标记
+`auto_named: true`。显式 `--name` 不排重，只接受单个程序名（`/`、空值、
+保留字 `all` 及非法字符以退出码 2 拒绝）。
+
+同名默认拒绝：程序名已注册（或在内存中）时，未带 `--force` 的 `ak run` 以
 冲突错误退出（守护进程 409，不写盘、不启停任何进程）。带 `--force` 时逐字节
 比较新旧配置：有差异则原子重写记录并停旧启新，无差异则输出「配置无修改，
 不做任何动作」并以 0 退出。`--force` 不放行跨应用程序名冲突，也不覆盖指向
@@ -77,7 +93,7 @@ ak start web                                          # 5. 再启动
 | 命令 | 意图 |
 | --- | --- |
 | `ak ps` | 程序状态表（NAME/APP/STATE/PID/…/PENDING，守护离线退出 3） |
-| `ak ps --all` | 含已注册未运行的 app；离线时降级为本地注册表清单（退出 0） |
+| `ak ps --all` | 含已注册未运行的 app 与散装程序；离线时降级为本地注册表清单（含 `run`/`compose` 来源标注，退出 0） |
 | `ak ps --out json` | JSON 投影（等价 `GET /v1/status`，脚本消费） |
 | `ak log <名…> [-f] [--tail N] [--stream out\|err\|both]` | 查看/跟随日志（多名时行首带 `[名]`） |
 | `ak pid <名>` | 打印程序 pid |
@@ -86,8 +102,10 @@ ak start web                                          # 5. 再启动
 
 `ps` 表格的 PENDING 列标记磁盘配置与运行定义存在待应用差异的程序（`changed` /
 `new`），表格尾部追加 pending 摘要行（新增/移除的 app、daemon 级提示、检出错误）；
-`ak apply` 后标记消失。`pid`/`log`/`action`/`signal` 以程序名寻址——单程序 app
-的程序名与 app 名相同。
+`ak apply` 后标记消失。散装程序不属于任何 app，APP 列显示 `-`；`ps --all` 的
+ORIGIN 列按记录位置标注来源（`app_dir/adhoc/` → `run`，顶层 → `compose`）。
+`pid`/`log`/`action`/`signal` 以程序名寻址——散装程序的程序名即记录名，单程序
+app 的程序名与 app 名相同。
 
 **注册与配置流转**
 
@@ -96,15 +114,17 @@ ak start web                                          # 5. 再启动
 | `ak compose up [目录]` | **声明式一条命令**：读取 `<目录>/.appkeeper.toml`，整组注册并启动（见下「开发场景速览」） |
 | `ak compose <目录\|.toml\|可执行>` | 注册 app：目录/配置→`app_dir` 链接；可执行→脚手架生成配置 |
 | `ak compose … --apply` | 注册后立即生效（守护离线时自动后台拉起） |
-| `ak remove <app>` | 注销：守护进程一次完成，立即清除注册与内存投影，**无需 apply**；要求该 app 无 `running/starting/stopping/backoff` 程序，否则 409 列出阻塞项并提示先 `ak stop <app>`（守护离线退出 3，不做本地直删） |
+| `ak remove <program>` | 移除散装程序记录（`app_dir/adhoc/<程序名>.toml`）：守护进程一次完成，**无需 apply**；要求该程序无 `running/starting/stopping/backoff` 状态（守护离线退出 3） |
+| `ak remove <app>/all` | 注销整个 app（整组只写 `<app>/all`）；裸 app 名不隐式移除，app 内程序不支持单独 remove（改 compose 声明后 apply） |
 | `ak config --reload` | 立即重扫配置，检出待应用变更（pending），**不触碰任何进程** |
-| `ak apply [<app> [<程序>]] [--restart]` | 应用待应用变更（见下「两阶段」） |
+| `ak apply [<target>] [--restart]` | 应用待应用变更；`<target>` = `<program>` / `<app>/<program>` / `<app>/all`（缺省全部，见下「两阶段」） |
 | `ak validate [路径]` | 校验 daemon 配置 + 全部注册应用（或单个文件） |
 | `ak config --init \| --set k=v \| --get k \| --delete k \| --edit \| --reload` | daemon 配置管理（本地动作 + 可选在线重载） |
 
 **其他**：`ak shell [-e "ps"]` 交互式控制台（supervisorctl 风格，内置
 `ps/start/stop/restart/log/pid/pending/apply/action/signal/shutdown/open` 词；
-`start|stop|restart` 同样是 `<app> [<program>]` 双位置参数）。
+`start|stop|restart|apply|remove` 同样接受统一目标文法
+`<program> | <app>/<program> | <app>/all`）。
 
 CLI 退出码：`0` 成功、`1` 一般错误、`2` 配置/用法错误、`3` 守护进程不可达。
 
@@ -339,11 +359,12 @@ ak config --delete webui                              # 删段 = 关闭
 - 旧动词已删（无别名）：`service install/uninstall` → `ak daemon install/uninstall`；
   `status`/`list` → `ak ps` / `ak ps --all`（`status --json` → `ps --out json`）；
   `shutdown` → `ak daemon shutdown`；`add` → `ak compose`。
-- 启动面收敛到 `start|stop|restart <app> [<program>]`：`ak run <name>` →
-  `ak start <app>`；`ak run --app <app>` → `ak start <app>`；旧
-  `ak stop|restart --app <app>` → `ak stop|restart <app>`（`--app` 旗标已删）。
-  `ak run` 仅保留 ad-hoc 形态，应用命名 `--name` → `--app`（如
-  `ak run -- python -m http.server 8000 --app web`）。
+- 启动面收敛到 `start|stop|restart <program> | <app>/<program> | <app>/all`：
+  `ak run <name>` → `ak start <program>`；单 token 恒为程序名，整组只写
+  `<app>/all`（裸 app 名报未知程序并提示）。`--app` 旗标已移除：`run` 的命名
+  参数为 `--name <程序名>`（只接受单程序名，`app/program` 复合名以退出码 2
+  拒绝）；`ak start|stop|restart|apply|remove` 改为位置目标参数。`ak run` 只
+  创建散装程序（`app_dir/adhoc/`），不再有 app 维度。
 - 顶层 `reload` 已删：`ak reload` → `ak config --reload`（可与 `--set` /
   `--delete` / `--edit` 组合，`--get`/`--init` 组合为用法错误）。
 - 已装机 systemd unit 必须重新生成：`sudo ak daemon install --force --now`，
