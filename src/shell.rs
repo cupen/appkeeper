@@ -1127,8 +1127,9 @@ fn open_webui(c: &Client) -> Result<()> {
         bail!("{e:#}");
     }
     crate::webui_open::launch_browser(&url)?;
-    // Same contract as `ak webui`: print the URL actually handed to the
-    // browser (token included in auto mode) so it stays clickable.
+    // Shares URL construction with `ak webui` (webui-open-best-effort): the
+    // shell keeps its own `opening <url>` output — it has no process exit code,
+    // so the CLI's bare-URL stream layout does not apply here.
     println!("opening {url}");
     Ok(())
 }

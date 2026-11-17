@@ -3,6 +3,13 @@
 //! auto-mode bootstrap token, the `/api/health` readiness probe, the
 //! platform browser launcher, and the exit-code/message contract.
 //!
+//! `ak webui` is split at the side-effect boundary (webui-open-best-effort
+//! D1): [`plan`] is pure and decides everything that depends on the console
+//! status, the output mode and the session; [`execute`] runs the probe and the
+//! launcher and returns only the stderr notes plus the exit code. The URL is
+//! printed by the caller *before* [`execute`] runs, so nothing can delay or
+//! suppress it, and `execute` never sees it.
+//!
 //! Nothing here reads the daemon config's `[webui]` section: the console's
 //! address and token come from the control plane (`GET /v1/webui`), which is
 //! the only way to learn an `auto` token (control-plane spec: daemon-first,
@@ -23,9 +30,18 @@ pub(crate) const DEFAULT_WEBUI_URL: &str = "http://127.0.0.1:9877";
 pub(crate) const HEALTH_BUDGET: Duration = Duration::from_secs(5);
 /// Delay between readiness probes inside [`HEALTH_BUDGET`].
 const HEALTH_POLL: Duration = Duration::from_millis(150);
-/// Printed when no browser is launched because the session is headless.
+/// Process exit code for every path where the console is usable (control-plane
+/// spec: convenience degradations never fail the command).
+const EXIT_OK: i32 = 0;
+/// Prefix for the single stderr note a degradation emits. The command exits 0
+/// on every one of these paths, so `error:` would be a lie (and would trip CI
+/// log matchers and editor problem panes).
+const WARNING_PREFIX: &str = "ak: warning: ";
+/// Printed when no browser is launched because the session is headless. The
+/// URL is on stdout, so this line points there instead of saying "above"
+/// (webui-open-best-effort D5: the streams are independent).
 const NO_GUI_HINT: &str =
-    "no graphical session (DISPLAY/WAYLAND_DISPLAY unset) — open the URL above manually";
+    "no graphical session (DISPLAY/WAYLAND_DISPLAY unset) — open the URL on stdout manually";
 
 /// How `ak webui` was invoked: the two output-only modes never launch a
 /// browser (mutually exclusive at the CLI layer).
@@ -39,15 +55,18 @@ pub(crate) enum WebuiMode {
     Json,
 }
 
-/// The decided outcome of one `ak webui` invocation: the process exit code
-/// and the lines for each stream. Keeping the decision pure makes the
-/// exit-code/message contract unit-testable without a live daemon or a real
-/// browser.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct WebuiReport {
-    pub code: i32,
-    pub stdout: Vec<String>,
-    pub stderr: Vec<String>,
+/// Everything one `ak webui` invocation outputs, decided without side effects
+/// (webui-open-best-effort D1). `Unavailable` deliberately has no URL field:
+/// "no URL when the console is unusable" is then structural, not a convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Plan {
+    /// The daemon reports the console as not enabled / not serving: exit 1
+    /// with the operator's repair command, and no URL.
+    Unavailable { reason: String },
+    /// `--print-url` / `--json`: print this line and exit 0.
+    Print { line: String },
+    /// Default mode: print `url`, then probe and launch.
+    Open { url: String, gui: bool },
 }
 
 /// The URL the browser should open. In `auto` mode the bootstrap token rides
@@ -84,84 +103,77 @@ pub(crate) fn unavailable_reason(status: &WebuiStatus) -> Option<String> {
     None
 }
 
-/// The hint shown when the console is on but does not answer `/api/health`.
-fn unreachable_message(base: &str, err: &anyhow::Error) -> String {
-    format!(
-        "the web console is not reachable at {base}: {err:#} — check the daemon log and \
-         whether that address is already in use, then `ak config --reload` to retry"
-    )
+/// Collapse an error chain onto one line: each degradation is exactly one
+/// stderr line (control-plane spec), and `anyhow`'s `{:#}` can still carry
+/// newlines from the underlying error.
+fn one_line(err: &anyhow::Error) -> String {
+    format!("{err:#}").replace('\n', " ").replace('\r', " ")
 }
 
-/// Decide everything `ak webui` outputs. `probe` and `launch` are injected so
-/// tests can assert the contract without sockets or a browser.
-pub(crate) fn run(
-    status: &WebuiStatus,
-    mode: WebuiMode,
-    gui: bool,
-    probe: impl FnOnce(&str) -> Result<()>,
-    launch: impl FnOnce(&str) -> Result<()>,
-) -> WebuiReport {
-    let mut report = WebuiReport::default();
+/// Decide everything `ak webui` prints, without any side effect. `gui` is
+/// passed in so the decision stays pure and testable (the caller reads
+/// [`gui_available`]).
+pub(crate) fn plan(status: &WebuiStatus, mode: WebuiMode, gui: bool) -> Plan {
     if let Some(reason) = unavailable_reason(status) {
-        report.code = 1;
-        report.stderr.push(format!("ak: error: {reason}"));
-        return report;
+        return Plan::Unavailable { reason };
     }
     let full = console_url(status);
     match mode {
-        WebuiMode::PrintUrl => {
-            report.stdout.push(full);
-            return report;
-        }
-        WebuiMode::Json => {
-            report.stdout.push(
-                serde_json::json!({
-                    "url": full,
-                    "listen": status.listen,
-                    "auth": status.auth,
-                    "opened": false,
-                })
-                .to_string(),
-            );
-            return report;
-        }
-        WebuiMode::Open => {}
+        WebuiMode::PrintUrl => Plan::Print { line: full },
+        WebuiMode::Json => Plan::Print {
+            line: serde_json::json!({
+                "url": full,
+                "listen": status.listen,
+                "auth": status.auth,
+                // Output modes never launch a browser, so `opened` can only
+                // ever be false (webui-open-best-effort D4).
+                "opened": false,
+            })
+            .to_string(),
+        },
+        WebuiMode::Open => Plan::Open { url: full, gui },
     }
-    // Probe the base URL (no token): `/api/health` is public and the token
-    // must not travel in a request line more than necessary.
-    if let Err(e) = probe(&status.url) {
-        report.code = 1;
-        report.stderr.push(format!(
-            "ak: error: {}",
-            unreachable_message(&status.url, &e)
-        ));
-        return report;
-    }
+}
+
+/// Run the convenience steps of default mode and report their degradations.
+///
+/// The caller prints the URL first and flushes; this function only produces
+/// the stderr notes and the exit code, so it cannot reorder or suppress the
+/// URL (webui-open-best-effort D1). Every degradation exits 0: the console
+/// is serving, so the command delivered its artifact.
+///
+/// - headless: never probes, never launches;
+/// - probe failure: the console did not answer `/api/health` in
+///   [`HEALTH_BUDGET`], so no browser is launched;
+/// - launch failure: the launcher is missing or exited non-zero; no fallback
+///   launcher is tried.
+pub(crate) fn execute(
+    gui: bool,
+    probe: impl FnOnce() -> Result<()>,
+    launch: impl FnOnce() -> Result<()>,
+) -> (i32, Vec<String>) {
     if !gui {
-        // Headless: never try to launch; hand the operator the full URL.
-        report.stdout.push(full);
-        report.stdout.push(NO_GUI_HINT.to_string());
-        return report;
+        // No browser to open: probing would only delay the exit.
+        return (EXIT_OK, vec![format!("{WARNING_PREFIX}{NO_GUI_HINT}")]);
     }
-    match launch(&full) {
-        Ok(()) => {
-            // Print the URL the browser was handed (token included in auto
-            // mode) so a terminal can render it as a clickable link — the
-            // automatic launch may target another desktop/session.
-            report.stdout.push(format!("opening {full}"));
-        }
-        Err(e) => {
-            report.code = 1;
-            report.stdout.push(full);
-            report.stderr.push(format!(
-                "ak: error: could not launch the system browser: {e:#}"
-            ));
-            report
-                .stderr
-                .push("hint: open the URL above manually".to_string());
-        }
+    if let Err(e) = probe() {
+        let note = format!(
+            "{WARNING_PREFIX}the web console is not reachable: {} — check the daemon log \
+             and whether the listen address is already in use, then `ak config --reload` \
+             to retry",
+            one_line(&e)
+        );
+        return (EXIT_OK, vec![note]);
     }
-    report
+    if let Err(e) = launch() {
+        let note = format!(
+            "{WARNING_PREFIX}could not launch the system browser: {} — open the URL on \
+             stdout manually",
+            one_line(&e)
+        );
+        return (EXIT_OK, vec![note]);
+    }
+    (EXIT_OK, Vec::new())
 }
 
 /// Whether a graphical session is available for launching a browser. Unix
@@ -294,58 +306,64 @@ mod tests {
         }
     }
 
-    fn no_launch(_: &str) -> Result<()> {
+    // Panic closures: the decision must not reach a side effect.
+
+    fn no_probe() -> Result<()> {
+        panic!("must not probe the console");
+    }
+
+    fn no_launch() -> Result<()> {
         panic!("must not launch a browser");
     }
 
-    fn ok_launch(_: &str) -> Result<()> {
+    fn ok_probe() -> Result<()> {
         Ok(())
     }
 
-    fn ok_probe(_: &str) -> Result<()> {
+    fn ok_launch() -> Result<()> {
         Ok(())
     }
 
-    /// 4.3: auto mode carries `?token=`, fixed mode does not — for both URL
-    /// output modes.
+    /// Not enabled / not serving are exit 1 decisions carrying the repair
+    /// command, and `Unavailable` has no URL field to print.
     #[test]
-    fn print_url_carries_the_token_only_in_auto_mode() {
-        let auto = run(
-            &status("auto", Some("abc123")),
-            WebuiMode::PrintUrl,
-            true,
-            ok_probe,
-            no_launch,
-        );
-        assert_eq!(auto.code, 0);
-        assert_eq!(
-            auto.stdout,
-            vec!["http://127.0.0.1:9877?token=abc123".to_string()]
-        );
+    fn unavailable_console_fails_with_the_repair_command() {
+        let mut off = status("auto", None);
+        off.enabled = false;
+        off.serving = false;
+        match plan(&off, WebuiMode::Open, true) {
+            Plan::Unavailable { reason } => {
+                assert!(reason.contains("not enabled"), "{reason}");
+                assert!(
+                    reason.contains("ak config --set webui.listen=127.0.0.1:9877"),
+                    "{reason}"
+                );
+                assert!(reason.contains("ak config --reload"), "{reason}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
 
-        let fixed = run(
-            &status("token", Some("s3cr3t")),
-            WebuiMode::PrintUrl,
-            true,
-            ok_probe,
-            no_launch,
-        );
-        assert_eq!(fixed.code, 0);
-        assert_eq!(fixed.stdout, vec!["http://127.0.0.1:9877".to_string()]);
+        let mut broken = status("auto", None);
+        broken.serving = false;
+        match plan(&broken, WebuiMode::Open, true) {
+            Plan::Unavailable { reason } => {
+                assert!(reason.contains("not serving on 127.0.0.1:9877"), "{reason}");
+                assert!(reason.contains("already in use"), "{reason}");
+                assert!(reason.contains("ak config --reload"), "{reason}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 
-    /// 4.3: `--json` reports url/listen/auth/opened and never opens.
+    /// `--json` reports url/listen/auth/opened and never opens (`opened` is
+    /// the constant false: output modes never launch).
     #[test]
     fn json_mode_reports_the_documented_fields() {
-        let report = run(
-            &status("auto", Some("abc123")),
-            WebuiMode::Json,
-            false,
-            ok_probe,
-            no_launch,
-        );
-        assert_eq!(report.code, 0);
-        let doc: serde_json::Value = serde_json::from_str(&report.stdout[0]).unwrap();
+        let Plan::Print { line } = plan(&status("auto", Some("abc123")), WebuiMode::Json, false)
+        else {
+            panic!("--json must be side-effect free");
+        };
+        let doc: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(doc["url"], "http://127.0.0.1:9877?token=abc123");
         assert_eq!(doc["listen"], "127.0.0.1:9877");
         assert_eq!(doc["auth"], "auto");
@@ -353,108 +371,123 @@ mod tests {
         assert!(doc.get("token").is_none(), "no separate token field: {doc}");
     }
 
-    /// 4.2: not enabled / not serving are exit 1 with the repair command,
-    /// before any probe or browser launch.
+    /// Auto mode carries `?token=`, fixed mode does not — for the
+    /// `--print-url` output mode.
     #[test]
-    fn unavailable_console_fails_with_the_repair_command() {
-        let mut off = status("auto", None);
-        off.enabled = false;
-        off.serving = false;
-        let report = run(&off, WebuiMode::Open, true, ok_probe, no_launch);
-        assert_eq!(report.code, 1);
-        assert!(report.stdout.is_empty());
-        let text = report.stderr.join("\n");
-        assert!(text.contains("not enabled"), "{text}");
-        assert!(
-            text.contains("ak config --set webui.listen=127.0.0.1:9877"),
-            "{text}"
-        );
-        assert!(text.contains("ak config --reload"), "{text}");
-
-        let mut broken = status("auto", None);
-        broken.serving = false;
-        let report = run(&broken, WebuiMode::Open, true, ok_probe, no_launch);
-        assert_eq!(report.code, 1);
-        let text = report.stderr.join("\n");
-        assert!(text.contains("not serving on 127.0.0.1:9877"), "{text}");
-        assert!(text.contains("already in use"), "{text}");
-        assert!(text.contains("ak config --reload"), "{text}");
-    }
-
-    /// 4.2: a failed readiness probe is exit 1 and never launches.
-    #[test]
-    fn unreachable_console_fails_without_launching() {
-        let report = run(
-            &status("auto", Some("t")),
-            WebuiMode::Open,
-            true,
-            |_| Err(anyhow::anyhow!("webui unreachable: connection refused")),
-            no_launch,
-        );
-        assert_eq!(report.code, 1);
-        assert!(report.stdout.is_empty());
-        let text = report.stderr.join("\n");
-        assert!(
-            text.contains("not reachable at http://127.0.0.1:9877"),
-            "{text}"
-        );
-        assert!(text.contains("connection refused"), "{text}");
-    }
-
-    /// 4.4: headless (no DISPLAY/WAYLAND_DISPLAY) prints the full URL with
-    /// the token and exits 0 without launching.
-    #[test]
-    fn headless_prints_the_full_url_and_exits_zero() {
-        let report = run(
-            &status("auto", Some("abc123")),
-            WebuiMode::Open,
-            false,
-            ok_probe,
-            no_launch,
-        );
-        assert_eq!(report.code, 0);
-        assert_eq!(report.stdout[0], "http://127.0.0.1:9877?token=abc123");
-        assert!(report.stdout[1].contains("no graphical session"));
-        assert!(report.stderr.is_empty());
-    }
-
-    /// 4.4 + success output: the default open path prints the full URL it
-    /// handed to the browser (token included in auto mode, so it stays
-    /// clickable); a launcher failure prints the same URL and exits 1.
-    #[test]
-    fn launch_success_prints_the_full_url_and_failure_exits_one() {
-        let ok = run(
-            &status("auto", Some("abc123")),
-            WebuiMode::Open,
-            true,
-            ok_probe,
-            ok_launch,
-        );
-        assert_eq!(ok.code, 0);
-        let text = ok.stdout.join("\n");
-        assert_eq!(text, "opening http://127.0.0.1:9877?token=abc123");
-
-        let failed = run(
-            &status("auto", Some("abc123")),
-            WebuiMode::Open,
-            true,
-            ok_probe,
-            |_| Err(anyhow::anyhow!("no handler")),
-        );
-        assert_eq!(failed.code, 1);
+    fn print_url_carries_the_token_only_in_auto_mode() {
         assert_eq!(
-            failed.stdout,
-            vec!["http://127.0.0.1:9877?token=abc123".to_string()]
+            plan(&status("auto", Some("abc123")), WebuiMode::PrintUrl, true),
+            Plan::Print {
+                line: "http://127.0.0.1:9877?token=abc123".to_string(),
+            }
         );
-        let text = failed.stderr.join("\n");
-        assert!(
-            text.contains("could not launch the system browser"),
-            "{text}"
+        assert_eq!(
+            plan(&status("token", Some("s3cr3t")), WebuiMode::PrintUrl, true),
+            Plan::Print {
+                line: "http://127.0.0.1:9877".to_string(),
+            }
         );
-        assert!(text.contains("no handler"), "{text}");
     }
 
-    /// 4.4: the headless decision reads DISPLAY/WAYLAND_DISPLAY (unix) and is
+    /// Default mode decides the full URL (token included in auto mode) and
+    /// passes `gui` through untouched.
+    #[test]
+    fn open_plan_carries_the_full_url_and_gui() {
+        assert_eq!(
+            plan(&status("auto", Some("abc123")), WebuiMode::Open, true),
+            Plan::Open {
+                url: "http://127.0.0.1:9877?token=abc123".to_string(),
+                gui: true,
+            }
+        );
+        assert_eq!(
+            plan(&status("token", None), WebuiMode::Open, false),
+            Plan::Open {
+                url: "http://127.0.0.1:9877".to_string(),
+                gui: false,
+            }
+        );
+    }
+
+    /// Headless: no probe, no launch, one `ak: warning:` line and exit 0.
+    #[test]
+    fn execute_headless_does_not_probe_or_launch() {
+        let (code, notes) = execute(false, no_probe, no_launch);
+        assert_eq!(code, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("ak: warning: "), "{:?}", notes[0]);
+        assert!(notes[0].contains("no graphical session"), "{:?}", notes[0]);
+        assert!(notes[0].contains("stdout"), "{:?}", notes[0]);
+        assert!(!notes[0].contains('\n'), "{:?}", notes[0]);
+    }
+
+    /// A probe that never answers is a degradation: exit 0, one warning with
+    /// the reason, and no browser launch.
+    #[test]
+    fn execute_probe_failure_exits_zero_with_one_warning() {
+        let (code, notes) = execute(
+            true,
+            || Err(anyhow::anyhow!("webui unreachable: connection refused")),
+            no_launch,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("ak: warning: "), "{:?}", notes[0]);
+        assert!(notes[0].contains("not reachable"), "{:?}", notes[0]);
+        assert!(notes[0].contains("connection refused"), "{:?}", notes[0]);
+        assert!(!notes[0].contains('\n'), "{:?}", notes[0]);
+    }
+
+    /// A missing launcher (spawn failure) and a launcher that exits non-zero
+    /// are the same degradation: exit 0, exactly one warning with the reason
+    /// and the manual fallback.
+    #[test]
+    fn execute_launch_failure_exits_zero_with_one_warning() {
+        let (code, notes) = execute(true, ok_probe, || {
+            Err(anyhow::anyhow!(
+                "could not start the system browser for http://127.0.0.1:9877: \
+                     No such file or directory"
+            ))
+        });
+        assert_eq!(code, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("ak: warning: "), "{:?}", notes[0]);
+        assert!(
+            notes[0].contains("could not launch the system browser"),
+            "{:?}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains("open the URL on stdout manually"),
+            "{:?}",
+            notes[0]
+        );
+        assert!(!notes[0].contains('\n'), "{:?}", notes[0]);
+
+        let (code, notes) = execute(true, ok_probe, || {
+            Err(anyhow::anyhow!(
+                "the browser launcher exited with exit status: 4"
+            ))
+        });
+        assert_eq!(code, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("the browser launcher exited with"),
+            "{:?}",
+            notes[0]
+        );
+        assert!(!notes[0].contains('\n'), "{:?}", notes[0]);
+    }
+
+    /// Success is silent: stderr is empty and the code is 0.
+    #[test]
+    fn execute_success_is_silent() {
+        let (code, notes) = execute(true, ok_probe, ok_launch);
+        assert_eq!(code, 0);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The headless decision reads DISPLAY/WAYLAND_DISPLAY (unix) and is
     /// always GUI-capable elsewhere.
     #[test]
     fn gui_session_reads_display_and_wayland() {

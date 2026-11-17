@@ -2297,13 +2297,16 @@ fn remove_cmd(config_path: &Path, name: &str) -> Result<()> {
     })
 }
 
-/// `ak webui` (add-webui-launch-command): daemon-first — read the console's
-/// runtime status from `GET /v1/webui`, then print/open according to the
-/// mode. Offline is the client contract's exit 3; an unusable console and a
-/// failed launch are exit 1 with a repair hint; headless prints the full URL
-/// and exits 0. The token is only ever printed by the explicit output modes
-/// (`--print-url`, `--json`) and by the headless/launch-failure fallbacks,
-/// never by the regular success line.
+/// `ak webui` (add-webui-launch-command, webui-open-best-effort): daemon-first
+/// — read the console's runtime status from `GET /v1/webui`, then print/open
+/// according to the mode. Offline is the client contract's exit 3.
+///
+/// Once the daemon reports `enabled && serving`, the URL is the command's
+/// deliverable: it is printed and flushed *before* the reachability probe and
+/// the browser launch, so neither can delay or suppress it. Exit 1 is reserved
+/// for the daemon's own verdict (not enabled / not serving); headless, probe
+/// failure and launch failure only add one `ak: warning:` line on stderr and
+/// exit 0.
 fn webui_cmd(config_path: &Path, print_url: bool, json: bool) -> Result<()> {
     let config = client::load_config(config_path)?;
     let c = client::Client::from_config(&config);
@@ -2321,21 +2324,30 @@ fn webui_cmd(config_path: &Path, print_url: bool, json: bool) -> Result<()> {
     } else {
         webui_open::WebuiMode::Open
     };
-    let report = webui_open::run(
-        &status,
-        mode,
-        webui_open::gui_available(),
-        |base| webui_open::wait_ready(base, webui_open::HEALTH_BUDGET),
-        webui_open::launch_browser,
-    );
-    for line in &report.stdout {
-        println!("{line}");
-    }
-    for line in &report.stderr {
-        eprintln!("{line}");
-    }
-    if report.code != EXIT_OK {
-        std::process::exit(report.code);
+    match webui_open::plan(&status, mode, webui_open::gui_available()) {
+        webui_open::Plan::Unavailable { reason } => {
+            eprintln!("ak: error: {reason}");
+            std::process::exit(EXIT_ERROR);
+        }
+        webui_open::Plan::Print { line } => println!("{line}"),
+        webui_open::Plan::Open { url, gui } => {
+            println!("{url}");
+            // `/api/health` is public: the probe uses the base URL, so the
+            // bootstrap token never travels in a request line.
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            let (code, notes) = webui_open::execute(
+                gui,
+                || webui_open::wait_ready(&status.url, webui_open::HEALTH_BUDGET),
+                || webui_open::launch_browser(&url),
+            );
+            for note in &notes {
+                eprintln!("{note}");
+            }
+            if code != EXIT_OK {
+                std::process::exit(code);
+            }
+        }
     }
     Ok(())
 }
