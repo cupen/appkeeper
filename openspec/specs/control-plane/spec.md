@@ -20,6 +20,7 @@
 - `GET /v1/programs`：程序列表
 - `GET /v1/programs/{name}`：单个程序详情（所属应用、状态、pid、存活时长、重启/退出计数、健康状态、等待原因、CPU 利用率与驻留内存（可空，metrics 能力口径）、stdout/stderr 日志输出速率）
 - `POST /v1/programs/{name}/start` / `stop` / `restart`
+- `POST /v1/programs/{name}/remove`：移除散装程序记录（仅 `standalone` 程序；app 内程序返回 400/409 并提示改 compose 声明）
 - `POST /v1/programs/{name}/signal`：向该程序的子进程投递白名单信号，请求体指定信号名
 - `POST /v1/programs/{name}/actions/{action}`：执行该程序声明的自定义动作，同步等待至完成或超时，返回退出码、耗时与截断输出
 - `POST /v1/apps/{name}/start` / `stop` / `restart`：app 级扇出动作，按启动排序（停止为逆序）作用于该 app 全部程序，返回逐程序结果
@@ -31,6 +32,18 @@
 
 程序详情与状态汇总中的指标字段为增量扩展：仅新增可空字段，既有字段名与
 语义不变，既有消费者（含 CLI 控制命令）行为不受影响。
+
+程序投影 SHALL 新增 `standalone` 布尔字段：散装程序（`app_dir/adhoc/` 记录）为
+`true`，其 `app` 字段为空字符串（不表示任何 app）；compose 产物为 `false` 且
+`app` 非空。该字段随 `ProgramInfo` 同源导出到 `/v1/status`、`/v1/programs`、
+`/api/*` 与 WS 帧，不得只在其中一处出现。`/v1/apps/<name>/*` 的 app 级扇出
+MUST NOT 把散装程序当作 app 展开；散装程序只经程序面端点（`/v1/programs/{name}/*`）
+寻址。
+
+CLI 的目标文法 `<program>` / `<app>/<program>` / `<app>/all` SHALL 由客户端解析后
+映射到既有端点：程序目标（含 `<app>/<program>`）走 `/v1/programs/<program>/*`；
+`remove` 的散装程序目标走 `/v1/programs/<program>/remove`；仅 `<app>/all` 走
+`/v1/apps/<app>/*`。API 本身不新增范围语法，也不接受 `all` 作为程序名。
 
 #### Scenario: 状态汇总可查询
 
@@ -104,30 +117,35 @@
 - **WHEN** 配置 `socket = "tcp://127.0.0.1:7310"` 且携带正确 token 请求 `GET /v1/status`
 - **THEN** 返回与本地 IPC 形态字节等价的 JSON；端点集合、状态码与错误语义不因形态改变
 
+#### Scenario: 散装程序投影
+
+- **WHEN** 存在由 `ak run` 注册的散装程序 `agent`，请求 `GET /v1/status` 或 `GET /v1/programs/agent`
+- **THEN** 该程序投影的 `standalone` 为 true、`app` 为空字符串；compose 产物保持 `standalone: false` 且 `app` 非空
+
 ### Requirement: CLI 控制命令
 
 单二进制 SHALL 同时承担守护进程与客户端两种角色。守护进程 SHALL 由显式子命令族 `ak daemon`（`start` / `install` / `uninstall` / `shutdown`）运行；客户端动词分工：`ak start` 启动已注册的程序/app（与 `stop` 对偶），`ak run` 仅承载 ad-hoc 注册（注册并跑一个新的命令行），SHALL NOT 承载任何守护入口语义：
 
 - `daemon start` 为唯一守护运行入口：缺省后台拉起、就绪即返回；`daemon start --foreground` 前台运行（Ctrl+C / SIGTERM 优雅停机）；裸 `ak daemon` 以退出码 2 报 usage 错误并列出子命令。后台形态与拉起协议见 `background-daemon` 能力规范；
-- `start <app> [<program>]` 为启动形态（原 `run` 启动形态的承接者，与 `stop`/`restart`/`apply` 同构的双位置范围参数）：裸 `<app>` 按既定顺序扇出启动整个 app 的全部程序，第二位置参数收窄到该 app 内的单个程序；语义与控制面动作一致（经本地 API 操作守护进程；对已 `running` 程序启动返回 409，未知 app/程序返回 404）；
-- run 的 ad-hoc 形态（`-- <命令行>` 或 `--cmd "<字符串>"`，二选一）：命令行由守护进程注册并立即生效，注册落盘顺序为「先启动成功、后落盘」（语义见 `app-registry` 能力规范）；ad-hoc 的应用命名参数为 `--app`（原 `--name` 改名；`ak run -- python -m http.server --app web`）；
+- `start <target>` 为启动形态（与 `stop`/`restart`/`apply` 同构的统一目标文法）：`<program>` 启动该程序（app 内程序或散装程序），`<app>/<program>` 启动指定 app 下的该程序，`<app>/all` 按既定顺序扇出启动整个 app。单 token MUST NOT 隐式按 app 解析——若该名字只是 app 名而无同名程序，返回未知程序并提示改用 `<app>/all`。`<app>` 仅指 **compose 建立并管理的进程组**（`compose up`/compose 注册的产物），散装程序不能作为 `<app>/all` 的目标。语义与控制面动作一致（经本地 API 操作守护进程；对已 `running` 程序启动返回 409，未知 app/程序返回 404）。第二位置 `<app> <program>` MAY 作为 `<app>/<program>` 的等价旧形式；
+- run 的 ad-hoc 形态（`-- <命令行>` 或 `--cmd "<字符串>"`，二选一）：命令行由守护进程注册并立即生效，注册落盘顺序为「先启动成功、后落盘」（语义见 `app-registry` 能力规范）；ad-hoc 的命名参数为 `--name <程序名>`，只创建**散装程序**（不属于任何 app，app 名在投影中为空），未给时按命令 stem 自动命名并排重（语法、冲突与 `--force` 语义见 `app-registry`）；`--app` 不再是合法参数，`app/program` 复合名同样不被接受；
 - 守护形态的 `run`（裸 `run`、`run --detach`、仅带 `--config` 的 `run`）SHALL 被移除并在参数解析前拦截：以退出码 2 失败，错误提示按形态分流——`--detach` 形态提示改用 `ak daemon start`；仅带 `--config` 的形态（systemd 旧 ExecStart 特征）SHALL 额外提示用 `ak daemon install --force --now` 重新生成 unit（见 `service-registration`）。
 
 `run` 的 ad-hoc 形态与 `start` 的全部形态 SHALL 统一为 daemon-first：CLI SHALL NOT 自行读写注册目录或自行拉起/操作进程，而是把意图交给守护进程，由守护进程完成启动与（ad-hoc 形态的）落盘，并把结果回传 CLI。`start` 与 ad-hoc `run` SHALL 阻塞等待守护进程返回最终结果为止，MUST NOT 提前退出。守护进程离线时两者的全部形态 SHALL 输出不可达提示并以退出码 3 退出，MUST NOT 隐式后台拉起守护进程。
 
-`start` 与 ad-hoc `run` 的每种形态 SHALL 返回并打印所涉程序的 `{程序名, 配置路径, PID}`：单程序形态输出一行；`--app` 扇出形态输出逐程序一行（含程序名、配置路径、PID 与结果状态），全部程序成功才以 0 退出，任一程序失败则以非零码退出并逐项列出失败者与原因。`start` 与 `run` SHALL 支持 `--json` 输出等价的机器可读结构（单程序对象 / 扇出数组），供脚本消费。
+`start` 与 ad-hoc `run` 的每种形态 SHALL 返回并打印所涉程序的 `{程序名, 配置路径, PID}`：单程序形态（含散装程序）输出一行；app 扇出形态（`ak start <app>/all`）输出逐程序一行（含程序名、配置路径、PID 与结果状态），全部程序成功才以 0 退出，任一程序失败则以非零码退出并逐项列出失败者与原因。`start` 与 `run` SHALL 支持 `--json` 输出等价的机器可读结构（单程序对象 / 扇出数组），供脚本消费。
 
 `run` 失败时（命令无法解析、启动失败、健康探测未通过、落盘失败等）SHALL 在 stderr 明确展示守护进程回传的错误信息，退出码遵循既有约定（配置/解析类 2、一般错误 1、守护不可达 3），且 MUST NOT 因失败在 `app_dir` 留下注册残留。
 
-裸 `ak`（无子命令）SHALL 输出与 `ak --help` 等价的完整 help 到 stdout 并以退出码 0 退出，MUST NOT 启动守护进程。帮助信息 SHALL 简洁明了（动词一句话说明，不堆细节）；顶层 help 末尾 SHALL 附三行基本用法示例，演示「启动 daemon → 启动 app → 停止 app」的最小工作流。裸 `ak run`（无 `--`/`--cmd`）SHALL 报用法错误并列出 ad-hoc 的两种形态（`run -- <cmd...>` / `run --cmd "<字符串>"`），以退出码 2 退出。
+裸 `ak`（无子命令）SHALL 输出与 `ak --help` 等价的完整 help 到 stdout 并以退出码 0 退出，MUST NOT 启动守护进程。帮助信息 SHALL 简洁明了（动词一句话说明，不堆细节）；顶层 help 末尾 SHALL 有 `Examples:` 小节，示例总数 MUST 少于 5 行，覆盖最快上手路径：启动 daemon、`ak run -- <cmd>` 注册散装程序、单程序目标 `<program>`、整组目标 `<app>/all`；示例注释 SHALL 提示指定 app 内程序写 `<app>/<program>`。示例 SHALL 可直接复制执行（仅允许用户需替换的名字占位），MUST NOT 堆叠与上手无关的高级用法。裸 `ak run`（无 `--`/`--cmd`）SHALL 报用法错误并列出 ad-hoc 的两种形态（`run -- <cmd...>` / `run --cmd "<字符串>"`），以退出码 2 退出。
 
-`ak ps|start|stop|restart|apply|log|pid` 为其余控制子命令（通过本地 API 操作守护进程）；`ak daemon shutdown` SHALL 停止全部程序并退出守护进程；`ak compose|remove` 为应用注册子命令（离线直接读写 daemon 配置，在线时经控制 API 同步，见 `app-registry`）。`ak apply` SHALL 支持范围参数（缺省全部 / `<app>` / `<app> <program>`）与 `--restart` 开关，输出逐程序的变更与动作结果。顶层 `reload` 动词 SHALL 移除，重载入口迁至 `ak config --reload`（daemon 配置面动作：经既有 `/v1/reload` 端点触发守护进程重读配置并立即重扫，组合规则与退出码见 `configuration`「config 子命令」；控制面 API 零变化）；`ak reload` 调用 SHALL 得到未知子命令错误。
+`ak ps|start|stop|restart|apply|log|pid` 为其余控制子命令（通过本地 API 操作守护进程）；`ak daemon shutdown` SHALL 停止全部程序并退出守护进程；`ak compose|remove` 为应用注册子命令（离线直接读写 daemon 配置，在线时经控制 API 同步，见 `app-registry`）。`ak apply` SHALL 支持范围参数（缺省全部 pending / `<program>` / `<app>/<program>` / `<app>/all`）与 `--restart` 开关，输出逐程序的变更与动作结果。`ak remove` SHALL 接受同一目标文法：`remove <program>` 移除散装程序记录，`remove <app>/all` 移除整个 app；app 内程序不支持单独 remove（须改 compose 声明后应用），且 MUST NOT 因单 token 命中 app 名而隐式移除 app。顶层 `reload` 动词 SHALL 移除，重载入口迁至 `ak config --reload`（daemon 配置面动作：经既有 `/v1/reload` 端点触发守护进程重读配置并立即重扫，组合规则与退出码见 `configuration`「config 子命令」；控制面 API 零变化）；`ak reload` 调用 SHALL 得到未知子命令错误。
 
 `ak log` SHALL 支持一次查看多个程序：`log <p1> [p2...] [-f] [--tail N] [--stream out|err|both]`。多程序时 SHALL 按 `[name] ` 前缀标识每行归属；单程序时输出 MUST NOT 添加前缀。`--stream both` SHALL 合并双流输出。`-f/--follow` 跟随输出与 `--tail N` 语义保持不变。
 
-`ak ps` SHALL 默认输出人读表格：每程序一行，列与 shell 的 `ps` 表格一致（共享渲染器：NAME、APP、STATE、PID、RESTARTS、UNHEALTHY）并增列配置本体路径与描述，以及 **PENDING** 列——磁盘配置与运行定义存在待应用差异的程序 SHALL 带变更标记（如 changed/new），无差异为空；app 级注册增删（apps_added/apps_removed）、daemon 级 hints 与检出错误 SHALL 以表格尾部的摘要行呈现；unhealthy 程序 SHALL 带标记；`--out json` SHALL 输出与 `GET /v1/status` 等价的 pretty JSON（`--out table` 为缺省；pending 信息投影已含于其中，`--out json` 形态零新增字段）。`--all` SHALL 展示全量视图：除守护进程已加载的程序外，还包含已注册但未运行/未 apply 的 app（由 CLI 本地读注册表与 `/v1` 投影在客户端合并），其程序行同样带 PENDING 标记。守护进程离线时：不带 `--all` 的 `ps` SHALL 输出不可达提示并以退出码 3 退出；`ps --all` SHALL 降级为本地注册表清单（名称、配置本体路径、描述）并注明 daemon offline，以退出码 0 退出。
+`ak ps` SHALL 默认输出人读表格：每程序一行，列与 shell 的 `ps` 表格一致（共享渲染器：NAME、APP、STATE、PID、RESTARTS、UNHEALTHY）并增列配置本体路径与描述，以及 **PENDING** 列——磁盘配置与运行定义存在待应用差异的程序 SHALL 带变更标记（如 changed/new），无差异为空；app 级注册增删（apps_added/apps_removed）、daemon 级 hints 与检出错误 SHALL 以表格尾部的摘要行呈现；unhealthy 程序 SHALL 带标记；散装程序的 APP 列 SHALL 显示 `-`；`--out json` SHALL 输出与 `GET /v1/status` 等价的 pretty JSON（`--out table` 为缺省；pending 信息投影已含于其中，`--out json` 形态零新增字段）。`--all` SHALL 展示全量视图：除守护进程已加载的程序外，还包含已注册但未运行/未 apply 的 app（由 CLI 本地读注册表与 `/v1` 投影在客户端合并），其程序行同样带 PENDING 标记。守护进程离线时：不带 `--all` 的 `ps` SHALL 输出不可达提示并以退出码 3 退出；`ps --all` SHALL 降级为本地注册表清单（名称、配置本体路径、描述）并注明 daemon offline，以退出码 0 退出。
 
-`appkeeper action <program> <action>` SHALL 执行自定义动作并输出退出码与输出尾部，CLI 退出码 SHALL 透传动作自身的退出码（调用失败为 1，守护不可达为 3）；`appkeeper signal <program> <SIGNAL>` SHALL 投递白名单信号；`pid`/`log`/`action`/`signal` 为进程面动词，SHALL 以全局唯一的程序名无前缀寻址（单程序 app 的程序名与 app 名相同，帮助文案 SHALL 注明）。`start|stop|restart` SHALL 采用 `<app> [<program>]` 双位置参数（裸 `<app>` 整 app 扇出，服务端按序展开；第二参数收窄单程序），原 `--app` 旗标 SHALL 移除，`ak start --app x` 类调用得到 clap 未知参数错误。
+`appkeeper action <program> <action>` SHALL 执行自定义动作并输出退出码与输出尾部，CLI 退出码 SHALL 透传动作自身的退出码（调用失败为 1，守护不可达为 3）；`appkeeper signal <program> <SIGNAL>` SHALL 投递白名单信号；`pid`/`log`/`action`/`signal` 为进程面动词，SHALL 以全局唯一的程序名无前缀寻址（散装程序的程序名即记录名，分组 app 的程序名独立；帮助文案 SHALL 注明）。`start|stop|restart` SHALL 采用统一目标文法 `<program>` / `<app>/<program>` / `<app>/all`：`<program>` 为单程序，`<app>/<program>` 为指定 app 内的程序，`<app>/all` 为整 app 扇出（服务端按序展开/逆序停止）；第二位置 `<app> <program>` MAY 作为等价旧形式。原 `--app` 旗标 SHALL 移除，`ak start --app x` 类调用得到 clap 未知参数错误。
 
 控制命令 SHALL 使用如下退出码约定：0 成功（含 apply 无变更的幂等情形、裸 `ak` 的 help 输出、`ps --all` 的离线降级清单）；1 一般错误（如非法状态转换、未知程序、注册校验失败）；2 配置错误（含被拦截的守护形态 `run`、无操作数的裸 `run` 用法错误、裸 `ak daemon` 的 usage 错误、命令无法解析）；3 守护进程不可达。
 
@@ -140,6 +158,21 @@
 
 - **WHEN** 执行 `ak stop <name>` 且该程序正在运行
 - **THEN** 命令返回成功，程序进入 `stopped`
+
+#### Scenario: 单 token 按程序启动
+
+- **WHEN** 执行 `ak start api` 且 `api` 是某 app 内的程序名（同时存在名为 `api` 的 app）
+- **THEN** 只启动名为 `api` 的程序，MUST NOT 按 app 扇出；若不存在同名程序而只有 app `api`，报未知程序并提示 `api/all`
+
+#### Scenario: app/program 指定程序
+
+- **WHEN** 执行 `ak start gateway/api`（或旧形式 `ak start gateway api`）
+- **THEN** 仅启动 app gateway 下的 `api` 程序，二者语义等价
+
+#### Scenario: 保留字 all 不被当作程序
+
+- **WHEN** 执行 `ak start all` 或 `ak stop all`
+- **THEN** 以退出码 2 报用法错误，提示整组操作为 `<app>/all`，不启动/停止任何程序
 
 #### Scenario: CLI 跟随日志
 
@@ -170,36 +203,38 @@
 
 #### Scenario: CLI 扇出启动
 
-- **WHEN** 执行 `ak start gateway`
+> 标题为既有场景锚点；整 app 扇出现以 `<app>/all` 表达。
+
+- **WHEN** 执行 `ak start gateway/all`
 - **THEN** 服务端按排序规则逐程序启动，输出逐程序结果；未知 app 报错退出码 1
 
 #### Scenario: run 扇出启动整个 app
 
-> 本变更将扇出形态移至 `start <app>`（标题为既有场景锚点，现行行为以下文为准）。
+> 本变更将扇出形态表示为 `start <app>/all`（标题为既有场景锚点，现行行为以下文为准）。
 
-- **WHEN** 执行 `ak start demo` 且 demo 的全部程序成功拉起
+- **WHEN** 执行 `ak start demo/all` 且 demo 的全部程序成功拉起
 - **THEN** 输出逐程序一行（程序名、配置路径、PID、状态），全部成功时退出码 0；任一失败时非零退出并列出失败项
 
 #### Scenario: run --json 机器可读
 
 > `--json` 由 `start` 与 ad-hoc `run` 共同支持（标题为既有场景锚点，现行行为以下文为准）。
 
-- **WHEN** 执行 `ak start demo --json`
+- **WHEN** 执行 `ak start demo/all --json`
 - **THEN** stdout 输出等价结构的 JSON（含每程序 name/config/pid/status），可被脚本解析
 
 #### Scenario: run 阻塞至守护进程返回
 
-- **WHEN** 执行 `ak start web`（或 `ak run -- ./server --app web`）且程序需要数秒才判定启动成功
+- **WHEN** 执行 `ak start web`（或 `ak run --name web -- ./server`）且程序需要数秒才判定启动成功
 - **THEN** 命令持续等待，直到收到守护进程的最终结果才打印并退出，MUST NOT 在结果返回前退出
 
 #### Scenario: run 离线退出 3 且不拉起
 
-- **WHEN** 守护进程未运行时执行 `ak start web` 或 `ak run -- ./server --app web`
+- **WHEN** 守护进程未运行时执行 `ak start web` 或 `ak run --name web -- ./server`
 - **THEN** 输出守护进程不可达提示，退出码 3，MUST NOT 后台拉起守护进程，`app_dir` 不变
 
 #### Scenario: run 失败不污染注册目录
 
-- **WHEN** 执行 `ak run -- /nonexistent/binary --app bad` 且守护进程在线
+- **WHEN** 执行 `ak run --name bad -- /nonexistent/binary` 且守护进程在线
 - **THEN** stderr 明确展示启动失败原因，以非零码退出，`app_dir` 中不出现 `bad.toml` 或任何占位残留
 
 #### Scenario: start 动词已移除
@@ -212,7 +247,12 @@
 #### Scenario: 裸 ak 输出 help
 
 - **WHEN** 执行 `ak`（不带任何子命令与参数）
-- **THEN** 完整 help 输出到 stdout（与 `ak --help` 等价，含子命令列表），每个动词一句话说明；末尾附三行基本用法示例（`ak daemon start` 启动守护进程、`ak start <app>` 启动应用、`ak stop <app>` 停止应用），退出码 0，不启动守护进程
+- **THEN** 完整 help 输出到 stdout（与 `ak --help` 等价，含子命令列表），每个动词一句话说明；末尾 `Examples:` 小节少于 5 行，覆盖 `ak daemon start`、`ak run -- <cmd>`、`ak start <program>` 与 `ak stop <app>/all`，并提示指定 app 内程序写 `<app>/<program>`；退出码 0，不启动守护进程
+
+#### Scenario: help 示例覆盖目标文法
+
+- **WHEN** 执行 `ak --help`
+- **THEN** 示例行数少于 5，`<program>`、`<app>/<program>`、`<app>/all` 三种写法均被展示；示例不含已移除的 `--app`，也不把裸 app 名示例为整组操作
 
 #### Scenario: daemon 前台守护
 
@@ -238,13 +278,22 @@
 
 #### Scenario: run 的 ad-hoc 命名参数为 --app
 
-- **WHEN** 执行 `ak run -- python -m http.server 8000 --app web`
-- **THEN** 注册的应用名为 `web`；`--name` 不再是合法参数（clap 报未知参数，退出码 2）
+> 标题为既有场景锚点；现行命名参数为 `--name`，且只创建散装程序，`--app` 已移除。
+
+- **WHEN** 执行 `ak run --name web -- python -m http.server 8000`
+- **THEN** 注册为散装程序 `web`（投影中 `standalone: true`、`app` 为空）；`--app` 不再是合法参数（clap 报未知参数，退出码 2）
+
+#### Scenario: run 的 ad-hoc 复合名指定 app 与程序
+
+> 标题为既有场景锚点；`run` 不再支持 `app/program` 复合名。
+
+- **WHEN** 执行 `ak run --name gateway/api -- ./api`
+- **THEN** 以退出码 2 拒绝（非法程序名），提示 `--name` 只接受单个程序名；不写盘、不启动进程
 
 #### Scenario: status 默认输出人读表格
 
 - **WHEN** 执行 `ak ps` 且守护进程在线、存在运行中与已停止的程序
-- **THEN** 输出每程序一行的表格，列与 shell 的 `ps` 表格一致（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）并含配置本体路径与描述，不健康程序带标记；无 JSON 大括号输出
+- **THEN** 输出每程序一行的表格，列与 shell 的 `ps` 表格一致（NAME/APP/STATE/PID/RESTARTS/UNHEALTHY）并含配置本体路径与描述，不健康程序带标记；散装程序的 APP 列为 `-`；无 JSON 大括号输出
 
 #### Scenario: status --json 保留机器可读输出
 
@@ -316,22 +365,40 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 ### Requirement: 注册并启动端点
 
-守护进程 SHALL 提供「注册并启动」端点（ad-hoc `run` 的服务端实现），接受一个临时应用定义（命令、参数、环境变量、工作目录、名称、`force`、restart/backoff 等微调 flag），并 SHALL 按以下顺序处理：
+守护进程 SHALL 提供「注册并启动」端点（ad-hoc `run` 的服务端实现），接受一个临时程序定义（命令、参数、环境变量、工作目录、可选 `--name`、`force`、restart/backoff 等微调 flag）。名称 SHALL 为单个可选**程序名**，语法与解析规则见 `app-registry` 的「run ad-hoc 散装程序注册与命名」；端点 SHALL **只创建散装程序记录**，MUST NOT 接受 app 归属或 `app/program` 复合名。端点 SHALL 按以下顺序处理：
 
-1. 校验定义：名称合法且非保留字 `all`、命令可解析为绝对路径、应用名尚未注册（未带 `force` 时同名一律拒绝；带 `force` 时按 `app-registry` 的「run ad-hoc --force 强制覆盖」语义处理）、程序名不与**其他应用**的已注册程序冲突；
-2. 启动该程序并等待判定「启动成功」——进程存活超过 `startsecs`，且该程序若配置了健康探测，则其首轮探测通过。`force` 且新旧配置逐字节相同的情况下 SHALL 跳过本步，不启动任何进程；
-3. 判定成功后，将定义写入 `app_dir` 完成注册（落盘契约见 `app-registry` 能力规范）。`force` 且配置有差异时，记录在启动判定前即原子落盘；配置无差异时不写盘。
+1. 解析名称：显式 `name` 直接作为程序名；未提交名称时按命令 stem 解析出唯一名字（基名占用时顺延 `<stem>-<N>`）；把最终程序名回传客户端。语法错误（空值、含 `/`、非法字符、保留字 `all`）SHALL 以校验错误回传；
+2. 校验定义：命令可解析为绝对路径；显式名称对应的记录已存在（任一分区）、内存中已有同名 app 或程序、或该名字已被任何 app 占用时，SHALL 回传 409 冲突；缺省名解析已避开占用，不因重名回传冲突；程序名全局唯一仍是硬校验；
+3. 启动该程序并等待判定「启动成功」——进程存活超过 `startsecs`，且该程序若配置了健康探测，则其首轮探测通过。`force` 且新旧配置逐字节相同的情况下 SHALL 跳过本步，不启动任何进程；
+4. 判定成功后，将定义写入 `app_dir/adhoc/<程序名>.toml` 完成注册（落盘契约见 `app-registry` 能力规范）。`force` 且配置有差异时，记录在启动判定前即原子落盘；配置无差异时不写盘。
 
-同名判定 SHALL 在守护进程的命令处理路径中完成（注册表记录与内存中的同名应用同源判定），MUST NOT 仅由客户端预检，以免与巡检/apply 竞态后仍覆盖既有应用。
+名称解析与同名判定 SHALL 在守护进程的命令处理路径中完成（注册表记录、内存中的同名 app/程序、暂存 app 同源判定），MUST NOT 仅由客户端预检，以免与巡检/apply 竞态后仍覆盖既有应用或产生重名。名称解析 MUST NOT 启动进程或写盘；暂存残留的判定 SHALL 先于顺延（候选名对应未落盘的暂存 app 时回传残留态）。散装程序不属于任何 app，端点在注册记录中 MUST NOT 写入 app 归属（默认不写 `[app]` 表）；`--description` 仅作为元数据，不构成 app 身份。
 
-任一步骤失败时，守护进程 SHALL 回传结构化错误（失败阶段 + 可读原因），且 MUST NOT 在 `app_dir` 留下注册文件或占位残留；已启动但判定失败的进程 SHALL 被停止并清理。同名冲突 SHALL 以状态冲突类错误回传，且 MUST NOT 写盘、MUST NOT 启动新进程、MUST NOT 停止或重启既有进程。
+任一步骤失败时，守护进程 SHALL 回传结构化错误（失败阶段 + 可读原因），且 MUST NOT 在 `app_dir` 留下注册文件或占位残留；已启动但判定失败的进程 SHALL 被停止并清理。**显式名称**的同名冲突 SHALL 以 409 状态冲突回传，且 MUST NOT 写盘、MUST NOT 启动新进程、MUST NOT 停止或重启既有进程。
 
-端点 SHALL 回传成功结果，含 `{程序名, 配置路径, PID}`；对扇出（app 级）请求 SHALL 回传逐程序结果数组。
+端点 SHALL 回传成功结果，含 `{程序名, 配置路径, PID, 是否散装}`：程序名即散装记录名；对扇出（app 级）请求 SHALL 回传逐程序结果数组。缺省名发生顺延时，成功结果 SHALL 额外标记 `auto_named: true`（未顺延时为 `false` 或省略）。
 
 #### Scenario: 成功注册并启动
 
 - **WHEN** 客户端提交合法定义且程序在 `startsecs` 内稳定运行（无健康探测）
-- **THEN** 守护进程启动程序、判定成功、写入 `app_dir/<name>.toml`，回传程序名、配置路径与 PID
+- **THEN** 守护进程启动程序、判定成功、写入 `app_dir/adhoc/<name>.toml`（不含 `[app]`），回传程序名、配置路径与 PID
+
+#### Scenario: 缺省名被占用时自动顺延成功
+
+- **WHEN** 客户端提交的命令 stem 对应的名字已被注册，且请求未带名称、未带 `force`
+- **THEN** 守护进程以 `<stem>-<N>` 注册并启动，回传该名字、配置路径、PID 与 `auto_named: true`，既有同名应用不受影响
+
+#### Scenario: 显式分组名注册
+
+> 标题为既有场景锚点；注册端点不再接受 `app/program` 复合名。
+
+- **WHEN** 客户端提交 `name = "gateway/api"`
+- **THEN** 以校验错误回传（程序名不得含 `/`），不写盘、不启动进程
+
+#### Scenario: 显式名称同名仍回传冲突
+
+- **WHEN** 客户端显式提交已注册的 app 名（或已被任何应用占用的程序名）且未带 `force`
+- **THEN** 守护进程以 409 状态冲突错误回传，不写盘、不启动新进程、不停止或重启既有进程，MUST NOT 自动改名为 `<name>-N`
 
 #### Scenario: 启动失败不留残留
 
@@ -340,29 +407,29 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 #### Scenario: 名称冲突被拒绝
 
-- **WHEN** 提交的定义其程序名与**其他应用**的已注册程序冲突
-- **THEN** 守护进程以校验错误回传，不启动任何进程、不写盘
+- **WHEN** 提交的定义其**显式**程序名与**其他应用**的已注册程序冲突
+- **THEN** 守护进程以 409 状态冲突回传，不启动任何进程、不写盘，MUST NOT 自动加后缀
 
 #### Scenario: 同名重复提交走再生
 
-> 标题为既有场景锚点，现行行为以下文为准：未带 `force` 时同名重复提交被拒绝；带 `force` 时按差异覆盖、无差异空操作。
+> 标题为既有场景锚点，现行行为以下文为准：显式名称未带 `force` 时同名重复提交被拒绝；带 `force` 时按差异覆盖、无差异空操作。缺省名称不适用本场景，走自动顺延。
 
-- **WHEN** 对已注册的同名应用（无论其程序当前是否在运行）再次提交定义且未带 `force`
-- **THEN** 守护进程以状态冲突错误回传，不写盘、不启动新进程、不停止或重启既有进程，MUST NOT 以「幂等成功」放行
+- **WHEN** 对已注册的同名散装程序（无论其程序当前是否在运行）再次提交**显式**定义且未带 `force`
+- **THEN** 守护进程以 409 状态冲突错误回传，不写盘、不启动新进程、不停止或重启既有进程，MUST NOT 以「幂等成功」放行
 
 #### Scenario: force 且配置有差异
 
-- **WHEN** 对已注册的同名应用提交带 `force` 且渲染结果与磁盘记录不同的定义
+- **WHEN** 对已注册的同名散装程序提交带 `force` 且渲染结果与磁盘记录不同的定义
 - **THEN** 守护进程原子重写记录，停止旧程序并按新定义启动，回传新 PID
 
 #### Scenario: force 且配置无差异
 
-- **WHEN** 对已注册的同名应用提交带 `force` 且渲染结果与磁盘记录逐字节相同的定义
+- **WHEN** 对已注册的同名散装程序提交带 `force` 且渲染结果与磁盘记录逐字节相同的定义
 - **THEN** 守护进程不写盘、不停止/重启进程、不启动新进程，回传成功结果并标记 `unchanged`
 
 #### Scenario: 保留字 all 被拒绝
 
-- **WHEN** 提交的定义应用名为 `all`
+- **WHEN** 提交的定义程序名为 `all`（显式指定，或由命令 stem 推导）
 - **THEN** 守护进程以校验错误回传，不启动进程、不写盘
 
 ### Requirement: 启动进度流式反馈
@@ -504,11 +571,13 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 ### Requirement: App 移除控制端点
 
-控制面 SHALL 提供 `POST /v1/apps/<app>/remove`，供 CLI、shell 与其他控制客户端请求 app 级注销。端点 SHALL 经守护进程的命令队列执行 app-registry 定义的无存活进程前置检查、注册删除与状态清理，MUST NOT 由客户端或 HTTP 连接线程自行停止进程或维护注册文件。
+控制面 SHALL 提供两个移除端点：`POST /v1/programs/<name>/remove` 只移除散装程序记录，`POST /v1/apps/<app>/remove` 移除整个 compose app。两者 SHALL 经守护进程的命令队列执行 app-registry 定义的无存活进程前置检查、注册删除与状态清理，MUST NOT 由客户端或 HTTP 连接线程自行停止进程或维护注册文件。
 
-未知 app SHALL 返回 404；被删除 app 中任一程序处于 `running`、`starting`、`stopping` 或 `backoff` 时 SHALL 返回 409，响应列出阻塞程序及状态；成功 SHALL 返回结构化结果，至少含 app 名、注册记录路径、是否删除生成文件及保留的外部配置路径（适用时），结果 SHALL 表明移除已生效且无需 apply。端点在本地 IPC 与 TCP 形态下的准入规则和响应语义 SHALL 一致。
+散装程序的移除 SHALL 只走程序面端点；app 内程序不提供单独移除（其归属由 compose 声明决定），对 app 内程序请求 `POST /v1/programs/<name>/remove` SHALL 返回 400 并提示修改 compose 声明后应用。app 级端点 MUST NOT 接受散装程序名：散装程序不是 app，请求 `/v1/apps/<name>/remove` 且该名字只对应散装记录时 SHALL 返回 404（或结构化提示改用程序面端点）。
 
-`ak remove <app>` SHALL 调用该端点，守护不可达时输出提示并以退出码 3 退出；CLI MUST NOT 隐式拉起守护进程，也不得在请求后另行触发 reload 或 apply。其他控制错误的退出码保持 CLI 既有约定。
+未知 app 或散装程序 SHALL 返回 404；目标 app 中任一程序处于 `running`、`starting`、`stopping` 或 `backoff` 时 SHALL 返回 409，响应列出阻塞程序及状态；成功 SHALL 返回结构化结果，至少含 app 名（散装程序即程序名）、注册记录路径、是否删除生成文件及保留的外部配置路径（适用时），结果 SHALL 表明移除已生效且无需 apply。端点在本地 IPC 与 TCP 形态下的准入规则和响应语义 SHALL 一致。
+
+`ak remove <target>` SHALL 调用对应端点：`remove <program>` 移除散装程序记录（请求 `POST /v1/programs/<program>/remove`），`remove <app>/all` 移除整个 app（请求 `POST /v1/apps/<app>/remove`）；单 token 只命中 app 名时 MUST NOT 隐式移除 app，应报未知程序并提示 `<app>/all`。app 内程序不支持单独 remove（其归属由 compose 声明决定），非 `<app>/all` 的 app 内程序目标 SHALL 以用法错误拒绝并提示改 compose 声明。守护不可达时输出提示并以退出码 3 退出；CLI MUST NOT 隐式拉起守护进程，也不得在请求后另行触发 reload 或 apply。其他控制错误的退出码保持 CLI 既有约定。
 
 #### Scenario: 存活程序导致移除冲突
 
@@ -529,6 +598,26 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** 守护进程不可达时执行 `ak remove web`
 - **THEN** CLI 输出不可达提示并以退出码 3 退出，不直接删除注册、不自动拉起守护进程，也不请求 apply
+
+#### Scenario: 散装程序单名移除
+
+- **WHEN** 对已停止的散装程序 `agent` 执行 `ak remove agent`
+- **THEN** 请求 `POST /v1/programs/agent/remove`，端点删除 `app_dir/adhoc/agent.toml`，返回表明无需 apply 的成功结果
+
+#### Scenario: 整 app 移除用 app/all
+
+- **WHEN** 执行 `ak remove gateway/all` 且 gateway 全部程序已停止
+- **THEN** 请求 `POST /v1/apps/gateway/remove` 并移除整个 app；而 `ak remove gateway` 只按程序名解析，不存在同名程序时报错并提示 `gateway/all`
+
+#### Scenario: app 内程序不能单独 remove
+
+- **WHEN** 执行 `ak remove gateway/api`（或旧形式 `ak remove gateway api`）
+- **THEN** 以用法错误拒绝，提示修改 compose 声明后应用，MUST NOT 删除 app 内单个程序或整个 app
+
+#### Scenario: 程序移除端点拒绝 app 内程序
+
+- **WHEN** 对属于 app gateway 的程序 `api` 请求 `POST /v1/programs/api/remove`
+- **THEN** 返回 400 并提示修改 compose 声明后应用，注册记录与运行状态不变
 
 ### Requirement: compose up 端点族
 
