@@ -629,7 +629,7 @@ daemon 配置驱动，见 webui-api 能力规范。）
   - `needs-update`：同名 compose 记录（顶层）与渲染结果有差异，附差异摘要与既有程序运行态；
   - `adhoc-takeover`：同名记录位于 `app_dir/adhoc/`（run 产物），附其运行态；
   - `external-refused`：同名记录为外部部署链接，附 `ak remove` 指引。
-  校验失败（非法名/保留字、解析失败、程序名跨 app 冲突、依赖成环）SHALL 以校验类错误回传，零副作用。
+  校验失败（非法名/保留字、解析失败、程序名跨 app 冲突、依赖成环）SHALL 以校验类错误回传，零副作用。程序运行身份解析失败（账号或组不存在、非法 `umask`、Windows 声明 `user`/`group`/`umask`）或身份不可行（守护进程非 root 却要求切换用户或主组）SHALL 同样以校验类错误回传，零副作用，MUST NOT 先落盘或先启动再失败。预览响应 SHALL 携带非致命警告列表（可为空），至少覆盖「程序以 root 身份运行」这一情形；CLI SHALL 将其输出到 stderr，且警告不影响退出码。
 - `POST /v1/compose/up`：执行。请求携带同样的声明内容、应用名、`-e/--env` 变量值对与 `force` 布尔。同名判定 SHALL 在守护进程命令处理路径完成，MUST NOT 仅由客户端预检决定（与「注册并启动端点」同源要求，防与巡检/apply 竞态）。分类为 `needs-update` 或 `adhoc-takeover` 而未带 `force` 时 SHALL 以状态冲突类错误回传并附预览详情（供非交互客户端呈现指引），MUST NOT 写盘、MUST NOT 启停任何进程；`external-refused` 无论 `force` 一律以校验/冲突类错误拒绝回传。
 
 执行 SHALL 复用「注册并启动端点」的 staged 契约并扩展到多程序：按 priority 与 depends_on 拓扑拉起、逐个等待启动判定、**全部通过才落盘**；任一失败 SHALL 由服务端自行中止——停止本轮已拉起的程序、清理全部占位残留——并以结构化错误（失败阶段、程序名、原因）回传。进度 SHALL 按「启动进度流式反馈」语义流式回传（逐程序事件帧）。
@@ -685,6 +685,21 @@ daemon 配置驱动，见 webui-api 能力规范。）
 
 - **WHEN** TCP 形态控制端点下，CLI 从另一台机器提交声明内容与基准目录
 - **THEN** 渲染与注册成功，全程不依赖守护进程侧存在 `.appkeeper.toml` 文件路径
+
+#### Scenario: 预览携带非致命警告
+
+- **WHEN** 声明未指定 `user` 且守护进程以 root 运行，客户端请求预览
+- **THEN** 响应含「程序将以 root 身份运行」的警告项，CLI 打印到 stderr，分类仍为正常分类且退出码不受影响
+
+#### Scenario: 身份不可行时预检拒绝
+
+- **WHEN** 守护进程以非 root 运行，声明要求 `user = "deploy"`
+- **THEN** 预览与提交均返回校验类错误并说明原因，不写盘、不启动任何进程
+
+#### Scenario: 未知账号在解析期被拒绝
+
+- **WHEN** 声明中的 `user` 指向不存在的账号
+- **THEN** 预览返回校验类错误，零副作用
 
 ### Requirement: 服务托管时的停机命令语义
 
@@ -761,57 +776,82 @@ Linux 的 `<unit>` SHALL 取自守护进程自身的 cgroup 归属（`/proc/self
 
 ### Requirement: 控制台打开命令
 
-CLI SHALL 提供顶层子命令 `ak webui`，用于打开 Web 控制台。命令 SHALL 为 daemon-first：经控制面 `GET /v1/webui` 读取控制台状态，MUST NOT 读取或推断控制台的进程内 token。守护进程不可达时 SHALL 输出不可达提示并以退出码 3 退出，MUST NOT 隐式拉起守护进程。
+CLI SHALL 提供顶层子命令 `ak webui`，用于打开 Web 控制台。命令 SHALL 为 daemon-first：经控制面 `GET /v1/webui` 读取控制台状态，MUST NOT 读取或推断控制台的进程内 token。守护进程不可达时 SHALL 输出不可达提示并以退出码 3 退出，MUST NOT 隐式拉起守护进程，也不打印 URL（地址与 auto token 均不可知）。
 
-控制台未启用（`enabled == false`）或未成功伺服（`serving == false`）时，命令 SHALL 以退出码 1 失败，并在错误信息中给出修复命令（启用：`ak config --set webui.listen=<addr>` 配合 `ak config --reload`；伺服失败：查看 daemon 日志与监听地址占用）。
+控制台未启用（`enabled == false`）或未成功伺服（`serving == false`）时，命令 SHALL 以退出码 1 失败，并在错误信息中给出修复命令（启用：`ak config --set webui.listen=<addr>` 配合 `ak config --reload`；伺服失败：查看 daemon 日志与监听地址占用），MUST NOT 打印 URL，MUST NOT 尝试启动浏览器：这是配置问题，不是便利功能的降级。
 
-打开前命令 SHALL 探测控制台可达性（`GET /api/health`），等待其上线的总时长 SHALL 有上界（约 5 秒）；超时或不可达 SHALL 按未伺服处理并以退出码 1 失败，不启动浏览器。可达后命令 SHALL 调用系统默认浏览器打开控制台 URL：
+daemon 报告已启用且正在伺服后，命令 SHALL 在 stdout 打印完整 URL，且该打印 SHALL 发生在可达性探测与浏览器启动**之前**——URL 是命令的交付物，输出模式、默认模式、无图形会话、探测失败与启动失败都必须给出它；探测（至多约 5 秒）与浏览器启动（launcher 可能阻塞到浏览器退出）MUST NOT 延迟或抑制该打印：
 
 - `auth == "auto"` 时 URL SHALL 携带引导查询参数 `?token=<token>`（token 取自 `GET /v1/webui`）；
 - `auth == "token"`（固定 token）时 URL MUST NOT 携带 token；
-- 成功时命令 SHALL 在 stdout 打印浏览器将要打开的完整 URL（auto 模式含 `?token=<token>`），使自动打开失败、无图形会话或终端里点击比切换窗口更方便的场景都能直接进入；固定 token 模式打印的 URL 不含 token。
+- 打印的就是浏览器将收到的完整地址，不额外包裹文案（MUST NOT 使用 `opening ` 一类前缀），使终端能直接渲染为可点击链接。
 
-命令 SHALL 支持两种不打开浏览器的输出模式（二者互斥）：
+命令 SHALL 支持两种不打开浏览器的输出模式（二者互斥），二者打印 URL 后即以 0 退出，且 MUST NOT 向 stderr 输出任何提示：
 
-- `--print-url`：把完整 URL（auto 模式下含 `?token=`）打印到 stdout 并以 0 退出；
-- `--json`：输出机器可读对象，至少含 `url`、`listen`、`auth` 与 `opened` 字段，以 0 退出。
+- `--print-url`：只输出完整 URL；
+- `--json`：输出机器可读对象，至少含 `url`、`listen`、`auth` 与 `opened` 字段。`opened` 描述「本次调用是否把 URL 交给系统浏览器且启动成功」；输出模式从不启动浏览器，因此该字段恒为 `false`，调用方 MUST NOT 据此推断默认模式的行为。
 
-无图形会话的环境（Linux 且 `DISPLAY` 与 `WAYLAND_DISPLAY` 均未设置；macOS 的 `open`
-不依赖这两个变量）SHALL NOT 尝试启动浏览器，改为打印完整 URL 与提示并以 0 退出。浏览器启动失败时 SHALL 打印完整 URL 与失败原因，并以退出码 1 失败。
+默认模式（无 `--print-url` / `--json`）在打印 URL 后决定是否启动浏览器：
+
+- 无图形会话（Linux 且 `DISPLAY` 与 `WAYLAND_DISPLAY` 均未设置；macOS 的 `open` 不依赖这两个变量）时 MUST NOT 探测可达性、MUST NOT 启动浏览器：没有浏览器可开，探测没有意义；
+- 有图形会话时 SHALL 先探测控制台可达性（`GET /api/health`，等待其上线的总时长有上界，约 5 秒）：探测成功才调用系统默认浏览器打开该 URL；探测超时或不可达 MUST NOT 启动浏览器（打开一个不应答的地址没有意义）；
+- 浏览器启动失败（含系统 launcher 不存在或启动后返回非 0）时 MUST NOT 回退尝试其他 launcher。
+
+无图形会话、探测失败与启动失败三种降级 SHALL 在 stderr 各给出一行提示（分别说明无图形会话、探测失败原因、启动失败原因，并在需要时提示手动打开 stdout 上的 URL），前缀统一为 `ak: warning:`（命令并未失败，MUST NOT 使用 `error:` 前缀），三种路径均以退出码 0 结束。自动打开与可达性探测属于便利功能，MUST NOT 使命令失败，MUST NOT 以退出码 1 表达；退出码 1 只留给「daemon 自述控制台未启用/未伺服」的配置问题。
 
 `ak webui` MUST NOT 修改 daemon 配置、MUST NOT 停止或启动任何受管程序。
 
 #### Scenario: auto 模式一条命令进入控制台
 
 - **WHEN** `[webui]` 以 auto 模式伺服，执行 `ak webui`
-- **THEN** 系统默认浏览器被调起，且 stdout 打印的地址含 `?token=<token>`（完整 URL，可直接点击），退出码 0
+- **THEN** stdout 恰为裸 URL（含 `?token=<token>`，不带 `opening ` 前缀，可直接点击），stderr 为空，系统默认浏览器随后被调起，退出码 0
 
 #### Scenario: 固定 token 模式不带 token
 
 - **WHEN** `[webui] auth_token` 为固定值，执行 `ak webui`
-- **THEN** 浏览器打开的地址不含 `?token=`，凭据门由用户在页面输入固定 token
+- **THEN** stdout 与浏览器打开的地址均不含 `?token=`，凭据门由用户在页面输入固定 token，退出码 0
+
+#### Scenario: URL 先于探测与启动交付
+
+- **WHEN** 存在图形会话，执行 `ak webui`
+- **THEN** URL 在探测与浏览器启动开始前即写入 stdout：探测等待与 launcher 阻塞都不会推迟它
 
 #### Scenario: 只打印 URL
 
 - **WHEN** auto 模式下执行 `ak webui --print-url`
-- **THEN** stdout 输出含 `?token=<token>` 的完整 URL，不启动浏览器，退出码 0
+- **THEN** stdout 只输出含 `?token=<token>` 的完整 URL，stderr 为空，不探测、不启动浏览器，退出码 0
 
 #### Scenario: JSON 输出
 
 - **WHEN** 执行 `ak webui --json`
-- **THEN** stdout 输出含 `url`、`listen`、`auth`、`opened` 的 JSON 对象，退出码 0
+- **THEN** stdout 输出含 `url`、`listen`、`auth`、`opened` 的 JSON 对象，stderr 为空，不探测、不启动浏览器，退出码 0
+
+#### Scenario: JSON 的 opened 恒为 false
+
+- **WHEN** 以 `--json` 执行（唯一的 JSON 输出模式）
+- **THEN** `opened` 为 `false`：输出模式从不启动浏览器，不存在 `opened` 为 `true` 的 JSON 调用
 
 #### Scenario: 控制台未启用
 
 - **WHEN** daemon 配置不含 `[webui]` 段，执行 `ak webui`
-- **THEN** 退出码 1，错误信息含启用控制台的配置命令，不启动浏览器
+- **THEN** 退出码 1，错误信息含启用控制台的配置命令，stdout 为空（不打印 URL），不启动浏览器
 
 #### Scenario: 守护进程离线
 
 - **WHEN** 守护进程未运行，执行 `ak webui`
-- **THEN** 输出守护进程不可达提示，退出码 3，不尝试启动浏览器，不拉起守护进程
+- **THEN** 输出守护进程不可达提示，退出码 3，不打印 URL，不尝试启动浏览器，不拉起守护进程
 
 #### Scenario: 无图形会话
 
 - **WHEN** Linux 环境下 `DISPLAY` 与 `WAYLAND_DISPLAY` 均未设置，执行 `ak webui`
-- **THEN** 不尝试启动浏览器，打印完整 URL 与提示，退出码 0
+- **THEN** stdout 恰为完整 URL（一行），stderr 给出一行 `ak: warning:` 无图形会话提示，不探测可达性、不启动浏览器，退出码 0
+
+#### Scenario: 探测失败仍交付 URL
+
+- **WHEN** daemon 报告 `enabled && serving`，但 `/api/health` 在约 5 秒内无应答（例如监听地址被代理抢占或刚 reload 尚未就绪）
+- **THEN** stdout 打印完整 URL，stderr 给出一行 `ak: warning:` 失败原因与排查提示，不启动浏览器，退出码 0
+
+#### Scenario: 浏览器启动失败不影响命令成功
+
+- **WHEN** 存在图形会话且探测成功，但系统 launcher 不存在或启动后返回非 0（例如主机没有安装浏览器），执行 `ak webui`
+- **THEN** stdout 打印完整 URL，stderr 给出一行 `ak: warning:` 提示（含失败原因与「手动打开 stdout 上的 URL」），退出码 0
