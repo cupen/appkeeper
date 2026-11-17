@@ -493,6 +493,54 @@ fn cli_try(bin: &Path, ws: &Workspace, args: &[&str]) -> Result<(bool, i32, Stri
     Ok((out.status.success(), code, combined))
 }
 
+/// Run the CLI with extra environment overrides and keep the two output
+/// streams separate: `None` removes a variable, `Some(v)` sets it. Needed by
+/// the `ak webui` degradation steps, which must observe stdout and stderr
+/// independently (URL vs `ak: warning:` line) while forcing the session
+/// (DISPLAY/WAYLAND_DISPLAY) and the launcher lookup (PATH). The CLI is
+/// invoked by absolute path, so overriding PATH only affects its children.
+fn cli_try_env(
+    bin: &Path,
+    ws: &Workspace,
+    args: &[&str],
+    envs: &[(&str, Option<&str>)],
+) -> Result<(bool, i32, String, String)> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--config").arg(ws.config_arg()).args(args);
+    for (key, value) in envs {
+        match value {
+            Some(value) => {
+                cmd.env(key, value);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    let out = cmd
+        .output()
+        .with_context(|| format!("run appkeeper {:?} (env {envs:?})", args))?;
+    Ok((
+        out.status.success(),
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+/// The single line a stream carries, or `None` when it is empty or has more
+/// than one line (a trailing newline is allowed). Used to pin the `ak webui`
+/// contract: exactly one URL on stdout and exactly one warning on stderr.
+fn single_line(stream: &str) -> Option<&str> {
+    let body = stream.strip_suffix('\n').unwrap_or(stream);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    if body.is_empty() || body.contains('\n') || body.contains('\r') {
+        None
+    } else {
+        Some(body)
+    }
+}
+
 /// Run the CLI against an explicit daemon config (for bad-config scenarios
 /// where the workspace's own daemon.toml must stay valid), expecting FAILURE.
 fn cli_try_cfg(bin: &Path, cfg: &Path, args: &[&str]) -> Result<(bool, i32, String)> {
@@ -7926,10 +7974,15 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     step("W1b. `ak webui` on a disabled console exits 1 with the enable command");
     // control-plane spec (控制台未启用): a reachable daemon with no `[webui]`
     // section is exit 1 — not 3 and never a browser launch.
-    let (ok, code, combined) = cli_try(bin, ws, &["webui"])?;
+    let (ok, code, stdout, stderr) = cli_try_env(bin, ws, &["webui"], &[])?;
+    let combined = format!("{stdout}{stderr}");
     expect(
         !ok && code == 1,
         &format!("`ak webui` without [webui] exits 1, got {code}: {combined:?}"),
+    )?;
+    expect(
+        stdout.is_empty(),
+        &format!("the disabled console prints no URL on stdout: {stdout:?}"),
     )?;
     expect(
         combined.contains("not enabled"),
@@ -8049,10 +8102,15 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
     )?;
     // A degraded console (enabled but not serving) is exit 1 too, and the
     // error points at the address/occupancy fix (control-plane spec).
-    let (ok, code, combined) = cli_try(bin, ws, &["webui", "--print-url"])?;
+    let (ok, code, stdout, stderr) = cli_try_env(bin, ws, &["webui", "--print-url"], &[])?;
+    let combined = format!("{stdout}{stderr}");
     expect(
         !ok && code == 1,
         &format!("`ak webui` on a degraded console exits 1, got {code}: {combined:?}"),
+    )?;
+    expect(
+        stdout.is_empty(),
+        &format!("the degraded console prints no URL on stdout: {stdout:?}"),
     )?;
     expect(
         combined.contains("not serving") && combined.contains("already in use"),
@@ -8148,6 +8206,74 @@ fn webui_pass(bin: &Path, ws: &Workspace) -> Result<()> {
         token2 == token,
         &format!("a reload keeps the auto token ({token:?} -> {token2:?}): {doc2}"),
     )?;
+
+    // webui-open-best-effort: the URL is the deliverable even when the
+    // convenience steps (probe, launch) cannot run. Headless and a missing
+    // launcher are the two degradations a real session can hit; both must
+    // keep stdout to the bare URL and add exactly one `ak: warning:` line.
+    // Only Unix-without-macOS has the DISPLAY-based headless branch.
+    if cfg!(all(unix, not(target_os = "macos"))) {
+        let print_out = cli(bin, ws, &["webui", "--print-url"])?;
+        let expected = single_line(&print_out)
+            .expect("--print-url prints exactly one URL line")
+            .to_string();
+
+        step("W6c. `ak webui` without a graphical session prints the bare URL and exits 0");
+        let (ok, code, stdout, stderr) = cli_try_env(
+            bin,
+            ws,
+            &["webui"],
+            &[("DISPLAY", None), ("WAYLAND_DISPLAY", None)],
+        )?;
+        expect(
+            ok && code == 0,
+            &format!("headless `ak webui` exits 0, got {code}: {stderr:?}"),
+        )?;
+        expect(
+            single_line(&stdout) == Some(expected.as_str()),
+            &format!("stdout is exactly the --print-url URL (byte-identical), got {stdout:?}"),
+        )?;
+        let warning = single_line(&stderr);
+        expect(
+            warning.is_some_and(|w| w.starts_with("ak: warning:")),
+            &format!("stderr is exactly one `ak: warning:` line, got {stderr:?}"),
+        )?;
+        expect(
+            warning.is_some_and(|w| w.contains("no graphical session")),
+            &format!("the warning names the missing graphical session, got {stderr:?}"),
+        )?;
+
+        step("W6d. `ak webui` with a missing browser launcher warns once and exits 0");
+        // PATH=/nonexistent makes `xdg-open` unresolvable; the CLI itself is
+        // invoked by absolute path, so only the launcher lookup is affected.
+        let (ok, code, stdout, stderr) = cli_try_env(
+            bin,
+            ws,
+            &["webui"],
+            &[
+                ("PATH", Some("/nonexistent")),
+                ("DISPLAY", Some(":0")),
+                ("WAYLAND_DISPLAY", None),
+            ],
+        )?;
+        expect(
+            ok && code == 0,
+            &format!("`ak webui` with no launcher exits 0, got {code}: {stderr:?}"),
+        )?;
+        expect(
+            single_line(&stdout) == Some(expected.as_str()),
+            &format!("stdout stays the bare URL when the launcher is missing, got {stdout:?}"),
+        )?;
+        let warning = single_line(&stderr);
+        expect(
+            warning.is_some_and(|w| w.starts_with("ak: warning:")),
+            &format!("stderr is exactly one `ak: warning:` line, got {stderr:?}"),
+        )?;
+        expect(
+            warning.is_some_and(|w| w.contains("could not launch the system browser")),
+            &format!("the warning names the failed launcher, got {stderr:?}"),
+        )?;
+    }
 
     step(
         "W7. a bare [webui] section serves the built-in default 127.0.0.1:9877 and exits with the daemon",
