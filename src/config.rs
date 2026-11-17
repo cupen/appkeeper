@@ -1,7 +1,7 @@
 //! Configuration: the unique global daemon config plus per-app deployment
 //! config files (`appkeeper.toml`), with layered defaults resolution.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -1796,7 +1796,17 @@ pub enum HealthKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedProgram {
-    pub app: String,
+    /// Owning app name; `None` for a **standalone program** (an
+    /// `app_dir/adhoc/<name>.toml` record produced by `ak run` or by an older
+    /// run version, add-standalone-programs D2). Standalone programs are not
+    /// app members: they have no app identity and are addressed by their
+    /// globally unique program name.
+    ///
+    /// Skipped by serde so [`def_hash`] stays ownership-independent: adopting
+    /// a record as standalone (or re-owning it) changes no process behavior
+    /// and must not surface as a pending definition change.
+    #[serde(skip)]
+    pub app: Option<String>,
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
@@ -1837,7 +1847,29 @@ pub struct ResolvedApp {
     #[allow(dead_code)]
     pub description: Option<String>,
     pub priority: i32,
+    /// True for a **standalone program record** (`app_dir/adhoc/<name>.toml`):
+    /// the record is not an app, its programs carry `app = None`, and callers
+    /// MUST NOT turn it into an app record (add-standalone-programs D2/D3).
+    pub standalone: bool,
     pub programs: Vec<ResolvedProgram>,
+}
+
+impl ResolvedProgram {
+    /// True when the program belongs to no app (a standalone record).
+    pub fn is_standalone(&self) -> bool {
+        self.app.is_none()
+    }
+
+    /// The owning app name (`None` for a standalone program).
+    pub fn owner(&self) -> Option<&str> {
+        self.app.as_deref()
+    }
+
+    /// Display label of the owner: the app name, or `-` for a standalone
+    /// program (the `ps` APP column's placeholder, glossary spec).
+    pub fn owner_label(&self) -> &str {
+        self.app.as_deref().unwrap_or("-")
+    }
 }
 
 fn parse_health(s: &str, raw: &ProgramRaw) -> Result<HealthCheck> {
@@ -1885,8 +1917,14 @@ fn def_hash(p: &ResolvedProgram) -> u64 {
 
 /// Resolve one `[program.<name>]` entry against the `[app]` layer and the
 /// daemon `[app-default]` layer (highest priority first).
+///
+/// `app_name` labels the `[app]` layer in error messages (the record name for
+/// a standalone record); `owner` is the app the program belongs to — `None`
+/// for a standalone program, whose record's `[app]` table is metadata plus
+/// fallback defaults only.
 pub fn resolve_program(
     app_name: &str,
+    owner: Option<&str>,
     prog_name: &str,
     raw: &ProgramRaw,
     meta: Option<&AppMeta>,
@@ -2092,7 +2130,7 @@ pub fn resolve_program(
     }
 
     let p = ResolvedProgram {
-        app: app_name.to_string(),
+        app: owner.map(str::to_string),
         name: prog_name.to_string(),
         command,
         args,
@@ -2131,8 +2169,53 @@ pub fn resolve_app(
     raw: &AppRaw,
     defaults: Option<&AppDefaults>,
 ) -> Result<ResolvedApp> {
+    resolve_record(name, Some(name), path, raw, defaults)
+}
+
+/// Resolve a whole **standalone program record** (`app_dir/adhoc/<name>.toml`,
+/// add-standalone-programs D2).
+///
+/// The record name (the file stem) is the program-facing name; the field
+/// merging is exactly [`resolve_app`]'s, but every program's owner is `None`
+/// and the result is flagged `standalone = true`. An older record's `[app]`
+/// table is therefore only a metadata/fallback source: its `description` is
+/// kept, and its `restart` / `restart_backoff` / … values apply only where the
+/// program table did not set them. Callers MUST NOT turn the result into an
+/// app record.
+pub fn resolve_standalone(
+    path: &Path,
+    raw: &AppRaw,
+    defaults: Option<&AppDefaults>,
+) -> Result<ResolvedApp> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "cannot derive a program name from the record path {}",
+                path.display()
+            )
+        })?;
+    resolve_record(name, None, path, raw, defaults)
+}
+
+/// Shared body of [`resolve_app`] / [`resolve_standalone`]: identical field
+/// merging, differing only in program ownership and the `standalone` flag.
+fn resolve_record(
+    name: &str,
+    owner: Option<&str>,
+    path: &Path,
+    raw: &AppRaw,
+    defaults: Option<&AppDefaults>,
+) -> Result<ResolvedApp> {
     if !is_valid_name(name) {
-        bail!("app name {name:?} is invalid: {NAME_RULE}");
+        let what = if owner.is_some() {
+            "app name"
+        } else {
+            "standalone record name"
+        };
+        bail!("{what} {name:?} is invalid: {NAME_RULE}");
     }
     let meta = raw.app.as_ref();
     let priority = meta
@@ -2152,6 +2235,7 @@ pub fn resolve_app(
         .map(|(pname, praw)| {
             resolve_program(
                 name,
+                owner,
                 pname,
                 praw,
                 meta,
@@ -2165,6 +2249,7 @@ pub fn resolve_app(
         path: path.to_path_buf(),
         description: meta.and_then(|m| m.description.clone()),
         priority,
+        standalone: owner.is_none(),
         programs,
     })
 }
@@ -2193,17 +2278,50 @@ impl AppMeta {
     }
 }
 
-/// Cross-app validation: program-name uniqueness, dependency existence and
-/// dependency cycles.
+/// Owner label for cross-record diagnostics: an app or a standalone record.
+fn record_label(a: &ResolvedApp) -> String {
+    if a.standalone {
+        format!("standalone record {:?}", a.name)
+    } else {
+        format!("app {:?}", a.name)
+    }
+}
+
+/// Cross-app validation: program-name uniqueness (apps **and** standalone
+/// records, add-standalone-programs 1.4), the standalone-name/app-name
+/// non-collision invariant, dependency existence and dependency cycles.
 pub fn validate_all(apps: &[ResolvedApp]) -> Result<()> {
     let mut errors = Vec::new();
-    let mut owners: HashMap<&str, &str> = HashMap::new();
+    let mut owners: HashMap<&str, String> = HashMap::new();
     for a in apps {
+        let label = record_label(a);
         for p in &a.programs {
-            if let Some(prev) = owners.insert(p.name.as_str(), a.name.as_str()) {
+            if let Some(prev) = owners.insert(p.name.as_str(), label.clone()) {
                 errors.push(format!(
-                    "program name {:?} is duplicated between app {:?} and app {:?}",
-                    p.name, prev, a.name
+                    "program name {:?} is duplicated between {prev} and {label}",
+                    p.name
+                ));
+            }
+        }
+    }
+    // A standalone record name (and every standalone program name) must not
+    // collide with an app name: single-token addressing would be ambiguous
+    // (glossary 标识符不变量).
+    let app_names: HashSet<&str> = apps
+        .iter()
+        .filter(|a| !a.standalone)
+        .map(|a| a.name.as_str())
+        .collect();
+    for s in apps.iter().filter(|a| a.standalone) {
+        let mut names: Vec<&str> = vec![s.name.as_str()];
+        names.extend(s.programs.iter().map(|p| p.name.as_str()));
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            if app_names.contains(name) {
+                errors.push(format!(
+                    "standalone program name {name:?} conflicts with an app of the same name; \
+                     names must be globally unique"
                 ));
             }
         }
@@ -4312,6 +4430,144 @@ mod tests {
             msg.contains("dup") && msg.contains("alpha") && msg.contains("beta"),
             "error must name the program and both apps: {msg}"
         );
+    }
+
+    // -- standalone program records (add-standalone-programs D2) -------------
+
+    /// A standalone record is resolved from its path: the file stem names it,
+    /// every program is owner-less and the record is flagged standalone.
+    fn standalone_of(name: &str, toml_text: &str) -> ResolvedApp {
+        let raw: AppRaw = toml::from_str(toml_text).unwrap();
+        let path = PathBuf::from(format!("/opt/app.d/adhoc/{name}.toml"));
+        resolve_standalone(&path, &raw, None).unwrap()
+    }
+
+    /// 1.3 (new format): a run record without `[app]` — program-level fields
+    /// only, `description` is `None`, no app identity.
+    #[test]
+    fn resolve_standalone_new_format_has_no_app_and_no_description() {
+        let a = standalone_of(
+            "agent",
+            "[program.agent]\ncommand = \"./agent --serve\"\nrestart = \"unless-stopped\"\n",
+        );
+        assert!(a.standalone);
+        assert_eq!(a.name, "agent");
+        assert_eq!(a.path, Path::new("/opt/app.d/adhoc/agent.toml"));
+        assert!(a.description.is_none());
+        assert_eq!(a.programs.len(), 1);
+        let p = &a.programs[0];
+        assert_eq!(p.name, "agent");
+        assert!(p.is_standalone());
+        assert_eq!(p.owner(), None);
+        assert_eq!(p.owner_label(), "-");
+        assert_eq!(p.restart, RestartPolicy::UnlessStopped);
+        assert_eq!(p.restart_backoff, 1.0, "built-in fallback");
+    }
+
+    /// 1.3 (old format): an `adhoc/` record that still carries `[app]` keeps
+    /// the description and uses the app layer as a fallback for restart and
+    /// backoff — it never becomes an app record (owner stays `None`).
+    #[test]
+    fn resolve_standalone_old_format_uses_app_table_as_metadata_and_defaults() {
+        let a = standalone_of(
+            "agent",
+            "[app]\ndescription = \"old run product\"\nrestart = \"always\"\nrestart_backoff = 7.5\n\n\
+             [program.agent]\ncommand = \"./agent\"\n",
+        );
+        assert!(a.standalone);
+        assert_eq!(a.description.as_deref(), Some("old run product"));
+        let p = &a.programs[0];
+        assert!(p.is_standalone(), "old `[app]` must not create ownership");
+        assert_eq!(p.owner(), None);
+        assert_eq!(
+            p.restart,
+            RestartPolicy::Always,
+            "app layer is the fallback"
+        );
+        assert_eq!(p.restart_backoff, 7.5);
+    }
+
+    /// 1.3: program-level values win over the old `[app]` fallback.
+    #[test]
+    fn resolve_standalone_program_fields_override_old_app_table() {
+        let a = standalone_of(
+            "agent",
+            "[app]\nrestart = \"always\"\nrestart_backoff = 7.5\n\n\
+             [program.agent]\ncommand = \"./agent\"\nrestart = \"no\"\nrestart_backoff = 2.5\n",
+        );
+        let p = &a.programs[0];
+        assert_eq!(p.restart, RestartPolicy::No);
+        assert_eq!(p.restart_backoff, 2.5);
+    }
+
+    /// A regular app resolution is never `standalone`, and its programs carry
+    /// the app name as the owner.
+    #[test]
+    fn resolve_app_is_not_standalone() {
+        let a = app_of("[program.api]\ncommand = \"x\"\n").unwrap();
+        assert!(!a.standalone);
+        assert_eq!(a.programs[0].owner(), Some("demo"));
+        assert_eq!(a.programs[0].owner_label(), "demo");
+        assert!(!a.programs[0].is_standalone());
+    }
+
+    /// Ownership is not part of the definition hash: resolving the same file
+    /// as an app and as a standalone record yields the same hash, so adopting
+    /// a record never flaps the pending "changed" state.
+    #[test]
+    fn def_hash_ignores_ownership() {
+        let raw: AppRaw = toml::from_str("[program.agent]\ncommand='x'\n").unwrap();
+        // Same path for both so path-derived defaults (e.g. `work_dir`) match;
+        // only ownership differs.
+        let path = Path::new("/opt/adhoc/agent.toml");
+        let app = resolve_app("agent", path, &raw, None).unwrap();
+        let standalone = resolve_standalone(path, &raw, None).unwrap();
+        assert_eq!(app.programs[0].hash, standalone.programs[0].hash);
+    }
+
+    /// 1.4: a program name duplicated between an app and a standalone record
+    /// is refused, and the message names the standalone record.
+    #[test]
+    fn validate_all_rejects_program_duplicated_between_app_and_standalone() {
+        let app = app_of("[program.dup]\ncommand='x'\n").unwrap();
+        let standalone = standalone_of("solo", "[program.dup]\ncommand='y'\n");
+        let msg = validate_all(&[app, standalone])
+            .expect_err("duplicate refused")
+            .to_string();
+        assert!(
+            msg.contains("dup") && msg.contains("standalone record") && msg.contains("solo"),
+            "error must name the program and the standalone record: {msg}"
+        );
+    }
+
+    /// 1.4: a standalone record name (== its program name by convention) must
+    /// not collide with any app name; single-token addressing would be
+    /// ambiguous.
+    #[test]
+    fn validate_all_rejects_standalone_name_equal_to_app_name() {
+        let app = resolve_app(
+            "gateway",
+            Path::new("/opt/gateway/appkeeper.toml"),
+            &toml::from_str("[program.api]\ncommand='x'\n").unwrap(),
+            None,
+        )
+        .unwrap();
+        let standalone = standalone_of("gateway", "[program.gw]\ncommand='y'\n");
+        let msg = validate_all(&[app, standalone])
+            .expect_err("cross-namespace collision refused")
+            .to_string();
+        assert!(
+            msg.contains("gateway") && msg.contains("conflicts with an app"),
+            "error must name the collision: {msg}"
+        );
+    }
+
+    /// 1.4: distinct app/program/standalone names validate cleanly.
+    #[test]
+    fn validate_all_accepts_distinct_apps_and_standalone_records() {
+        let app = app_of("[program.api]\ncommand='x'\n").unwrap();
+        let standalone = standalone_of("worker", "[program.worker]\ncommand='y'\n");
+        validate_all(&[app, standalone]).expect("distinct names are valid");
     }
 
     #[test]

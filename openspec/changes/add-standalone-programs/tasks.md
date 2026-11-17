@@ -1,16 +1,16 @@
 ## 1. 配置模型：程序归属可空
 
-- [ ] 1.1 `config::ResolvedProgram.app` 改为 `Option<String>`（散装为 `None`），并为 `ResolvedProgram` 提供 `is_standalone()` / `owner_label()` 辅助；编译驱动修正全部 `def.app` 使用点（预期约 30 处）
-- [ ] 1.2 `config::ResolvedApp` 增加 `standalone: bool`；新增 `resolve_standalone(path, raw, defaults)`，复用 `resolve_app` 的字段合并但把程序归属置 `None`、`standalone = true`
-- [ ] 1.3 散装记录加载兼容：`adhoc/` 内旧记录若含 `[app]`，只取 `description` 与未显式配置的 restart/backoff 缺省值，MUST NOT 生成 AppRecord；单测覆盖旧格式（含 `[app].restart`）与新格式（无 `[app]`）
-- [ ] 1.4 `validate_all` 保持并补齐不变量：程序名跨 app 与散装全局唯一，散装记录名 MUST NOT 与 app 名冲突；单测覆盖冲突矩阵
+- [x] 1.1 `config::ResolvedProgram.app` 改为 `Option<String>`（散装为 `None`），并为 `ResolvedProgram` 提供 `is_standalone()` / `owner_label()` 辅助；编译驱动修正全部 `def.app` 使用点（预期约 30 处）
+- [x] 1.2 `config::ResolvedApp` 增加 `standalone: bool`；新增 `resolve_standalone(path, raw, defaults)`，复用 `resolve_app` 的字段合并但把程序归属置 `None`、`standalone = true`
+- [x] 1.3 散装记录加载兼容：`adhoc/` 内旧记录若含 `[app]`，只取 `description` 与未显式配置的 restart/backoff 缺省值，MUST NOT 生成 AppRecord；单测覆盖旧格式（含 `[app].restart`）与新格式（无 `[app]`）
+- [x] 1.4 `validate_all` 保持并补齐不变量：程序名跨 app 与散装全局唯一，散装记录名 MUST NOT 与 app 名冲突；单测覆盖冲突矩阵
 
 ## 2. 注册表：散装记录渲染与分类
 
-- [ ] 2.1 `registry::render_scaffold` 增加散装模式：默认不写 `[app]`；`--description` 才写仅含该字段的 `[app]`；`restart`/`restart_backoff` 等 run flag 写入 `[program.<name>]`；compose 调用点保持旧输出（单测 snapshot 对比）
-- [ ] 2.2 `registry::list()` 的返回项增加 `standalone`（`adhoc/` 为 true、顶层为 false），按位置分类、与文件内容无关；保持 `Origin::{Run,Compose}` 与顶层优先去重
-- [ ] 2.3 散装记录的 `description` 解析：优先 `[app].description`，否则 `None`；`ps --all` 与投影的 description 字段同源
-- [ ] 2.4 单测：同名跨区（顶层 + `adhoc/`）不并存、悬空链接、`adhoc/` 旧格式、顶层历史 run 文件按 compose 分类
+- [x] 2.1 `registry::render_scaffold` 增加散装模式：默认不写 `[app]`；`--description` 才写仅含该字段的 `[app]`；`restart`/`restart_backoff` 等 run flag 写入 `[program.<name>]`；compose 调用点保持旧输出（单测 snapshot 对比）
+- [x] 2.2 `registry::list()` 的返回项增加 `standalone`（`adhoc/` 为 true、顶层为 false），按位置分类、与文件内容无关；保持 `Origin::{Run,Compose}` 与顶层优先去重
+- [x] 2.3 散装记录的 `description` 解析：优先 `[app].description`，否则 `None`；`ps --all` 与投影的 description 字段同源
+- [x] 2.4 单测：同名跨区（顶层 + `adhoc/`）不并存、悬空链接、`adhoc/` 旧格式、顶层历史 run 文件按 compose 分类
 
 ## 3. 守护进程：命名、暂存与命令作用域
 

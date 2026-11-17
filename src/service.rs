@@ -617,13 +617,7 @@ fn timeout_from_listed(
 ) -> Result<u64> {
     let mut max = 0.0f64;
     for listed in listed.iter().filter(|a| a.broken.is_none()) {
-        let (raw, _) = crate::config::AppRaw::load(&listed.path)?;
-        let app = crate::config::resolve_app(
-            &listed.name,
-            &listed.path,
-            &raw,
-            config.app_default.as_ref(),
-        )?;
+        let app = crate::registry::resolve_listed(config, listed)?;
         for p in &app.programs {
             max = max.max(p.stop_timeout);
         }
@@ -2333,6 +2327,7 @@ mod tests {
                 description: None,
                 broken: Some("cannot parse: missing command".into()),
                 origin: crate::registry::Origin::Compose,
+                standalone: false,
             },
             crate::registry::ListedApp {
                 name: "good".into(),
@@ -2340,6 +2335,7 @@ mod tests {
                 description: None,
                 broken: None,
                 origin: crate::registry::Origin::Compose,
+                standalone: false,
             },
         ];
         let outcome = precheck(

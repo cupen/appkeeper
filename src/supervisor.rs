@@ -665,7 +665,7 @@ pub fn run_context(st: &SupervisorState) -> crate::action::RunContext {
             crate::action::ProgramVars {
                 pid: p.pid(),
                 state: p.state().to_string(),
-                app: p.def.app.clone(),
+                app: p.def.app.clone().unwrap_or_default(),
                 work_dir: p.def.work_dir.clone(),
                 log_dir: p.log_dir.clone(),
             },
@@ -735,7 +735,11 @@ pub fn resolve_apply_scope(
             return Err(format!("unknown app {a:?}"));
         }
         if let Some(p) = program {
-            let known = st.programs.get(p).map(|x| x.def.app == a).unwrap_or(false);
+            let known = st
+                .programs
+                .get(p)
+                .map(|x| x.def.owner() == Some(a))
+                .unwrap_or(false);
             if !known {
                 return Err(format!("unknown program {p:?}"));
             }
@@ -1185,33 +1189,50 @@ impl Supervisor {
         let mut records = Vec::new();
         let mut resolved: Vec<ResolvedApp> = Vec::new();
         for l in &listed {
+            // A record's position decides what it is (add-standalone-programs
+            // D3): `adhoc/` records resolve as standalone programs (an older
+            // `[app]` table is metadata/defaults only) and MUST NOT become an
+            // app record; top-level records stay apps.
+            let what = if l.standalone {
+                "standalone record"
+            } else {
+                "app"
+            };
             if let Some(reason) = &l.broken {
                 error!(
-                    "app[{}] failed to load at startup (skipped): {}",
+                    "{what}[{}] failed to load at startup (skipped): {}",
                     l.name, reason
                 );
                 continue;
             }
-            match registry::reload_app(&l.name, &l.path, config.app_default.as_ref()) {
+            match registry::resolve_listed(&config, l) {
                 Ok(a) => match config::check_identity_feasible(&a) {
                     Ok(warnings) => {
                         for w in warnings {
                             warn!("{w}");
                         }
-                        records.push(AppRecord {
-                            name: a.name.clone(),
-                            path: a.path.clone(),
-                            description: a.description.clone(),
-                            priority: a.priority,
-                        });
+                        if !a.standalone {
+                            records.push(AppRecord {
+                                name: a.name.clone(),
+                                path: a.path.clone(),
+                                description: a.description.clone(),
+                                priority: a.priority,
+                            });
+                        }
                         resolved.push(a);
                     }
                     // A non-root daemon cannot switch users: isolate this app
                     // like any other broken record instead of spawning into a
                     // restart loop (process-management spec).
-                    Err(e) => error!("app[{}] failed to load at startup (skipped): {e:#}", l.name),
+                    Err(e) => error!(
+                        "{what}[{}] failed to load at startup (skipped): {e:#}",
+                        l.name
+                    ),
                 },
-                Err(e) => error!("app[{}] failed to load at startup (skipped): {e:#}", l.name),
+                Err(e) => error!(
+                    "{what}[{}] failed to load at startup (skipped): {e:#}",
+                    l.name
+                ),
             }
         }
         // Uniqueness of program names across apps is enforced at add-time, but
@@ -1277,18 +1298,31 @@ impl Supervisor {
                 let st = self.state.lock().unwrap();
                 let mut eligible: Vec<&AppRecord> = st.apps.iter().collect();
                 eligible.sort_by_key(|a| (a.priority, a.name.clone()));
-                eligible
+                let mut names: Vec<String> = eligible
                     .iter()
                     .flat_map(|a| {
                         let mut names: Vec<&String> = st
                             .programs
                             .values()
-                            .filter(|p| p.def.app == a.name)
+                            .filter(|p| p.def.owner() == Some(a.name.as_str()))
                             .map(|p| &p.def.name)
                             .collect();
                         names.sort();
                         names.into_iter().cloned().collect::<Vec<_>>()
                     })
+                    .collect();
+                // Standalone programs have no app record to order them; they
+                // start after the apps, by name (add-standalone-programs 1.3).
+                let mut standalone: Vec<String> = st
+                    .programs
+                    .values()
+                    .filter(|p| p.def.is_standalone())
+                    .map(|p| p.def.name.clone())
+                    .collect();
+                standalone.sort();
+                names.extend(standalone);
+                names
+                    .into_iter()
                     .map(|n| {
                         let deps = st
                             .programs
@@ -1489,7 +1523,7 @@ impl Supervisor {
         let mut names: Vec<String> = st
             .programs
             .values()
-            .filter(|p| p.def.app == app)
+            .filter(|p| p.def.owner() == Some(app))
             .map(|p| p.def.name.clone())
             .collect();
         if names.is_empty() {
@@ -1616,17 +1650,9 @@ impl Supervisor {
             let mut members: Vec<String> = st
                 .programs
                 .values()
-                .filter(|p| p.def.app == app)
+                .filter(|p| p.def.owner() == Some(app))
                 .map(|p| p.def.name.clone())
                 .collect();
-            members.sort();
-            let mut blockers: Vec<(String, ProgramState)> = st
-                .programs
-                .values()
-                .filter(|p| p.def.app == app && !p.state().removable())
-                .map(|p| (p.def.name.clone(), p.state()))
-                .collect();
-            blockers.sort_by(|a, b| a.0.cmp(&b.0));
             // Loaded apps and freshly-registered (pending) apps are valid
             // targets; anything else is a 404. A record whose TOML fails to
             // parse is included on purpose: such an app is not in `st.apps`
@@ -1635,10 +1661,28 @@ impl Supervisor {
             // still remove it, and that is the only cleanup path. The
             // liveness guard needs no change: a broken app has no running
             // program, so it is removable by construction.
-            let known = st.apps.iter().any(|a| a.name == app)
-                || registry::list(&st.config, &st.config_dir)
-                    .map(|l| l.iter().any(|r| r.name == app))
-                    .unwrap_or(false);
+            let listed = registry::list(&st.config, &st.config_dir).unwrap_or_default();
+            let known =
+                st.apps.iter().any(|a| a.name == app) || listed.iter().any(|r| r.name == app);
+            // A standalone record has no app owner, so its programs are found
+            // by reading the record's definition (the record name addresses
+            // the standalone program).
+            if let Some(l) = listed
+                .iter()
+                .find(|r| r.name == app && r.standalone && r.broken.is_none())
+                && let Ok(r) = registry::resolve_listed(&st.config, l)
+            {
+                members.extend(r.programs.into_iter().map(|p| p.name));
+            }
+            members.sort();
+            members.dedup();
+            let mut blockers: Vec<(String, ProgramState)> = members
+                .iter()
+                .filter_map(|n| st.programs.get(n))
+                .filter(|p| !p.state().removable())
+                .map(|p| (p.def.name.clone(), p.state()))
+                .collect();
+            blockers.sort_by(|a, b| a.0.cmp(&b.0));
             (
                 st.config.clone(),
                 st.config_dir.clone(),
@@ -1738,7 +1782,6 @@ impl Supervisor {
         let (new_config, _) = DaemonConfig::load_or_default(&config_path)
             .map_err(|e| anyhow::anyhow!("detection failed, daemon config invalid: {e:#}"))?;
         let config_dir = self.state.lock().unwrap().config_dir.clone();
-        let defaults = new_config.app_default.clone();
 
         let listed = registry::list(&new_config, &config_dir)?;
         let stamps_now = self.state.lock().unwrap().file_stamps.clone();
@@ -1748,10 +1791,19 @@ impl Supervisor {
         let mut resolved: Vec<ResolvedApp> = Vec::new();
 
         for l in &listed {
+            // Position decides the record kind (add-standalone-programs 1.3):
+            // an `adhoc/` record is a standalone program, never an app record.
+            let what = if l.standalone {
+                "standalone record"
+            } else {
+                "app"
+            };
             if let Some(reason) = &l.broken {
-                errors.push(format!("app[{}] kept old config: {reason}", l.name));
+                errors.push(format!("{what}[{}] kept old config: {reason}", l.name));
                 let st = self.state.lock().unwrap();
-                if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                if !l.standalone
+                    && let Some(old) = st.apps.iter().find(|a| a.name == l.name)
+                {
                     new_records.push(old.clone());
                 }
                 continue;
@@ -1764,36 +1816,42 @@ impl Supervisor {
             {
                 let cached = cached_defs.lock().unwrap().get(&l.path).cloned();
                 if let Some(a) = cached {
-                    new_records.push(AppRecord {
-                        name: a.name.clone(),
-                        path: a.path.clone(),
-                        description: a.description.clone(),
-                        priority: a.priority,
-                    });
+                    if !a.standalone {
+                        new_records.push(AppRecord {
+                            name: a.name.clone(),
+                            path: a.path.clone(),
+                            description: a.description.clone(),
+                            priority: a.priority,
+                        });
+                    }
                     resolved.push(a);
                     continue;
                 }
                 // No cached parse yet (first pass after boot): fall through
                 // to a full parse below.
             }
-            match registry::reload_app(&l.name, &l.path, defaults.as_ref()) {
+            match registry::resolve_listed(&new_config, l) {
                 Ok(a) => {
                     cached_defs
                         .lock()
                         .unwrap()
                         .insert(l.path.clone(), a.clone());
-                    new_records.push(AppRecord {
-                        name: a.name.clone(),
-                        path: a.path.clone(),
-                        description: a.description.clone(),
-                        priority: a.priority,
-                    });
+                    if !a.standalone {
+                        new_records.push(AppRecord {
+                            name: a.name.clone(),
+                            path: a.path.clone(),
+                            description: a.description.clone(),
+                            priority: a.priority,
+                        });
+                    }
                     resolved.push(a);
                 }
                 Err(e) => {
-                    errors.push(format!("app[{}] kept old config: {e:#}", l.name));
+                    errors.push(format!("{what}[{}] kept old config: {e:#}", l.name));
                     let st = self.state.lock().unwrap();
-                    if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                    if !l.standalone
+                        && let Some(old) = st.apps.iter().find(|a| a.name == l.name)
+                    {
                         new_records.push(old.clone());
                     }
                 }
@@ -1816,10 +1874,18 @@ impl Supervisor {
         };
         {
             let st = self.state.lock().unwrap();
-            // Apps no longer registered on disk.
+            // Apps no longer registered on disk. A record that the disk now
+            // classifies as standalone is not a removed app: its programs stay
+            // managed under the owner-less model (the apply resets the app
+            // identity, it does not remove work).
             let keep: HashSet<String> = new_records.iter().map(|a| a.name.clone()).collect();
+            let standalone_names: HashSet<&str> = resolved
+                .iter()
+                .filter(|a| a.standalone)
+                .map(|a| a.name.as_str())
+                .collect();
             for a in &st.apps {
-                if !keep.contains(&a.name) {
+                if !keep.contains(&a.name) && !standalone_names.contains(a.name.as_str()) {
                     doc.apps_removed.push(a.name.clone());
                 }
             }
@@ -1854,7 +1920,9 @@ impl Supervisor {
                     }
                 }
                 for p in st.programs.values() {
-                    if p.def.app == app.name && !new_names.contains(p.def.name.as_str()) {
+                    if p.def.owner() == Some(app.name.as_str())
+                        && !new_names.contains(p.def.name.as_str())
+                    {
                         doc.programs.push(PendingProgram {
                             app: app.name.clone(),
                             program: p.def.name.clone(),
@@ -1952,11 +2020,14 @@ impl Supervisor {
         // a program owned by a different app stays refused (`--force` never
         // bypasses this check — refuse-run-existing-app D8).
         if let Some(p) = st.programs.get(&name)
-            && p.def.app != name
+            && p.def.owner() != Some(name.as_str())
         {
+            let by = match p.def.owner() {
+                Some(app) => format!("app {app:?}"),
+                None => "a standalone record".to_string(),
+            };
             return Err(AdhocUpError::Validation(format!(
-                "program name {name:?} is already registered by app {:?}; choose another --name",
-                p.def.app
+                "program name {name:?} is already registered by {by}; choose another --name"
             )));
         }
         Ok(name)
@@ -2001,7 +2072,10 @@ impl Supervisor {
             work_dir,
             health_check: spec.health_check.clone(),
         };
-        let text = registry::render_scaffold(name, &scaf, &opts)
+        // Relay 1 keeps the run product shape unchanged; the standalone
+        // renderer (`standalone = true`) is wired in when the run command
+        // itself moves over.
+        let text = registry::render_scaffold(name, &scaf, &opts, false)
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         // Validate the rendered config against the current registry (round-trip).
         let raw: crate::config::AppRaw = toml::from_str(&text).map_err(|e| {
@@ -2018,10 +2092,8 @@ impl Supervisor {
             if l.name == name {
                 continue;
             }
-            let (r, _) = crate::config::AppRaw::load(&l.path)
-                .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
             all.push(
-                config::resolve_app(&l.name, &l.path, &r, config.app_default.as_ref())
+                registry::resolve_listed(&config, l)
                     .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?,
             );
         }
@@ -2188,7 +2260,10 @@ impl Supervisor {
         }
         let st = self.state.lock().unwrap();
         st.apps.iter().any(|a| a.name == name)
-            || st.programs.get(name).is_some_and(|p| p.def.app == name)
+            || st
+                .programs
+                .get(name)
+                .is_some_and(|p| p.def.owner() == Some(name))
     }
 
     /// The program in memory that belongs to app `name`, if any. A same-name
@@ -2197,7 +2272,7 @@ impl Supervisor {
     fn adhoc_program<'a>(st: &'a SupervisorState, name: &str) -> Option<&'a ManagedProgram> {
         st.programs
             .get(name)
-            .or_else(|| st.programs.values().find(|p| p.def.app == name))
+            .or_else(|| st.programs.values().find(|p| p.def.owner() == Some(name)))
     }
 
     /// `--force` overwrite of an existing same-name app (refuse-run-existing-app
@@ -2322,7 +2397,7 @@ impl Supervisor {
             let stale: Vec<String> = st
                 .programs
                 .iter()
-                .filter(|(k, p)| k.as_str() == name || p.def.app == name)
+                .filter(|(k, p)| k.as_str() == name || p.def.owner() == Some(name))
                 .map(|(k, _)| k.clone())
                 .collect();
             for key in stale {
@@ -2573,7 +2648,7 @@ impl Supervisor {
             let mut ps: Vec<ComposeProgramInfo> = st
                 .programs
                 .values()
-                .filter(|p| p.def.app == name)
+                .filter(|p| p.def.owner() == Some(name))
                 .map(|p| ComposeProgramInfo {
                     program: p.def.name.clone(),
                     state: p.state().to_string(),
@@ -2724,7 +2799,7 @@ impl Supervisor {
             let stale: Vec<String> = st
                 .programs
                 .iter()
-                .filter(|(k, p)| k.as_str() == name || p.def.app == name)
+                .filter(|(k, p)| k.as_str() == name || p.def.owner() == Some(name))
                 .map(|(k, _)| k.clone())
                 .collect();
             for key in stale.iter().rev() {
@@ -2942,21 +3017,29 @@ impl Supervisor {
         let (new_config, _) = DaemonConfig::load_or_default(&config_path)
             .map_err(|e| anyhow::anyhow!("apply aborted, daemon config invalid: {e:#}"))?;
         let config_dir = self.state.lock().unwrap().config_dir.clone();
-        let defaults = new_config.app_default.clone();
         let listed = registry::list(&new_config, &config_dir)?;
         let mut failed: Vec<String> = Vec::new();
         let mut new_records: Vec<AppRecord> = Vec::new();
         let mut resolved: Vec<ResolvedApp> = Vec::new();
         for l in &listed {
+            // Same positional classification as bootstrap/detect: `adhoc/`
+            // records are standalone programs and never app records.
+            let what = if l.standalone {
+                "standalone record"
+            } else {
+                "app"
+            };
             if let Some(reason) = &l.broken {
-                failed.push(format!("app[{}] kept old config: {reason}", l.name));
+                failed.push(format!("{what}[{}] kept old config: {reason}", l.name));
                 let st = self.state.lock().unwrap();
-                if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                if !l.standalone
+                    && let Some(old) = st.apps.iter().find(|a| a.name == l.name)
+                {
                     new_records.push(old.clone());
                 }
                 continue;
             }
-            match registry::reload_app(&l.name, &l.path, defaults.as_ref()) {
+            match registry::resolve_listed(&new_config, l) {
                 Ok(a) => {
                     // Same pre-spawn gate as bootstrap: an app the daemon
                     // cannot run under the requested identity keeps its old
@@ -2968,26 +3051,32 @@ impl Supervisor {
                             }
                         }
                         Err(e) => {
-                            failed.push(format!("app[{}] kept old config: {e:#}", l.name));
+                            failed.push(format!("{what}[{}] kept old config: {e:#}", l.name));
                             let st = self.state.lock().unwrap();
-                            if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                            if !l.standalone
+                                && let Some(old) = st.apps.iter().find(|a| a.name == l.name)
+                            {
                                 new_records.push(old.clone());
                             }
                             continue;
                         }
                     }
-                    new_records.push(AppRecord {
-                        name: a.name.clone(),
-                        path: a.path.clone(),
-                        description: a.description.clone(),
-                        priority: a.priority,
-                    });
+                    if !a.standalone {
+                        new_records.push(AppRecord {
+                            name: a.name.clone(),
+                            path: a.path.clone(),
+                            description: a.description.clone(),
+                            priority: a.priority,
+                        });
+                    }
                     resolved.push(a);
                 }
                 Err(e) => {
-                    failed.push(format!("app[{}] kept old config: {e:#}", l.name));
+                    failed.push(format!("{what}[{}] kept old config: {e:#}", l.name));
                     let st = self.state.lock().unwrap();
-                    if let Some(old) = st.apps.iter().find(|a| a.name == l.name) {
+                    if !l.standalone
+                        && let Some(old) = st.apps.iter().find(|a| a.name == l.name)
+                    {
                         new_records.push(old.clone());
                     }
                 }
@@ -3030,22 +3119,45 @@ impl Supervisor {
             })
             .collect();
         let mut blockers: Vec<String> = Vec::new();
+        // Standalone records carry no app name: a program belongs to one iff
+        // the detection still defines it in a standalone record.
+        let standalone_kept: HashSet<&str> = det
+            .resolved
+            .iter()
+            .filter(|a| a.standalone)
+            .flat_map(|a| a.programs.iter().map(|p| p.name.as_str()))
+            .collect();
         for p in st.programs.values() {
             // A program is deleted when its whole app registration is gone, or
-            // when the app survives but no longer defines it.
-            let deleted = match new_programs.get(p.def.app.as_str()) {
-                Some(names) => !names.contains(p.def.name.as_str()),
-                None => !keep_apps.contains(p.def.app.as_str()),
+            // when the app survives but no longer defines it. A standalone
+            // program is deleted when no standalone record defines it anymore.
+            let deleted = if p.def.is_standalone() {
+                !standalone_kept.contains(p.def.name.as_str())
+            } else {
+                match new_programs.get(p.def.owner().unwrap_or_default()) {
+                    Some(names) => !names.contains(p.def.name.as_str()),
+                    // Transitional: a run record created before the loader
+                    // split may still be owned in memory while the disk
+                    // position makes it standalone. Keep the program then.
+                    None => {
+                        !keep_apps.contains(p.def.owner().unwrap_or_default())
+                            && !standalone_kept.contains(p.def.name.as_str())
+                    }
+                }
             };
             if !deleted {
                 continue;
             }
-            if !scope.matches(&p.def.app, &p.def.name) {
+            if !scope.matches(p.def.owner().unwrap_or_default(), &p.def.name) {
                 continue;
             }
             let state = p.state();
             if !state.removable() {
-                blockers.push(format!("{}.{} ({state})", p.def.app, p.def.name));
+                if p.def.is_standalone() {
+                    blockers.push(format!("{} ({state})", p.def.name));
+                } else {
+                    blockers.push(format!("{}.{} ({state})", p.def.owner_label(), p.def.name));
+                }
             }
         }
         if blockers.is_empty() {
@@ -3093,18 +3205,30 @@ impl Supervisor {
             let ring_cap = st.config.daemon.log_buffer_lines;
 
             // Apps no longer registered: stop and drop all their programs.
+            // Standalone programs are kept while any standalone record still
+            // defines their name (they have no app registration of their own).
             let keep: HashSet<String> = new_records.iter().map(|a| a.name.clone()).collect();
+            let standalone_kept: HashSet<&str> = resolved
+                .iter()
+                .filter(|a| a.standalone)
+                .flat_map(|a| a.programs.iter().map(|p| p.name.as_str()))
+                .collect();
             let dropped: Vec<String> = st
                 .programs
                 .values()
-                .filter(|p| !keep.contains(&p.def.app))
+                .filter(|p| match p.def.owner() {
+                    Some(app) => {
+                        !keep.contains(app) && !standalone_kept.contains(p.def.name.as_str())
+                    }
+                    None => !standalone_kept.contains(p.def.name.as_str()),
+                })
                 .map(|p| p.def.name.clone())
                 .collect();
             for name in dropped {
                 let in_scope = st
                     .programs
                     .get(&name)
-                    .map(|p| scope.matches(&p.def.app, &p.def.name))
+                    .map(|p| scope.matches(p.def.owner().unwrap_or_default(), &p.def.name))
                     .unwrap_or(false);
                 if !in_scope {
                     continue;
@@ -3113,7 +3237,7 @@ impl Supervisor {
                     info!("program[{name}] stopped (app unregistered)");
                     p.stop();
                     result.programs.push(ProgramAction {
-                        app: p.def.app.clone(),
+                        app: p.def.app.clone().unwrap_or_default(),
                         program: name.clone(),
                         changed: true,
                         action: "remove".into(),
@@ -3129,7 +3253,7 @@ impl Supervisor {
                 let old_names: Vec<String> = st
                     .programs
                     .values()
-                    .filter(|p| p.def.app == app.name)
+                    .filter(|p| p.def.owner() == Some(app.name.as_str()))
                     .map(|p| p.def.name.clone())
                     .collect();
                 for old in old_names {
@@ -3137,7 +3261,7 @@ impl Supervisor {
                         let in_scope = st
                             .programs
                             .get(&old)
-                            .map(|p| scope.matches(&p.def.app, &p.def.name))
+                            .map(|p| scope.matches(p.def.owner().unwrap_or_default(), &p.def.name))
                             .unwrap_or(false);
                         if !in_scope {
                             continue;
@@ -3146,7 +3270,7 @@ impl Supervisor {
                             info!("program[{old}] removed by apply");
                             p.stop();
                             result.programs.push(ProgramAction {
-                                app: p.def.app.clone(),
+                                app: p.def.app.clone().unwrap_or_default(),
                                 program: old.clone(),
                                 changed: true,
                                 action: "remove".into(),
@@ -3335,18 +3459,30 @@ impl Supervisor {
                 }
             }
             apps.sort_by_key(|a| std::cmp::Reverse((a.priority, a.name.clone())));
-            apps.iter()
+            let mut order: Vec<String> = apps
+                .iter()
                 .flat_map(|a| {
                     let mut names: Vec<String> = st
                         .programs
                         .values()
-                        .filter(|p| p.def.app == a.name)
+                        .filter(|p| p.def.owner() == Some(a.name.as_str()))
                         .map(|p| p.def.name.clone())
                         .collect();
                     names.sort();
                     names
                 })
-                .collect()
+                .collect();
+            // Standalone programs belong to no app record; stop them too so no
+            // child outlives the daemon (add-standalone-programs 1.3).
+            let mut standalone: Vec<String> = st
+                .programs
+                .values()
+                .filter(|p| p.def.is_standalone())
+                .map(|p| p.def.name.clone())
+                .collect();
+            standalone.sort();
+            order.extend(standalone);
+            order
         };
         info!(
             "shutdown: stopping {} program(s) in reverse order",
@@ -5169,6 +5305,89 @@ mod tests {
             assert!(st.pending.is_empty(), "no pending published on conflict");
         }
         let _ = sup.shutdown_all();
+    }
+
+    /// 1.3: bootstrap classifies by position — an `adhoc/` record (even one
+    /// still carrying `[app]`) loads as a standalone program with no owner and
+    /// produces no AppRecord; its `[app]` values only fill unset defaults.
+    #[test]
+    fn bootstrap_loads_adhoc_record_as_standalone_not_app() {
+        let dir = std::env::temp_dir().join(format!("ak-test-standalone-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        // Old run product: `[app]` present, program-level values unset.
+        std::fs::write(
+            dir.join("app.d").join("adhoc").join("agent.toml"),
+            "[app]\ndescription = 'old run'\nrestart_backoff = 2.5\n\n\
+             [program.agent]\ncommand = 'true'\n",
+        )
+        .unwrap();
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(st.apps.is_empty(), "a standalone record is not an app");
+            let p = st.programs.get("agent").expect("program loaded");
+            assert!(p.def.is_standalone());
+            assert_eq!(p.def.owner(), None);
+            assert_eq!(
+                p.def.restart_backoff, 2.5,
+                "[app] values fill unset program defaults"
+            );
+        }
+        let _ = sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A standalone record is removable through the ordinary remove path: the
+    /// record file is deleted and the owner-less program dropped from state.
+    #[test]
+    fn remove_deletes_standalone_record_and_program() {
+        let dir = std::env::temp_dir().join(format!("ak-test-standalone-rm-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let record = dir.join("app.d").join("adhoc").join("agent.toml");
+        std::fs::write(&record, "[program.agent]\ncommand = 'true'\n").unwrap();
+
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        let outcome = sup.cmd_remove("agent").expect("standalone removal");
+        assert!(outcome.deleted_file, "the run record is deleted");
+        assert_eq!(outcome.programs, vec!["agent".to_string()]);
+        assert!(!record.exists(), "record file removed");
+        let st = sup.state.lock().unwrap();
+        assert!(st.programs.is_empty(), "program dropped from state");
+        assert!(st.apps.is_empty());
+        drop(st);
+        let _ = sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// apply-workflow: periodic detect picks up a disk edit without any

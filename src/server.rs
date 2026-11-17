@@ -264,7 +264,7 @@ pub(crate) fn program_info(
         .and_then(|t| t.program(&p.def.name))
         .unwrap_or_default();
     ProgramInfo {
-        app: p.def.app.clone(),
+        app: p.def.app.clone().unwrap_or_default(),
         name: p.def.name.clone(),
         state: p.state().to_string(),
         pid: p.pid(),
@@ -320,11 +320,11 @@ pub(crate) fn program_info_state(
     p: &crate::program::ManagedProgram,
     metrics: Option<&crate::metrics::MetricsTable>,
 ) -> ProgramInfo {
-    let config_path = app_config_path(st, &p.def.app);
+    let config_path = app_config_path(st, p.def.owner().unwrap_or_default());
     let description = st
         .apps
         .iter()
-        .find(|a| a.name == p.def.app)
+        .find(|a| p.def.owner() == Some(a.name.as_str()))
         .and_then(|a| a.description.clone());
     program_info(p, metrics, config_path.as_deref(), description.as_deref())
 }
@@ -629,7 +629,12 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
                     let (config_path, pid) = st
                         .programs
                         .get(*name)
-                        .map(|p| (app_config_path(&st, &p.def.app), p.pid()))
+                        .map(|p| {
+                            (
+                                app_config_path(&st, p.def.owner().unwrap_or_default()),
+                                p.pid(),
+                            )
+                        })
                         .unwrap_or((None, None));
                     json_bytes(
                         200,
@@ -947,7 +952,7 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
                             .get(&s.program)
                             .map(|p| {
                                 (
-                                    app_config_path(&st, &p.def.app),
+                                    app_config_path(&st, p.def.owner().unwrap_or_default()),
                                     p.pid(),
                                     p.state().to_string(),
                                 )

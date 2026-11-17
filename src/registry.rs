@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use log::{debug, warn};
 
 use crate::config::{
-    AppDefaults, AppMeta, AppRaw, DaemonConfig, ProgramRaw, RestartPolicy, is_valid_name,
-    resolve_app, split_command, validate_all,
+    AppMeta, AppRaw, DaemonConfig, ProgramRaw, RestartPolicy, is_valid_name, resolve_app,
+    resolve_standalone, split_command, validate_all,
 };
 
 /// Where a registration record lives (add-compose-up D1): the `app_dir` top
@@ -55,6 +55,11 @@ pub struct ListedApp {
     /// only — it never enters the status projections (read by the `ak ps
     /// --all` table and the offline registry listing).
     pub origin: Origin,
+    /// True for a **standalone program record**: derived from the location
+    /// alone (`adhoc/` → standalone, top level → app), never from the file's
+    /// content (add-standalone-programs D3). A standalone record is not an
+    /// app and MUST NOT be turned into one.
+    pub standalone: bool,
 }
 
 impl ListedApp {
@@ -142,6 +147,10 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
         if !area.is_dir() {
             continue;
         }
+        // Classification is positional (D3): everything under `adhoc/` is a
+        // standalone program record, everything at the top level is an app,
+        // regardless of whether the file still carries an `[app]` table.
+        let standalone = origin == Origin::Run;
         let mut entries: Vec<_> = std::fs::read_dir(&area)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -181,6 +190,7 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
                         path: real,
                         broken: None,
                         origin,
+                        standalone,
                     }),
                     // Keep the entry so the supervisor can isolate it explicitly
                     // (broken file ≠ unregistered); non-supervisor callers filter.
@@ -192,6 +202,7 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
                             path: real,
                             broken: Some(format!("app config fails to parse: {e}")),
                             origin,
+                            standalone,
                         })
                     }
                 },
@@ -203,6 +214,7 @@ pub fn list(config: &DaemonConfig, config_dir: &Path) -> Result<Vec<ListedApp>> 
                         path: real,
                         broken: Some(format!("app config cannot be read: {e}")),
                         origin,
+                        standalone,
                     })
                 }
             }
@@ -343,16 +355,13 @@ fn add_config(
     let existing = list(config, config_dir)?;
     let mut all_apps = Vec::new();
     for l in &existing {
-        if l.name == name {
-            continue; // replaced by the new definition below
+        // Only a same-name app is replaced by this registration; a same-name
+        // standalone record stays in the set so `validate_all` reports the
+        // cross-namespace collision (add-standalone-programs 1.4).
+        if l.name == name && !l.standalone {
+            continue;
         }
-        let (r, _) = crate::config::AppRaw::load(&l.path)?;
-        all_apps.push(resolve_app(
-            &l.name,
-            &l.path,
-            &r,
-            config.app_default.as_ref(),
-        )?);
+        all_apps.push(resolve_listed(config, l)?);
     }
     all_apps.push(resolved.clone());
     validate_all(&all_apps)?;
@@ -508,7 +517,7 @@ fn add_scaffold(
         health_check: None,
     };
 
-    let text = render_scaffold(&name, &spec, opts)?;
+    let text = render_scaffold(&name, &spec, opts, false)?;
 
     // Validate exactly what will land on disk (round-trip the rendered
     // text) against the current registry, before any write.
@@ -518,16 +527,12 @@ fn add_scaffold(
     let existing = list(config, config_dir)?;
     let mut all_apps = Vec::new();
     for l in &existing {
-        if l.name == name {
-            continue; // replaced by the regeneration below
+        // Only a same-name app is regenerated; a same-name standalone record
+        // stays in the set so `validate_all` reports the collision.
+        if l.name == name && !l.standalone {
+            continue;
         }
-        let (r, _) = AppRaw::load(&l.path)?;
-        all_apps.push(resolve_app(
-            &l.name,
-            &l.path,
-            &r,
-            config.app_default.as_ref(),
-        )?);
+        all_apps.push(resolve_listed(config, l)?);
     }
     all_apps.push(resolved);
     validate_all(&all_apps)?;
@@ -638,9 +643,24 @@ fn warn_if_not_executable(_exe: &Path) {}
 /// path contains whitespace it is rendered as a single-line quoted command
 /// (quote-aware splitting recovers it — see `config::split_command`).
 ///
+/// `standalone` selects the registration family (add-standalone-programs D3):
+///
+/// - `false` — compose family: the record **is** an app, so it always carries
+///   an `[app]` table and the tuning flags land in it (output unchanged);
+/// - `true` — run family: a **standalone program record** that is not an app.
+///   The `[app]` table is omitted by default (only `--description` emits a
+///   metadata-only one) and the run flags (`restart`, `restart_backoff`) go
+///   into `[program.<name>]`; `priority` has no program-level home and is
+///   ignored.
+///
 /// Pure: given a definition it returns the exact text the scaffold writes,
 /// so the daemon-side ad-hoc commit can reuse it (run-daemon-first task 2.1).
-pub fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Result<String> {
+pub fn render_scaffold(
+    name: &str,
+    spec: &ScaffoldSpec,
+    opts: &AddOptions,
+    standalone: bool,
+) -> Result<String> {
     let command_str = spec.command.display().to_string();
     let (command, args) = if command_str.contains(char::is_whitespace) {
         (
@@ -669,23 +689,50 @@ pub fn render_scaffold(name: &str, spec: &ScaffoldSpec, opts: &AddOptions) -> Re
         health_check: spec.health_check.clone(),
         ..Default::default()
     };
-    let raw = AppRaw {
-        app: Some(AppMeta {
+    let (program, app, header) = if !standalone {
+        let app = AppMeta {
             description: opts.description.clone(),
             restart: opts.restart,
             restart_backoff: opts.restart_backoff,
             priority: opts.priority,
             ..Default::default()
-        }),
+        };
+        (
+            program,
+            Some(app),
+            format!(
+                "# Composed by `ak compose <executable>` — scaffold for app {name:?}.\n\
+                     # Re-running the same `ak compose` recomposes this whole file (manual edits are overwritten).\n\
+                     # After hand edits run `ak apply {name}` (or bare `ak apply`) to take effect.\n"
+            ),
+        )
+    } else {
+        let program = ProgramRaw {
+            restart: opts.restart,
+            restart_backoff: opts.restart_backoff,
+            ..program
+        };
+        // `--description` is the only reason to emit `[app]`: a
+        // metadata-only table that does not make the record an app.
+        let app = opts.description.clone().map(|description| AppMeta {
+            description: Some(description),
+            ..Default::default()
+        });
+        (
+            program,
+            app,
+            format!(
+                "# Registered by `ak run` — standalone program {name:?} (not part of an app).\n\
+                     # Re-running `ak run --force --name {name}` recomposes this whole file.\n"
+            ),
+        )
+    };
+    let raw = AppRaw {
+        app,
         program: std::collections::BTreeMap::from([(name.to_string(), program)]),
     };
     let body = toml::to_string_pretty(&raw).context("failed to render scaffold config")?;
-    Ok(format!(
-        "# Composed by `ak compose <executable>` — scaffold for app {name:?}.\n\
-         # Re-running the same `ak compose` recomposes this whole file (manual edits are overwritten).\n\
-         # After hand edits run `ak apply {name}` (or bare `ak apply`) to take effect.\n\
-         \n{body}"
-    ))
+    Ok(format!("{header}\n{body}"))
 }
 
 // (The single-line command rendering moved to `config::render_single_line_command`
@@ -1045,14 +1092,20 @@ fn apply_flags(path: &Path, opts: &AddOptions) -> Result<()> {
     Ok(())
 }
 
-/// Re-parse the deployment file after flag writes so callers see final state.
-pub fn reload_app(
-    name: &str,
-    path: &Path,
-    defaults: Option<&AppDefaults>,
-) -> Result<crate::config::ResolvedApp> {
-    let (raw, _) = crate::config::AppRaw::load(path)?;
-    resolve_app(name, path, &raw, defaults)
+/// Resolve one listed record with its positional classification
+/// (add-standalone-programs 1.3): a record under `app_dir/adhoc/` is a
+/// **standalone program record** — resolved through
+/// [`crate::config::resolve_standalone`], so an older record's `[app]` table
+/// only supplies `description` and fallback restart/backoff values and the
+/// programs get no owner. Top-level records stay apps. Callers MUST NOT turn
+/// a `standalone == true` result into an app record.
+pub fn resolve_listed(config: &DaemonConfig, l: &ListedApp) -> Result<crate::config::ResolvedApp> {
+    let (raw, _) = crate::config::AppRaw::load(&l.path)?;
+    if l.standalone {
+        resolve_standalone(&l.path, &raw, config.app_default.as_ref())
+    } else {
+        resolve_app(&l.name, &l.path, &raw, config.app_default.as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -1783,10 +1836,110 @@ mod tests {
             work_dir: std::env::current_dir().unwrap(),
             health_check: None,
         };
-        let rendered = render_scaffold("abc", &spec, &o).unwrap();
+        let rendered = render_scaffold("abc", &spec, &o, false).unwrap();
         assert_eq!(
             rendered, written,
             "pure render must match the scaffold write"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.1: the standalone scaffold mode omits `[app]` and writes the run
+    /// flags into `[program.<name>]`, so the record loads as an owner-less
+    /// program (not an app).
+    #[test]
+    fn standalone_scaffold_omits_app_table_and_puts_flags_in_program() {
+        let tmp = tmp_dir("standalone-render");
+        let o = AddOptions {
+            name: Some("worker".into()),
+            restart: Some(RestartPolicy::UnlessStopped),
+            restart_backoff: Some(3.0),
+            ..Default::default()
+        };
+        let spec = ScaffoldSpec {
+            command: PathBuf::from("/opt/worker"),
+            args: vec!["--serve".into()],
+            env: Default::default(),
+            work_dir: tmp.clone(),
+            health_check: None,
+        };
+        let text = render_scaffold("worker", &spec, &o, true).unwrap();
+        assert!(
+            !text.contains("[app]"),
+            "standalone scaffold must omit [app]:\n{text}"
+        );
+        let raw: AppRaw = toml::from_str(&text).unwrap();
+        assert!(raw.app.is_none(), "no [app] table in the render: {text}");
+        let p = raw.program.get("worker").expect("program table");
+        assert_eq!(p.restart, Some(RestartPolicy::UnlessStopped));
+        assert_eq!(p.restart_backoff, Some(3.0));
+
+        // Round trip: the record is a standalone program, not an app.
+        let resolved = resolve_standalone(Path::new("/x/adhoc/worker.toml"), &raw, None).unwrap();
+        assert!(resolved.standalone);
+        assert_eq!(resolved.programs[0].owner(), None);
+        assert_eq!(resolved.programs[0].restart, RestartPolicy::UnlessStopped);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.1: `--description` is the only reason a standalone scaffold writes
+    /// `[app]`, and that table carries the description alone (metadata, not
+    /// app identity).
+    #[test]
+    fn standalone_scaffold_writes_metadata_only_app_for_description() {
+        let tmp = tmp_dir("standalone-desc");
+        let o = AddOptions {
+            name: Some("worker".into()),
+            description: Some("dev server".into()),
+            ..Default::default()
+        };
+        let spec = ScaffoldSpec {
+            command: PathBuf::from("/opt/worker"),
+            args: vec![],
+            env: Default::default(),
+            work_dir: tmp.clone(),
+            health_check: None,
+        };
+        let text = render_scaffold("worker", &spec, &o, true).unwrap();
+        let raw: AppRaw = toml::from_str(&text).unwrap();
+        let meta = raw.app.as_ref().expect("[app] written for description");
+        assert_eq!(meta.description.as_deref(), Some("dev server"));
+        assert!(
+            meta.restart.is_none() && meta.restart_backoff.is_none() && meta.priority.is_none(),
+            "metadata-only [app] must not carry run flags: {text}"
+        );
+        let resolved = resolve_standalone(Path::new("/x/adhoc/worker.toml"), &raw, None).unwrap();
+        assert!(resolved.standalone);
+        assert_eq!(resolved.description.as_deref(), Some("dev server"));
+        assert_eq!(resolved.programs[0].restart_backoff, 1.0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.1: the compose call site keeps the pre-split output — an `[app]`
+    /// table carrying the tuning flags.
+    #[test]
+    fn compose_scaffold_keeps_app_table_output() {
+        let tmp = tmp_dir("compose-render");
+        let o = AddOptions {
+            name: Some("abc".into()),
+            restart: Some(RestartPolicy::OnFailure),
+            ..Default::default()
+        };
+        let spec = ScaffoldSpec {
+            command: PathBuf::from("/opt/abc"),
+            args: vec![],
+            env: Default::default(),
+            work_dir: tmp.clone(),
+            health_check: None,
+        };
+        let text = render_scaffold("abc", &spec, &o, false).unwrap();
+        assert!(text.contains("[app]"), "{text}");
+        let raw: AppRaw = toml::from_str(&text).unwrap();
+        let meta = raw.app.as_ref().expect("compose keeps [app]");
+        assert_eq!(meta.restart, Some(RestartPolicy::OnFailure));
+        assert!(
+            raw.program.get("abc").unwrap().restart.is_none(),
+            "compose flags stay in [app], not the program table"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2005,6 +2158,11 @@ mod tests {
             "top level is compose"
         );
         assert_eq!(by_name["adhoc-app"].origin, Origin::Run);
+        // 2.2: classification is positional — top level is never standalone,
+        // `adhoc/` always is, independent of the file's content.
+        assert!(!by_name["linked"].standalone);
+        assert!(!by_name["legacy"].standalone);
+        assert!(by_name["adhoc-app"].standalone);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2028,9 +2186,130 @@ mod tests {
         assert_eq!(listed.len(), 1, "the top-level record wins: {listed:?}");
         assert_eq!(listed[0].origin, Origin::Compose);
         assert!(
+            !listed[0].standalone,
+            "the surviving top-level record is an app, the adhoc twin is dropped"
+        );
+        assert!(
             listed[0].path.parent() == Some(&dir),
             "the listed path is the top-level record"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.2/2.3: the `standalone` flag and the description come from the
+    /// record's POSITION, not its content: an old `adhoc/` record that still
+    /// has `[app]` is standalone and keeps its description; a new record
+    /// without `[app]` is standalone with no description; a top-level
+    /// run-shaped file stays an app.
+    #[test]
+    fn list_standalone_flag_and_description_follow_position() {
+        let tmp = tmp_dir("list-standalone");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join(ADHOC_SUBDIR)).unwrap();
+        let adhoc = dir.join(ADHOC_SUBDIR);
+
+        // Old run product: `[app]` present, but position makes it standalone.
+        std::fs::write(
+            adhoc.join("old.toml"),
+            "[app]\ndescription = 'legacy run'\nrestart = 'always'\n\n\
+             [program.old]\ncommand = 'true'\n",
+        )
+        .unwrap();
+        // New format: no `[app]` at all.
+        std::fs::write(adhoc.join("new.toml"), "[program.new]\ncommand = 'true'\n").unwrap();
+        // Top-level run-shaped file (historical run product): still an app.
+        std::fs::write(
+            dir.join("historical.toml"),
+            "[program.historical]\ncommand = 'true'\n",
+        )
+        .unwrap();
+
+        let listed = list(&config, &tmp).unwrap();
+        let by_name: BTreeMap<&str, &ListedApp> =
+            listed.iter().map(|l| (l.name.as_str(), l)).collect();
+        assert!(by_name["old"].standalone);
+        assert_eq!(by_name["old"].origin, Origin::Run);
+        assert_eq!(
+            by_name["old"].description.as_deref(),
+            Some("legacy run"),
+            "description prefers [app].description"
+        );
+        assert!(by_name["new"].standalone);
+        assert_eq!(
+            by_name["new"].description, None,
+            "no [app] → no description"
+        );
+        assert!(
+            !by_name["historical"].standalone,
+            "top level is always an app by position"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1.3: `resolve_listed` dispatches on the position — an `adhoc/` record
+    /// resolves through `resolve_standalone` (owner-less programs, `[app]`
+    /// used only for description/fallback defaults), a top-level record stays
+    /// an app.
+    #[test]
+    fn resolve_listed_keeps_adhoc_records_ownerless() {
+        let tmp = tmp_dir("resolve-listed");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join(ADHOC_SUBDIR)).unwrap();
+        std::fs::write(
+            dir.join(ADHOC_SUBDIR).join("agent.toml"),
+            "[app]\ndescription = 'old'\nrestart = 'always'\nrestart_backoff = 4.0\n\n\
+             [program.agent]\ncommand = 'true'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("gateway.toml"),
+            "[program.api]\ncommand = 'true'\n",
+        )
+        .unwrap();
+
+        let listed = list(&config, &tmp).unwrap();
+        let adhoc = listed.iter().find(|l| l.name == "agent").unwrap();
+        let resolved = resolve_listed(&config, adhoc).unwrap();
+        assert!(resolved.standalone, "adhoc/ record → standalone");
+        assert_eq!(resolved.description.as_deref(), Some("old"));
+        assert_eq!(resolved.programs.len(), 1);
+        assert!(resolved.programs[0].is_standalone(), "no AppRecord owner");
+        assert_eq!(resolved.programs[0].restart, RestartPolicy::Always);
+        assert_eq!(resolved.programs[0].restart_backoff, 4.0);
+
+        let app = listed.iter().find(|l| l.name == "gateway").unwrap();
+        let resolved = resolve_listed(&config, app).unwrap();
+        assert!(!resolved.standalone);
+        assert_eq!(resolved.programs[0].owner(), Some("gateway"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 2.4: a dangling link in `adhoc/` is skipped by `list` (warned about),
+    /// leaving the healthy records untouched.
+    #[test]
+    #[cfg(unix)]
+    fn list_skips_dangling_adhoc_link() {
+        let tmp = tmp_dir("list-dangling");
+        let config = DaemonConfig::default();
+        let dir = app_dir(&config, &tmp);
+        std::fs::create_dir_all(dir.join(ADHOC_SUBDIR)).unwrap();
+        std::fs::write(
+            dir.join(ADHOC_SUBDIR).join("ok.toml"),
+            "[program.ok]\ncommand = 'true'\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            tmp.join("does-not-exist.toml"),
+            dir.join(ADHOC_SUBDIR).join("stale.toml"),
+        )
+        .unwrap();
+
+        let listed = list(&config, &tmp).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "ok");
+        assert!(listed[0].standalone);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

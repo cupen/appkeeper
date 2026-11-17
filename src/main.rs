@@ -2762,13 +2762,9 @@ fn validate(config_path: &Path, single: Option<&Path>) -> Result<()> {
     let apps = registry::ListedApp::good(registry::list(&config, &config_dir)?);
     let mut resolved = Vec::new();
     for l in &apps {
-        let (raw, _) = config::AppRaw::load(&l.path)?;
-        resolved.push(config::resolve_app(
-            &l.name,
-            &l.path,
-            &raw,
-            config.app_default.as_ref(),
-        )?);
+        // Position decides the record kind: `adhoc/` records are standalone
+        // programs, validated as such (never as apps).
+        resolved.push(registry::resolve_listed(&config, l)?);
     }
     config::validate_all(&resolved)?;
     for app in &resolved {
