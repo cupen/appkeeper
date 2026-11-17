@@ -181,10 +181,22 @@ async fn pending(State(sup): State<Arc<Supervisor>>) -> Json<crate::supervisor::
 /// mapping is the error's own (404 unknown, 409 conflict, 500 delete failure).
 /// The console never stops programs or deletes files itself.
 async fn app_remove(State(sup): State<Arc<Supervisor>>, Path(name): Path<String>) -> Response {
+    remove_target(sup, name, false).await
+}
+
+/// `POST /api/programs/{name}/remove` — the console's standalone-program
+/// removal entry, isomorphic to `/v1/programs/{name}/remove`
+/// (add-standalone-programs D6). App-internal programs are a 400.
+async fn program_remove(State(sup): State<Arc<Supervisor>>, Path(name): Path<String>) -> Response {
+    remove_target(sup, name, true).await
+}
+
+async fn remove_target(sup: Arc<Supervisor>, name: String, standalone: bool) -> Response {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     sup.enqueue(Command::Remove {
-        app: name,
+        name,
+        standalone,
         reply: tx,
     });
     match rx.recv_timeout(COMMAND_TIMEOUT) {
@@ -292,6 +304,7 @@ pub fn build_router(sup: Arc<Supervisor>, stop: Arc<WebuiLifecycle>, auth_token:
         .route("/api/pending", get(pending))
         .route("/api/apply", post(apply))
         .route("/api/apps/{name}/remove", post(app_remove))
+        .route("/api/programs/{name}/remove", post(program_remove))
         .route("/ws", get(ws_upgrade))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&auth),
@@ -1281,6 +1294,7 @@ mod tests {
     fn status_delta_reports_only_changes() {
         let a = ProgramInfo {
             app: "app".into(),
+            standalone: false,
             name: "a".into(),
             state: "running".into(),
             pid: Some(1),
@@ -1317,6 +1331,7 @@ mod tests {
         // produce a delta entry (the STATUS event then carries the new value).
         let a = ProgramInfo {
             app: "app".into(),
+            standalone: false,
             name: "a".into(),
             state: "running".into(),
             pid: Some(1),
@@ -1350,6 +1365,7 @@ mod tests {
     fn status_removed_names_dropped_programs_only() {
         let mk = |app: &str, name: &str| ProgramInfo {
             app: app.into(),
+            standalone: false,
             name: name.into(),
             state: "stopped".into(),
             pid: None,
@@ -1577,6 +1593,77 @@ mod tests {
         assert!(dir.join("app.d/web.toml").exists(), "record untouched");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervisor with one standalone run product (`agent`) in `adhoc/`,
+    /// loaded and stopped (`restart = "no"`). Spawns the real command loop.
+    fn sup_with_standalone(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ak-test-web-sa-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.d").join("adhoc").join("agent.toml"),
+            "[program.agent]\ncommand = 'sleep 30'\nrestart = 'no'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        let sup2 = sup.clone();
+        std::thread::spawn(move || sup2.run());
+        (sup, dir)
+    }
+
+    /// 4.3: `/api/programs/<name>/remove` removes a standalone record and
+    /// returns the same shape as `/v1`; the app endpoint refuses the same name
+    /// (404) and an app-owned program is a 400.
+    #[tokio::test]
+    async fn api_program_remove_handles_standalone_names_only() {
+        let (sup, dir) = sup_with_standalone("ok");
+        let record = dir.join("app.d").join("adhoc").join("agent.toml");
+        let app = build_router(sup.clone(), test_stop(), "");
+        // A standalone name is not an app.
+        let (status, body, _) = call(app, "POST", "/api/apps/agent/remove", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("unknown app"), "{v}");
+        assert!(record.exists(), "the app endpoint deletes nothing");
+
+        let app = build_router(sup.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/programs/agent/remove", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["app"], "agent");
+        assert_eq!(v["standalone"], true);
+        assert_eq!(v["config_path"], record.display().to_string());
+        assert!(!record.exists(), "record deleted");
+
+        // An app-owned program cannot be removed on its own.
+        let (sup2, dir2) = sup_with_registered_app("sa-owned");
+        let app = build_router(sup2.clone(), test_stop(), "");
+        let (status, body, _) = call(app, "POST", "/api/programs/web/remove", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("compose declaration"),
+            "{v}"
+        );
+        assert!(dir2.join("app.d/web.toml").exists(), "record untouched");
+        sup.request_shutdown();
+        sup2.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// A supervisor with one declared program "m" and metric values injected
@@ -2219,7 +2306,8 @@ mod pending_ws_tests {
         // Remove out-of-band, exactly like `ak remove` / another console tab.
         let (tx, rx) = std::sync::mpsc::channel();
         sup.enqueue(Command::Remove {
-            app: "web".into(),
+            name: "web".into(),
+            standalone: false,
             reply: tx,
         });
         rx.recv_timeout(Duration::from_secs(10))
@@ -2254,6 +2342,100 @@ mod pending_ws_tests {
             "the removed app record is named: {v}"
         );
         assert!(!dir.join("app.d/web.toml").exists(), "record deleted");
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// add-standalone-programs 4.4: removing a standalone program emits only
+    /// `removed` (the program name) — never `apps_gone`, because a run product
+    /// is not an app. The client must not drop an app node that never existed.
+    #[tokio::test]
+    async fn ws_status_delta_standalone_removal_has_no_apps_gone() {
+        let dir = std::env::temp_dir().join(format!("ak-test-web-wsrm-sa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nmonitor_interval = 0.05\n",
+                dir.join("logs").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        // A run product: a real `adhoc/` record, no `[app]` table.
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
+        std::fs::write(
+            &record,
+            "[program.web]\ncommand = 'sleep 30'\nrestart = 'no'\nstartsecs = 0.0\n",
+        )
+        .unwrap();
+        let (config, _) = crate::config::DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        let runner = sup.clone();
+        std::thread::spawn(move || runner.run());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(sup2, test_stop(), "")).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let msg = ws.next().await.unwrap().unwrap();
+        let (t, _payload) = api::decode_ws_message(&msg.into_data()).unwrap();
+        assert_eq!(t, msg_type::SNAPSHOT, "the first frame is the snapshot");
+        assert!(
+            !sup.state
+                .lock()
+                .unwrap()
+                .apps
+                .iter()
+                .any(|a| a.name == "web"),
+            "a run product is never an app record"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        sup.enqueue(Command::Remove {
+            name: "web".into(),
+            standalone: true,
+            reply: tx,
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("remove answered")
+            .expect("remove succeeded");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let payload = loop {
+            assert!(tokio::time::Instant::now() < deadline, "no STATUS frame");
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a frame arrives")
+                .expect("the stream stays open")
+                .unwrap();
+            let Ok((t, payload)) = api::decode_ws_message(&msg.into_data()) else {
+                continue;
+            };
+            if t == msg_type::STATUS {
+                break payload;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            v["removed"],
+            serde_json::json!(["web"]),
+            "the dropped program is named: {v}"
+        );
+        assert!(
+            v.get("apps_gone").is_none(),
+            "a standalone removal never emits apps_gone: {v}"
+        );
+        assert!(!record.exists(), "record deleted");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

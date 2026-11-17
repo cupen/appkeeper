@@ -11,16 +11,7 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 
 use crate::client::{self, Client};
-
-/// What a start/stop/restart targets: a whole app (bare `<app>`, fan-out
-/// expanded server-side) or one program of that app (the second positional).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Target {
-    /// The whole app.
-    App(String),
-    /// One program inside an app (validated against its owning app).
-    Program { app: String, program: String },
-}
+use crate::target::Target;
 
 /// One parsed shell line.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,8 +41,9 @@ pub(crate) enum ShellCmd {
         program: Option<String>,
         restart: bool,
     },
-    /// `remove <app>`: the daemon-executed atomic removal
+    /// `remove <target>`: the daemon-executed atomic removal
     /// (guard-remove-until-stopped); never touches the registry locally.
+    /// A bare token is a standalone program, `<app>/all` a whole app.
     Remove(String),
     Shutdown,
     Open,
@@ -78,7 +70,13 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<ShellCmd>> {
         "log" => parse_log(args)?,
         "pending" => ShellCmd::Pending,
         "apply" => parse_apply(args)?,
-        "remove" => ShellCmd::Remove(one_arg(head, args)?),
+        "remove" => {
+            // Validate the unified target grammar up front (usage errors stay
+            // in the shell); routing happens in `execute`.
+            let token = one_arg(head, args)?;
+            crate::target::parse(&token, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+            ShellCmd::Remove(token)
+        }
         "shutdown" => ShellCmd::Shutdown,
         "open" => ShellCmd::Open,
         "help" | "?" => ShellCmd::Help,
@@ -99,13 +97,12 @@ fn parse_target(cmd: &str, args: &[String]) -> Result<Target> {
         positional.push(a.clone());
     }
     match positional.as_slice() {
-        [app] => Ok(Target::App(app.clone())),
-        [app, program] => Ok(Target::Program {
-            app: app.clone(),
-            program: program.clone(),
-        }),
-        [] => bail!("{cmd} needs an app name: {cmd} <app> [<program>]"),
-        _ => bail!("{cmd} takes at most two positional args: <app> [<program>]"),
+        [one] => crate::target::parse(one, None).map_err(|e| anyhow::anyhow!("{e}")),
+        [app, program] => {
+            crate::target::parse(app, Some(program)).map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        [] => bail!("{cmd} needs a target: {cmd} <program> | <app>/<program> | <app>/all"),
+        _ => bail!("{cmd} takes at most two positional args: <program> | <app> <program>"),
     }
 }
 
@@ -117,30 +114,36 @@ fn parse_two_args(cmd: &str, args: &[String], usage: &str) -> Result<(String, St
     }
 }
 
-/// Parse `apply [<app> [<program>]] [--restart]`.
+/// Parse `apply [<target>] [--restart]` with the unified target grammar
+/// (add-standalone-programs D6): no target = all pending, `<program>` = that
+/// program, `<app>/<program>` = one app program, `<app>/all` = the whole app.
 fn parse_apply(args: &[String]) -> Result<ShellCmd> {
-    let mut app = None;
-    let mut program = None;
     let mut restart = false;
-    let mut positional = 0;
+    let mut positional: Vec<String> = Vec::new();
     for a in args {
         if a == "--restart" {
             restart = true;
-        } else if a.starts_with("--") {
+        } else if a.starts_with('-') {
             bail!("unknown flag {a:?} (only --restart is supported)");
-        } else if positional == 0 {
-            app = Some(a.clone());
-            positional = 1;
-        } else if positional == 1 {
-            program = Some(a.clone());
-            positional = 2;
         } else {
-            bail!("apply takes at most two positional args: <app> <program>");
+            positional.push(a.clone());
         }
     }
-    if app.is_none() && program.is_some() {
-        bail!("apply <program> needs an app first: apply <app> <program>");
-    }
+    let (app, program) = match positional.as_slice() {
+        [] => (None, None),
+        [one] => match crate::target::parse(one, None) {
+            Ok(Target::Program(p)) => (None, Some(p)),
+            Ok(Target::AppProgram { app, program }) => (Some(app), Some(program)),
+            Ok(Target::AppAll(app)) => (Some(app), None),
+            Err(e) => bail!("{e}"),
+        },
+        [app, program] => match crate::target::parse(app, Some(program)) {
+            Ok(Target::AppProgram { app, program }) => (Some(app), Some(program)),
+            Ok(_) => unreachable!("a two-positional target is always <app> <program>"),
+            Err(e) => bail!("{e}"),
+        },
+        _ => bail!("apply takes at most one target: <program> | <app>/<program> | <app>/all"),
+    };
     Ok(ShellCmd::Apply {
         app,
         program,
@@ -487,10 +490,27 @@ fn execute(c: &Client, cmd: &ShellCmd) -> Result<Outcome> {
             );
             Ok(Outcome::Continue)
         }
-        ShellCmd::Remove(app) => {
+        ShellCmd::Remove(target) => {
+            // Unified target grammar (D6): a bare name is a standalone
+            // program, `<app>/all` a whole app. An app-internal program can
+            // only be removed by editing its compose declaration.
+            let (standalone, name) = match crate::target::parse(target, None) {
+                Ok(Target::Program(p)) => (true, p),
+                Ok(Target::AppAll(a)) => (false, a),
+                Ok(Target::AppProgram { .. }) => bail!(
+                    "a program of an app cannot be removed on its own; edit the \
+                     compose declaration and run `apply`, or remove the whole app \
+                     with `{target}/all`"
+                ),
+                Err(e) => bail!("{e}"),
+            };
             // The control plane owns the guard and the message (it names the
-            // blocking programs and the `stop <app>` remedy on 409).
-            let v = c.remove_app(app)?;
+            // blocking programs and the `stop <target>` remedy on 409).
+            let v = if standalone {
+                c.remove_program(&name)?
+            } else {
+                c.remove_app(&name)?
+            };
             println!(
                 "{}",
                 v.get("result")
@@ -527,26 +547,36 @@ fn print_action(c: &Client, name: &str, action: &str) -> Result<Outcome> {
     Ok(Outcome::Continue)
 }
 
-/// start/stop/restart against a whole app (bare `<app>`, server-side fan-out)
-/// or one program of it (the second positional, ownership-checked here since
-/// the program endpoints are name-addressed).
+/// start/stop/restart against a whole app (`<app>/all`, server-side fan-out)
+/// or one program (bare `<program>` or `<app>/<program>`; the latter is
+/// ownership-checked here since the program endpoints are name-addressed).
+/// A single token never fans out implicitly (add-standalone-programs D6).
 fn run_target(c: &Client, t: &Target, verb: &str) -> Result<Outcome> {
     match t {
-        Target::App(app) => {
-            let v = c.app_action(app, verb)?;
-            println!(
-                "{}",
-                v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
-            );
-            Ok(Outcome::Continue)
-        }
-        Target::Program { app, program } => {
+        Target::Program(program) => match print_action(c, program, verb) {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // A bare token is a program; if it only names an app the fix
+                // is `<app>/all` (D6). The CLI prints the same hint.
+                crate::eprint_app_all_hint(program, &e);
+                Err(e)
+            }
+        },
+        Target::AppProgram { app, program } => {
             let info = c.program(program)?;
             let owner = info.get("app").and_then(|a| a.as_str()).unwrap_or("");
             if owner != app {
                 bail!("program {program:?} does not belong to app {app:?} (its app is {owner:?})");
             }
             print_action(c, program, verb)
+        }
+        Target::AppAll(app) => {
+            let v = c.app_action(app, verb)?;
+            println!(
+                "{}",
+                v.get("result").and_then(|r| r.as_str()).unwrap_or("done")
+            );
+            Ok(Outcome::Continue)
         }
     }
 }
@@ -1102,6 +1132,14 @@ mod tests {
         assert_eq!(
             parse("apply myapp --restart"),
             Some(ShellCmd::Apply {
+                app: None,
+                program: Some("myapp".into()),
+                restart: true
+            })
+        );
+        assert_eq!(
+            parse("apply myapp/all --restart"),
+            Some(ShellCmd::Apply {
                 app: Some("myapp".into()),
                 program: None,
                 restart: true
@@ -1115,7 +1153,17 @@ mod tests {
                 restart: false
             })
         );
+        assert_eq!(
+            parse("apply myapp/web"),
+            Some(ShellCmd::Apply {
+                app: Some("myapp".into()),
+                program: Some("web".into()),
+                restart: false
+            })
+        );
         assert!(parse_line("apply --bogus").is_err());
+        assert!(parse_line("apply all").is_err(), "bare `all` is reserved");
+        assert!(parse_line("apply /web").is_err());
         assert!(
             parse_line("apply a b c").is_err(),
             "too many positional args"
@@ -1133,16 +1181,23 @@ mod tests {
         assert!(parse_line("log web --stream both").is_err());
     }
 
-    /// guard-remove-until-stopped 2.3: `remove <app>` is a first-class verb
-    /// that takes exactly one app name and routes to the control plane.
+    /// `remove <target>` is a first-class verb taking one unified target
+    /// (add-standalone-programs D6): `<program>` removes a standalone record,
+    /// `<app>/all` the whole app; the two-position form is not accepted.
     #[test]
     fn remove_parsing() {
         assert_eq!(parse("remove web"), Some(ShellCmd::Remove("web".into())));
-        assert!(parse_line("remove").is_err(), "remove needs an app name");
+        assert_eq!(
+            parse("remove web/all"),
+            Some(ShellCmd::Remove("web/all".into()))
+        );
+        assert!(parse_line("remove").is_err(), "remove needs a target");
         assert!(
             parse_line("remove a b").is_err(),
-            "remove takes exactly one app"
+            "remove takes exactly one target"
         );
+        assert!(parse_line("remove all").is_err(), "bare `all` is reserved");
+        assert!(parse_line("remove a/b/c").is_err());
         // The help text documents the verb and the stop-first contract.
         assert!(HELP_TEXT.contains("remove <app>"));
         assert!(HELP_TEXT.contains("stop <app>"));
@@ -1205,7 +1260,7 @@ mod tests {
         (cfg, req)
     }
 
-    /// A successful remove routes to the shared endpoint and keeps the shell
+    /// A successful app remove routes to the app endpoint and keeps the shell
     /// alive (REPL contract).
     #[cfg(unix)]
     #[test]
@@ -1213,16 +1268,36 @@ mod tests {
         let (cfg, req) = fake_daemon(
             "ok",
             http_ok(
-                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"kept_config":null,"programs":["api"],"applied":true,"result":"app[web] removed; no apply needed"}"#,
+                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"kept_config":null,"programs":["api"],"applied":true,"standalone":false,"result":"app[web] removed; no apply needed"}"#,
             ),
         );
         let c = Client::from_config(&cfg);
-        let outcome = execute(&c, &ShellCmd::Remove("web".into())).unwrap();
+        let outcome = execute(&c, &ShellCmd::Remove("web/all".into())).unwrap();
         assert!(matches!(outcome, Outcome::Continue), "the shell stays up");
         let req = req.join().unwrap();
         assert!(
             req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
             "the shell reuses the control-plane client: {req}"
+        );
+    }
+
+    /// A standalone remove routes to the program endpoint (D6/control-plane
+    /// remove endpoints), never to `/v1/apps`.
+    #[cfg(unix)]
+    #[test]
+    fn remove_standalone_routes_to_the_program_endpoint() {
+        let (cfg, req) = fake_daemon(
+            "standalone",
+            http_ok(
+                r#"{"app":"","config_path":"/tmp/apps/adhoc/agent.toml","deleted_file":true,"kept_config":null,"programs":["agent"],"applied":false,"standalone":true,"result":"standalone program[agent] removed; no apply needed"}"#,
+            ),
+        );
+        let c = Client::from_config(&cfg);
+        execute(&c, &ShellCmd::Remove("agent".into())).unwrap();
+        let req = req.join().unwrap();
+        assert!(
+            req.starts_with("POST /v1/programs/agent/remove HTTP/1.1\r\n"),
+            "a bare target is a standalone program: {req}"
         );
     }
 
@@ -1239,7 +1314,8 @@ mod tests {
             ),
         );
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("web".into())).expect_err("a conflict is an error");
+        let err =
+            execute(&c, &ShellCmd::Remove("web/all".into())).expect_err("a conflict is an error");
         let text = format!("{err:#}");
         assert!(text.contains("api (running)"), "blockers survive: {text}");
         assert!(text.contains("ak stop web"), "remedy survives: {text}");
@@ -1251,7 +1327,7 @@ mod tests {
         req.join().unwrap();
     }
 
-    /// Offline and unknown-app removals use the shared exit classes (3 and 1).
+    /// Offline and unknown-target removals use the shared exit classes (3 and 1).
     #[cfg(unix)]
     #[test]
     fn remove_offline_and_unknown_app_exit_classes() {
@@ -1262,7 +1338,7 @@ mod tests {
         ))
         .unwrap();
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("web".into())).expect_err("no daemon");
+        let err = execute(&c, &ShellCmd::Remove("web/all".into())).expect_err("no daemon");
         assert_eq!(client::exit_code_of(&err), 3);
 
         let (cfg, req) = fake_daemon(
@@ -1270,47 +1346,84 @@ mod tests {
             http_status("404 Not Found", r#"{"error":"unknown app \"ghost\""}"#),
         );
         let c = Client::from_config(&cfg);
-        let err = execute(&c, &ShellCmd::Remove("ghost".into())).expect_err("unknown app");
+        let err = execute(&c, &ShellCmd::Remove("ghost/all".into())).expect_err("unknown app");
         assert!(format!("{err:#}").contains("unknown app"), "{err:#}");
         assert_eq!(client::exit_code_of(&err), 1);
         req.join().unwrap();
     }
 
-    /// actions: start/stop/restart take `<app> [<program>]` (the CLI range
-    /// syntax); `--app` is gone.
+    /// An app-internal program cannot be removed on its own (D6): the shell
+    /// rejects it with a usage error before any request is sent.
+    #[test]
+    fn remove_app_program_is_a_usage_error() {
+        assert!(matches!(
+            parse("remove web/api"),
+            Some(ShellCmd::Remove(t)) if t == "web/api"
+        ));
+        let cfg: crate::config::DaemonConfig =
+            toml::from_str("[daemon]\nsocket = \"/nonexistent/ak-shell-remove.sock\"\n").unwrap();
+        let c = Client::from_config(&cfg);
+        let err = execute(&c, &ShellCmd::Remove("web/api".into()))
+            .expect_err("an app program target is rejected");
+        let text = format!("{err:#}");
+        assert!(text.contains("cannot be removed on its own"), "{text}");
+        assert!(text.contains("compose declaration"), "{text}");
+    }
+
+    /// actions: start/stop/restart take the unified target grammar
+    /// `<program> | <app>/<program> | <app>/all`; `--app` is gone.
     #[test]
     fn target_parsing_app_and_program() {
         assert_eq!(
             parse("start web"),
-            Some(ShellCmd::Start(Target::App("web".into())))
+            Some(ShellCmd::Start(Target::Program("web".into())))
         );
         assert_eq!(
             parse("stop web"),
-            Some(ShellCmd::Stop(Target::App("web".into())))
+            Some(ShellCmd::Stop(Target::Program("web".into())))
         );
         assert_eq!(
             parse("restart gateway"),
-            Some(ShellCmd::Restart(Target::App("gateway".into())))
+            Some(ShellCmd::Restart(Target::Program("gateway".into())))
+        );
+        assert_eq!(
+            parse("start web/all"),
+            Some(ShellCmd::Start(Target::AppAll("web".into())))
+        );
+        assert_eq!(
+            parse("stop gateway/all"),
+            Some(ShellCmd::Stop(Target::AppAll("gateway".into())))
+        );
+        assert_eq!(
+            parse("start web/api"),
+            Some(ShellCmd::Start(Target::AppProgram {
+                app: "web".into(),
+                program: "api".into()
+            }))
         );
         assert_eq!(
             parse("start web api"),
-            Some(ShellCmd::Start(Target::Program {
+            Some(ShellCmd::Start(Target::AppProgram {
                 app: "web".into(),
                 program: "api".into()
             }))
         );
         assert_eq!(
             parse("stop demo worker"),
-            Some(ShellCmd::Stop(Target::Program {
+            Some(ShellCmd::Stop(Target::AppProgram {
                 app: "demo".into(),
                 program: "worker".into()
             }))
         );
-        // A missing app, too many positionals, or the removed --app flag: errors.
+        // A missing target, too many positionals, the removed --app flag, or
+        // the reserved bare `all`: errors.
         assert!(parse_line("start").is_err());
         assert!(parse_line("start --app web").is_err());
         assert!(parse_line("start a b c").is_err());
         assert!(parse_line("stop --bogus x").is_err());
+        assert!(parse_line("start all").is_err());
+        assert!(parse_line("start /api").is_err());
+        assert!(parse_line("start a/b/c").is_err());
     }
 
     /// The retired words are unknown and get the successor hint (shell-client

@@ -14,21 +14,21 @@
 
 ## 3. 守护进程：命名、暂存与命令作用域
 
-- [ ] 3.1 `resolve_adhoc_name` 收紧为「程序名」：显式名不排重、重复回 409；缺省名取 stem，占用则 `<stem>-N`（N = 现存最大值 + 1，不填空号）；`/`、空值、非法字符、`all` 退出 2 / 校验错误；单测矩阵
-- [ ] 3.2 占用判定收敛为 `Free | Taken | Staged` 单谓词：顶层/`adhoc/` 记录（含悬空链接）、内存 app、任意程序名、暂存 app；缺省循环遇 `Staged` 立即走残留确认；表驱动单测
-- [ ] 3.3 `cmd_adhoc_up` / `adhoc_force` 适配散装记录：落盘 `app_dir/adhoc/<program>.toml`、不注册 AppRecord；`--force` 仅覆盖 `adhoc/` 记录，逐字节相同为空操作，顶层/链接/手工文件拒绝；单测覆盖 409、覆盖、空操作、拒绝矩阵
-- [ ] 3.4 `Command::Remove` 增加散装分支：`Program` 命中散装记录时删记录、清内存/pending/用户停止记录，返回 `RemoveOutcome { standalone: true, ... }`；`AppAll` 走既有 app 移除；app 内程序单独 remove 用法错误；`apply_detection` 整批预检覆盖散装
-- [ ] 3.5 实现统一目标解析器 `Target`：`<program>` / `<app>/<program>` / `<app>/all`；空段/多斜杠/裸 `all` 退出 2；单 token 按程序解析，只命中 app 名时 404 并提示 `<app>/all`；`app/program` 校验程序归属；双位置 `<app> <program>` 归一化为同义；单测覆盖全部分支
-- [ ] 3.5a `start/stop/restart/apply/remove` 接入 `Target` 路由：程序目标走 `/v1/programs`，`app/all` 走 `/v1/apps`；`remove` 的散装/app 分支与错误提示按 D6；单测覆盖 app 扇出（`app/all`）、app 单程序、散装单名、裸 app 名报错、`all` 报错
-- [ ] 3.6 `AdhocUpResult` 增加 `standalone: bool` 与 `auto_named: bool`，穿透成功 / `unchanged` / `residual` / `register_only` 全部构造点
-- [ ] 3.7 回归断言「app 仅由 compose 产生」：run 的任何路径（成功/覆盖/残留/补落盘）都不写 `app_dir` 顶层、不创建 AppRecord、不产生 app 名；compose 产物（含只注册未启动）仍按 app 处理
+- [x] 3.1 `resolve_adhoc_name` 收紧为「程序名」：显式名不排重、重复回 409；缺省名取 stem，占用则 `<stem>-N`（N = 现存最大值 + 1，不填空号）；`/`、空值、非法字符、`all` 退出 2 / 校验错误；单测矩阵
+- [x] 3.2 占用判定收敛为 `Free | Taken | Staged` 单谓词：顶层/`adhoc/` 记录（含悬空链接）、内存 app、任意程序名、暂存 app；缺省循环遇 `Staged` 立即走残留确认；表驱动单测
+- [x] 3.3 `cmd_adhoc_up` / `adhoc_force` 适配散装记录：落盘 `app_dir/adhoc/<program>.toml`、不注册 AppRecord；`--force` 仅覆盖 `adhoc/` 记录，逐字节相同为空操作，顶层/链接/手工文件拒绝；单测覆盖 409、覆盖、空操作、拒绝矩阵
+- [x] 3.4 `Command::Remove` 增加散装分支：`Program` 命中散装记录时删记录、清内存/pending/用户停止记录，返回 `RemoveOutcome { standalone: true, ... }`；`AppAll` 走既有 app 移除；app 内程序单独 remove 用法错误；`apply_detection` 整批预检覆盖散装
+- [x] 3.5 实现统一目标解析器 `Target`：`<program>` / `<app>/<program>` / `<app>/all`；空段/多斜杠/裸 `all` 退出 2；单 token 按程序解析，只命中 app 名时 404 并提示 `<app>/all`；`app/program` 校验程序归属；双位置 `<app> <program>` 归一化为同义；单测覆盖全部分支
+- [x] 3.5a `start/stop/restart/apply/remove` 接入 `Target` 路由：程序目标走 `/v1/programs`，`app/all` 走 `/v1/apps`；`remove` 的散装/app 分支与错误提示按 D6；单测覆盖 app 扇出（`app/all`）、app 单程序、散装单名、裸 app 名报错、`all` 报错
+- [x] 3.6 `AdhocUpResult` 增加 `standalone: bool` 与 `auto_named: bool`，穿透成功 / `unchanged` / `residual` / `register_only` 全部构造点
+- [x] 3.7 回归断言「app 仅由 compose 产生」：run 的任何路径（成功/覆盖/残留/补落盘）都不写 `app_dir` 顶层、不创建 AppRecord、不产生 app 名；compose 产物（含只注册未启动）仍按 app 处理
 
 ## 4. 控制面投影与服务端
 
-- [ ] 4.1 `server::ProgramInfo` 增加 `standalone: bool`；散装条目 `app` 为空字符串、`config_path` 指向 `app_dir/adhoc/<name>.toml`；集中在单一投影函数产生，确保 `/v1/status`、`/v1/programs`、`/api/*`、WS 同源
-- [ ] 4.2 `/v1/run` 的 `parse_adhoc_spec` 去掉 `app/program` 拆分；终端 NDJSON 帧与 `--json` 携带 `standalone`/`auto_named`；端点测试覆盖显式 409、缺省顺延、旧格式兼容、非法名
-- [ ] 4.3 `/v1/apps/<name>/*` 不把散装程序当 app 展开，app 移除端点对散装名返回 404；新增 `POST /v1/programs/<name>/remove`（仅散装，app 内程序 400）并复用 `Command::Remove`；`/api/programs/<name>/remove` 与 `/api/apps/<app>/remove` 同构；`/v1/apply` 的活态删除预检覆盖散装
-- [ ] 4.4 WS 增量帧的 `removed`/`apps_gone` 对散装移除的收敛语义：散装只发 `removed`（程序名），不发 `apps_gone`；补 server 端测试
+- [x] 4.1 `server::ProgramInfo` 增加 `standalone: bool`；散装条目 `app` 为空字符串、`config_path` 指向 `app_dir/adhoc/<name>.toml`；集中在单一投影函数产生，确保 `/v1/status`、`/v1/programs`、`/api/*`、WS 同源
+- [x] 4.2 `/v1/run` 的 `parse_adhoc_spec` 去掉 `app/program` 拆分；终端 NDJSON 帧与 `--json` 携带 `standalone`/`auto_named`；端点测试覆盖显式 409、缺省顺延、旧格式兼容、非法名
+- [x] 4.3 `/v1/apps/<name>/*` 不把散装程序当 app 展开，app 移除端点对散装名返回 404；新增 `POST /v1/programs/<name>/remove`（仅散装，app 内程序 400）并复用 `Command::Remove`；`/api/programs/<name>/remove` 与 `/api/apps/<app>/remove` 同构；`/v1/apply` 的活态删除预检覆盖散装
+- [x] 4.4 WS 增量帧的 `removed`/`apps_gone` 对散装移除的收敛语义：散装只发 `removed`（程序名），不发 `apps_gone`；补 server 端测试
 
 ## 5. CLI 与 shell 输出
 

@@ -24,6 +24,7 @@ mod service;
 mod shell;
 mod shutdown_signal;
 mod supervisor;
+mod target;
 mod transport;
 mod web;
 mod webui_open;
@@ -38,6 +39,7 @@ use log::info;
 use crate::config::DaemonConfig;
 use crate::registry::AddOptions;
 use crate::supervisor::Supervisor;
+use crate::target::Target;
 
 const EXIT_OK: i32 = 0;
 const EXIT_ERROR: i32 = 1;
@@ -839,10 +841,17 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 *json,
             )
         }
-        Some(Cmd::Start { app, program, json }) => match program {
-            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Start, *json),
-            None => fanout_cmd(&config_path, app, "start", *json),
-        },
+        Some(Cmd::Start { app, program, json }) => {
+            match parse_target_or_exit(app, program.as_deref()) {
+                Target::Program(p) => {
+                    program_scoped_cmd(&config_path, None, &p, StartVerb::Start, *json)
+                }
+                Target::AppProgram { app, program } => {
+                    program_scoped_cmd(&config_path, Some(&app), &program, StartVerb::Start, *json)
+                }
+                Target::AppAll(app) => fanout_cmd(&config_path, &app, "start", *json),
+            }
+        }
         None => {
             // Bare `ak` is a legal exploratory call (design D1): print the
             // full help to stdout and exit 0. Not clap's
@@ -887,14 +896,30 @@ fn dispatch(cli: &Cli) -> Result<()> {
             }
             Ok(())
         }),
-        Some(Cmd::Stop { app, program }) => match program {
-            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Stop, false),
-            None => fanout_cmd(&config_path, app, "stop", false),
+        Some(Cmd::Stop { app, program }) => match parse_target_or_exit(app, program.as_deref()) {
+            Target::Program(p) => {
+                program_scoped_cmd(&config_path, None, &p, StartVerb::Stop, false)
+            }
+            Target::AppProgram { app, program } => {
+                program_scoped_cmd(&config_path, Some(&app), &program, StartVerb::Stop, false)
+            }
+            Target::AppAll(app) => fanout_cmd(&config_path, &app, "stop", false),
         },
-        Some(Cmd::Restart { app, program }) => match program {
-            Some(p) => program_scoped_cmd(&config_path, app, p, StartVerb::Restart, false),
-            None => fanout_cmd(&config_path, app, "restart", false),
-        },
+        Some(Cmd::Restart { app, program }) => {
+            match parse_target_or_exit(app, program.as_deref()) {
+                Target::Program(p) => {
+                    program_scoped_cmd(&config_path, None, &p, StartVerb::Restart, false)
+                }
+                Target::AppProgram { app, program } => program_scoped_cmd(
+                    &config_path,
+                    Some(&app),
+                    &program,
+                    StartVerb::Restart,
+                    false,
+                ),
+                Target::AppAll(app) => fanout_cmd(&config_path, &app, "restart", false),
+            }
+        }
         Some(Cmd::Action { program, name }) => custom_action_cmd(&config_path, program, name),
         Some(Cmd::Signal { program, signal }) => client_cmd(&config_path, |c| {
             let v = c.signal(program, signal)?;
@@ -911,7 +936,17 @@ fn dispatch(cli: &Cli) -> Result<()> {
             program,
             restart,
         }) => client_cmd(&config_path, |c| {
-            let v = c.apply(app.as_deref(), program.as_deref(), *restart)?;
+            // Bare `ak apply` is the full scope; otherwise the unified target
+            // grammar decides (D6). `all` alone is a usage error there.
+            let (scope_app, scope_program) = match app {
+                None => (None, None),
+                Some(first) => match parse_target_or_exit(first, program.as_deref()) {
+                    Target::Program(p) => (None, Some(p)),
+                    Target::AppProgram { app, program } => (Some(app), Some(program)),
+                    Target::AppAll(app) => (Some(app), None),
+                },
+            };
+            let v = c.apply(scope_app.as_deref(), scope_program.as_deref(), *restart)?;
             println!(
                 "{}",
                 v.get("result")
@@ -1471,6 +1506,15 @@ fn run_adhoc(
     // `--force` is accepted in both positions (`ak run --force -- <cmd>` and
     // `ak run -- <cmd> --force`) and has no value.
     let force = force || flags.force;
+    // A run name is a program name, never a target expression: `/`, empty
+    // values and the reserved `all` are exit-2 usage errors with no request
+    // sent and no `app_dir` side effects (add-standalone-programs D1).
+    if let Some(n) = name
+        && let Err(e) = crate::supervisor::validate_standalone_name(n)
+    {
+        eprintln!("ak: error: {e}");
+        std::process::exit(EXIT_CONFIG);
+    }
     let envs: Vec<String> = if flags.envs.is_empty() {
         envs.to_vec()
     } else {
@@ -1876,6 +1920,30 @@ fn eprint_unknown_program_hint(program: &str, e: &anyhow::Error) {
     }
 }
 
+/// Hint for a bare `<program>` target that only matches an app name: a single
+/// token is always a program, and a whole app is `<app>/all` (D6). The CLI
+/// must never fan out implicitly.
+pub(crate) fn eprint_app_all_hint(program: &str, e: &anyhow::Error) {
+    if format!("{e:#}").contains("404") {
+        eprintln!(
+            "hint: a single target is a program name; if {program:?} is an app, \
+             use `{program}/all` to act on the whole app"
+        );
+    }
+}
+
+/// Parse the unified target grammar, exiting with the config/usage code on a
+/// malformed target (add-standalone-programs D6).
+fn parse_target_or_exit(first: &str, second: Option<&str>) -> Target {
+    match crate::target::parse(first, second) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ak: error: {e}");
+            std::process::exit(EXIT_CONFIG);
+        }
+    }
+}
+
 /// `ak start|stop|restart <app> <program>`: the second positional narrows the
 /// scope to one program of that app (design D1). The program must belong to
 /// the app — a cross-app name is a scope error, not a silent retarget. `start`
@@ -1890,7 +1958,7 @@ enum StartVerb {
 
 fn program_scoped_cmd(
     config_path: &Path,
-    app: &str,
+    expect_app: Option<&str>,
     program: &str,
     verb: StartVerb,
     json: bool,
@@ -1900,21 +1968,28 @@ fn program_scoped_cmd(
     // Resolve the program's owning app first: the control-plane program
     // endpoints are name-addressed (program names are globally unique), so
     // the app scope has to be checked here (control-plane spec: 未知 app 报错).
+    // A bare `<program>` target (expect_app = None) skips the ownership check
+    // and may address any globally unique program name (D6).
     let info = match c.program(program) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("ak: error: {e:#}");
-            eprint_unknown_program_hint(program, &e);
+            match expect_app {
+                Some(_) => eprint_unknown_program_hint(program, &e),
+                None => eprint_app_all_hint(program, &e),
+            }
             std::process::exit(client::exit_code_of(&e));
         }
     };
-    let owner = info.get("app").and_then(|a| a.as_str()).unwrap_or("");
-    if owner != app {
-        eprintln!(
-            "ak: error: program {program:?} does not belong to app {app:?} \
-             (its app is {owner:?})"
-        );
-        std::process::exit(EXIT_ERROR);
+    if let Some(app) = expect_app {
+        let owner = info.get("app").and_then(|a| a.as_str()).unwrap_or("");
+        if owner != app {
+            eprintln!(
+                "ak: error: program {program:?} does not belong to app {app:?} \
+                 (its app is {owner:?})"
+            );
+            std::process::exit(EXIT_ERROR);
+        }
     }
     match verb {
         StartVerb::Start => match c.start_and_wait(program) {
@@ -2030,9 +2105,29 @@ fn custom_action_cmd(config_path: &Path, program: &str, action: &str) -> Result<
 ///
 /// Exit codes follow the client contract: an unreachable daemon is 3 (via
 /// [`client::exit_code_of`]), a 409 conflict / 404 unknown app is 1.
-fn remove_cmd(config_path: &Path, app: &str) -> Result<()> {
+fn remove_cmd(config_path: &Path, name: &str) -> Result<()> {
+    // Unified target grammar (add-standalone-programs D6): a bare name is a
+    // standalone program, `<app>/all` a whole app. An app-internal program
+    // cannot be removed on its own — edit the compose declaration instead.
+    let target = parse_target_or_exit(name, None);
+    let (is_standalone, name) = match target {
+        Target::Program(p) => (true, p),
+        Target::AppAll(a) => (false, a),
+        Target::AppProgram { .. } => {
+            eprintln!(
+                "ak: error: a program of an app cannot be removed on its own; \
+                 edit the compose declaration and run `ak apply`, or remove the \
+                 whole app with `<app>/all`"
+            );
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
     client_cmd(config_path, |c| {
-        let v = c.remove_app(app)?;
+        let v = if is_standalone {
+            c.remove_program(&name)?
+        } else {
+            c.remove_app(&name)?
+        };
         println!(
             "{}",
             v.get("result")
@@ -3428,10 +3523,12 @@ mod sync_tests {
         server.join().unwrap();
     }
 
-    /// guard-remove-until-stopped 2.2: `ak remove` is a single online call to
-    /// the daemon-owned endpoint. It never probes/pulls up a daemon first, and
-    /// it never deletes the registration record or asks for a reload/apply
-    /// itself — the daemon owns all of that.
+    /// guard-remove-until-stopped 2.2 + add-standalone-programs D6: `ak remove`
+    /// is a single online call to the daemon-owned endpoint — a bare target is
+    /// a standalone program (`/v1/programs`), `<app>/all` a whole app
+    /// (`/v1/apps`). It never probes/pulls up a daemon first, and it never
+    /// deletes the registration record or asks for a reload/apply itself — the
+    /// daemon owns all of that.
     #[test]
     fn remove_cli_is_one_online_call_and_touches_no_files() {
         let (socket, mut listener) = mock_socket("remove-cli");
@@ -3447,9 +3544,9 @@ mod sync_tests {
             }
             let req = String::from_utf8_lossy(&raw).to_string();
             let body = concat!(
-                r#"{"app":"web","config_path":"/tmp/apps/web.toml","deleted_file":true,"#,
-                r#""kept_config":null,"programs":["api"],"applied":true,"#,
-                r#""result":"app[web] removed; no apply needed"}"#
+                r#"{"app":"web","standalone":true,"config_path":"/tmp/apps/adhoc/web.toml","deleted_file":true,"#,
+                r#""kept_config":null,"programs":["web"],"applied":true,"#,
+                r#""result":"standalone program[web] removed; no apply needed"}"#
             );
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -3465,8 +3562,9 @@ mod sync_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("daemon.toml");
         // The record exists on disk; the client must leave it alone.
-        let record = dir.join("web.toml");
-        std::fs::write(&record, "[program.api]\ncommand = \"sleep\"\n").unwrap();
+        let record = dir.join("adhoc").join("web.toml");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "[program.web]\ncommand = \"sleep\"\n").unwrap();
         std::fs::write(
             &config_path,
             format!(
@@ -3480,8 +3578,8 @@ mod sync_tests {
         remove_cmd(&config_path, "web").expect("the daemon answered 200");
         let req = server.join().unwrap();
         assert!(
-            req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
-            "one targeted call, no preflight: {req}"
+            req.starts_with("POST /v1/programs/web/remove HTTP/1.1\r\n"),
+            "a bare target is a standalone program: {req}"
         );
         assert!(
             !req.contains("/v1/health")
@@ -3492,6 +3590,53 @@ mod sync_tests {
         assert!(
             record.exists(),
             "the CLI never deletes registration files itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D6/3.5a: `<app>/all` addresses the whole app through the app endpoint;
+    /// the CLI never rewrites it into a program name.
+    #[test]
+    fn remove_cli_app_all_routes_to_the_app_endpoint() {
+        let (socket, mut listener) = mock_socket("remove-app-all");
+        let server = std::thread::spawn(move || {
+            let mut sock = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            while !raw.ends_with(b"\r\n\r\n") {
+                if std::io::Read::read(&mut sock, &mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                raw.push(byte[0]);
+            }
+            let req = String::from_utf8_lossy(&raw).to_string();
+            let body = concat!(
+                r#"{"app":"web","standalone":false,"config_path":"/tmp/apps/web.toml","deleted_file":true,"#,
+                r#""kept_config":null,"programs":["api"],"applied":true,"#,
+                r#""result":"app[web] removed; no apply needed"}"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut sock, resp.as_bytes()).unwrap();
+            req
+        });
+        let dir = std::env::temp_dir().join(format!("ak-test-remove-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("daemon.toml");
+        std::fs::write(
+            &config_path,
+            format!("[daemon]\nsocket = {:?}\n", socket.to_string_lossy()),
+        )
+        .unwrap();
+        remove_cmd(&config_path, "web/all").expect("the daemon answered 200");
+        let req = server.join().unwrap();
+        assert!(
+            req.starts_with("POST /v1/apps/web/remove HTTP/1.1\r\n"),
+            "`<app>/all` fans out through the app endpoint: {req}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

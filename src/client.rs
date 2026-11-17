@@ -371,6 +371,12 @@ impl Client {
         self.call("POST", &format!("/v1/apps/{app}/remove"))
     }
 
+    /// `remove <program>`: remove a standalone program record
+    /// (add-standalone-programs D6). App-owned programs answer 400.
+    pub fn remove_program(&self, program: &str) -> Result<serde_json::Value> {
+        self.call("POST", &format!("/v1/programs/{program}/remove"))
+    }
+
     pub fn pending(&self) -> Result<serde_json::Value> {
         self.call("GET", "/v1/pending")
     }

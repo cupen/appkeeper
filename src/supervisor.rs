@@ -157,6 +157,14 @@ pub struct AdhocUpResult {
     /// startup judgement, so the caller MUST NOT run the commit step again
     /// (there is no placeholder / staged entry) (refuse-run-existing-app D7).
     pub landed: bool,
+    /// True for every run product: the record is a standalone program in
+    /// `app_dir/adhoc/`, not an app (add-standalone-programs D2/D8).
+    #[serde(default)]
+    pub standalone: bool,
+    /// True when no `--name` was given and the command stem was already
+    /// taken, so the daemon registered `<stem>-N` instead (D4/D8).
+    #[serde(default)]
+    pub auto_named: bool,
 }
 
 /// Successful `AdhocCommit`: the record is on disk.
@@ -422,12 +430,16 @@ pub enum Command {
         req: ComposeUpRequest,
         reply: ComposeUpReply,
     },
-    /// guard-remove-until-stopped D1: unregister one app atomically — the
+    /// guard-remove-until-stopped D1 / add-standalone-programs D6:
+    /// unregister one app **or** one standalone program atomically — the
     /// liveness guard, the registration deletion and the state cleanup all run
     /// in this one serialized turn. Every entry point (CLI, shell, `/v1`,
     /// `/api`) enqueues this command; none of them deletes files itself.
     Remove {
-        app: String,
+        name: String,
+        /// `true` = remove a standalone program record (`adhoc/<name>.toml`);
+        /// `false` = remove a whole app (top-level record).
+        standalone: bool,
         reply: RemoveReply,
     },
 }
@@ -491,6 +503,10 @@ pub fn render_fanout(r: &FanoutResult) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoveOutcome {
     pub app: String,
+    /// True when the removed registration was a standalone program record
+    /// (`app_dir/adhoc/<name>.toml`) rather than an app.
+    #[serde(default)]
+    pub standalone: bool,
     /// The registration record path that was removed
     /// (`app_dir/<app>.toml`).
     pub config_path: String,
@@ -515,20 +531,25 @@ impl RemoveOutcome {
     /// One-line summary for the CLI/shell (no `apply` hint: removal already
     /// took effect).
     pub fn render(&self) -> String {
+        let kind = if self.standalone {
+            "standalone program"
+        } else {
+            "app"
+        };
         if self.already_unregistered {
             format!(
-                "app[{}] removed (the registration record was already gone; \
+                "{kind}[{}] removed (the registration record was already gone; \
                  runtime state cleaned up); no apply needed",
                 self.app
             )
         } else if self.deleted_file {
             format!(
-                "app[{}] removed (generated config file removed: {}); no apply needed",
+                "{kind}[{}] removed (generated config file removed: {}); no apply needed",
                 self.app, self.config_path
             )
         } else {
             format!(
-                "app[{}] removed (deployment config kept at {}); no apply needed",
+                "{kind}[{}] removed (deployment config kept at {}); no apply needed",
                 self.app,
                 self.kept_config
                     .clone()
@@ -544,6 +565,12 @@ impl RemoveOutcome {
 pub enum RemoveError {
     /// No such app is loaded or registered.
     UnknownApp(String),
+    /// No such standalone program record or program is known.
+    UnknownProgram(String),
+    /// The target is not a removable standalone program (an app, or a program
+    /// owned by an app): the program-level remove endpoint only accepts
+    /// standalone records (control-plane spec; D6).
+    NotStandalone(String),
     /// At least one program is running/starting/stopping/backoff; the payload
     /// carries `(program, state)` pairs sorted by name.
     Busy {
@@ -558,6 +585,8 @@ impl RemoveError {
     pub fn http_status(&self) -> u16 {
         match self {
             RemoveError::UnknownApp(_) => 404,
+            RemoveError::UnknownProgram(_) => 404,
+            RemoveError::NotStandalone(_) => 400,
             RemoveError::Busy { .. } => 409,
             RemoveError::Delete(_) => 500,
         }
@@ -568,6 +597,14 @@ impl std::fmt::Display for RemoveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RemoveError::UnknownApp(app) => write!(f, "unknown app {app:?}"),
+            RemoveError::UnknownProgram(name) => {
+                write!(f, "unknown standalone program {name:?}")
+            }
+            RemoveError::NotStandalone(name) => write!(
+                f,
+                "program {name:?} is not a standalone program (programs of an app cannot be \
+                 removed individually; edit the compose declaration and run `ak apply`)"
+            ),
             RemoveError::Busy { app, blockers } => {
                 let list = blockers
                     .iter()
@@ -674,12 +711,15 @@ pub fn run_context(st: &SupervisorState) -> crate::action::RunContext {
     ctx
 }
 
-/// Range an `apply` acts on: everything, one app, or one program.
+/// Range an `apply` acts on: everything, one app, one program identified by
+/// its owning app, or one program by its globally unique name (the unified
+/// `<program>` target — app-internal and standalone alike).
 #[derive(Debug, Clone)]
 pub enum ApplyScope {
     All,
     App(String),
     Program(String, String),
+    ProgramName(String),
 }
 
 impl ApplyScope {
@@ -688,6 +728,7 @@ impl ApplyScope {
             ApplyScope::All => true,
             ApplyScope::App(a) => a == app,
             ApplyScope::Program(a, p) => a == app && p == program,
+            ApplyScope::ProgramName(p) => p == program,
         }
     }
 }
@@ -697,6 +738,51 @@ impl ApplyScope {
 /// registering an app named `all` so the two can never collide
 /// (apply-workflow spec).
 pub const ALL_KEYWORD: &str = "all";
+
+/// Validate a run `--name` as a **program name** (add-standalone-programs D1):
+/// identifier charset, non-empty, and not the reserved `all` keyword. `/` is
+/// rejected by the charset — the run name is never a target expression. The
+/// daemon applies this to both explicit and derived names; the CLI calls it
+/// before sending the spec so a syntax error exits 2 without a round trip.
+pub fn validate_standalone_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("a program name must not be empty; pass --name <program>".into());
+    }
+    if !config::is_valid_name(name) {
+        return Err(format!(
+            "program name {name:?} is invalid: {}; pass --name <program>",
+            config::NAME_RULE
+        ));
+    }
+    if name == ALL_KEYWORD {
+        return Err(format!(
+            "program name {name:?} is reserved: `all` is the full-scope keyword; \
+             pass another --name"
+        ));
+    }
+    Ok(())
+}
+
+/// Occupancy of one candidate program name (add-standalone-programs D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupancy {
+    /// Nothing uses the name.
+    Free,
+    /// A registration record (top level or `adhoc/`, including dangling
+    /// links), an in-memory app, or any program (of any app or standalone)
+    /// already uses it.
+    Taken,
+    /// A staged (started but not yet persisted) record uses it: the caller
+    /// must run the residual confirmation flow instead of renaming around it.
+    Staged,
+}
+
+/// The chosen name for one ad-hoc submission and whether it was auto-named
+/// (no `--name`, stem already taken).
+struct AdhocName {
+    name: String,
+    auto_named: bool,
+}
 
 /// Validate apply-scope request parts against the registered apps/programs
 /// and resolve them into an [`ApplyScope`]. Single source shared by
@@ -726,10 +812,15 @@ pub fn resolve_apply_scope(
         // Loaded apps validate directly; a freshly registered app may only
         // be pending (detected on disk, not applied yet) — it is still a
         // valid target (apply-workflow: a new app's programs start when
-        // they enter the apply scope).
+        // they enter the apply scope). A standalone record is NOT an app and
+        // must not be addressable through the app scope (D6).
         let known = st.apps.iter().any(|r| r.name == a)
             || registry::list(&st.config, &st.config_dir)
-                .map(|listed| listed.iter().any(|l| l.name == a && l.broken.is_none()))
+                .map(|listed| {
+                    listed
+                        .iter()
+                        .any(|l| l.name == a && l.broken.is_none() && !l.standalone)
+                })
                 .unwrap_or(false);
         if !known {
             return Err(format!("unknown app {a:?}"));
@@ -744,10 +835,28 @@ pub fn resolve_apply_scope(
                 return Err(format!("unknown program {p:?}"));
             }
         }
+    } else if let Some(p) = program {
+        // `<program>`: the global program name addresses an app-internal or a
+        // standalone program (D6). A registered-but-not-yet-loaded record is
+        // still a valid target for a scoped apply.
+        let in_memory = st.programs.contains_key(p);
+        let on_disk = registry::list(&st.config, &st.config_dir)
+            .map(|listed| {
+                listed
+                    .iter()
+                    .filter(|l| l.broken.is_none())
+                    .filter_map(|l| registry::resolve_listed(&st.config, l).ok())
+                    .any(|r| r.programs.iter().any(|x| x.name == p))
+            })
+            .unwrap_or(false);
+        if !in_memory && !on_disk {
+            return Err(format!("unknown program {p:?}"));
+        }
     }
     Ok(match (app, program) {
         (Some(a), Some(p)) => ApplyScope::Program(a.to_string(), p.to_string()),
         (Some(a), None) => ApplyScope::App(a.to_string()),
+        (None, Some(p)) => ApplyScope::ProgramName(p.to_string()),
         _ => ApplyScope::All,
     })
 }
@@ -1431,8 +1540,12 @@ impl Supervisor {
                 let _ = reply.send(self.cmd_compose_up(&req));
             }
             Command::Reload { reply } => answer(reply, self.cmd_reload()),
-            Command::Remove { app, reply } => {
-                let _ = reply.send(self.cmd_remove(&app));
+            Command::Remove {
+                name,
+                standalone,
+                reply,
+            } => {
+                let _ = reply.send(self.cmd_remove(&name, standalone));
             }
             Command::Apply {
                 scope,
@@ -1644,32 +1757,63 @@ impl Supervisor {
     /// Order: resolve members → liveness guard → delete the registration
     /// record → only then mutate runtime state. A deletion failure therefore
     /// leaves the app and its programs untouched (D3).
-    fn cmd_remove(&self, app: &str) -> std::result::Result<RemoveOutcome, RemoveError> {
-        let (config, config_dir, members, blockers, known) = {
+    fn cmd_remove(
+        &self,
+        name: &str,
+        standalone: bool,
+    ) -> std::result::Result<RemoveOutcome, RemoveError> {
+        // Resolve the target and its members inside one lock. `standalone`
+        // selects the naming space: a program record in `adhoc/` or an app at
+        // the top level. The two never cross (D6).
+        let (config, config_dir, members, blockers, record_present) = {
             let st = self.state.lock().unwrap();
+            let listed = registry::list(&st.config, &st.config_dir).unwrap_or_default();
+            let record = listed.iter().find(|r| r.name == name);
+            let is_standalone_record = record.is_some_and(|r| r.standalone);
+            if standalone {
+                // Only a standalone record (or its transitional in-memory
+                // program) may be removed through the program endpoint. An
+                // app or an app-owned program is a 400 — never delete it.
+                if !is_standalone_record
+                    && !st.programs.get(name).is_some_and(|p| p.def.is_standalone())
+                {
+                    return Err(
+                        if record.is_some()
+                            || st.apps.iter().any(|a| a.name == name)
+                            || st.programs.contains_key(name)
+                        {
+                            RemoveError::NotStandalone(name.to_string())
+                        } else {
+                            RemoveError::UnknownProgram(name.to_string())
+                        },
+                    );
+                }
+            } else {
+                // The app namespace excludes standalone records: `/v1/apps/
+                // <name>/remove` for a standalone name is a 404 (D6).
+                let known_app =
+                    st.apps.iter().any(|a| a.name == name) || record.is_some_and(|r| !r.standalone);
+                if !known_app {
+                    return Err(RemoveError::UnknownApp(name.to_string()));
+                }
+            }
             let mut members: Vec<String> = st
                 .programs
                 .values()
-                .filter(|p| p.def.owner() == Some(app))
+                .filter(|p| {
+                    if standalone {
+                        p.def.is_standalone() && p.def.name == name
+                    } else {
+                        p.def.owner() == Some(name)
+                    }
+                })
                 .map(|p| p.def.name.clone())
                 .collect();
-            // Loaded apps and freshly-registered (pending) apps are valid
-            // targets; anything else is a 404. A record whose TOML fails to
-            // parse is included on purpose: such an app is not in `st.apps`
-            // and `registry::list` flags it `broken`, so filtering it here
-            // would strand the operator — the old local-delete CLI could
-            // still remove it, and that is the only cleanup path. The
-            // liveness guard needs no change: a broken app has no running
-            // program, so it is removable by construction.
-            let listed = registry::list(&st.config, &st.config_dir).unwrap_or_default();
-            let known =
-                st.apps.iter().any(|a| a.name == app) || listed.iter().any(|r| r.name == app);
-            // A standalone record has no app owner, so its programs are found
-            // by reading the record's definition (the record name addresses
-            // the standalone program).
-            if let Some(l) = listed
-                .iter()
-                .find(|r| r.name == app && r.standalone && r.broken.is_none())
+            // A standalone record whose program is not loaded yet (fresh
+            // registration, pending apply) still defines the record's program
+            // name — the record name by construction.
+            if standalone
+                && let Some(l) = record.filter(|r| r.standalone && r.broken.is_none())
                 && let Ok(r) = registry::resolve_listed(&st.config, l)
             {
                 members.extend(r.programs.into_iter().map(|p| p.name));
@@ -1688,79 +1832,84 @@ impl Supervisor {
                 st.config_dir.clone(),
                 members,
                 blockers,
-                known,
+                // `list` normally surfaces every record (broken links
+                // included); the direct existence probe is the fallback for a
+                // record the listing could not read, so the removal still
+                // deletes instead of claiming "already unregistered".
+                record.is_some() || registry::is_registered(&st.config, &st.config_dir, name),
             )
         };
-        if !known {
-            return Err(RemoveError::UnknownApp(app.to_string()));
-        }
         if !blockers.is_empty() {
             return Err(RemoveError::Busy {
-                app: app.to_string(),
+                app: name.to_string(),
                 blockers,
             });
         }
         // Registration deletion first (D3): a failure must not clean up state.
         //
         // A record that is already gone is NOT a failure: the operator may
-        // have deleted it by hand, and the app is still loaded here (that is
-        // why the request resolved at all). The removal goal — app gone from
-        // the runtime projection and no pending unregistration left — is
-        // still reachable in this turn, so cleanup runs and the result says
-        // the record was already absent. Reporting `Delete`/500 here would be
-        // both wrong (nothing failed) and misleading (apply is not the fix:
-        // the cleanup below is).
-        let (deleted_file, already_unregistered, kept_config, record_path) =
-            if registry::is_registered(&config, &config_dir, app) {
-                let removed = registry::remove(&config, &config_dir, app)
-                    .map_err(|e| RemoveError::Delete(format!("{e:#}")))?;
-                let path = removed.path.clone();
-                let kept = if removed.deleted_file {
-                    None
-                } else {
-                    Some(removed.path.display().to_string())
-                };
-                (removed.deleted_file, false, kept, path)
+        // have deleted it by hand, and the runtime entry is still there (that
+        // is why the request resolved at all). The removal goal — the record
+        // gone from the runtime projection and no pending unregistration left
+        // — is still reachable in this turn, so cleanup runs and the result
+        // says the record was already absent.
+        let (deleted_file, already_unregistered, kept_config, record_path) = if record_present {
+            let removed = if standalone {
+                registry::remove_standalone(&config, &config_dir, name)
             } else {
-                // Best-effort guess for the report: the top-level record path
-                // (the only possible location before the adhoc partition).
-                (
-                    false,
-                    true,
-                    None,
-                    registry::link_path(&config, &config_dir, app),
-                )
+                registry::remove(&config, &config_dir, name)
+            }
+            .map_err(|e| RemoveError::Delete(format!("{e:#}")))?;
+            let path = removed.path.clone();
+            let kept = if removed.deleted_file {
+                None
+            } else {
+                Some(removed.path.display().to_string())
             };
+            (removed.deleted_file, false, kept, path)
+        } else {
+            let path = if standalone {
+                registry::adhoc_link_path(&config, &config_dir, name)
+            } else {
+                registry::link_path(&config, &config_dir, name)
+            };
+            (false, true, None, path)
+        };
         let mut dropped: Vec<String> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
-            for name in &members {
-                if st.programs.remove(name).is_some() {
-                    dropped.push(name.clone());
+            for member in &members {
+                if st.programs.remove(member).is_some() {
+                    dropped.push(member.clone());
                 }
             }
-            st.apps.retain(|a| a.name != app);
-            // The app's user-stop records die with it; other apps' records
-            // stay untouched.
+            st.apps.retain(|a| a.name != name);
+            // The target's user-stop records die with it; other records stay
+            // untouched.
             let mut changed = false;
-            for name in &members {
-                changed |= st.user_stopped.remove(name);
+            for member in &members {
+                changed |= st.user_stopped.remove(member);
             }
             if changed {
                 save_user_stopped(&st.state_dir, &st.user_stopped);
             }
-            // The removal itself must never surface as a pending注销项.
-            st.pending.programs.retain(|p| p.app != app);
-            st.pending.apps_added.retain(|a| a != app);
-            st.pending.apps_removed.retain(|a| a != app);
+            // The removal itself must never surface as a pending item. For a
+            // standalone record the pending entries are keyed by program name
+            // (its app field is the record name), so match both.
+            st.pending
+                .programs
+                .retain(|p| p.app != name && !members.contains(&p.program));
+            st.pending.apps_added.retain(|a| a != name);
+            st.pending.apps_removed.retain(|a| a != name);
         }
         self.sync_health_tasks();
         // Republish the pending projection against the post-removal disk.
         if let Err(e) = self.detect(true) {
-            warn!("app[{app}]: removal succeeded but the pending rescan failed: {e:#}");
+            warn!("[{name}]: removal succeeded but the pending rescan failed: {e:#}");
         }
         Ok(RemoveOutcome {
-            app: app.to_string(),
+            app: name.to_string(),
+            standalone,
             config_path: record_path.display().to_string(),
             deleted_file,
             kept_config,
@@ -1892,6 +2041,12 @@ impl Supervisor {
             // Per-app program diff: hash mismatch, new program, or dropped
             // program (file no longer defines it) — all count as changed.
             for app in &resolved {
+                // A standalone record is a program, never an app: it must not
+                // surface as a registration change (add-standalone-programs
+                // D2/D7).
+                if app.standalone {
+                    continue;
+                }
                 // A staged app is started-but-unpersisted: it is deliberately
                 // absent from `st.apps` and MUST NOT show up as "added"
                 // (run-daemon-first D1).
@@ -1981,60 +2136,212 @@ impl Supervisor {
 
     // -- ad-hoc registration (run-daemon-first D1/D3) ------------------------
 
-    /// Resolve the app name from the spec (explicit `--name` or the command's
-    /// file stem) and validate it: identifier charset, not the reserved `all`
-    /// keyword, and no collision with a program name owned by a DIFFERENT app.
+    /// The name one `ak run` submission registers under (add-standalone-
+    /// programs D4/D5).
     ///
-    /// A same-name app's own repeated submission is not a collision here: the
-    /// same-name decision is `--force`'s job ([`Self::cmd_adhoc_up`]), and a
-    /// program owned by the SAME app name is allowed through. `--force` never
-    /// bypasses this check — a program owned by a DIFFERENT app stays refused.
-    fn resolve_adhoc_name(&self, spec: &AdhocSpec) -> std::result::Result<String, AdhocUpError> {
-        let name = match &spec.name {
-            Some(n) => n.clone(),
+    /// - explicit `--name`: validated as a program name and never renamed.
+    ///   Without `--force` any occupancy is a 409 conflict; with `--force`
+    ///   the name is returned as-is (the overwrite path decides whether an
+    ///   `adhoc/` record may be rewritten).
+    /// - no `--name`: the command's file stem is the base. Free → use it;
+    ///   taken → `<base>-N` with N = highest existing `<base>-k` + 1 (no gap
+    ///   filling); a staged candidate is returned unchanged so the caller
+    ///   reports the residual instead of starting a second process.
+    ///   `--force` targets the base exactly and never participates in the
+    ///   suffix search (D5).
+    fn resolve_adhoc_name(&self, spec: &AdhocSpec) -> std::result::Result<AdhocName, AdhocUpError> {
+        let explicit = spec.name.as_deref();
+        let base = match explicit {
+            Some(n) => n.to_string(),
             None => spec
                 .command
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    AdhocUpError::Validation(
-                        "cannot derive an app name from the command path; pass --name".into(),
-                    )
-                })?,
+                .unwrap_or_else(|| "program".to_string()),
         };
-        if !config::is_valid_name(&name) {
-            return Err(AdhocUpError::Validation(format!(
-                "app name {name:?} is invalid: {}",
-                config::NAME_RULE
-            )));
-        }
-        if name == ALL_KEYWORD {
-            return Err(AdhocUpError::Validation(format!(
-                "app name {name:?} is reserved: `ak apply all` means apply-all; choose another --name"
-            )));
-        }
-        let st = self.state.lock().unwrap();
-        // Only a program owned by ANOTHER app is a genuine collision here: a
-        // same-name app's own program is the `--force` overwrite target, while
-        // a program owned by a different app stays refused (`--force` never
-        // bypasses this check — refuse-run-existing-app D8).
-        if let Some(p) = st.programs.get(&name)
-            && p.def.owner() != Some(name.as_str())
-        {
-            let by = match p.def.owner() {
-                Some(app) => format!("app {app:?}"),
-                None => "a standalone record".to_string(),
+        validate_standalone_name(&base).map_err(AdhocUpError::Validation)?;
+        if explicit.is_some() || spec.force {
+            return match self.candidate_status(&base) {
+                Occupancy::Free | Occupancy::Staged => Ok(AdhocName {
+                    name: base,
+                    auto_named: false,
+                }),
+                Occupancy::Taken => {
+                    if spec.force {
+                        // `--force` only overwrites run products: a same-name
+                        // top-level record is refused here with a targeted
+                        // message, and a same-name program of another app is
+                        // refused by validation when the config is rendered.
+                        if self.top_level_record_exists(&base) {
+                            return Err(AdhocUpError::Validation(
+                                self.top_level_overwrite_message(&base),
+                            ));
+                        }
+                        Ok(AdhocName {
+                            name: base,
+                            auto_named: false,
+                        })
+                    } else {
+                        Err(AdhocUpError::Conflict(adhoc_conflict_message(&base)))
+                    }
+                }
             };
-            return Err(AdhocUpError::Validation(format!(
-                "program name {name:?} is already registered by {by}; choose another --name"
-            )));
         }
-        Ok(name)
+        match self.candidate_status(&base) {
+            Occupancy::Free | Occupancy::Staged => {
+                return Ok(AdhocName {
+                    name: base,
+                    auto_named: false,
+                });
+            }
+            Occupancy::Taken => {}
+        }
+        let mut n = self.max_suffix(&base) + 1;
+        loop {
+            let candidate = format!("{base}-{n}");
+            match self.candidate_status(&candidate) {
+                Occupancy::Free | Occupancy::Staged => {
+                    return Ok(AdhocName {
+                        name: candidate,
+                        auto_named: true,
+                    });
+                }
+                Occupancy::Taken => n += 1,
+            }
+        }
+    }
+
+    /// The single occupancy predicate for run naming (D4): staged first (the
+    /// residual flow owns those names), then `app_dir` top-level and
+    /// `adhoc/` record paths via lstat (dangling links included), in-memory
+    /// app names, any in-memory program name, and the program names defined
+    /// by registered records not yet loaded.
+    fn candidate_status(&self, name: &str) -> Occupancy {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        {
+            let st = self.state.lock().unwrap();
+            if st.staged.contains_key(name) {
+                return Occupancy::Staged;
+            }
+            for path in [
+                registry::link_path(&config, &config_dir, name),
+                registry::adhoc_link_path(&config, &config_dir, name),
+            ] {
+                if let Ok(md) = std::fs::symlink_metadata(&path)
+                    && (md.is_file() || md.file_type().is_symlink())
+                {
+                    return Occupancy::Taken;
+                }
+            }
+            if st.apps.iter().any(|a| a.name == name) {
+                return Occupancy::Taken;
+            }
+            // Any program name, regardless of its owner.
+            if st.programs.contains_key(name) {
+                return Occupancy::Taken;
+            }
+        }
+        // Registered-but-not-loaded records still occupy their program names
+        // (a same-name program of another app is a suffix/conflict trigger).
+        let Ok(listed) = registry::list(&config, &config_dir) else {
+            return Occupancy::Free;
+        };
+        for l in listed.iter().filter(|l| l.broken.is_none()) {
+            if let Ok(r) = registry::resolve_listed(&config, l)
+                && r.programs.iter().any(|p| p.name == name)
+            {
+                return Occupancy::Taken;
+            }
+        }
+        Occupancy::Free
+    }
+
+    /// Every name the default-name suffix search must consider: staged names,
+    /// in-memory apps/programs, record stems and the program names defined by
+    /// registered records.
+    fn occupied_names(&self) -> HashSet<String> {
+        let (config, config_dir, mut names) = {
+            let st = self.state.lock().unwrap();
+            let names: HashSet<String> = st
+                .staged
+                .keys()
+                .chain(st.apps.iter().map(|a| &a.name))
+                .chain(st.programs.keys())
+                .cloned()
+                .collect();
+            (st.config.clone(), st.config_dir.clone(), names)
+        };
+        if let Ok(listed) = registry::list(&config, &config_dir) {
+            for l in listed.iter().filter(|l| l.broken.is_none()) {
+                names.insert(l.name.clone());
+                if let Ok(r) = registry::resolve_listed(&config, l) {
+                    names.extend(r.programs.into_iter().map(|p| p.name));
+                }
+            }
+        }
+        names
+    }
+
+    /// Highest `k` among occupied names matching exactly `<base>-<k>`; 0 when
+    /// none exists (add-standalone-programs D4: N = max + 1, never the first
+    /// free gap).
+    fn max_suffix(&self, base: &str) -> u32 {
+        let prefix = format!("{base}-");
+        self.occupied_names()
+            .iter()
+            .filter_map(|n| n.strip_prefix(&prefix))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .filter_map(|s| s.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// True when `name` is registered at the `app_dir` top level (a compose
+    /// product or an external link). `--force` must not rewrite it.
+    fn top_level_record_exists(&self, name: &str) -> bool {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let path = registry::link_path(&config, &config_dir, name);
+        std::fs::symlink_metadata(&path)
+            .map(|md| md.is_file() || md.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
+    fn top_level_overwrite_message(&self, name: &str) -> String {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let top = registry::link_path(&config, &config_dir, name);
+        format!(
+            "program {name:?} is registered at the app_dir top level ({}) — run \
+             `ak remove {name}` first or use `ak compose up`; `--force` only \
+             covers the run products in app_dir/adhoc/",
+            top.display()
+        )
+    }
+
+    /// True when `app_dir/adhoc/<name>.toml` exists (a run product; dangling
+    /// links included). `--force` only overwrites this area.
+    fn adhoc_record_exists(&self, name: &str) -> bool {
+        let (config, config_dir) = {
+            let st = self.state.lock().unwrap();
+            (st.config.clone(), st.config_dir.clone())
+        };
+        let path = registry::adhoc_link_path(&config, &config_dir, name);
+        std::fs::symlink_metadata(&path)
+            .map(|md| md.is_file() || md.file_type().is_symlink())
+            .unwrap_or(false)
     }
 
     /// Render + validate the ad-hoc definition without touching disk or
-    /// processes; returns the app name, program name and rendered text.
+    /// processes; returns the record path and the rendered text.
     fn render_adhoc(
         &self,
         spec: &AdhocSpec,
@@ -2072,10 +2379,10 @@ impl Supervisor {
             work_dir,
             health_check: spec.health_check.clone(),
         };
-        // Relay 1 keeps the run product shape unchanged; the standalone
-        // renderer (`standalone = true`) is wired in when the run command
-        // itself moves over.
-        let text = registry::render_scaffold(name, &scaf, &opts, false)
+        // A run product is a standalone program record: no `[app]` (except a
+        // description-only metadata table) and the run flags live on the
+        // program table (add-standalone-programs D2).
+        let text = registry::render_scaffold(name, &scaf, &opts, true)
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         // Validate the rendered config against the current registry (round-trip).
         let raw: crate::config::AppRaw = toml::from_str(&text).map_err(|e| {
@@ -2083,12 +2390,14 @@ impl Supervisor {
         })?;
         // Run products live in `app_dir/adhoc/` (add-compose-up D1).
         let target = registry::adhoc_link_path(&config, &config_dir, name);
-        let resolved = config::resolve_app(name, &target, &raw, config.app_default.as_ref())
+        let resolved = config::resolve_standalone(&target, &raw, config.app_default.as_ref())
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         let existing = registry::list(&config, &config_dir)
             .map_err(|e| AdhocUpError::Validation(format!("{e:#}")))?;
         let mut all = Vec::new();
         for l in &existing {
+            // The target record is being rewritten; everything else is a
+            // competing registration (cross-name uniqueness is validated).
             if l.name == name {
                 continue;
             }
@@ -2114,7 +2423,9 @@ impl Supervisor {
     /// is the residual (failed-commit) case (D4) and `--force` does not take it
     /// over.
     fn cmd_adhoc_up(&self, spec: &AdhocSpec) -> std::result::Result<AdhocUpResult, AdhocUpError> {
-        let name = self.resolve_adhoc_name(spec)?;
+        let chosen = self.resolve_adhoc_name(spec)?;
+        let name = chosen.name;
+        let auto_named = chosen.auto_named;
         // Residual check (D4): a same-name staged app that already started but
         // whose commit failed. Report it instead of restarting; `--force` does
         // not take over the residual (refuse-run-existing-app D8).
@@ -2141,18 +2452,18 @@ impl Supervisor {
                     residual: true,
                     unchanged: false,
                     landed: false,
+                    standalone: true,
+                    auto_named,
                 });
             }
         }
-        // Existence check before rendering (D1/D3): a default same-name
-        // submission is a conflict with zero side effects, no matter what the
-        // new definition looks like. With `--force` the overwrite path renders
-        // and validates first (D4).
-        if self.adhoc_exists(&name) {
-            if spec.force {
-                return self.adhoc_force(spec, &name);
-            }
-            return Err(AdhocUpError::Conflict(adhoc_conflict_message(&name)));
+        // `--force` targets the explicit name (or the stem) exactly: only an
+        // existing run product in `adhoc/` takes the overwrite path. A
+        // missing record is a fresh standalone registration under that name
+        // (a top-level record or a cross-app program-name collision is
+        // refused by name resolution/validation).
+        if spec.force && self.adhoc_record_exists(&name) {
+            return self.adhoc_force(spec, &name, auto_named);
         }
         // Render + validate the NEW definition before touching anything: a
         // failure here must not disturb the existing record or process.
@@ -2174,7 +2485,7 @@ impl Supervisor {
                 return Err(AdhocUpError::Validation(format!("{e}")));
             }
         };
-        let resolved = match config::resolve_app(&name, &target, &raw, config.app_default.as_ref())
+        let resolved = match config::resolve_standalone(&target, &raw, config.app_default.as_ref())
         {
             Ok(r) => r,
             Err(e) => {
@@ -2225,45 +2536,9 @@ impl Supervisor {
             residual: false,
             unchanged: false,
             landed: false,
+            standalone: true,
+            auto_named,
         })
-    }
-
-    /// True when `name` already exists as an app (refuse-run-existing-app D2):
-    /// its registration record is on disk, it is in the in-memory `apps`
-    /// registry, or `st.programs` holds a same-name program owned by that app
-    /// (covers the window before a rescan). A staged-but-unlanded app is
-    /// handled as residual before this check is reached.
-    ///
-    /// "On disk" is an lstat, not a stat: a dangling symlink record still IS a
-    /// registration (the same predicate [`registry::guard_scaffold_overwrite`]
-    /// uses), so it must be a conflict rather than a free path to rename over.
-    /// Only a regular file or a symlink counts — a DIRECTORY at the record path
-    /// is not a registration record; it is left to the landing stage, which
-    /// fails its rename and reports the partial failure (residual).
-    fn adhoc_exists(&self, name: &str) -> bool {
-        let (config, config_dir) = {
-            let st = self.state.lock().unwrap();
-            (st.config.clone(), st.config_dir.clone())
-        };
-        // Name uniqueness spans both record areas (add-compose-up task 1.2):
-        // a record at the top level (a compose product or an external link)
-        // and a run product in `adhoc/` both make the name taken.
-        for path in [
-            registry::link_path(&config, &config_dir, name),
-            registry::adhoc_link_path(&config, &config_dir, name),
-        ] {
-            if let Ok(md) = std::fs::symlink_metadata(&path)
-                && (md.is_file() || md.file_type().is_symlink())
-            {
-                return true;
-            }
-        }
-        let st = self.state.lock().unwrap();
-        st.apps.iter().any(|a| a.name == name)
-            || st
-                .programs
-                .get(name)
-                .is_some_and(|p| p.def.owner() == Some(name))
     }
 
     /// The program in memory that belongs to app `name`, if any. A same-name
@@ -2275,19 +2550,24 @@ impl Supervisor {
             .or_else(|| st.programs.values().find(|p| p.def.owner() == Some(name)))
     }
 
-    /// `--force` overwrite of an existing same-name app (refuse-run-existing-app
-    /// D4). Validation runs first (a failure touches nothing), the target must
-    /// be our own scaffold file (`--force` does not bypass the guard), and the
-    /// rendered text is compared with the record byte for byte:
+    /// `--force` overwrite of an existing run product (refuse-run-existing-app
+    /// D4, add-standalone-programs D5). Validation runs first (a failure
+    /// touches nothing), the target must be our own `adhoc/` file (`--force`
+    /// does not bypass the guard), and the rendered text is compared with the
+    /// record byte for byte:
     ///
     /// - identical → `unchanged`: no write, no stop, no spawn; existing pid;
     /// - different → placeholder + atomic rename lands the new record, then the
     ///   old program is stopped and the new definition started (`--restart=no`
     ///   stops only, without spawning) → `landed`.
+    ///
+    /// A top-level record is never an overwrite target: the caller's name
+    /// resolution already refused it; the guard below keeps the invariant.
     fn adhoc_force(
         &self,
         spec: &AdhocSpec,
         name: &str,
+        auto_named: bool,
     ) -> std::result::Result<AdhocUpResult, AdhocUpError> {
         let (target, text) = self.render_adhoc(spec, name)?;
         let (config, config_dir) = {
@@ -2303,12 +2583,9 @@ impl Supervisor {
         if let Ok(md) = std::fs::symlink_metadata(&top)
             && (md.is_file() || md.file_type().is_symlink())
         {
-            return Err(AdhocUpError::Validation(format!(
-                "app {name:?} is registered at the app_dir top level ({}) — run \
-                 `ak remove {name}` first or use `ak compose up`; `--force` only \
-                 covers the run products in app_dir/adhoc/",
-                top.display()
-            )));
+            return Err(AdhocUpError::Validation(
+                self.top_level_overwrite_message(name),
+            ));
         }
         // An external/hand-written record inside the adhoc area is never
         // clobbered either, `--force` or not.
@@ -2318,6 +2595,19 @@ impl Supervisor {
         // Byte comparison against the record on disk (a missing or unreadable
         // record counts as "different": there is nothing to preserve).
         let old_text = std::fs::read_to_string(&target).ok();
+        // Only our own generation may be overwritten: a hand-written record in
+        // `adhoc/` carries no run/compose scaffold header (D5/app-registry
+        // 「--force 强制覆盖」: 手工文件仍被拒绝).
+        if let Some(old) = &old_text
+            && !is_generated_record(old)
+        {
+            return Err(AdhocUpError::Validation(format!(
+                "program {name:?} at {} was not generated by `ak run` — `--force` only \
+                 overwrites run products; run `ak remove {name}` first or keep the \
+                 hand-written record",
+                target.display()
+            )));
+        }
         if old_text.as_deref() == Some(text.as_str()) {
             let st = self.state.lock().unwrap();
             let pid = Self::adhoc_program(&st, name).and_then(|p| p.pid());
@@ -2335,6 +2625,8 @@ impl Supervisor {
                 residual: false,
                 unchanged: true,
                 landed: false,
+                standalone: true,
+                auto_named,
             });
         }
         // Different: land the new record atomically (placeholder + rename)
@@ -2349,7 +2641,8 @@ impl Supervisor {
                 return Err(AdhocUpError::Validation(format!("{e}")));
             }
         };
-        let resolved = match config::resolve_app(name, &target, &raw, config.app_default.as_ref()) {
+        let resolved = match config::resolve_standalone(&target, &raw, config.app_default.as_ref())
+        {
             Ok(r) => r,
             Err(e) => {
                 registry::discard_placeholder(&config, &config_dir, name, registry::Origin::Run);
@@ -2378,6 +2671,8 @@ impl Supervisor {
                     residual: false,
                     unchanged: true,
                     landed: false,
+                    standalone: true,
+                    auto_named,
                 });
             }
             Ok(_) => {}
@@ -2411,14 +2706,9 @@ impl Supervisor {
             }
             let pid = mp.pid();
             st.programs.insert(program.clone(), mp);
-            if !st.apps.iter().any(|a| a.name == name) {
-                st.apps.push(AppRecord {
-                    name: resolved.name.clone(),
-                    path: resolved.path.clone(),
-                    description: resolved.description.clone(),
-                    priority: resolved.priority,
-                });
-            }
+            // A run product is a standalone program: never an AppRecord, even
+            // when the old definition was a transitional app-owned record.
+            st.apps.retain(|a| a.name != name);
             pid
         };
         self.sync_health_tasks();
@@ -2433,6 +2723,8 @@ impl Supervisor {
             residual: false,
             unchanged: false,
             landed: true,
+            standalone: true,
+            auto_named,
         })
     }
 
@@ -2449,10 +2741,12 @@ impl Supervisor {
     }
 
     /// `AdhocCommit`: rename the placeholder onto the record, drop the staged
-    /// entry and add the app to `apps`. On a rename failure the process is
-    /// kept running and a partial-failure result is returned (D4). Shared by
-    /// the run and the compose-up pipelines — the staged entry carries the
-    /// record area ([`StagedApp::origin`]).
+    /// entry and — only for a compose product — add the app to `apps`. On a
+    /// rename failure the process is kept running and a partial-failure
+    /// result is returned (D4). Shared by the run and the compose-up
+    /// pipelines — the staged entry carries the record area
+    /// ([`StagedApp::origin`]); a run product (`standalone`) never becomes an
+    /// AppRecord (add-standalone-programs D2).
     fn cmd_adhoc_commit(&self, name: &str) -> Result<AdhocCommitResult> {
         let (config, config_dir, staged) = {
             let st = self.state.lock().unwrap();
@@ -2473,10 +2767,11 @@ impl Supervisor {
             registry::commit_staged(&config, &config_dir, name, &staged.text, staged.origin);
         let (partial, partial_reason, unchanged) = match outcome {
             Ok(o) => {
-                // Persisted: clear the staged entry and register the app record.
+                // Persisted: clear the staged entry and, for an app record,
+                // register it. Run products stay standalone (owner-less).
                 let mut st = self.state.lock().unwrap();
                 st.staged.remove(name);
-                if !st.apps.iter().any(|a| a.name == staged.app) {
+                if !staged.resolved.standalone && !st.apps.iter().any(|a| a.name == staged.app) {
                     st.apps.push(AppRecord {
                         name: staged.resolved.name.clone(),
                         path: staged.resolved.path.clone(),
@@ -4000,9 +4295,18 @@ fn answer(reply: Option<Reply>, r: Result<String>) {
 /// escapes (a different `--app`, or an explicit overwrite).
 fn adhoc_conflict_message(name: &str) -> String {
     format!(
-        "app {name:?} is already registered — `ak run` refuses to replace an existing app; \
-         choose another `--app` name or pass `--force` to overwrite it"
+        "program {name:?} is already registered — `ak run` refuses to replace an existing \
+         program or app; choose another `--name`, or pass `--force` to overwrite the run \
+         record"
     )
+}
+
+/// True when a record's text carries one of this tool's scaffold headers:
+/// the current run header or the legacy compose header (older run products
+/// were rendered by the compose scaffold). A hand-written file has neither.
+fn is_generated_record(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or_default();
+    first.starts_with("# Registered by `ak run`") || first.starts_with("# Composed by `ak compose")
 }
 
 // -- startup judgement (run-daemon-first D3/D5) ------------------------------
@@ -4862,7 +5166,7 @@ mod tests {
             let st = sup.state.lock().unwrap();
             assert!(st.programs["web"].state().removable());
         }
-        let outcome = sup.cmd_remove("web").unwrap();
+        let outcome = sup.cmd_remove("web", false).unwrap();
         assert_eq!(outcome.app, "web");
         assert!(outcome.applied, "removal needs no apply");
         assert!(!outcome.deleted_file, "web is a link registration");
@@ -4907,7 +5211,7 @@ mod tests {
         );
         wait_state(&sup, "web", ProgramState::Running);
         let pid = sup.state.lock().unwrap().programs["web"].pid();
-        let err = sup.cmd_remove("web").unwrap_err();
+        let err = sup.cmd_remove("web", false).unwrap_err();
         match &err {
             RemoveError::Busy { app, blockers } => {
                 assert_eq!(app, "web");
@@ -4939,7 +5243,7 @@ mod tests {
                 "[app]\nrestart = \"no\"\n\n[program.web]\ncommand = 'true'\nstartsecs = 0.0\n",
             )],
         );
-        let err = sup.cmd_remove("ghost").unwrap_err();
+        let err = sup.cmd_remove("ghost", false).unwrap_err();
         assert!(matches!(err, RemoveError::UnknownApp(_)));
         assert_eq!(err.http_status(), 404);
         sup.shutdown_all();
@@ -4965,7 +5269,7 @@ mod tests {
         std::fs::write(&record, &body).unwrap();
         // The command dies before startsecs with no retry budget → fatal.
         wait_state(&sup, "abc", ProgramState::Fatal);
-        let outcome = sup.cmd_remove("abc").unwrap();
+        let outcome = sup.cmd_remove("abc", false).unwrap();
         assert!(outcome.deleted_file, "the generated record was deleted");
         assert!(outcome.kept_config.is_none(), "nothing external is kept");
         assert_eq!(outcome.config_path, record.display().to_string());
@@ -5000,7 +5304,7 @@ mod tests {
             let st = sup.state.lock().unwrap();
             (st.programs.len(), st.apps.len())
         };
-        let err = sup.cmd_remove("web").unwrap_err();
+        let err = sup.cmd_remove("web", false).unwrap_err();
         assert_eq!(err.http_status(), 500, "{err}");
         let msg = err.to_string();
         assert!(
@@ -5060,7 +5364,7 @@ mod tests {
         }
 
         let outcome = sup
-            .cmd_remove("web")
+            .cmd_remove("web", false)
             .expect("a broken record must remain removable");
         assert_eq!(outcome.app, "web");
         assert!(!outcome.deleted_file, "web is a link registration");
@@ -5079,7 +5383,7 @@ mod tests {
         assert!(sup.state.lock().unwrap().programs.contains_key("other"));
         // A second removal is now unknown — the record is really gone.
         assert!(matches!(
-            sup.cmd_remove("web").unwrap_err(),
+            sup.cmd_remove("web", false).unwrap_err(),
             RemoveError::UnknownApp(_)
         ));
         sup.shutdown_all();
@@ -5120,7 +5424,7 @@ mod tests {
             "the hand deletion is pending"
         );
 
-        let outcome = sup.cmd_remove("web").expect("removal must not fail");
+        let outcome = sup.cmd_remove("web", false).expect("removal must not fail");
         assert_eq!(outcome.app, "web");
         assert!(
             outcome.already_unregistered,
@@ -5378,7 +5682,7 @@ mod tests {
         let sup = Supervisor::new(config, &dir).unwrap();
         sup.set_config_path(&cfg_path);
         sup.bootstrap().unwrap();
-        let outcome = sup.cmd_remove("agent").expect("standalone removal");
+        let outcome = sup.cmd_remove("agent", true).expect("standalone removal");
         assert!(outcome.deleted_file, "the run record is deleted");
         assert_eq!(outcome.programs, vec!["agent".to_string()]);
         assert!(!record.exists(), "record file removed");
@@ -5470,6 +5774,39 @@ mod tests {
         assert!(!ApplyScope::App("a".into()).matches("b", "x"));
         assert!(ApplyScope::Program("a".into(), "x".into()).matches("a", "x"));
         assert!(!ApplyScope::Program("a".into(), "x".into()).matches("a", "y"));
+        // A bare program target matches by name regardless of ownership
+        // (app-internal or standalone) — D6.
+        assert!(ApplyScope::ProgramName("x".into()).matches("a", "x"));
+        assert!(ApplyScope::ProgramName("x".into()).matches("", "x"));
+        assert!(!ApplyScope::ProgramName("x".into()).matches("a", "y"));
+    }
+
+    /// 3.4/D6: `apply <program>` addresses a standalone record by its global
+    /// program name; the app scope never accepts a standalone name.
+    #[test]
+    fn apply_scope_program_name_addresses_standalone() {
+        let (sup, dir, h) = adhoc_harness("apply-scope-sa");
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join("adhoc").join("agent.toml"),
+            "[program.agent]\ncommand = 'true'\nrestart = 'no'\n",
+        )
+        .unwrap();
+        sup.bootstrap().unwrap();
+        assert!(
+            matches!(
+                resolve_apply_scope(&sup, None, Some("agent")).unwrap(),
+                ApplyScope::ProgramName(p) if p == "agent"
+            ),
+            "a bare program name scopes to the standalone record"
+        );
+        assert!(
+            resolve_apply_scope(&sup, Some("agent"), None).is_err(),
+            "a standalone program is not an app"
+        );
+        assert!(resolve_apply_scope(&sup, None, Some("ghost")).is_err());
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// apply-workflow: the literal `all` resolves to the whole-registry
@@ -7217,7 +7554,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
         assert_eq!(err.http_status(), 400);
-        assert!(err.to_string().contains("already registered"), "{err}");
+        assert!(err.to_string().contains("duplicated between"), "{err}");
         assert!(
             !dir.join("app.d").join("adhoc").join("web.toml").exists(),
             "nothing was written"
@@ -7466,7 +7803,16 @@ mod tests {
         {
             let st = sup.state.lock().unwrap();
             assert!(!st.staged.contains_key("web"), "staged cleared");
-            assert!(st.apps.iter().any(|a| a.name == "web"), "app recorded");
+            assert!(
+                !st.apps.iter().any(|a| a.name == "web"),
+                "a run product is a standalone program, never an app record"
+            );
+            assert!(
+                st.programs
+                    .get("web")
+                    .is_some_and(|p| p.def.is_standalone()),
+                "the program is loaded as standalone"
+            );
         }
         let (config, _) = DaemonConfig::load_or_default(&dir.join("daemon.toml")).unwrap();
         let listed = registry::list(&config, &dir).unwrap();
@@ -7578,6 +7924,386 @@ mod tests {
         .unwrap();
         assert!(second.residual, "same-name staged app is residual");
         assert_eq!(second.pid, pid, "no restart, same pid");
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- run naming: stem, suffix advancement, occupancy (D4/D5) -------------
+
+    /// 3.1/D4: a missing `--name` registers under the command's file stem;
+    /// a taken stem advances to `<stem>-1` without touching the existing record
+    /// or process, and the result marks the automatic name (D8).
+    #[test]
+    fn adhoc_default_name_uses_stem_then_advances() {
+        let (sup, dir, h) = adhoc_harness("auto-name");
+        let spec = || AdhocSpec {
+            name: None,
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        let first = adhoc_up(&sup, spec()).unwrap();
+        assert_eq!(first.app, "sleep", "stem of the command");
+        assert_eq!(first.program, "sleep");
+        assert!(first.standalone, "a run product is standalone");
+        assert!(!first.auto_named, "the stem was free");
+        let pid = first.pid.expect("spawned");
+        adhoc_commit(&sup, "sleep").unwrap();
+        assert!(dir.join("app.d").join("adhoc").join("sleep.toml").exists());
+
+        let second = adhoc_up(&sup, spec()).unwrap();
+        assert_eq!(second.app, "sleep-1", "suffix starts at 1");
+        assert!(second.auto_named, "the name was advanced");
+        assert!(second.standalone);
+        assert!(
+            dir.join("app.d")
+                .join("adhoc")
+                .join("sleep-1.toml.pending")
+                .exists(),
+            "the new name stages into adhoc/"
+        );
+        {
+            let st = sup.state.lock().unwrap();
+            assert_eq!(
+                st.programs["sleep"].pid(),
+                Some(pid),
+                "the existing process is untouched"
+            );
+            assert!(!st.apps.iter().any(|a| a.name.starts_with("sleep")));
+        }
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1/D4: the next default name is `max(k) + 1` — a free lower number is
+    /// never filled (`sleep` and `sleep-2` exist → `sleep-3`).
+    #[test]
+    fn adhoc_default_name_does_not_fill_gaps() {
+        let (sup, dir, h) = adhoc_harness("auto-gap");
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        for name in ["sleep", "sleep-2"] {
+            std::fs::write(
+                dir.join("app.d").join("adhoc").join(format!("{name}.toml")),
+                format!(
+                    "[program.{name}]\ncommand = {:?}\nargs = ['30']
+                     restart = 'no'
+                     startsecs = 0.0
+",
+                    sleep_bin()
+                ),
+            )
+            .unwrap();
+        }
+        sup.bootstrap().unwrap();
+        let up = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: None,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert_eq!(up.app, "sleep-3", "max existing suffix + 1");
+        assert!(up.auto_named);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2: a top-level compose record occupies the name, so the default
+    /// name advances instead of colliding with the app.
+    #[test]
+    fn adhoc_default_name_skips_top_level_record() {
+        let (sup, dir, h) = adhoc_harness("auto-top");
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join("sleep.toml"),
+            "[program.sleep]\ncommand = 'sleep 30'\nrestart = 'no'\n",
+        )
+        .unwrap();
+        sup.bootstrap().unwrap();
+        let up = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: None,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap();
+        assert_eq!(up.app, "sleep-1");
+        assert!(up.auto_named);
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3/D5: `--force` only overwrites `adhoc/` run products. A top-level
+    /// compose record is refused with a targeted message; nothing is written
+    /// under `adhoc/` and no process starts.
+    #[test]
+    fn adhoc_force_refuses_a_top_level_record() {
+        let (sup, dir, h) = adhoc_harness("force-top");
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        let record = dir.join("app.d").join("web.toml");
+        std::fs::write(&record, "[program.web]\ncommand = 'sleep 30'\n").unwrap();
+        sup.bootstrap().unwrap();
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
+        assert_eq!(err.http_status(), 400);
+        let text = err.to_string();
+        assert!(text.contains("app_dir top level"), "{text}");
+        assert!(text.contains("only covers the run products"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "[program.web]\ncommand = 'sleep 30'\n",
+            "the top-level record is untouched"
+        );
+        assert!(
+            !dir.join("app.d").join("adhoc").join("web.toml").exists(),
+            "nothing is staged under adhoc/"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.3/D5: a hand-written `adhoc/` record (no scaffold header) is never
+    /// clobbered by `--force`, even when the rendered text would match.
+    #[test]
+    fn adhoc_force_refuses_a_hand_written_record() {
+        let (sup, dir, h) = adhoc_harness("force-manual");
+        let record = dir.join("app.d").join("adhoc").join("web.toml");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let manual = "[program.web]\ncommand = '/bin/sleep'\nargs = ['30']\n";
+        std::fs::write(&record, manual).unwrap();
+        sup.bootstrap().unwrap();
+        let err = adhoc_up(
+            &sup,
+            AdhocSpec {
+                name: Some("web".into()),
+                force: true,
+                ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdhocUpError::Validation(_)), "{err:?}");
+        assert_eq!(err.http_status(), 400);
+        assert!(
+            err.to_string().contains("was not generated by `ak run`"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            manual,
+            "the hand-written record is untouched"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.1: explicit names are validated as program names — `/`, empty,
+    /// reserved `all` and characters outside the name set are all refused
+    /// before anything is staged or spawned.
+    #[test]
+    fn adhoc_explicit_name_matrix_is_rejected() {
+        let (sup, dir, h) = adhoc_harness("name-matrix");
+        for bad in ["a/b", "", "all", "my.tool", "/api"] {
+            let err = adhoc_up(
+                &sup,
+                AdhocSpec {
+                    name: Some(bad.into()),
+                    ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, AdhocUpError::Validation(_)),
+                "{bad:?} must be a validation error: {err:?}"
+            );
+            assert_eq!(err.http_status(), 400, "{bad:?}");
+        }
+        assert!(
+            sup.state.lock().unwrap().programs.is_empty(),
+            "nothing was spawned"
+        );
+        assert!(
+            !dir.join("app.d").join("adhoc").exists(),
+            "nothing was written"
+        );
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4/D6: removing a standalone program clears the pending entry and the
+    /// user-stop record along with the runtime program, and reports
+    /// `standalone: true` with the `adhoc/` record path.
+    #[test]
+    fn remove_standalone_cleans_pending_and_user_stop() {
+        let dir = std::env::temp_dir().join(format!("ak-test-standalone-clean-{}", unique_tag()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app.d").join("adhoc")).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        let cfg_path = dir.join("daemon.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[daemon]\nlog_dir = {:?}\nstate_dir = {:?}\n",
+                dir.join("logs").to_string_lossy(),
+                dir.join("state").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let record = dir.join("app.d").join("adhoc").join("agent.toml");
+        std::fs::write(&record, "[program.agent]\ncommand = 'true'\n").unwrap();
+        let (config, _) = DaemonConfig::load_or_default(&cfg_path).unwrap();
+        let sup = Supervisor::new(config, &dir).unwrap();
+        sup.set_config_path(&cfg_path);
+        sup.bootstrap().unwrap();
+        // A pending change and a user-stop record both name the program.
+        {
+            let mut st = sup.state.lock().unwrap();
+            st.pending.programs.push(PendingProgram {
+                app: "agent".into(),
+                program: "agent".into(),
+                running: false,
+            });
+            st.user_stopped.insert("agent".into());
+        }
+        let outcome = sup.cmd_remove("agent", true).expect("standalone removal");
+        assert!(outcome.standalone, "the result is a standalone removal");
+        assert!(!outcome.already_unregistered);
+        assert_eq!(outcome.app, "agent", "the record name is the program name");
+        assert_eq!(outcome.config_path, record.display().to_string());
+        assert!(!record.exists(), "the adhoc record is deleted");
+        let st = sup.state.lock().unwrap();
+        assert!(st.programs.is_empty(), "program dropped");
+        assert!(st.apps.is_empty(), "no app record is created or left");
+        assert!(st.pending.programs.is_empty(), "pending cleared");
+        assert!(st.user_stopped.is_empty(), "user-stop record cleared");
+        drop(st);
+        let _ = sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4/D6: the two removal namespaces do not cross — a standalone name
+    /// through the app endpoint is a 404, and an app-owned program through the
+    /// program endpoint is a 400.
+    #[test]
+    fn remove_namespaces_do_not_cross() {
+        let (sup, dir, _files) = setup_apps(
+            "remove-cross",
+            &[(
+                "web",
+                "[app]\nrestart = \"no\"\n\n[program.api]\ncommand = 'sleep 30'\n\
+                 startsecs = 0.0\n",
+            )],
+        );
+        let err = sup.cmd_remove("web", true).unwrap_err();
+        assert!(
+            matches!(err, RemoveError::NotStandalone(_)),
+            "an app is not a standalone program: {err:?}"
+        );
+        assert_eq!(err.http_status(), 400);
+        assert!(dir.join("app.d/web.toml").exists(), "record untouched");
+
+        let err = sup.cmd_remove("api", true).unwrap_err();
+        assert!(
+            matches!(err, RemoveError::NotStandalone(_)),
+            "an app-owned program is refused: {err:?}"
+        );
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("compose declaration"), "{err}");
+
+        let err = sup.cmd_remove("ghost", false).unwrap_err();
+        assert!(matches!(err, RemoveError::UnknownApp(_)), "{err:?}");
+        assert_eq!(err.http_status(), 404);
+        let _ = sup.shutdown_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.4: a standalone record deleted by hand still removes cleanly
+    /// (`already_unregistered`, runtime state dropped).
+    #[test]
+    fn remove_standalone_after_hand_deleted_record_succeeds() {
+        let (sup, dir, h) = adhoc_harness("standalone-hand");
+        let spec = AdhocSpec {
+            name: Some("agent".into()),
+            ..spec_for(sleep_bin().to_str().unwrap(), &["30"])
+        };
+        adhoc_up(&sup, spec).unwrap();
+        adhoc_commit(&sup, "agent").unwrap();
+        // Stop it so the liveness guard allows the removal.
+        sup.cmd_stop("agent").unwrap();
+        let record = dir.join("app.d").join("adhoc").join("agent.toml");
+        std::fs::remove_file(&record).unwrap();
+        let outcome = sup.cmd_remove("agent", true).expect("removal succeeds");
+        assert!(outcome.standalone);
+        assert!(outcome.already_unregistered, "the record was already gone");
+        assert!(!record.exists());
+        assert!(!sup.state.lock().unwrap().programs.contains_key("agent"));
+        stop_adhoc(&sup, h);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.7: every run path — fresh, forced overwrite, residual and
+    /// register-only — leaves the app namespace alone: no top-level record, no
+    /// AppRecord, no app name. Only compose products become apps.
+    #[test]
+    fn run_never_creates_an_app() {
+        let (sup, dir, h) = adhoc_harness("run-appless");
+        let run = |name: &str, force: bool, register_only: bool, secs: &str| AdhocSpec {
+            name: Some(name.to_string()),
+            force,
+            register_only,
+            ..spec_for(sleep_bin().to_str().unwrap(), &[secs])
+        };
+        // Fresh run: stages, then commits into `adhoc/`.
+        adhoc_up(&sup, run("web", false, false, "30")).unwrap();
+        adhoc_commit(&sup, "web").unwrap();
+        // Forced overwrite of the run record: still a standalone program.
+        let forced = adhoc_up(&sup, run("web", true, false, "31")).unwrap();
+        assert!(forced.landed, "the overwrite landed");
+        assert!(forced.standalone);
+        // Residual path: a second name staged but never committed.
+        let residual = adhoc_up(&sup, run("worker", false, false, "30")).unwrap();
+        assert!(!residual.residual);
+        // Register-only: no process, still a standalone record.
+        let register_only = adhoc_up(&sup, run("ghost", false, true, "30")).unwrap();
+        assert!(register_only.pid.is_none(), "register-only never spawns");
+
+        {
+            let st = sup.state.lock().unwrap();
+            assert!(
+                !st.apps
+                    .iter()
+                    .any(|a| ["web", "worker", "ghost"].contains(&&*a.name)),
+                "run never registers an app: {:?}",
+                st.apps.iter().map(|a| &a.name).collect::<Vec<_>>()
+            );
+            for name in ["web", "worker", "ghost"] {
+                let p = st.programs.get(name).expect("program loaded");
+                assert!(p.def.is_standalone(), "{name} is standalone");
+                assert_eq!(p.def.owner(), None, "{name} has no app owner");
+            }
+        }
+        assert!(
+            !dir.join("app.d").join("web.toml").exists(),
+            "nothing is written at the app_dir top level"
+        );
+        assert!(
+            dir.join("app.d").join("adhoc").join("web.toml").exists(),
+            "the run product lives under adhoc/"
+        );
+        // No app name is produced anywhere in the registry listing.
+        let (config, _) = DaemonConfig::load_or_default(&dir.join("daemon.toml")).unwrap();
+        let listed = registry::list(&config, &dir).unwrap();
+        assert!(
+            !listed.is_empty() && listed.iter().all(|l| l.standalone),
+            "every run product is classified standalone"
+        );
         stop_adhoc(&sup, h);
         let _ = std::fs::remove_dir_all(&dir);
     }

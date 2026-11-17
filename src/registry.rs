@@ -1025,6 +1025,42 @@ pub fn remove(config: &DaemonConfig, config_dir: &Path, name: &str) -> Result<Re
     })
 }
 
+/// Remove a **standalone program** record: only `app_dir/adhoc/<name>.toml`
+/// is ever deleted. Unlike [`remove`] this never falls back to the top-level
+/// area — a top-level record is an app and must go through the app path
+/// (add-standalone-programs D6).
+///
+/// A dangling link counts as a record (the occupancy predicate does the same
+/// lstat probe), so an operator can clean up a stale run product.
+pub fn remove_standalone(
+    config: &DaemonConfig,
+    config_dir: &Path,
+    name: &str,
+) -> Result<RemovedApp> {
+    let link = adhoc_link_path(config, config_dir, name);
+    if !matches!(
+        std::fs::symlink_metadata(&link),
+        Ok(md) if md.is_file() || md.file_type().is_symlink()
+    ) {
+        bail!(
+            "program {name:?} is not registered as a standalone record (no record at {})",
+            link.display()
+        );
+    }
+    let real_canon = std::fs::canonicalize(&link).unwrap_or_else(|_| link.clone());
+    std::fs::remove_file(&link)
+        .with_context(|| format!("failed to remove registration link {}", link.display()))?;
+    let dir_canon = app_dir(config, config_dir).canonicalize().ok();
+    let deleted_file = dir_canon
+        .as_ref()
+        .map(|d| real_canon.parent() == Some(&d.join(ADHOC_SUBDIR)))
+        .unwrap_or(false);
+    Ok(RemovedApp {
+        path: display_absolute(real_canon),
+        deleted_file,
+    })
+}
+
 fn make_link(link: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {

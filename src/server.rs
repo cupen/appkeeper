@@ -45,8 +45,14 @@ static FOLLOWS: AtomicUsize = AtomicUsize::new(0);
 /// sampler ([`crate::metrics`]): `None`/default means "no data", never 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProgramInfo {
+    /// Owning app name; empty for a standalone program (never forged).
     pub app: String,
     pub name: String,
+    /// True when the program comes from an `app_dir/adhoc/` record and is not
+    /// part of an app (add-standalone-programs D7). Backward-compatible
+    /// addition: older consumers simply ignore it.
+    #[serde(default)]
+    pub standalone: bool,
     pub state: String,
     pub pid: Option<u32>,
     pub unhealthy: bool,
@@ -265,6 +271,7 @@ pub(crate) fn program_info(
         .unwrap_or_default();
     ProgramInfo {
         app: p.def.app.clone().unwrap_or_default(),
+        standalone: p.def.is_standalone(),
         name: p.def.name.clone(),
         state: p.state().to_string(),
         pid: p.pid(),
@@ -314,13 +321,31 @@ fn startup_estimate_for(sup: &Arc<Supervisor>, program: &str) -> Duration {
     Duration::from_secs_f64(secs.max(0.1) + 5.0)
 }
 
+/// The record path a program is defined by: an app's top-level registration
+/// or a standalone program's `adhoc/<name>.toml` (add-standalone-programs
+/// D7). Single source for every projection and the start/fan-out replies.
+pub(crate) fn program_config_path(
+    st: &crate::supervisor::SupervisorState,
+    p: &crate::program::ManagedProgram,
+) -> Option<String> {
+    if p.def.is_standalone() {
+        Some(
+            crate::registry::adhoc_link_path(&st.config, &st.config_dir, &p.def.name)
+                .display()
+                .to_string(),
+        )
+    } else {
+        app_config_path(st, p.def.owner().unwrap_or_default())
+    }
+}
+
 /// [`program_info`] with the app's config path resolved from the live state.
 pub(crate) fn program_info_state(
     st: &crate::supervisor::SupervisorState,
     p: &crate::program::ManagedProgram,
     metrics: Option<&crate::metrics::MetricsTable>,
 ) -> ProgramInfo {
-    let config_path = app_config_path(st, p.def.owner().unwrap_or_default());
+    let config_path = program_config_path(st, p);
     let description = st
         .apps
         .iter()
@@ -629,12 +654,7 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
                     let (config_path, pid) = st
                         .programs
                         .get(*name)
-                        .map(|p| {
-                            (
-                                app_config_path(&st, p.def.owner().unwrap_or_default()),
-                                p.pid(),
-                            )
-                        })
+                        .map(|p| (program_config_path(&st, p), p.pid()))
                         .unwrap_or((None, None));
                     json_bytes(
                         200,
@@ -677,6 +697,9 @@ fn handle_connection(sup: &Arc<Supervisor>, stream: Box<dyn Conn>) {
         // Supervisor command owns the liveness guard, the record deletion and
         // the state cleanup (this thread never touches files or processes).
         ("POST", ["v1", "apps", name, "remove"]) => post_app_remove(sup, name),
+        // add-standalone-programs D6: the program-level removal endpoint only
+        // accepts standalone records; programs of an app are a 400.
+        ("POST", ["v1", "programs", name, "remove"]) => post_program_remove(sup, name),
         ("GET", ["v1", "programs", name, "logs"]) => {
             // Streaming response: owns the connection until the client leaves.
             respond_logs(sup, name, &query, Box::new(writer));
@@ -950,13 +973,7 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
                         let (config_path, pid, state) = st
                             .programs
                             .get(&s.program)
-                            .map(|p| {
-                                (
-                                    app_config_path(&st, p.def.owner().unwrap_or_default()),
-                                    p.pid(),
-                                    p.state().to_string(),
-                                )
-                            })
+                            .map(|p| (program_config_path(&st, p), p.pid(), p.state().to_string()))
                             .unwrap_or((None, None, String::new()));
                         // With `wait=1`, reclassify a program that did not reach
                         // Running as a failure so the CLI exits non-zero, and
@@ -1020,9 +1037,21 @@ fn post_app_fanout(sup: &Arc<Supervisor>, app: &str, verb: &str, wait: bool) -> 
 /// Status mapping: unknown app → 404, a live/backoff program → 409,
 /// a registration-deletion failure → 500 (nothing was cleaned up).
 fn post_app_remove(sup: &Arc<Supervisor>, app: &str) -> Vec<u8> {
+    post_remove(sup, app, false)
+}
+
+/// `POST /v1/programs/{name}/remove` — remove a standalone program record
+/// (add-standalone-programs D6). Same command, same structured outcome; the
+/// supervisor refuses app-owned programs with 400 and unknown names with 404.
+fn post_program_remove(sup: &Arc<Supervisor>, name: &str) -> Vec<u8> {
+    post_remove(sup, name, true)
+}
+
+fn post_remove(sup: &Arc<Supervisor>, name: &str, standalone: bool) -> Vec<u8> {
     let (tx, rx) = mpsc::channel();
     sup.enqueue(Command::Remove {
-        app: app.to_string(),
+        name: name.to_string(),
+        standalone,
         reply: tx,
     });
     match rx.recv_timeout(Duration::from_secs(120)) {
@@ -1036,6 +1065,7 @@ fn post_app_remove(sup: &Arc<Supervisor>, app: &str) -> Vec<u8> {
 pub(crate) fn remove_json(o: &crate::supervisor::RemoveOutcome) -> serde_json::Value {
     serde_json::json!({
         "app": o.app,
+        "standalone": o.standalone,
         "config_path": o.config_path,
         "deleted_file": o.deleted_file,
         "kept_config": o.kept_config,
@@ -1186,6 +1216,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                 "program": up.program,
                 "config_path": up.config_path,
                 "pid": up.pid,
+                "standalone": up.standalone,
+                "auto_named": up.auto_named,
                 "error": "the program is already started but not registered",
             }),
         );
@@ -1204,6 +1236,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                 "program": up.program,
                 "config_path": up.config_path,
                 "pid": up.pid,
+                "standalone": up.standalone,
+                "auto_named": up.auto_named,
                 "unchanged": true,
                 "partial": false,
                 "error": "",
@@ -1226,6 +1260,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                     "program": up.program,
                     "config_path": up.config_path,
                     "pid": serde_json::Value::Null,
+                    "standalone": up.standalone,
+                    "auto_named": up.auto_named,
                     "unchanged": false,
                     "partial": false,
                     "error": "",
@@ -1245,6 +1281,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                         "program": c.program,
                         "config_path": c.config_path,
                         "pid": serde_json::Value::Null,
+                        "standalone": up.standalone,
+                        "auto_named": up.auto_named,
                         "unchanged": c.unchanged,
                         "partial": c.partial,
                         "error": if c.partial { c.partial_reason.clone() } else { String::new() },
@@ -1307,6 +1345,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                         "program": up.program,
                         "config_path": up.config_path,
                         "pid": pid,
+                        "standalone": up.standalone,
+                        "auto_named": up.auto_named,
                         "unchanged": false,
                         "partial": false,
                         "error": "",
@@ -1326,6 +1366,8 @@ fn respond_adhoc_run(sup: &Arc<Supervisor>, body: &[u8], mut writer: Box<dyn Wri
                             "program": c.program,
                             "config_path": c.config_path,
                             "pid": pid,
+                            "standalone": up.standalone,
+                            "auto_named": up.auto_named,
                             "unchanged": c.unchanged,
                             "partial": c.partial,
                             "error": if c.partial { c.partial_reason.clone() } else { String::new() },
@@ -1861,6 +1903,7 @@ mod tests {
     fn sample_doc() -> StatusDoc {
         let info = ProgramInfo {
             app: "app".into(),
+            standalone: false,
             name: "a".into(),
             state: "running".into(),
             pid: Some(1),
@@ -2544,6 +2587,8 @@ mod tests {
         let last = frames.last().unwrap();
         assert_eq!(last["ok"], true, "{frames:?}");
         assert_eq!(last["program"], "web");
+        assert_eq!(last["standalone"], true, "a run product is standalone");
+        assert_eq!(last["auto_named"], false, "the explicit name is kept");
         assert!(last["pid"].as_u64().unwrap() > 0);
         assert!(last["config_path"].as_str().unwrap().ends_with("web.toml"));
         assert!(
@@ -2551,6 +2596,109 @@ mod tests {
             "record written"
         );
         assert!(!dir.join("app.d").join("web.toml.pending").exists());
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.2/D4: without `--name` the endpoint registers the command stem; a
+    /// taken stem advances to `<stem>-1` and the terminal frame says
+    /// `auto_named: true` (both frames carry `standalone: true`).
+    #[test]
+    fn run_endpoint_default_name_advances() {
+        let (sup, dir, ep) = serve_harness("run-auto-name");
+        let (cmd, args) = sleep_cmd();
+        let run = || {
+            ep.post(
+                "/v1/run",
+                &serde_json::json!({
+                    "command": cmd, "args": args,
+                    "register_only": true, "restart": "no",
+                }),
+            )
+        };
+        let first = run();
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let body = dechunk(first.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(v["program"], "sleep", "the command stem: {v}");
+        assert_eq!(v["standalone"], true, "{v}");
+        assert_eq!(v["auto_named"], false, "{v}");
+        assert!(dir.join("app.d").join("adhoc").join("sleep.toml").exists());
+
+        let second = run();
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+        let body = dechunk(second.split("\r\n\r\n").nth(1).unwrap_or(""));
+        let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(v["program"], "sleep-1", "the stem was taken: {v}");
+        assert_eq!(v["standalone"], true, "{v}");
+        assert_eq!(v["auto_named"], true, "the name was advanced: {v}");
+        assert!(
+            dir.join("app.d")
+                .join("adhoc")
+                .join("sleep-1.toml")
+                .exists(),
+            "the advanced record lands in adhoc/"
+        );
+        assert!(
+            !dir.join("app.d").join("sleep-1.toml").exists(),
+            "never at the app_dir top level"
+        );
+        sup.request_shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 4.2: a legacy `adhoc/` record (with an `[app]` table) is still a
+    /// standalone program: it starts by name and the projection marks it
+    /// `standalone`, with an empty `app` and the `adhoc/` config path.
+    #[test]
+    fn old_format_adhoc_record_is_standalone_in_the_projection() {
+        let (sup, dir, ep) = serve_harness("run-old-format");
+        let record = dir.join("app.d").join("adhoc").join("legacy.toml");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let (cmd, args) = sleep_cmd();
+        let args = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &record,
+            format!(
+                "[app]\ndescription = 'old run'\n\n[program.legacy]\ncommand = {cmd:?}\n\
+                 args = [{args}]\nrestart = 'no'\n"
+            ),
+        )
+        .unwrap();
+        // Load the record the way a daemon (re)start does.
+        sup.bootstrap().unwrap();
+        let start = ep.post("/v1/programs/legacy/start", &serde_json::json!({}));
+        assert!(start.starts_with("HTTP/1.1 200"), "{start}");
+
+        for route in ["/v1/status", "/v1/programs"] {
+            let resp = ep.get(route);
+            assert!(resp.starts_with("HTTP/1.1 200"), "{route}: {resp}");
+            let v = response_json(&resp);
+            let programs = v
+                .get("programs")
+                .and_then(|p| p.as_array())
+                .unwrap_or_else(|| panic!("{route} carries the projection: {v}"));
+            let p = programs
+                .iter()
+                .find(|p| p["name"] == "legacy")
+                .unwrap_or_else(|| panic!("{route} projects legacy: {v}"));
+            assert_eq!(p["standalone"], true, "{route}: {p}");
+            assert_eq!(p["app"], "", "{route}: no app owner: {p}");
+            assert_eq!(
+                p["config_path"].as_str().unwrap(),
+                record.display().to_string(),
+                "{route}: the adhoc record path: {p}"
+            );
+            // The old `[app].description` is metadata, not an app identity.
+            assert!(p["app"] != "legacy", "{route}: {p}");
+        }
+        // The app namespace does not see it: a start fan-out is a 404.
+        let fanout = ep.post("/v1/apps/legacy/start", &serde_json::json!({}));
+        assert!(fanout.starts_with("HTTP/1.1 404"), "{fanout}");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2644,6 +2792,22 @@ mod tests {
         // Missing command → 400.
         let resp = ep.post("/v1/run", &serde_json::json!({ "name": "web" }));
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        // A `/` in the name is a usage error in the run naming grammar
+        // (add-standalone-programs D6: `/` is management-plane addressing).
+        for bad in ["a/b", "", "my.tool"] {
+            let resp = ep.post(
+                "/v1/run",
+                &serde_json::json!({ "name": bad, "command": cmd, "args": args }),
+            );
+            assert!(
+                resp.starts_with("HTTP/1.1 400"),
+                "{bad:?} must be a validation error: {resp}"
+            );
+            assert!(
+                !dir.join("app.d").join("adhoc").exists(),
+                "{bad:?} writes nothing"
+            );
+        }
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2805,7 +2969,7 @@ mod tests {
     #[test]
     fn run_endpoint_force_failed_startup_stops_new_process() {
         let (sup, dir, ep) = serve_harness("run-force-fail");
-        let record = register_only_app(&ep, &dir, "web");
+        let record = register_only_standalone(&ep, &dir, "web");
         assert!(record.exists());
         // A definition that exits inside startsecs: the startup judgement fails.
         #[cfg(unix)]
@@ -3091,15 +3255,12 @@ mod tests {
     }
 
     /// 5.4: the app fan-out response keeps per-program `result` and adds
-    /// `config_path`/`pid`.
+    /// `config_path`/`pid`. A fan-out target must be a real compose app: a
+    /// standalone program is not an app (add-standalone-programs D6/D7).
     #[test]
     fn fanout_endpoint_adds_structured_fields() {
         let (sup, dir, ep) = serve_harness("fanout-fields");
-        let (cmd, args) = sleep_cmd();
-        let _ = ep.post(
-            "/v1/run",
-            &serde_json::json!({ "name": "web", "command": cmd, "args": args, "register_only": true, "restart": "no" }),
-        );
+        write_compose_app(&sup, &dir, "web");
         let resp = ep.post("/v1/apps/web/start", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -3114,11 +3275,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -- app removal endpoint (guard-remove-until-stopped 2.1) ---------------
+    /// Write a compose app (top-level record) and load it. `restart = "no"`
+    /// keeps it stopped until an explicit start/fan-out.
+    fn write_compose_app(sup: &Supervisor, dir: &Path, name: &str) {
+        let (cmd, args) = sleep_cmd();
+        let args = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::create_dir_all(dir.join("app.d")).unwrap();
+        std::fs::write(
+            dir.join("app.d").join(format!("{name}.toml")),
+            format!("[program.{name}]\ncommand = {cmd:?}\nargs = [{args}]\nrestart = 'no'\n"),
+        )
+        .unwrap();
+        sup.bootstrap().unwrap();
+    }
 
-    /// Register a `restart = "no"` app through the ad-hoc endpoint and return
-    /// its registration record path. `register_only` means it is never started.
-    fn register_only_app(ep: &TestEndpoint, dir: &Path, name: &str) -> std::path::PathBuf {
+    // -- program/app removal endpoints (guard-remove-until-stopped 2.1,
+    //    add-standalone-programs D6/4.3) -------------------------------------
+
+    /// Register a `restart = "no"` standalone program through the run endpoint
+    /// and return its `adhoc/` record path. `register_only` means it is never
+    /// started. Run products are standalone programs, never apps.
+    fn register_only_standalone(ep: &TestEndpoint, dir: &Path, name: &str) -> std::path::PathBuf {
         let (cmd, args) = sleep_cmd();
         let resp = ep.post(
             "/v1/run",
@@ -3131,20 +3312,31 @@ mod tests {
         dir.join("app.d").join("adhoc").join(format!("{name}.toml"))
     }
 
-    /// 2.1: a stopped app is removed immediately with the structured result;
-    /// the status projection no longer contains it.
+    /// 2.1/D6: a stopped standalone program is removed immediately through the
+    /// program endpoint with the structured result; the status projection no
+    /// longer contains it and the app endpoint refuses the same name.
     #[test]
-    fn remove_endpoint_succeeds_for_a_stopped_app() {
+    fn remove_program_endpoint_succeeds_for_a_stopped_standalone() {
         let (sup, dir, ep) = serve_harness("remove-ok");
-        let record = register_only_app(&ep, &dir, "web");
+        let record = register_only_standalone(&ep, &dir, "web");
         assert!(record.exists());
-        let resp = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        // A standalone name is not an app: the app endpoint is a 404 and the
+        // record survives (D6).
+        let as_app = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        assert!(as_app.starts_with("HTTP/1.1 404"), "{as_app}");
+        assert!(as_app.contains("unknown app"), "{as_app}");
+        assert!(record.exists(), "the app endpoint deletes nothing");
+        let resp = ep.post("/v1/programs/web/remove", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         let v: serde_json::Value =
             serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
-        assert_eq!(v["app"], "web");
+        // The structured result's `app` field carries the record name — for a
+        // standalone program that is the program name (control-plane spec).
+        assert_eq!(v["app"], "web", "{v}");
+        assert_eq!(v["standalone"], true, "{v}");
+        assert_eq!(v["config_path"], record.display().to_string(), "{v}");
         assert_eq!(v["deleted_file"], true, "generated record deleted: {v}");
-        assert_eq!(v["applied"], true);
+        assert_eq!(v["applied"], true, "removal is immediate: {v}");
         assert!(v["programs"].as_array().is_some());
         assert!(
             v["result"].as_str().unwrap().contains("no apply needed"),
@@ -3159,26 +3351,27 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|p| p["app"] == "web"),
+                .any(|p| p["program"] == "web"),
             "web's program projection is gone: {sv}"
         );
         // A second removal is a 404 (nothing is registered any more).
-        let again = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        let again = ep.post("/v1/programs/web/remove", &serde_json::json!({}));
         assert!(again.starts_with("HTTP/1.1 404"), "{again}");
+        assert!(again.contains("unknown standalone program"), "{again}");
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 2.1: a running program is a 409; nothing changes.
+    /// 2.1: a running standalone program is a 409; nothing changes.
     #[test]
-    fn remove_endpoint_conflict_for_a_running_app() {
+    fn remove_program_endpoint_conflict_for_a_running_standalone() {
         let (sup, dir, ep) = serve_harness("remove-busy");
-        let _record = register_only_app(&ep, &dir, "web");
+        let _record = register_only_standalone(&ep, &dir, "web");
         // Start it (register=false, restart=no means it stays stopped until a
         // start command).
         let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
         assert!(start.starts_with("HTTP/1.1 200"), "{start}");
-        let resp = ep.post("/v1/apps/web/remove", &serde_json::json!({}));
+        let resp = ep.post("/v1/programs/web/remove", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 409"), "{resp}");
         // The program is either still starting or already running — both block.
         assert!(
@@ -3196,13 +3389,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 2.1: an unknown app is a 404.
+    /// 2.1/4.3: an unknown program and an unknown app are 404s with their
+    /// namespace-specific message; an app-internal program is a 400 (its
+    /// ownership is the compose declaration's business).
     #[test]
-    fn remove_endpoint_unknown_app_is_404() {
+    fn remove_endpoints_reject_unknown_and_app_owned_names() {
         let (sup, dir, ep) = serve_harness("remove-404");
+        let resp = ep.post("/v1/programs/not-registered/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        assert!(resp.contains("unknown standalone program"), "{resp}");
         let resp = ep.post("/v1/apps/not-registered/remove", &serde_json::json!({}));
         assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
         assert!(resp.contains("unknown app"), "{resp}");
+        // A compose app owns its programs: the program endpoint refuses them.
+        write_compose_app(&sup, &dir, "shop");
+        let resp = ep.post("/v1/programs/shop/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("not a standalone program"), "{resp}");
+        assert!(resp.contains("compose declaration"), "{resp}");
+        assert!(dir.join("app.d/shop.toml").exists(), "record untouched");
+        // The app endpoint still removes the whole compose app.
+        let resp = ep.post("/v1/apps/shop/remove", &serde_json::json!({}));
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+        assert_eq!(v["app"], "shop");
+        assert_eq!(v["standalone"], false, "{v}");
+        assert!(!dir.join("app.d/shop.toml").exists());
         sup.request_shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3275,11 +3488,11 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
         // No token → 401, and the record survives.
-        let denied = ep.post_auth("/v1/apps/web/remove", &serde_json::json!({}), None);
+        let denied = ep.post_auth("/v1/programs/web/remove", &serde_json::json!({}), None);
         assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
         assert!(dir.join("app.d/adhoc/web.toml").exists());
         let ok = ep.post_auth(
-            "/v1/apps/web/remove",
+            "/v1/programs/web/remove",
             &serde_json::json!({}),
             Some("secret-1"),
         );
@@ -3295,7 +3508,7 @@ mod tests {
     #[test]
     fn apply_endpoint_maps_a_live_deletion_to_409() {
         let (sup, dir, ep) = serve_harness("apply-guard");
-        let record = register_only_app(&ep, &dir, "web");
+        let record = register_only_standalone(&ep, &dir, "web");
         let start = ep.post("/v1/programs/web/start", &serde_json::json!({}));
         assert!(start.starts_with("HTTP/1.1 200"), "{start}");
         // Hand-delete the registration while the program still runs.
@@ -3309,9 +3522,10 @@ mod tests {
             assert!(resp.contains(needle), "the 409 names {needle:?}: {resp}");
         }
         // The blocker is reported with its live state (`starting` until
-        // startsecs elapses, `running` after — both are guard states).
+        // startsecs elapses, `running` after — both are guard states). A
+        // standalone program has no `<app>.` prefix (D6/4.3).
         assert!(
-            resp.contains("web.web (starting)") || resp.contains("web.web (running)"),
+            resp.contains("web (starting)") || resp.contains("web (running)"),
             "the 409 names the blocker program and state: {resp}"
         );
         assert!(!record.exists(), "the on-disk deletion is not rolled back");
